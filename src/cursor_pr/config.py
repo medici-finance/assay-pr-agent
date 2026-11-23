@@ -54,7 +54,7 @@ def project_from(row):
     return Project(row["provider"], url, slug, checkout, frozenset(ids), visibility)
 
 
-def prompt_config():
+def prompt_config(*, visibility=False):
     rows = []
     while True:
         provider = input("Forge (github/gitlab): ").strip().lower()
@@ -62,10 +62,22 @@ def prompt_config():
         checkout = input("Trusted checkout path inside this service: ").strip()
         ids = [int(x.strip()) for x in input("Human requester numeric IDs (comma-separated): ").split(",")]
         rows.append(dict(provider=provider, url=url, checkout=checkout, requester_ids=ids))
-        if "REVIEW_OPERATOR" in os.environ:
+        if visibility or "REVIEW_OPERATOR" in os.environ:
             rows[-1]["visibility"] = input("Project visibility (private/internal/public) [private]: ").strip() or "private"
         if input("Add another project? [y/N] ").strip().lower() not in ("y", "yes"):
             return {"projects": rows}
+
+
+def parse_projects(rows):
+    projects = {}
+    for row in rows:
+        project = project_from(row)
+        if any(p.slug.casefold() == project.slug.casefold() for p in projects.values()):
+            raise ValueError("Assay requires an unambiguous owner/project address")
+        projects[project.key] = project
+    if not projects:
+        raise ValueError("Configure at least one project")
+    return projects
 
 
 def load_config(state):
@@ -81,15 +93,8 @@ def load_config(state):
         rows = prompt_config()["projects"]
         save = True
     else:
-        raise ValueError("Set REVIEW_PROJECTS or start interactively with a TTY")
-    projects = {}
-    for row in rows:
-        project = project_from(row)
-        if any(p.slug.casefold() == project.slug.casefold() for p in projects.values()):
-            raise ValueError("Assay requires an unambiguous owner/project address")
-        projects[project.key] = project
-    if not projects:
-        raise ValueError("Configure at least one project")
+        raise ValueError("Run cursor-review-setup with a TTY or set REVIEW_PROJECTS")
+    projects = parse_projects(rows)
     if save:
         with tempfile.NamedTemporaryFile(mode="w", dir=state, delete=False) as temp:
             json.dump({"projects": [{k: row[k] for k in ("provider", "url", "checkout", "requester_ids", "visibility") if k in row}

@@ -14,6 +14,7 @@ import time
 from .config import load_config
 from .credentials import SETUP_INPUTS, forge_credentials
 from .discovery import poll_project
+from . import setup
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ def run_review(project, number, state):
     if os.getenv("REVIEW_MODEL"):
         argv.extend(["--model", os.environ["REVIEW_MODEL"]])
     env = dict(os.environ)
+    env["CURSOR_REVIEW_POLLER_CHILD"] = "1"
     for key in ("REVIEW_PROJECTS", *SETUP_INPUTS):
         env.pop(key, None)
     for key in list(env):
@@ -99,19 +101,32 @@ def cycle(projects, state, jobs, since, runner=run_review):
         jobs.finish(job, status)
 
 
+def container_main():
+    if sys.argv[1:2] == ["setup"]:
+        return setup.main(sys.argv[2:])
+    return main()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Poll Assay for GitHub and GitLab /review comments")
-    parser.add_argument("--state-dir", type=Path, default=os.environ.get(
-        "REVIEW_STATE_DIR", str(Path.home() / ".local/state/cursor-review")))
-    parser.add_argument("--interval", type=int, default=os.environ.get("REVIEW_POLL_SECONDS", "120"),
+    parser.add_argument("--state-dir", type=Path, default=setup.state_dir())
+    parser.add_argument("--interval", type=int,
                         help="seconds to wait after each cycle (default 120)")
     args = parser.parse_args()
-    if args.interval < 1:
-        parser.error("poll interval must be positive")
     state = args.state_dir.resolve()
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     with ExitStack() as stack:
         try:
+            fresh = not any((state / p).exists() for p in ("setup", "projects.json", "hooks.json"))
+            if (fresh and sys.stdin.isatty() and "REVIEW_PROJECTS" not in os.environ
+                    and not any(k in os.environ for k in SETUP_INPUTS)
+                    and not (Path.home() / ".config/assay/roster.env").exists()):
+                setup.configure(state)
+            setup.apply_saved_setup(state)
+            if args.interval is None:
+                args.interval = int(os.getenv("REVIEW_POLL_SECONDS", "120"))
+            if args.interval < 1:
+                raise ValueError("poll interval must be positive")
             if int(os.getenv("REVIEW_MAX_INPUT_TOKENS", "6000")) < 1:
                 raise ValueError("REVIEW_MAX_INPUT_TOKENS must be positive")
             projects = load_config(state)

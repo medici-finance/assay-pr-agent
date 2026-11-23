@@ -46,16 +46,38 @@ def positive_id(name):
     return value
 
 
+def validate_pem(value):
+    pem = value.replace("\\n", "\n") + "\n"
+    if not pem.startswith(("-----BEGIN RSA PRIVATE KEY-----\n", "-----BEGIN PRIVATE KEY-----\n")):
+        raise ValueError(f"{KEY} must contain an unencrypted RSA PEM")
+    check = subprocess.run(["openssl", "rsa", "-check", "-noout", "-passin", "pass:"],
+                           input=pem.encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           env={"PATH": os.defpath})
+    if check.returncode:
+        raise ValueError(f"{KEY} must contain an unencrypted RSA PEM")
+    return pem.rstrip()
+
+
+def validate_token(value):
+    if not value or not value.isascii() or not value.isprintable() or any(c.isspace() for c in value):
+        raise ValueError("Expected a single printable token without spaces")
+    return value
+
+
 def private_file(path, value):
     with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, encoding="utf-8") as tmp:
         tmp.write(value + "\n")
     os.replace(tmp.name, path)
 
 
-def write_roster(home, projects):
-    operator = os.getenv("REVIEW_OPERATOR", "")
+def validate_operator(operator):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*:[1-9][0-9]*", operator):
         raise ValueError("Set REVIEW_OPERATOR to the responsible human's forge login:numeric-id")
+    return operator
+
+
+def write_roster(home, projects):
+    operator = validate_operator(os.getenv("REVIEW_OPERATOR", ""))
     login = operator.split(":")[0]
     config = home / ".config/assay"
     config.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -84,15 +106,7 @@ def forge_credentials(projects, state):
                 raise ValueError("The pinned Assay GitHub App backend requires github.com")
             updates["REVIEWER_APP_ID"] = positive_id(APP_ID)
             updates["REVIEWER_INSTALL_ID"] = positive_id(INSTALL_ID)
-            pem = read_secret(KEY).replace("\\n", "\n") + "\n"
-            if not pem.startswith(("-----BEGIN RSA PRIVATE KEY-----\n", "-----BEGIN PRIVATE KEY-----\n")):
-                raise ValueError(f"{KEY} must contain an unencrypted RSA PEM")
-            check = subprocess.run(["openssl", "rsa", "-check", "-noout", "-passin", "pass:"],
-                                   input=pem.encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                   env={"PATH": os.defpath})
-            if check.returncode:
-                raise ValueError(f"{KEY} must contain an unencrypted RSA PEM")
-            private_file(creds / "reviewer-app.pem", pem.rstrip())
+            private_file(creds / "reviewer-app.pem", validate_pem(read_secret(KEY)))
             updates["REVIEWER_APP"] = "reviewer-app"
             updates["REVIEWER_PEM"] = str(creds / "reviewer-app.pem")
         if "gitlab" in providers:
@@ -101,10 +115,7 @@ def forge_credentials(projects, state):
             if len(bases) != 1 or (base and base not in bases):
                 raise ValueError("Configure one GitLab instance per container; GITLAB_API_BASE must match it")
             updates["GITLAB_API_BASE"] = bases.pop()
-            pat = read_secret(TOKEN)
-            if not pat.isascii() or not pat.isprintable() or any(c.isspace() for c in pat):
-                raise ValueError(f"{TOKEN} must be a single printable token")
-            private_file(creds / "gitlab-reviewer.token", pat)
+            private_file(creds / "gitlab-reviewer.token", validate_token(read_secret(TOKEN)))
         if not (Path.home() / ".config/assay/roster.env").exists():
             # Keep audit records and Assay's write limits across container restarts.
             home = state / "forge-home"

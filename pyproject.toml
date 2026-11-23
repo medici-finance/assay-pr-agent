@@ -10,6 +10,8 @@ requires-python = ">=3.12"
 dependencies = ["pr-agent==0.50.0", "httpx"]
 
 [project.scripts]
+cursor-review-setup = "cursor_pr.setup:main"
+cursor-review-container = "cursor_pr.poll:container_main"
 cursor-review-poll = "cursor_pr.poll:main"
 cursor-review = "cursor_pr.cli:main"
 

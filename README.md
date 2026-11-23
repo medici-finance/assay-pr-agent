@@ -18,6 +18,30 @@ The image contains Cursor Agent, Assay’s released forge tools, ShellCheck and 
 docker build --platform linux/amd64 -t assay-pr-agent .
 ```
 
+### Interactive setup
+
+Run the setup command once with a writable state volume and your checkouts mounted at the paths the reviewer will use:
+
+```sh
+docker run --rm -it --platform linux/amd64 \
+  -v review-state:/state -v /path/to/checkouts:/repos:ro assay-pr-agent setup
+```
+
+Enter the projects, checkout paths inside the container, visibility, numeric IDs allowed to request reviews, and the responsible operator’s `login:numeric-id`. Setup asks for a Cursor API key and only the credentials for the forges you selected. For GitHub, have the App ID, installation ID and private PEM ready. For GitLab, have the reviewer token ready. You can accept the defaults of 120 seconds between polls, 6,000 estimated input tokens per review and Cursor’s default model.
+
+For each credential, choose **paste** to enter it with terminal echo disabled, **import** to copy a readable file into the volume, or **mount** to keep using an external file. For import or mount, add the source volume to the setup command (for example, `-v /path/to/secrets:/run/secrets:ro`) and enter the file’s absolute path **inside** the container. With **mount**, provide the same file path when running the service. With **import**, the source mount is only needed during setup.
+
+Start the reviewer with the same volumes. No configuration environment variables are required:
+
+```sh
+docker run --rm --platform linux/amd64 \
+  -v review-state:/state -v /path/to/checkouts:/repos:ro assay-pr-agent
+```
+
+The active settings and imported or pasted credentials are in `/state/setup/`. Credential files are plaintext, owner-readable and writable (0600), inside a private directory (0700). Protect the volume and its backups. Setup checks the local files and credential formats offline. The poller checks forge access during normal operation.
+
+To change settings or rotate credentials, run the setup command again, or run `docker exec -it <container> cursor-review-setup`. Existing settings and credentials can be kept without displaying their values. Restart the reviewer to load the new setup. Cancelling before the save keeps the previous configuration active. An explicit environment setting takes precedence over its saved value.
+
 ### Standalone Docker credentials
 
 Mount the checkout for each project read-only and a writable volume at `/state` for the request queue, cache and Assay audit records. The container runs as UID 10001. It generates the reviewer configuration on first start and updates it from the supplied settings on restart. You can use it without installing Assay on the host.
@@ -84,7 +108,7 @@ spec:
 
 Assay uses mode-0600 runtime copies of the supplied credentials. In Docker these live in `/dev/shm`; incoming keys are excluded from the project settings and review database. Keep one service instance per state volume. The normal `/review` path uses GitLab’s token without rotating it. `REVIEW_MODEL` selects the Cursor model.
 
-For interactive project setup, omit `REVIEW_PROJECTS` and add `-it`. The wizard saves project settings in `/state/projects.json` (0600). Environment project settings take precedence. Deployments with an existing Assay reviewer configuration can still mount it at `/home/reviewer/.config/assay` and omit the standalone setup variables. When supplying credentials alongside a mounted roster, its existing repository and identity rules apply.
+On an unconfigured interactive first start, the container runs setup before polling. Deployments with an existing Assay reviewer configuration can still mount it at `/home/reviewer/.config/assay` and omit the standalone setup variables. When supplying credentials alongside a mounted roster, its existing repository and identity rules apply.
 
 **Upgrading from v0.1.0.** Stop the old receiver and start the polling image with the same state volume. It reads the existing project settings, request queue and cache. You can remove the forge webhooks, reverse proxy, published port, `REVIEW_PUBLIC_URL` and webhook secrets. The polling container only needs outbound connections.
 

@@ -16,4 +16,4 @@ ENV DESK_LOOP=pr-review-desk DESK_TOOLS_BIN=/usr/local/bin HOME=/home/reviewer P
 USER reviewer
 RUN curl -fsSL https://cursor.com/install -o /tmp/install-cursor.sh && bash /tmp/install-cursor.sh && rm /tmp/install-cursor.sh && cursor-agent --version
 VOLUME /state
-ENTRYPOINT ["cursor-review-poll"]
+ENTRYPOINT ["cursor-review-container"]

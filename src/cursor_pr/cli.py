@@ -10,6 +10,7 @@ import tempfile
 from unidiff.errors import UnidiffParseError
 import yaml
 
+from .setup import apply_saved_setup, state_dir
 from .config import load_config
 from .credentials import forge_credentials, standalone_requested
 from .checks import go_report, scan_files
@@ -57,7 +58,7 @@ def parser():
     p.add_argument("--path", action="append", default=[], help="Limit review to an exact changed path; repeatable")
     p.add_argument("--go-report", type=Path, help="Assay go-analysis/v1 JSON for this head")
     p.add_argument("--model", help="Explicit Cursor model (otherwise the CLI default)")
-    p.add_argument("--max-input-tokens", type=int, default=6000, help="Preflight estimate limit (default 6000)")
+    p.add_argument("--max-input-tokens", type=int, help="Preflight estimate limit (default 6000)")
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling Cursor")
     p.add_argument("--cache-dir", type=Path, default=Path(os.getenv("XDG_CACHE_HOME", Path.home()/".cache"))/"cursor-pr-review")
     p.add_argument("--post", action="store_true", help="Publish a head-bound summary using deskpost with --change")
@@ -139,8 +140,14 @@ def main():
     old = Path.cwd()
     try:
         with ExitStack() as stack:
+            state = state_dir().resolve()
+            if args.change and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
+                apply_saved_setup(state)
+            if args.max_input_tokens is None:
+                args.max_input_tokens = int(os.getenv("REVIEW_MAX_INPUT_TOKENS", "6000"))
+            if args.model is None:
+                args.model = os.getenv("REVIEW_MODEL")
             if args.change and standalone_requested():
-                state = Path(os.getenv("REVIEW_STATE_DIR", Path.home()/".local/state/cursor-review")).resolve()
                 state.mkdir(mode=0o700, parents=True, exist_ok=True)
                 projects = load_config(state)
                 slug, _, number = args.change.rpartition("#")
