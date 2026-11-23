@@ -1,6 +1,7 @@
-"""Receive forge comments and run one requested review at a time."""
+"""Poll configured forges and process explicit review requests serially."""
 import argparse
-from contextlib import asynccontextmanager, closing
+from contextlib import closing
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -8,17 +9,12 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
-import threading
+import time
 
-from starlette.applications import Starlette
-from starlette.responses import Response
-from starlette.routing import Route
-import uvicorn
+from .config import load_config
+from .discovery import poll_project
 
-from .hook_config import load_config
-from .hook_events import authenticated, command
-
-log = logging.getLogger("uvicorn.error")
+log = logging.getLogger(__name__)
 
 
 class Jobs:
@@ -28,15 +24,25 @@ class Jobs:
             db.execute("""CREATE TABLE IF NOT EXISTS requests (
                 project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,
                 status TEXT NOT NULL, PRIMARY KEY(project, number, comment))""")
-        self.wake = threading.Event()
+            db.execute("""CREATE TABLE IF NOT EXISTS activations (
+                project TEXT PRIMARY KEY, since TEXT NOT NULL)""")
 
-    def enqueue(self, project, number, comment):
+    def activated(self, project):
         with closing(sqlite3.connect(self.path)) as db, db:
-            inserted = db.execute("INSERT OR IGNORE INTO requests VALUES (?,?,?,'queued')",
-                                  (project, number, comment)).rowcount
-        if inserted:
-            self.wake.set()
-        return bool(inserted)
+            db.execute("INSERT OR IGNORE INTO activations VALUES (?,?)",
+                       (project, datetime.now(timezone.utc).isoformat()))
+            return datetime.fromisoformat(db.execute(
+                "SELECT since FROM activations WHERE project=?", (project,)).fetchone()[0])
+
+    def recorded(self, project, number, comment):
+        with closing(sqlite3.connect(self.path)) as db:
+            return db.execute("SELECT 1 FROM requests WHERE project=? AND number=? AND comment=?",
+                              (project, number, comment)).fetchone() is not None
+
+    def enqueue(self, project, number, comment, status="queued"):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("INSERT OR IGNORE INTO requests VALUES (?,?,?,?)",
+                       (project, number, comment, status))
 
     def next(self):
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -74,77 +80,47 @@ def run_review(project, number, state):
     return report["state"] if report.get("publication") == "posted-or-already-present" else "failed"
 
 
-def make_app(projects, state, runner=run_review):
-    jobs = Jobs(state)
-    stop = threading.Event()
-
-    def work():
-        while not stop.is_set():
-            jobs.wake.clear()
-            job = jobs.next()
-            if not job:
-                jobs.wake.wait()
-                continue
-            key, number, comment = job
+def cycle(projects, state, jobs, since, runner=run_review):
+    for project in projects.values():
+        try:
+            poll_project(project, state, jobs, since[project.key])
+        except Exception:
+            log.exception("Poll failed for %s; will retry next cycle", project.key)
+    while job := jobs.next():
+        key, number, comment = job
+        status = "failed"
+        if key in projects:
             try:
                 status = runner(projects[key], number, state)
             except Exception:
                 log.exception("Review failed for %s #%d comment %d", key, number, comment)
-                status = "failed"
-            jobs.finish(job, status)
-
-    @asynccontextmanager
-    async def lifespan(app):
-        thread = threading.Thread(target=work, name="requested-reviews", daemon=True)
-        thread.start()
-        try:
-            yield
-        finally:
-            stop.set()
-            jobs.wake.set()
-            thread.join(timeout=1)
-
-    async def receive(request):
-        project = projects.get(request.path_params["key"])
-        if project is None:
-            return Response(status_code=404)
-        body = bytearray()
-        async for chunk in request.stream():
-            if len(body) + len(chunk) > 2_000_000:
-                return Response(status_code=413)
-            body.extend(chunk)
-        if not authenticated(project, request.headers, body):
-            return Response(status_code=403)
-        header = "x-github-event" if project.provider == "github" else "x-gitlab-event"
-        try:
-            found = command(project, request.headers.get(header), json.loads(body))
-        except (ValueError, TypeError, AttributeError, KeyError):
-            return Response(status_code=400)
-        if found and jobs.enqueue(project.key, *found):
-            return Response(status_code=202)
-        return Response(status_code=204)
-
-    return Starlette(routes=[Route("/hooks/{key:path}", receive, methods=["POST"])], lifespan=lifespan)
+        jobs.finish(job, status)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Serve on-demand GitHub and GitLab /review hooks")
+    parser = argparse.ArgumentParser(description="Poll Assay for GitHub and GitLab /review comments")
     parser.add_argument("--state-dir", type=Path, default=os.environ.get(
         "REVIEW_STATE_DIR", str(Path.home() / ".local/state/cursor-review")))
-    parser.add_argument("--bind", default=os.environ.get("REVIEW_BIND", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=os.environ.get("REVIEW_PORT", "8787"))
+    parser.add_argument("--interval", type=int, default=os.environ.get("REVIEW_POLL_SECONDS", "120"),
+                        help="seconds to wait after each cycle (default 120)")
     args = parser.parse_args()
+    if args.interval < 1:
+        parser.error("poll interval must be positive")
     state = args.state_dir.resolve()
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         if int(os.getenv("REVIEW_MAX_INPUT_TOKENS", "6000")) < 1:
             raise ValueError("REVIEW_MAX_INPUT_TOKENS must be positive")
-        public, projects = load_config(state)
+        projects = load_config(state)
     except (ValueError, KeyError, TypeError, EOFError, OSError) as err:
-        parser.exit(2, f"Webhook configuration: {err}\n")
-    for key in projects:
-        print(f"{projects[key].provider} comment webhook: {public}/hooks/{key}", flush=True)
-    uvicorn.run(make_app(projects, state), host=args.bind, port=args.port)
+        parser.exit(2, f"Polling configuration: {err}\n")
+    jobs = Jobs(state)
+    since = {key: jobs.activated(key) for key in projects}
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log.info("Polling %s with %d seconds between cycles", ", ".join(projects), args.interval)
+    while True:
+        cycle(projects, state, jobs, since)
+        time.sleep(args.interval)
 
 
 if __name__ == "__main__":

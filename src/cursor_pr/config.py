@@ -1,6 +1,5 @@
-"""First-start settings for project-specific webhook endpoints."""
-from dataclasses import dataclass, field
-from getpass import getpass
+"""First-start settings for polling projects."""
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -17,7 +16,6 @@ class Project:
     slug: str
     checkout: Path
     requesters: frozenset[int]
-    secret: bytes = field(repr=False)
 
     @property
     def key(self):
@@ -46,55 +44,49 @@ def project_from(row):
     ids = row["requester_ids"]
     if not isinstance(ids, list) or not ids or any(type(i) is not int or i <= 0 for i in ids):
         raise ValueError("requester_ids must list positive numeric IDs of human reviewers")
-    if "secret_env" in row and not re.fullmatch(r"REVIEW_SECRET_[A-Z0-9_]+", row["secret_env"]):
-        raise ValueError("Use a REVIEW_SECRET_ environment variable for each webhook secret")
-    secret = os.environ.get(row["secret_env"], "") if "secret_env" in row else row.get("secret", "")
-    if not secret or not secret.isascii() or not secret.isprintable() or any(c.isspace() for c in secret):
-        raise ValueError("Set a nonempty printable webhook secret without whitespace")
     checkout = Path(row["checkout"])
     if not checkout.is_absolute() or not checkout.is_dir():
-        raise ValueError("checkout must be an existing absolute directory on the receiver")
-    return Project(row["provider"], url, slug, checkout, frozenset(ids), secret.encode())
+        raise ValueError("checkout must be an existing absolute directory on the poller")
+    return Project(row["provider"], url, slug, checkout, frozenset(ids))
 
 
 def prompt_config():
-    public = input("Public HTTPS receiver URL: ").strip()
     rows = []
     while True:
         provider = input("Forge (github/gitlab): ").strip().lower()
         url = input("Full HTTPS project URL: ").strip()
         checkout = input("Trusted checkout path inside this service: ").strip()
         ids = [int(x.strip()) for x in input("Human requester numeric IDs (comma-separated): ").split(",")]
-        secret = getpass("Webhook secret (enter the same secret in the forge): ")
-        rows.append(dict(provider=provider, url=url, checkout=checkout, requester_ids=ids, secret=secret))
+        rows.append(dict(provider=provider, url=url, checkout=checkout, requester_ids=ids))
         if input("Add another project? [y/N] ").strip().lower() not in ("y", "yes"):
-            return {"public_url": public, "projects": rows}
+            return {"projects": rows}
 
 
 def load_config(state):
-    path = state / "hooks.json"
-    fresh = False
+    path = state / "projects.json"
+    legacy = state / "hooks.json"
+    save = False
     if "REVIEW_PROJECTS" in os.environ:
-        settings = {"projects": json.loads(os.environ["REVIEW_PROJECTS"]),
-                    "public_url": os.environ.get("REVIEW_PUBLIC_URL", "")}
-    elif path.exists():
-        settings = json.loads(path.read_text())
+        rows = json.loads(os.environ["REVIEW_PROJECTS"])
+    elif path.exists() or legacy.exists():
+        rows = json.loads((path if path.exists() else legacy).read_text())["projects"]
+        save = not path.exists()
     elif sys.stdin.isatty():
-        settings = prompt_config()
-        fresh = True
+        rows = prompt_config()["projects"]
+        save = True
     else:
-        raise ValueError("Set REVIEW_PROJECTS and REVIEW_PUBLIC_URL or start interactively with a TTY")
-    public = https_url(os.environ.get("REVIEW_PUBLIC_URL", settings["public_url"]))
+        raise ValueError("Set REVIEW_PROJECTS or start interactively with a TTY")
     projects = {}
-    for row in settings["projects"]:
+    for row in rows:
         project = project_from(row)
-        if project.key in projects:
-            raise ValueError("Duplicate project endpoint")
+        if any(p.slug.casefold() == project.slug.casefold() for p in projects.values()):
+            raise ValueError("Assay requires an unambiguous owner/project address")
         projects[project.key] = project
     if not projects:
         raise ValueError("Configure at least one project")
-    if fresh:
+    if save:
         with tempfile.NamedTemporaryFile(mode="w", dir=state, delete=False) as temp:
-            json.dump(settings, temp)
+            json.dump({"projects": [{k: row[k] for k in ("provider", "url", "checkout", "requester_ids")}
+                                    for row in rows]}, temp)
         os.replace(temp.name, path)
-    return public, projects
+    return projects

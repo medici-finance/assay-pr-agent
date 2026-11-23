@@ -7,10 +7,10 @@ name = "cursor-pr-review"
 version = "0.1.0"
 description = "Single-pass Cursor reviewer for GitHub pull requests and GitLab merge requests"
 requires-python = ">=3.12"
-dependencies = ["pr-agent==0.50.0", "starlette", "uvicorn"]
+dependencies = ["pr-agent==0.50.0", "httpx"]
 
 [project.scripts]
-cursor-review-hooks = "cursor_pr.hooks:main"
+cursor-review-poll = "cursor_pr.poll:main"
 cursor-review = "cursor_pr.cli:main"
 
 [tool.setuptools.packages.find]
