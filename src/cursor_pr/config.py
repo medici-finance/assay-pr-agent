@@ -17,6 +17,7 @@ class Project:
     checkout: Path
     requesters: frozenset[int]
     visibility: str = "private"
+    go_analysis: str = ""
 
     @property
     def key(self):
@@ -51,7 +52,13 @@ def project_from(row):
     visibility = row.get("visibility", "private")
     if visibility not in ("private", "internal", "public"):
         raise ValueError("visibility must be private, internal or public")
-    return Project(row["provider"], url, slug, checkout, frozenset(ids), visibility)
+    producer = row.get("go_analysis", "")
+    if not isinstance(producer, str) or len(producer) > 255 or (
+            producer and (not producer.isprintable() or producer != producer.strip())):
+        raise ValueError("go_analysis must name a CI producer")
+    if row["provider"] == "github" and producer and not re.fullmatch(r"[\w.-]+\.ya?ml|[1-9][0-9]*", producer):
+        raise ValueError("go_analysis must be a GitHub workflow filename or numeric ID")
+    return Project(row["provider"], url, slug, checkout, frozenset(ids), visibility, producer)
 
 
 def prompt_config(*, visibility=False):
@@ -64,6 +71,10 @@ def prompt_config(*, visibility=False):
         rows.append(dict(provider=provider, url=url, checkout=checkout, requester_ids=ids))
         if visibility or "REVIEW_OPERATOR" in os.environ:
             rows[-1]["visibility"] = input("Project visibility (private/internal/public) [private]: ").strip() or "private"
+        label = "GitHub Actions workflow filename or ID" if provider == "github" else "GitLab CI job name"
+        producer = input(f"Trusted Go analysis {label} (blank to skip): ").strip()
+        if producer:
+            rows[-1]["go_analysis"] = producer
         if input("Add another project? [y/N] ").strip().lower() not in ("y", "yes"):
             return {"projects": rows}
 
@@ -97,7 +108,7 @@ def load_config(state):
     projects = parse_projects(rows)
     if save:
         with tempfile.NamedTemporaryFile(mode="w", dir=state, delete=False) as temp:
-            json.dump({"projects": [{k: row[k] for k in ("provider", "url", "checkout", "requester_ids", "visibility") if k in row}
+            json.dump({"projects": [{k: row[k] for k in ("provider", "url", "checkout", "requester_ids", "visibility", "go_analysis") if k in row}
                                     for row in rows]}, temp)
         os.replace(temp.name, path)
     return projects

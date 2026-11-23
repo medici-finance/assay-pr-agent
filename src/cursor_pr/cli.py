@@ -13,6 +13,7 @@ import yaml
 from .setup import apply_saved_setup, state_dir
 from .config import load_config
 from .credentials import forge_credentials, standalone_requested
+from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .engine import CursorFailure, pack, review, tokens
 from .source import ReviewError, ci_refs, forge_change, local_change, run_desk
@@ -32,7 +33,7 @@ def publish(address, head, report):
         body.append("No model findings in the reviewed scope.")
     for check in report["checks"]:
         if check["state"] != "complete":
-            body.append(f"- {check['tool']}: could not check {check.get('path', '')}")
+            body.append(f"- {check['tool']}: could not check {check.get('path') or check.get('reason', '')}")
         for item in check["findings"]:
             body.append(f"- {item['path']}:{item['line']} — {item['rule']} {item.get('message', '')}")
     for path in report["omitted"]:
@@ -56,7 +57,9 @@ def parser():
     p.add_argument("--head", help="Local head revision (default HEAD with --base)")
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="Checkout for local Git and scanners")
     p.add_argument("--path", action="append", default=[], help="Limit review to an exact changed path; repeatable")
-    p.add_argument("--go-report", type=Path, help="Assay go-analysis/v1 JSON for this head")
+    evidence = p.add_mutually_exclusive_group()
+    evidence.add_argument("--go-analysis-producer", help="Trusted CI producer for --expected-change-url")
+    evidence.add_argument("--go-report", type=Path, help="Assay go-analysis/v1 JSON for this head")
     p.add_argument("--model", help="Explicit Cursor model (otherwise the CLI default)")
     p.add_argument("--max-input-tokens", type=int, help="Preflight estimate limit (default 6000)")
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling Cursor")
@@ -71,6 +74,8 @@ def execute(args):
     root = args.repo.resolve()
     if args.expected_change_url and not args.change:
         raise ReviewError("--expected-change-url requires --change")
+    if args.go_analysis_producer and not args.expected_change_url:
+        raise ReviewError("--go-analysis-producer requires --expected-change-url")
     if args.change:
         change = forge_change(args.change, args.expected_change_url)
     else:
@@ -83,8 +88,12 @@ def execute(args):
         raise ReviewError("--path must name a file changed in this review")
     files = sorted((f for f in change.files if f.path in selected), key=lambda f: f.path)
     checks = scan_files(root, change.head, files)
+    go = None
     if args.go_report:
         go = go_report(args.go_report, change.head)
+    elif args.go_analysis_producer:
+        go = forge_go_report(change.identity, args.go_analysis_producer, change.head, root)
+    if go is not None:
         go["findings"] = [row for row in go["findings"] if row["path"] in selected]
         checks.append(go)
 

@@ -25,6 +25,15 @@ def run_desk(args, *, env=None, **kwargs):
     return run(args, env=env, **kwargs)
 
 
+def reviewer_token(provider, slug, checkout):
+    custody = run_desk(["desktoken", "--no-rotate", "--forge", provider, "reviewer", "--repo", slug],
+                       cwd=checkout).decode().strip()
+    token = Path(custody).read_text().strip()
+    if not token:
+        raise ReviewError("Empty reviewer credential")
+    return token
+
+
 def valid_sha(value):
     return isinstance(value, str) and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value)
 

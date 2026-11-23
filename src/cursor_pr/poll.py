@@ -63,6 +63,8 @@ def run_review(project, number, state):
     argv = [sys.executable, "-I", "-m", "cursor_pr.cli", "--repo", str(project.checkout),
             "--change", address, "--expected-change-url", project.change_url(number),
             "--post", "--cache-dir", str(state / "cache")]
+    if project.go_analysis:
+        argv.extend(["--go-analysis-producer", project.go_analysis])
     if os.getenv("REVIEW_MAX_INPUT_TOKENS"):
         argv.extend(["--max-input-tokens", os.environ["REVIEW_MAX_INPUT_TOKENS"]])
     if os.getenv("REVIEW_MODEL"):

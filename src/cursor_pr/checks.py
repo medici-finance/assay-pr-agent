@@ -10,13 +10,19 @@ from .source import ReviewError, git
 
 
 def go_report(path, head):
-    value = json.loads(Path(path).read_text())
+    return import_go_report(json.loads(Path(path).read_bytes()), head)
+
+
+def import_go_report(value, head, *, repository=None):
+    if repository is not None and value.get("repository") != repository:
+        raise ReviewError("Go analysis report repository does not match")
     if value.get("schema") != "go-analysis/v1" or value.get("source_sha") != head:
         raise ReviewError("Go analysis report schema or source SHA does not match")
     incomplete = {"tool": "go-analysis", "state": "could-not-check", "findings": []}
     coverage = value.get("coverage")
     if (value.get("state") != "complete" or value.get("errors") != []
-            or not isinstance(coverage, list) or len(coverage) != value.get("expected_scans")
+            or type(value.get("expected_scans")) is not int
+            or not isinstance(coverage, list) or len(coverage) != value["expected_scans"]
             or any(scan.get("state") != "complete" for scan in coverage)):
         return incomplete
     dispositions = ("existing", "new", "worsened", "resolved")
@@ -33,6 +39,10 @@ def go_report(path, head):
     findings = [{"path": f["path"], "line": f["line"], "rule": f["rule"],
                  "analyzer": f["analyzer"], "disposition": f["disposition"]}
                 for f in value["findings"] if f["disposition"] in ("new", "worsened")]
+    if any(type(f["line"]) is not int or f["line"] < 1
+           or any(not isinstance(f[k], str) or not f[k] for k in ("path", "rule", "analyzer"))
+           for f in findings):
+        return incomplete
     return {"tool": "go-analysis", "state": "complete", "findings": findings}
 
 

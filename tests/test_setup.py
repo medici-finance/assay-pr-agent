@@ -23,8 +23,8 @@ class InteractiveSetupTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def project(self, provider, again="n"):
-        return [provider, f"https://{provider}.com/org/{provider}", str(self.checkout), "13,27", "public", again]
+    def project(self, provider, again="n", producer=""):
+        return [provider, f"https://{provider}.com/org/{provider}", str(self.checkout), "13,27", "public", producer, again]
 
     def configure(self, answers, secrets=()):
         with patch("builtins.input", side_effect=answers), patch.object(setup, "hidden", side_effect=secrets):
@@ -35,7 +35,7 @@ class InteractiveSetupTests(unittest.TestCase):
         pem.write_bytes(subprocess.check_output(["openssl","genrsa","2048"], stderr=subprocess.DEVNULL))
         external = self.root/"gitlab-pat"
         external.write_text("fixture-pat")
-        self.configure(self.project("github","y")+self.project("gitlab")+
+        self.configure(self.project("github","y","go.yml")+self.project("gitlab",producer="go-lint")+
                        ["alice:13","41","42","90","3600","model-a","paste","import",str(pem),"mount",str(external)],
                        ["fixture-cursor"])
         pem.unlink()  # Imported once; only the external GitLab mount is needed again.
@@ -48,7 +48,8 @@ class InteractiveSetupTests(unittest.TestCase):
         external.write_text("rotated-fixture")
         setup.apply_saved_setup(self.state)
         projects = load_config(self.state)
-        self.assertEqual(len(projects), 2)
+        self.assertEqual({p.provider: p.go_analysis for p in projects.values()},
+                         {"github": "go.yml", "gitlab": "go-lint"})
         self.assertEqual(os.environ["REVIEW_POLL_SECONDS"],"90")
         self.assertEqual(os.environ["REVIEW_MAX_INPUT_TOKENS"],"3600")
         self.assertEqual(os.environ["REVIEW_MODEL"],"model-a")

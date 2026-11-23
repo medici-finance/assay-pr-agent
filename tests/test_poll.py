@@ -52,7 +52,7 @@ class PollTests(unittest.TestCase):
     def test_wizard_env_and_legacy_config(self):
         row = dict(provider="github", url=self.gh.url, checkout=str(self.state), requester_ids=[7])
         with patch.dict(os.environ, {}, clear=True), patch("sys.stdin.isatty", return_value=True), \
-             patch("builtins.input", side_effect=["github",self.gh.url,str(self.state),"7","n"]):
+             patch("builtins.input", side_effect=["github",self.gh.url,str(self.state),"7","","n"]):
             initial = load_config(self.state)
             self.assertEqual(load_config(self.state), initial)
             config = self.state / "projects.json"
@@ -73,7 +73,7 @@ class PollTests(unittest.TestCase):
                       author={"id":7}, body="/review", created_at="t.001", updated_at="t.001")
         request = httpx.Request("GET", "https://gitlab.com")
         with patch.dict(os.environ, {"GITLAB_API_BASE":"https://gitlab.com/api/v4"}), \
-             patch("cursor_pr.discovery.run_desk", return_value=str(token).encode()) as lookup, \
+             patch("cursor_pr.source.run_desk", return_value=str(token).encode()) as lookup, \
              patch("cursor_pr.discovery.httpx.get") as get:
             for delta in ({}, {"internal":True}, {"internal":None}, {"confidential":True}, {"system":True},
                           {"updated_at":"t.002"}, {"author":{"id":7,"bot":True}}, {"author":{"id":8}},
@@ -131,6 +131,16 @@ class PollTests(unittest.TestCase):
             cycle(self.projects,self.state,Jobs(self.state),since,review)
             self.assertEqual(reviews, [(self.gl.key,3),(self.gh.key,3)])
             visibility.assert_called_once()
+
+    def test_worker_passes_configured_ci_producer_to_review(self):
+        from dataclasses import replace
+        for project, producer in ((self.gh, "go.yml"), (self.gl, "go-lint")):
+            with patch("cursor_pr.poll.subprocess.run") as run:
+                run.return_value.stdout = b'{"state":"reviewed","publication":"posted-or-already-present"}'
+                self.assertEqual(run_review(replace(project, go_analysis=producer), 3, self.state), "reviewed")
+                argv = run.call_args.args[0]
+                self.assertEqual(argv[argv.index("--go-analysis-producer")+1], producer)
+                self.assertEqual(argv[argv.index("--expected-change-url")+1], project.change_url(3))
 
     def test_real_command_path_with_stubbed_executables(self):
         # Only the external forge and model binaries are replaced. Exercise the installed

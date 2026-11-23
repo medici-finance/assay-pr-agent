@@ -5,12 +5,11 @@ from itertools import batched
 import json
 import logging
 import os
-from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 import httpx
 
-from .source import ReviewError, run_desk
+from .source import ReviewError, reviewer_token, run_desk
 
 log = logging.getLogger(__name__)
 
@@ -76,11 +75,7 @@ def public_gitlab_request(project, number, note):
     base = os.environ.get("GITLAB_API_BASE", "").rstrip("/")
     if base != "https://" + urlsplit(project.url).netloc + "/api/v4":
         raise ReviewError("GITLAB_API_BASE must match the project's HTTPS instance /api/v4")
-    custody = run_desk(["desktoken", "--no-rotate", "--forge", "gitlab", "reviewer", "--repo", project.slug],
-                  cwd=project.checkout).decode().strip()
-    token = Path(custody).read_text().strip()
-    if not token:
-        raise ReviewError("Empty GitLab reviewer credential")
+    token = reviewer_token("gitlab", project.slug, project.checkout)
     url = f"{base}/projects/{quote(project.slug, safe='')}/merge_requests/{number}/notes/{note['databaseId']}"
     response = httpx.get(url, headers={"PRIVATE-TOKEN": token}, follow_redirects=False, timeout=15)
     if response.status_code == 404:

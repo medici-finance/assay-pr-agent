@@ -155,6 +155,19 @@ ShellCheck and actionlint run on the reviewed head’s Git blobs in a temporary 
 
 To reuse Assay’s Go linters, pass `--go-report path/to/report.json` from its [pinned analysis action](https://github.com/medici-finance/assay/tree/main/actions/go-analysis). Supply an artifact from a trusted producer. The runner checks the `go-analysis/v1` schema, source SHA, coverage count, totals and gate, then imports new and worsened findings for the selected files. Scanner diagnostics outside the shown hunks remain in the report. Only diagnostics located in the supplied patch consume model context.
 
+### Use the Go report in a comment-triggered review
+
+In container setup, enter the project's trusted Go analysis workflow or job. Alternatively, add the optional `go_analysis` field to its entry in `REVIEW_PROJECTS`. Leave it blank for projects without an Assay producer. Only enable a producer whose CI definition and artifact publication your team controls. A contributor who can replace the producer could also fabricate its findings.
+
+| Project | Example setting | CI setup |
+|---|---|---|
+| GitHub | `"go_analysis": "go-lint.yml"` | Use the workflow filename or numeric ID. Run the [Assay action](https://github.com/medici-finance/assay/tree/v1.0.91/actions/go-analysis) on the PR source head. Give the existing reviewer App **Actions: read**. The worker reads the latest run of that workflow for the source SHA and its exact attempt's `go-analysis-lint-<sha>-<run-id>-<attempt>` artifact. |
+| GitLab | `"go_analysis": "go-lint"` | Use the exact job name in the MR head pipeline in the target project. Run the Assay scanner against the MR source head with `GITHUB_REPOSITORY="$CI_PROJECT_PATH"` (the existing report format reads this variable). Have that job publish the sanitized report at the artifact root as `report.json`, using `artifacts: {when: always, paths: [report.json]}`. The reviewer needs access to read the pipeline, job and artifact. |
+
+The worker looks up the report only when processing an authorized `/review`. It accepts a completed scan from a failed lint job, verifies the repository and analyzed source SHA, then imports new and worsened findings for changed paths. Findings inside the shown hunks share the existing Cursor prompt and token budget. The summary includes imported findings outside the hunks as well.
+
+If CI is still running or the report is missing, expired, unreadable, invalid or for a different head, the summary marks Go analysis as `could not check`. The rest of the review proceeds with the existing one-call ceiling. A new `/review` after CI finishes can pick up the report. Ordinary polls and CI completion never trigger a model call.
+
 ### GitHub Actions and GitLab CI
 
 To run the CLI explicitly in a PR or MR pipeline, use the pipeline event's commit references. This command invokes a review. Use the polling service above for comment-only operation:
