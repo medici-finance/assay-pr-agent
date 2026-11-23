@@ -47,17 +47,19 @@ def desk(kind, address):
     return items[0]["changeFiles" if kind == "change-files" else "change"]
 
 
-def forge_change(address):
+def forge_change(address, expected_url=None):
     if not re.fullmatch(r"[\w.\-]+/[\w.\-]+#[1-9][0-9]*", address):
         raise ReviewError("Use the configured Assay owner/repo#number address on either forge")
     first = desk("change", address)
+    if expected_url and (first.get("url") != expected_url or str(first.get("state")).lower() not in ("open", "opened")):
+        raise ReviewError("Assay resolved a different or closed change")
     head = first.get("headSha")
     if not valid_sha(head):
         raise ReviewError("Forge did not identify the reviewed head")
     result = desk("change-files", address)
     last = desk("change", address)
     # The file-list envelope has no revision. Bracket it with change observations.
-    if any(first.get(k) != last.get(k) for k in ("headSha", "baseRef", "changedFiles", "url")):
+    if any(first.get(k) != last.get(k) for k in ("headSha", "baseRef", "changedFiles", "url", "state")):
         raise ReviewError("Change moved during the forge read")
     rows = result.get("files")
     count = result.get("changedFiles")

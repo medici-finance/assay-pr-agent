@@ -430,10 +430,16 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "pr-agent" },
+    { name = "starlette" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pr-agent", specifier = "==0.50.0" }]
+requires-dist = [
+    { name = "pr-agent", specifier = "==0.50.0" },
+    { name = "starlette" },
+    { name = "uvicorn" },
+]
 
 [[package]]
 name = "distro"

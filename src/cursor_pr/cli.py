@@ -19,7 +19,12 @@ def publish(address, head, report):
     body = [f"Cursor review of {head}", report["state"]]
     for issue in report["findings"]:
         body.append(f"- {issue['path']}:{issue['line']} — {issue['title']}. {issue['message']}")
-    if not report["findings"]:
+    if report["state"] == "over-budget":
+        body.append(f"Skipped Cursor. Estimated prompt {report['estimated_input_tokens']} tokens "
+                    f"exceeds the limit of {report['max_input_tokens']}.")
+    elif report["state"] == "model-unavailable":
+        body.append("Cursor could not complete the review.")
+    elif not report["findings"]:
         body.append("No model findings in the reviewed scope.")
     for check in report["checks"]:
         if check["state"] != "complete":
@@ -42,6 +47,7 @@ def parser():
     mode.add_argument("--change", help="Assay-configured GitHub PR or GitLab MR, e.g. 'org/repo#42'")
     mode.add_argument("--base", help="Local base revision to compare against")
     mode.add_argument("--ci", action="store_true", help="Use provider CI event SHAs in the checkout")
+    p.add_argument("--expected-change-url", help="Require this exact open forge change before reviewing")
     p.add_argument("--head", help="Local head revision (default HEAD with --base)")
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="Checkout for local Git and scanners")
     p.add_argument("--path", action="append", default=[], help="Limit review to an exact changed path; repeatable")
@@ -58,8 +64,10 @@ def execute(args):
     if args.max_input_tokens < 1 or (args.head and not args.base) or (args.post and (not args.change or args.estimate)):
         raise ReviewError("Invalid budget or incompatible --head/--post options")
     root = args.repo.resolve()
+    if args.expected_change_url and not args.change:
+        raise ReviewError("--expected-change-url requires --change")
     if args.change:
-        change = forge_change(args.change)
+        change = forge_change(args.change, args.expected_change_url)
     else:
         base, head = ci_refs() if args.ci else (args.base, args.head or "HEAD")
         change = local_change(root, base, head)
@@ -103,13 +111,18 @@ def execute(args):
             report["cursor_usage"] = None
     incomplete = bool(omitted or any(c["state"] != "complete" for c in checks))
     report["state"] = "partial" if incomplete else ("reviewed" if has_text else "empty")
+    return report, 2 if incomplete else 0
+
+
+def run_request(args):
+    report, code = execute(args)
     if args.post:
         try:
-            publish(args.change, change.head, report)
+            publish(args.change, report["head"], report)
         except (ReviewError, OSError, subprocess.TimeoutExpired):
             return dict(report, publication="failed"), 2
         report["publication"] = "posted-or-already-present"
-    return report, 2 if incomplete else 0
+    return report, code
 
 
 def main():
@@ -128,7 +141,7 @@ def main():
             from pr_agent.algo.git_patch_processing import to_hunk_only_patch  # noqa: F401
             from pr_agent.algo.token_handler import TokenEncoder  # noqa: F401
             os.chdir(args.repo)
-            report, status = execute(args)
+            report, status = run_request(args)
         print(json.dumps(report, ensure_ascii=True, indent=2))
         return status
     except (ReviewError, OSError, ValueError, TypeError, KeyError, AttributeError,

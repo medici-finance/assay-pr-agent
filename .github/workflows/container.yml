@@ -1,0 +1,36 @@
+name: Publish review container
+on:
+  push:
+    branches: [main]
+    tags: ['**']
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ${{ vars.CONTAINER_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build, test and publish to GHCR
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_KIND: ${{ github.ref_type }}
+        run: |
+          export DOCKER_CONFIG="$RUNNER_TEMP/docker-publish-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$DOCKER_CONFIG"
+          trap 'rm -rf -- "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          unset REGISTRY_TOKEN
+          export IMAGE_REPOSITORY="ghcr.io/${GITHUB_REPOSITORY,,}"
+          export SOURCE_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          ci/publish-image.sh
