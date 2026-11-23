@@ -4,7 +4,7 @@ A standalone, single-pass reviewer for GitHub pull requests, GitLab merge reques
 
 ## Request a review in a PR or MR
 
-Post a new comment containing just `/review` on an open GitHub PR or GitLab MR. The receiver accepts configured human account IDs and posts the result on the reviewed head using Assay. An edit, push, approval, ordinary comment, internal GitLab note or bot response spends zero model tokens. Each accepted comment gets one durable queue entry. After a restart, queued requests continue. A request interrupted after it started stays recorded; a fresh `/review` can request another attempt. The worker processes requests one at a time and reuses successful results.
+Post a new comment containing just `/review` on an open GitHub PR or GitLab MR. That comment is the entire request. The receiver uses the PR or MR number from the event and posts a summary on the reviewed head with its configured reviewer account. Requesters do not need to create a tracking issue, add a role label or approve a separate posting step. An edit, push, approval, ordinary comment, internal GitLab note or bot response spends zero model tokens. Each accepted comment gets one durable queue entry. After a restart, queued requests continue. A request interrupted after it started stays recorded; a fresh `/review` can request another attempt. The worker processes requests one at a time and reuses successful results.
 
 ### Docker setup
 

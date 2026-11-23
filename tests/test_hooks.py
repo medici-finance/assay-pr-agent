@@ -136,6 +136,10 @@ else:
         patchAbsent=False,status='added',patch='@@ -0,0 +1 @@\\n+x=1\\n')])
 print(json.dumps(dict(schema=1,kind=kind,items=[item],partial=[])))
 """)
+        # Standalone PR/MR comments must never pass through issue filing or PR creation.
+        unexpected=self.state/"unexpected-desk-command"
+        for tool in ("deskfile", "deskpr"):
+            install(tool, f"from pathlib import Path\nPath({str(unexpected)!r}).touch()\nraise SystemExit(1)")
         calls=self.state/"model-calls"
         install("cursor-agent",f"""
 from pathlib import Path
@@ -163,6 +167,7 @@ with Path(os.environ['POST_LOG']).open('a') as out:
                         self.assertEqual(run_review(project,3,self.state),"over-budget")
             with patch.dict(os.environ,{"FIXTURE_CHANGE":self.gl.change_url(3)}):
                 self.assertEqual(run_review(self.gh,3,self.state),"failed")
+        self.assertFalse(unexpected.exists())
         self.assertEqual(calls.read_text().splitlines(),["called","called"])
         self.assertEqual(posts.read_text().count("Skipped Cursor"),2)
         self.assertEqual(posts.read_text().count("[PR-Agent](https://github.com/the-pr-agent/pr-agent)"),6)
