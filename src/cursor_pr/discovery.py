@@ -10,7 +10,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from .source import ReviewError, run
+from .source import ReviewError, run_desk
 
 log = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ def open_changes(project, state):
     # deskmonitor's documented baseline includes the whole open population. Its
     # event lines alone miss ordinary conversation comments on an unchanged head.
     directory = state / "monitor" / hashlib.sha256(project.key.encode()).hexdigest()
-    run(["deskmonitor", "pr", project.slug], cwd=project.checkout,
+    run_desk(["deskmonitor", "pr", project.slug], cwd=project.checkout,
         env={**os.environ, "PR_MONITOR_STATE_DIR": str(directory)}, timeout=120)
     baseline = directory / (project.slug.replace("/", "__") + ".state")
     numbers = []
@@ -35,7 +35,7 @@ def comment_threads(project, numbers):
     args = ["deskread", "comments"]
     for number in numbers:
         args.extend(["--change", f"{project.slug}#{number}"])
-    envelope = json.loads(run(args, cwd=project.checkout, timeout=120))
+    envelope = json.loads(run_desk(args, cwd=project.checkout, timeout=120))
     if envelope.get("schema") != 1 or envelope.get("kind") != "comments":
         raise ReviewError("Invalid deskread comments envelope")
     threads = {}
@@ -76,7 +76,7 @@ def public_gitlab_request(project, number, note):
     base = os.environ.get("GITLAB_API_BASE", "").rstrip("/")
     if base != "https://" + urlsplit(project.url).netloc + "/api/v4":
         raise ReviewError("GITLAB_API_BASE must match the project's HTTPS instance /api/v4")
-    custody = run(["desktoken", "--no-rotate", "--forge", "gitlab", "reviewer", "--repo", project.slug],
+    custody = run_desk(["desktoken", "--no-rotate", "--forge", "gitlab", "reviewer", "--repo", project.slug],
                   cwd=project.checkout).decode().strip()
     token = Path(custody).read_text().strip()
     if not token:

@@ -1,6 +1,6 @@
 """Poll configured forges and process explicit review requests serially."""
 import argparse
-from contextlib import closing
+from contextlib import ExitStack, closing
 from datetime import datetime, timezone
 import json
 import logging
@@ -12,6 +12,7 @@ import sys
 import time
 
 from .config import load_config
+from .credentials import SETUP_INPUTS, forge_credentials
 from .discovery import poll_project
 
 log = logging.getLogger(__name__)
@@ -66,7 +67,8 @@ def run_review(project, number, state):
     if os.getenv("REVIEW_MODEL"):
         argv.extend(["--model", os.environ["REVIEW_MODEL"]])
     env = dict(os.environ)
-    env.pop("REVIEW_PROJECTS", None)
+    for key in ("REVIEW_PROJECTS", *SETUP_INPUTS):
+        env.pop(key, None)
     for key in list(env):
         if key.startswith("REVIEW_SECRET_"):
             del env[key]
@@ -108,19 +110,21 @@ def main():
         parser.error("poll interval must be positive")
     state = args.state_dir.resolve()
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        if int(os.getenv("REVIEW_MAX_INPUT_TOKENS", "6000")) < 1:
-            raise ValueError("REVIEW_MAX_INPUT_TOKENS must be positive")
-        projects = load_config(state)
-    except (ValueError, KeyError, TypeError, EOFError, OSError) as err:
-        parser.exit(2, f"Polling configuration: {err}\n")
-    jobs = Jobs(state)
-    since = {key: jobs.activated(key) for key in projects}
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    log.info("Polling %s with %d seconds between cycles", ", ".join(projects), args.interval)
-    while True:
-        cycle(projects, state, jobs, since)
-        time.sleep(args.interval)
+    with ExitStack() as stack:
+        try:
+            if int(os.getenv("REVIEW_MAX_INPUT_TOKENS", "6000")) < 1:
+                raise ValueError("REVIEW_MAX_INPUT_TOKENS must be positive")
+            projects = load_config(state)
+            stack.enter_context(forge_credentials(projects, state))
+        except (ValueError, KeyError, TypeError, EOFError, OSError) as err:
+            parser.exit(2, f"Polling configuration: {err}\n")
+        jobs = Jobs(state)
+        since = {key: jobs.activated(key) for key in projects}
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        log.info("Polling %s with %d seconds between cycles", ", ".join(projects), args.interval)
+        while True:
+            cycle(projects, state, jobs, since)
+            time.sleep(args.interval)
 
 
 if __name__ == "__main__":

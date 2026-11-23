@@ -73,7 +73,7 @@ class PollTests(unittest.TestCase):
                       author={"id":7}, body="/review", created_at="t.001", updated_at="t.001")
         request = httpx.Request("GET", "https://gitlab.com")
         with patch.dict(os.environ, {"GITLAB_API_BASE":"https://gitlab.com/api/v4"}), \
-             patch("cursor_pr.discovery.run", return_value=str(token).encode()) as lookup, \
+             patch("cursor_pr.discovery.run_desk", return_value=str(token).encode()) as lookup, \
              patch("cursor_pr.discovery.httpx.get") as get:
             for delta in ({}, {"internal":True}, {"internal":None}, {"confidential":True}, {"system":True},
                           {"updated_at":"t.002"}, {"author":{"id":7,"bot":True}}, {"author":{"id":8}},
@@ -115,7 +115,7 @@ class PollTests(unittest.TestCase):
         def review(project, number, state):
             reviews.append((project.key,number))
             return "reviewed"
-        with patch("cursor_pr.discovery.run", side_effect=desk), \
+        with patch("cursor_pr.discovery.run_desk", side_effect=desk), \
              patch("cursor_pr.discovery.public_gitlab_request", return_value=True) as visibility:
             notes.append(self.note | dict(createdAt="2025-01-01T00:00:00Z", updatedAt="2025-01-01T00:00:00Z"))
             notes.append(self.note | dict(body="ordinary comment"))

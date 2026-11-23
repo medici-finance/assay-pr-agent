@@ -18,27 +18,73 @@ The image contains Cursor Agent, Assay’s released forge tools, ShellCheck and 
 docker build --platform linux/amd64 -t assay-pr-agent .
 ```
 
-Provide a persistent state volume, one trusted checkout per project and a dedicated Assay reviewer configuration that can already read and comment on the chosen projects. Mount the actual checkout including its Git objects. The container runs as UID 10001. Give that user read access to the checkouts and read/write access to its dedicated Assay credential cache. Configure the reviewer roster, role credentials and forge mapping for the instance before accepting requests. Supply only the credentials needed by this reviewer. Scanner coverage depends on having the reviewed head available in the checkout.
+### Standalone Docker credentials
 
-Start interactively with the host paths below adjusted. Setup asks for each project’s forge, full HTTPS URL, checkout path and allowed human account IDs. It saves them in `/state/projects.json` with mode 0600.
+Mount the checkout for each project read-only and a writable volume at `/state` for the request queue, cache and Assay audit records. The container runs as UID 10001. It generates the reviewer configuration on first start and updates it from the supplied settings on restart. You can use it without installing Assay on the host.
 
-```sh
-docker run -it --rm --platform linux/amd64 \
-  -v review-state:/state -v /path/to/checkouts:/repos:ro \
-  -v /path/to/reviewer-assay-config:/home/reviewer/.config/assay \
-  -e CURSOR_API_KEY -e GITLAB_API_BASE assay-pr-agent
-```
+| Docker setting | What to supply |
+|---|---|
+| `CURSOR_API_KEY` | Cursor API key for headless inference. |
+| `REVIEW_OPERATOR` | The responsible human’s forge `login:numeric-id`. Assay uses this for posting attribution. The project’s `requester_ids` separately control who can request reviews. |
+| `REVIEW_GITHUB_APP_ID`, `REVIEW_GITHUB_INSTALLATION_ID` | Numeric IDs for the GitHub App and the installation covering your repositories. Use a reviewer installation with access to read PRs and diffs and write PR conversation comments. |
+| `REVIEW_GITHUB_PRIVATE_KEY` **or** `REVIEW_GITHUB_PRIVATE_KEY_FILE` | The App’s unencrypted RSA PEM or an absolute path to the mounted PEM. The value accepts actual line breaks or literal `\n`. |
+| `REVIEW_GITLAB_TOKEN` **or** `REVIEW_GITLAB_TOKEN_FILE` | A dedicated GitLab reviewer token with API permission to read MRs and post notes, or an absolute path to the mounted token. |
+| `REVIEW_PROJECTS` | JSON project list. Each entry has a forge, full HTTPS URL, checkout path, allowed human account IDs and optional `visibility` (`private` by default, `internal`, or `public`). Set the actual visibility to authorize posting on public or internal projects. |
 
-For unattended setup, supply `--env-file /path/to/reviewer.env` in place of `-it`. Keep the state, checkout and reviewer configuration mounts. Example env file:
+Supply only the providers you use. Each container supports a GitHub App installation on github.com and one GitLab instance. The poller derives `GITLAB_API_BASE` from the configured GitLab projects. An explicit value must match their HTTPS instance and end in `/api/v4`.
+
+For example, this `review.env` uses both providers and reads the keys from a mounted secrets directory:
 
 ```dotenv
-REVIEW_PROJECTS=[{"provider":"github","url":"https://github.com/example/api","checkout":"/repos/api","requester_ids":[101]},{"provider":"gitlab","url":"https://gitlab.example.com/example/web","checkout":"/repos/web","requester_ids":[202]}]
-GITLAB_API_BASE=https://gitlab.example.com/api/v4
+REVIEW_OPERATOR=alice:101
+REVIEW_GITHUB_APP_ID=123456
+REVIEW_GITHUB_INSTALLATION_ID=789012
+REVIEW_GITHUB_PRIVATE_KEY_FILE=/run/secrets/github-reviewer.pem
+REVIEW_GITLAB_TOKEN_FILE=/run/secrets/gitlab-reviewer-token
+REVIEW_PROJECTS=[{"provider":"github","url":"https://github.com/example/api","checkout":"/repos/api","requester_ids":[101],"visibility":"public"},{"provider":"gitlab","url":"https://gitlab.example.com/example/web","checkout":"/repos/web","requester_ids":[202],"visibility":"private"}]
 REVIEW_POLL_SECONDS=120
 REVIEW_MAX_INPUT_TOKENS=6000
 ```
 
-`REVIEW_PROJECTS` overrides saved settings. Use the Assay `owner/project` address for each project. Set `GITLAB_API_BASE` to your configured GitLab instance when polling GitLab. `REVIEW_MODEL` selects the Cursor model. Logs report failed forge reads, publication outcomes and Cursor invocations. Polling resumes after a failed read. Use one service instance per state volume.
+```sh
+docker run --rm --platform linux/amd64 --env-file review.env -e CURSOR_API_KEY \
+  -v review-state:/state -v /path/to/checkouts:/repos:ro \
+  -v /path/to/reviewer-secrets:/run/secrets:ro assay-pr-agent
+```
+
+For environment-only credentials, omit the two `_FILE` lines and the secrets volume. Pass `-e REVIEW_GITHUB_PRIVATE_KEY -e REVIEW_GITLAB_TOKEN` to forward exported values. For Argo CD or Flux, the same container accepts Kubernetes Secret volumes via `_FILE` or Secret-backed environment variables via `env.valueFrom.secretKeyRef`. Mount files readable by UID 10001. Choose one source per credential. The agent reads them at startup, so restart or roll the deployment after rotation.
+
+For example, this Pod spec fragment mounts the GitHub App key and injects the GitLab token. The other settings from `review.env` can come from a ConfigMap.
+
+```yaml
+spec:
+  containers:
+    - name: reviewer
+      # Add to the reviewer's existing container settings.
+      env:
+        - name: REVIEW_GITHUB_PRIVATE_KEY_FILE
+          value: /run/secrets/reviewer/github.pem
+        - name: REVIEW_GITLAB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: reviewer-credentials
+              key: gitlab-token
+      volumeMounts:
+        - name: reviewer-key
+          mountPath: /run/secrets/reviewer
+          readOnly: true
+  volumes:
+    - name: reviewer-key
+      secret:
+        secretName: reviewer-credentials
+        items:
+          - key: github-private-key
+            path: github.pem
+```
+
+Assay uses mode-0600 runtime copies of the supplied credentials. In Docker these live in `/dev/shm`; incoming keys are excluded from the project settings and review database. Keep one service instance per state volume. The normal `/review` path uses GitLab’s token without rotating it. `REVIEW_MODEL` selects the Cursor model.
+
+For interactive project setup, omit `REVIEW_PROJECTS` and add `-it`. The wizard saves project settings in `/state/projects.json` (0600). Environment project settings take precedence. Deployments with an existing Assay reviewer configuration can still mount it at `/home/reviewer/.config/assay` and omit the standalone setup variables. When supplying credentials alongside a mounted roster, its existing repository and identity rules apply.
 
 **Upgrading from v0.1.0.** Stop the old receiver and start the polling image with the same state volume. It reads the existing project settings, request queue and cache. You can remove the forge webhooks, reverse proxy, published port, `REVIEW_PUBLIC_URL` and webhook secrets. The polling container only needs outbound connections.
 

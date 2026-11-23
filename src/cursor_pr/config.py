@@ -16,6 +16,7 @@ class Project:
     slug: str
     checkout: Path
     requesters: frozenset[int]
+    visibility: str = "private"
 
     @property
     def key(self):
@@ -47,7 +48,10 @@ def project_from(row):
     checkout = Path(row["checkout"])
     if not checkout.is_absolute() or not checkout.is_dir():
         raise ValueError("checkout must be an existing absolute directory on the poller")
-    return Project(row["provider"], url, slug, checkout, frozenset(ids))
+    visibility = row.get("visibility", "private")
+    if visibility not in ("private", "internal", "public"):
+        raise ValueError("visibility must be private, internal or public")
+    return Project(row["provider"], url, slug, checkout, frozenset(ids), visibility)
 
 
 def prompt_config():
@@ -58,6 +62,8 @@ def prompt_config():
         checkout = input("Trusted checkout path inside this service: ").strip()
         ids = [int(x.strip()) for x in input("Human requester numeric IDs (comma-separated): ").split(",")]
         rows.append(dict(provider=provider, url=url, checkout=checkout, requester_ids=ids))
+        if "REVIEW_OPERATOR" in os.environ:
+            rows[-1]["visibility"] = input("Project visibility (private/internal/public) [private]: ").strip() or "private"
         if input("Add another project? [y/N] ").strip().lower() not in ("y", "yes"):
             return {"projects": rows}
 
@@ -86,7 +92,7 @@ def load_config(state):
         raise ValueError("Configure at least one project")
     if save:
         with tempfile.NamedTemporaryFile(mode="w", dir=state, delete=False) as temp:
-            json.dump({"projects": [{k: row[k] for k in ("provider", "url", "checkout", "requester_ids")}
+            json.dump({"projects": [{k: row[k] for k in ("provider", "url", "checkout", "requester_ids", "visibility") if k in row}
                                     for row in rows]}, temp)
         os.replace(temp.name, path)
     return projects

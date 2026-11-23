@@ -1,4 +1,5 @@
 import argparse
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -9,9 +10,11 @@ import tempfile
 from unidiff.errors import UnidiffParseError
 import yaml
 
+from .config import load_config
+from .credentials import forge_credentials, standalone_requested
 from .checks import go_report, scan_files
 from .engine import CursorFailure, pack, review, tokens
-from .source import ReviewError, ci_refs, forge_change, local_change, run
+from .source import ReviewError, ci_refs, forge_change, local_change, run_desk
 
 
 def publish(address, head, report):
@@ -38,7 +41,7 @@ def publish(address, head, report):
         # A finding may quote a multiline source fragment, including forge quick actions.
         tmp.write("\n".join(" ".join(line.splitlines()) for line in body) + "\n")
         tmp.flush()
-        run(["deskpost", "comment", repo, number, "--kind", "mr", "--head", head,
+        run_desk(["deskpost", "comment", repo, number, "--kind", "mr", "--head", head,
              "--body-file", tmp.name])
 
 
@@ -135,7 +138,20 @@ def main():
         args.go_report = args.go_report.resolve()
     old = Path.cwd()
     try:
-        with tempfile.TemporaryDirectory(prefix="pr-agent-settings-") as clean:
+        with ExitStack() as stack:
+            if args.change and standalone_requested():
+                state = Path(os.getenv("REVIEW_STATE_DIR", Path.home()/".local/state/cursor-review")).resolve()
+                state.mkdir(mode=0o700, parents=True, exist_ok=True)
+                projects = load_config(state)
+                slug, _, number = args.change.rpartition("#")
+                project = next((p for p in projects.values() if p.slug == slug), None)
+                if project is None or not number.isdecimal():
+                    raise ReviewError("Use a --change address from the configured review projects")
+                if args.expected_change_url and args.expected_change_url != project.change_url(number):
+                    raise ReviewError("Configured project and expected change URL differ")
+                args.expected_change_url = project.change_url(number)
+                stack.enter_context(forge_credentials(projects, state))
+            clean = stack.enter_context(tempfile.TemporaryDirectory(prefix="pr-agent-settings-"))
             # deskread/deskpost discover their configured forge from the caller's checkout.
             # Compute the upstream imports here, then restore cwd before touching the forge.
             os.chdir(clean)
