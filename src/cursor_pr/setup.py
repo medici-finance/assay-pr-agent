@@ -18,7 +18,7 @@ from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secr
 CURSOR = "CURSOR_API_KEY"
 SECRETS = {CURSOR: "cursor.key", KEY: "github.pem", TOKEN: "gitlab.token"}
 SETTINGS = ("REVIEW_OPERATOR", APP_ID, INSTALL_ID, "REVIEW_MODEL", "REVIEW_MAX_INPUT_TOKENS",
-            "REVIEW_POLL_SECONDS")
+            "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS")
 
 
 def state_dir():
@@ -181,6 +181,8 @@ def configure(state):
         setting(INSTALL_ID, "GitHub App installation ID", number)
     setting("REVIEW_POLL_SECONDS", "Seconds between polls", number, "120")
     setting("REVIEW_MAX_INPUT_TOKENS", "Maximum estimated input tokens per review", number, "6000")
+    setting("REVIEW_QUALGEN_INTERVAL_SECONDS", "Seconds between Qualgen history refreshes (0 disables)",
+            lambda value: "0" if value == "0" else number(value), "86400")
     model = ask("Cursor model (auto for Cursor's default)", previous.get("REVIEW_MODEL", "auto"))
     if model != "auto":
         settings["REVIEW_MODEL"] = model

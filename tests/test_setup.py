@@ -36,7 +36,7 @@ class InteractiveSetupTests(unittest.TestCase):
         external = self.root/"gitlab-pat"
         external.write_text("fixture-pat")
         self.configure(self.project("github","y","go.yml")+self.project("gitlab",producer="go-lint")+
-                       ["alice:13","41","42","90","3600","model-a","paste","import",str(pem),"mount",str(external)],
+                       ["alice:13","41","42","90","3600","7200","model-a","paste","import",str(pem),"mount",str(external)],
                        ["fixture-cursor"])
         pem.unlink()  # Imported once; only the external GitLab mount is needed again.
         config = self.state/"setup"
@@ -52,6 +52,7 @@ class InteractiveSetupTests(unittest.TestCase):
                          {"github": "go.yml", "gitlab": "go-lint"})
         self.assertEqual(os.environ["REVIEW_POLL_SECONDS"],"90")
         self.assertEqual(os.environ["REVIEW_MAX_INPUT_TOKENS"],"3600")
+        self.assertEqual(os.environ["REVIEW_QUALGEN_INTERVAL_SECONDS"],"7200")
         self.assertEqual(os.environ["REVIEW_MODEL"],"model-a")
         self.assertEqual(os.environ["CURSOR_API_KEY"],"fixture-cursor")
         with forge_credentials(projects,self.state):
@@ -60,14 +61,14 @@ class InteractiveSetupTests(unittest.TestCase):
             self.assertEqual((runtime/"reviewer-app.pem").read_bytes(),(config/"github.pem").read_bytes())
 
     def test_cancel_and_reconfigure_keep_active_setup_and_env_precedence(self):
-        initial = self.project("gitlab")+["owner:13","","","","paste","paste"]
+        initial = self.project("gitlab")+["owner:13","","","","","paste","paste"]
         self.configure(initial, ["old-cursor","gl-key"])
         old = (self.state/"setup").resolve()
         with self.assertRaises(KeyboardInterrupt):
-            self.configure(["y","","","","","paste"], [KeyboardInterrupt])
+            self.configure(["y","","","","","","paste"], [KeyboardInterrupt])
         self.assertEqual((self.state/"setup").resolve(), old)
         self.assertEqual(list(self.state.glob(".review-setup-*")), [old])
-        self.configure(["y","","","5000","","paste","keep"], ["new-cursor"])
+        self.configure(["y","","","5000","","","paste","keep"], ["new-cursor"])
         self.assertFalse(old.exists())
         os.environ.update(REVIEW_GITLAB_TOKEN="from-env", REVIEW_POLL_SECONDS="45")
         setup.apply_saved_setup(self.state)
@@ -77,7 +78,7 @@ class InteractiveSetupTests(unittest.TestCase):
         self.assertEqual(os.environ["REVIEW_MAX_INPUT_TOKENS"],"5000")
 
     def test_saved_pat_stays_on_its_configured_host(self):
-        self.configure(self.project("gitlab")+["owner:13","","","","paste","paste"],["ck","pat"])
+        self.configure(self.project("gitlab")+["owner:13","","","","","paste","paste"],["ck","pat"])
         rows = json.loads((self.state/"setup/settings.json").read_text())["projects"]
         rows[0]["url"] = "https://other.example.org/org/gitlab"
         os.environ["REVIEW_PROJECTS"] = json.dumps(rows)

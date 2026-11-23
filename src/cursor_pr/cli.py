@@ -10,6 +10,7 @@ import tempfile
 from unidiff.errors import UnidiffParseError
 import yaml
 
+from . import history
 from .setup import apply_saved_setup, state_dir
 from .config import load_config
 from .credentials import forge_credentials, standalone_requested
@@ -36,6 +37,8 @@ def publish(address, head, report):
             body.append(f"- {check['tool']}: could not check {check.get('path') or check.get('reason', '')}")
         for item in check["findings"]:
             body.append(f"- {item['path']}:{item['line']} — {item['rule']} {item.get('message', '')}")
+    if "qualgen" in report:
+        body.extend(["", *history.summary(report["qualgen"]), ""])
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {path}")
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
@@ -60,6 +63,7 @@ def parser():
     evidence = p.add_mutually_exclusive_group()
     evidence.add_argument("--go-analysis-producer", help="Trusted CI producer for --expected-change-url")
     evidence.add_argument("--go-report", type=Path, help="Assay go-analysis/v1 JSON for this head")
+    p.add_argument("--qualgen-store", type=Path, help="Read the poller’s mined Qualgen history for this project")
     p.add_argument("--model", help="Explicit Cursor model (otherwise the CLI default)")
     p.add_argument("--max-input-tokens", type=int, help="Preflight estimate limit (default 6000)")
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling Cursor")
@@ -104,6 +108,8 @@ def execute(args):
               "estimated_input_tokens": estimated, "max_input_tokens": args.max_input_tokens,
               "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
               "findings": [], "cursor_usage": None}
+    if args.qualgen_store:
+        report["qualgen"] = history.screen(root, args.qualgen_store, selected, change.head)
     if estimated > args.max_input_tokens:
         return dict(report, state="over-budget"), 2
     if args.estimate:
@@ -146,6 +152,8 @@ def main():
     args.cache_dir = args.cache_dir.resolve()
     if args.go_report:
         args.go_report = args.go_report.resolve()
+    if args.qualgen_store:
+        args.qualgen_store = args.qualgen_store.resolve()
     old = Path.cwd()
     try:
         with ExitStack() as stack:

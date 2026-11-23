@@ -10,11 +10,12 @@ import sqlite3
 import subprocess
 import sys
 import time
+import threading
 
 from .config import load_config
 from .credentials import SETUP_INPUTS, forge_credentials
 from .discovery import poll_project
-from . import setup
+from . import history, setup
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +64,8 @@ def run_review(project, number, state):
     argv = [sys.executable, "-I", "-m", "cursor_pr.cli", "--repo", str(project.checkout),
             "--change", address, "--expected-change-url", project.change_url(number),
             "--post", "--cache-dir", str(state / "cache")]
+    if history.interval():
+        argv.extend(["--qualgen-store", str(history.store_for(state, project))])
     if project.go_analysis:
         argv.extend(["--go-analysis-producer", project.go_analysis])
     if os.getenv("REVIEW_MAX_INPUT_TOKENS"):
@@ -131,6 +134,7 @@ def main():
                 raise ValueError("poll interval must be positive")
             if int(os.getenv("REVIEW_MAX_INPUT_TOKENS", "6000")) < 1:
                 raise ValueError("REVIEW_MAX_INPUT_TOKENS must be positive")
+            mine_seconds = history.interval()
             projects = load_config(state)
             stack.enter_context(forge_credentials(projects, state))
         except (ValueError, KeyError, TypeError, EOFError, OSError) as err:
@@ -139,6 +143,9 @@ def main():
         since = {key: jobs.activated(key) for key in projects}
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         log.info("Polling %s with %d seconds between cycles", ", ".join(projects), args.interval)
+        if mine_seconds:
+            threading.Thread(target=history.mine_periodically, args=(projects, state, mine_seconds),
+                             name="qualgen-miner", daemon=True).start()
         while True:
             cycle(projects, state, jobs, since)
             time.sleep(args.interval)

@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 import httpx
 
+from cursor_pr import history
 from cursor_pr.config import load_config, project_from
 from cursor_pr.discovery import is_request, public_gitlab_request
 from cursor_pr.poll import Jobs, cycle, run_review
@@ -183,17 +185,35 @@ assert 'REVIEW_SECRET_FIXTURE' not in os.environ
 with Path(os.environ['POST_LOG']).open('a') as out:
     out.write(Path(sys.argv[-1]).read_text())
 """)
+        # Real Qualgen, local Git, and the installed poller child exercise both providers.
+        checkout = self.state / "checkout"
+        checkout.mkdir()
+        def git(*args):
+            subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.org",
+                            *args], cwd=checkout, check=True, capture_output=True)
+        git("init", "-q")
+        for revision in range(4):
+            for name in ("demo.py", "partner.py"):
+                (checkout / name).write_text(f"value = {revision}\n")
+            git("add", "--", "demo.py", "partner.py")
+            git("commit", "-qm", str(revision))
         posts=self.state/"posts"
         with patch.dict(os.environ,dict(PATH=str(bindir)+os.pathsep+os.environ["PATH"],
                     POST_LOG=str(posts), REVIEW_SECRET_FIXTURE="private")):
+            from dataclasses import replace
             for project in self.projects.values():
+                project = replace(project, checkout=checkout)
+                history.refresh(checkout, history.store_for(self.state, project))
                 with patch.dict(os.environ,{"FIXTURE_CHANGE":project.change_url(3),"FIXTURE_SLUG":project.slug}):
-                    self.assertEqual(run_review(project,3,self.state),"reviewed")
+                    with patch.dict(os.environ, {"REVIEW_QUALGEN_INTERVAL_SECONDS": "0"}):
+                        self.assertEqual(run_review(project,3,self.state),"reviewed")
+                    # The cache key contains the exact prompt. Enabling Qualgen must hit the same key.
                     self.assertEqual(run_review(project,3,self.state),"reviewed")
                     with patch.dict(os.environ,{"REVIEW_MAX_INPUT_TOKENS":"1"}):
                         self.assertEqual(run_review(project,3,self.state),"over-budget")
             with patch.dict(os.environ,{"FIXTURE_CHANGE":self.gl.change_url(3),"FIXTURE_SLUG":self.gh.slug}):
                 self.assertEqual(run_review(self.gh,3,self.state),"failed")
+        self.assertEqual(posts.read_text().count("historically coupled to partner.py"), 4)
         self.assertFalse(unexpected.exists())
         self.assertEqual(calls.read_text().splitlines(),["called","called"])
         self.assertEqual(posts.read_text().count("Skipped Cursor"),2)
