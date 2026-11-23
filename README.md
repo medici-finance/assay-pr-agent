@@ -1,10 +1,10 @@
 # Cursor PR review
 
-A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It uses PR-Agent’s published review prompt, line-numbered diff formatter and token estimator. Cursor Agent performs inference. Assay’s installed `deskread` and `deskpost` handle authenticated forge access when you use a change number. Local and CI runs require only the Git objects.
+A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It builds on [PR-Agent](https://github.com/the-pr-agent/pr-agent). The PR-Agent contributors provide the review prompt, line-numbered diff formatter and token estimator used here. We ship their [MIT-licensed](https://github.com/the-pr-agent/pr-agent/blob/main/LICENSE) Python package in the container, with its original license notice. Cursor Agent performs inference. Assay’s installed `deskread` and `deskpost` handle authenticated forge access when you use a change number. Local and CI runs require only the Git objects.
 
 ## Request a review in a PR or MR
 
-Post a new comment containing just `/review` on an open GitHub PR or GitLab MR. The receiver accepts configured human account IDs and posts the result on the reviewed head using Assay. An edit, push, approval, ordinary comment, internal GitLab note or bot response spends zero model tokens. Each accepted comment gets one durable queue entry. After a restart, queued requests continue. A request interrupted after it started stays recorded; a fresh `/review` can request another attempt. The worker processes requests one at a time and reuses successful results.
+Post a new comment containing just `/review` on an open GitHub PR or GitLab MR. That comment is the entire request. The receiver uses the PR or MR number from the event and posts a summary on the reviewed head with its configured reviewer account. Requesters do not need to create a tracking issue, add a role label or approve a separate posting step. An edit, push, approval, ordinary comment, internal GitLab note or bot response spends zero model tokens. Each accepted comment gets one durable queue entry. After a restart, queued requests continue. A request interrupted after it started stays recorded; a fresh `/review` can request another attempt. The worker processes requests one at a time and reuses successful results.
 
 ### Docker setup
 
