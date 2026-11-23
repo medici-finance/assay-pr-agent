@@ -33,6 +33,7 @@ def publish(address, head, report):
             body.append(f"- {item['path']}:{item['line']} — {item['rule']} {item.get('message', '')}")
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {path}")
+    body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
     with tempfile.NamedTemporaryFile("w", encoding="utf8") as tmp:
         # A finding may quote a multiline source fragment, including forge quick actions.
         tmp.write("\n".join(" ".join(line.splitlines()) for line in body) + "\n")

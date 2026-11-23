@@ -165,3 +165,4 @@ with Path(os.environ['POST_LOG']).open('a') as out:
                 self.assertEqual(run_review(self.gh,3,self.state),"failed")
         self.assertEqual(calls.read_text().splitlines(),["called","called"])
         self.assertEqual(posts.read_text().count("Skipped Cursor"),2)
+        self.assertEqual(posts.read_text().count("[PR-Agent](https://github.com/the-pr-agent/pr-agent)"),6)

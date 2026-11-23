@@ -1,6 +1,6 @@
 # Cursor PR review
 
-A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It uses PR-Agent’s published review prompt, line-numbered diff formatter and token estimator. Cursor Agent performs inference. Assay’s installed `deskread` and `deskpost` handle authenticated forge access when you use a change number. Local and CI runs require only the Git objects.
+A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It builds on [PR-Agent](https://github.com/the-pr-agent/pr-agent). The PR-Agent contributors provide the review prompt, line-numbered diff formatter and token estimator used here. We ship their [MIT-licensed](https://github.com/the-pr-agent/pr-agent/blob/main/LICENSE) Python package in the container, with its original license notice. Cursor Agent performs inference. Assay’s installed `deskread` and `deskpost` handle authenticated forge access when you use a change number. Local and CI runs require only the Git objects.
 
 ## Request a review in a PR or MR
 
