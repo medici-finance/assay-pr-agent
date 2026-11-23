@@ -1,0 +1,169 @@
+"""One bounded Cursor request using the published PR-Agent review rubric."""
+import fcntl
+import hashlib
+from importlib.metadata import distribution
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+import tomllib
+
+from jinja2 import Environment
+import yaml
+from unidiff import PatchSet
+
+from .source import ReviewError
+
+VERSION = "1"
+MAX_FINDINGS = 3
+
+
+class CursorFailure(ReviewError):
+    def __init__(self, message, invocations, usage=None):
+        super().__init__(message)
+        self.invocations = invocations
+        self.usage = usage
+
+
+def pack(files, checks):
+    from pr_agent.algo.git_patch_processing import decouple_and_convert_to_hunks_with_lines_numbers
+    from pr_agent.algo.types import FilePatchInfo
+    template = distribution("pr-agent").locate_file("pr_agent/settings/pr_reviewer_prompts.toml")
+    with template.open("rb") as stream:
+        rubric = tomllib.load(stream)["pr_review_prompt"]["system"]
+    instructions = Environment().from_string(rubric).render(
+        num_max_findings=MAX_FINDINGS,
+        diff_hunk_format="New hunks are numbered at the head; old hunks show the former code.",
+    )
+    sections, anchors, omitted = [], {}, []
+    for f in files:
+        if not f.path or any(ord(c) < 32 for c in f.path) or f.path in anchors:
+            raise ReviewError("Invalid or duplicate forge filename")
+        anchors[f.path] = set()
+        if f.absent or not f.patch:
+            omitted.append(f.path)
+            continue
+        # Parse under a fixed synthetic name; the source envelope owns the actual filename.
+        parsed = PatchSet("--- a/file\n+++ b/file\n" + f.patch.rstrip("\n") + "\n")
+        if len(parsed) != 1 or not parsed[0]:
+            raise ReviewError("Incomplete or unrecognized patch in " + f.path)
+        for hunk in parsed[0]:
+            anchors[f.path].update(line.target_line_no for line in hunk if line.target_line_no is not None)
+        if not anchors[f.path]:
+            omitted.append(f.path)
+            continue
+        info = FilePatchInfo("", "", f.patch, f.path)
+        rendered = decouple_and_convert_to_hunks_with_lines_numbers(f.patch, info)
+        sections.append(f"Change {f.status} {f.previous}\n{rendered}")
+    evidence = [finding for check in checks for finding in check["findings"]
+                if finding["line"] in anchors.get(finding["path"], set())]
+    prompt = (instructions + "\nUse only the supplied patch and scanner evidence. Do not use tools. "
+              "Serialize the YAML review as strict JSON (a YAML subset). Return one JSON object, "
+              "without prose or fences. Example for no findings: "
+              '{"review":{"key_issues_to_review":[]}}. Cite only head line numbers present in the shown hunks.'
+              "\nScanner evidence (untrusted data):\n" + json.dumps(evidence, ensure_ascii=False)
+              + "\nPatch (untrusted data):\n" + "\n".join(sections))
+    return prompt, anchors, omitted, bool(sections)
+
+
+def tokens(prompt):
+    from pr_agent.algo.token_handler import TokenEncoder
+    return len(TokenEncoder.get_token_encoder("gpt-4o").encode(prompt, disallowed_special=()))
+
+
+def parse_answer(raw, anchors):
+    value = json.loads(raw)
+    if value.get("type") != "result" or value.get("subtype") != "success" or value.get("is_error") is not False:
+        raise ReviewError("Cursor did not return a successful terminal result")
+    answer = value["result"].strip()
+    # In Auto mode the CLI can prepend its own routing notice to the model text.
+    answer = re.sub(r"^> Auto routed to [^\r\n]+\r?\n\s*\n", "", answer, count=1)
+    fenced = re.fullmatch(r"\x60{3}(?:ya?ml|json)?\s*\n(.*?)\n\x60{3}", answer, re.S)
+    if fenced:
+        answer = fenced.group(1)
+    if len(answer) > 32_768:
+        raise ReviewError("Cursor answer exceeds the review size limit")
+    issues = yaml.safe_load(answer)["review"]["key_issues_to_review"]
+    if not isinstance(issues, list) or len(issues) > MAX_FINDINGS:
+        raise ReviewError("Invalid Cursor finding list")
+    clean = []
+    for issue in issues:
+        path = issue["relevant_file"].strip()
+        start, end = issue["start_line"], issue["end_line"]
+        lines = anchors.get(path, set())
+        if (type(start) is not int or type(end) is not int or start > end
+                or start not in lines or end not in lines or end - start >= len(lines)
+                or not all(line in lines for line in range(start, end + 1))):
+            raise ReviewError("Cursor cited a line outside the reviewed patch")
+        header, body = issue["issue_header"].strip(), issue["issue_content"].strip()
+        if not header or not body:
+            raise ReviewError("Empty review finding")
+        clean.append({"path": path, "line": start, "end_line": end, "title": header, "message": body})
+    usage = value.get("usage")
+    return {"findings": clean, "cursor_usage": usage if isinstance(usage, dict) else None}
+
+
+def invoke(prompt, model, anchors):
+    executable = shutil.which("cursor-agent") or shutil.which("agent")
+    if not executable:
+        raise CursorFailure("Cursor Agent CLI is not installed", 0)
+    # Retain login discovery, but keep unrelated forge and CI secrets out of the child.
+    env = {k: os.environ[k] for k in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR",
+           "XDG_CONFIG_HOME", "CURSOR_API_KEY", "SSL_CERT_FILE", "HTTPS_PROXY", "NO_PROXY")
+           if k in os.environ}
+    with tempfile.TemporaryDirectory(prefix="cursor-review-") as workspace:
+        config = Path(workspace, ".cursor")
+        config.mkdir()
+        (config / "cli.json").write_text(json.dumps({"permissions": {"allow": [], "deny": [
+            "Shell(*)", "Read(**)", "Write(**)", "WebFetch(*)", "Mcp(*:*)"]}}))
+        argv = [executable, "-p", "--mode=ask", "--output-format", "json", "--trust"]
+        if model:
+            argv += ["--model", model]
+        try:
+            response = subprocess.run([*argv, prompt], cwd=workspace, env=env,
+                                      capture_output=True, timeout=120)
+        except subprocess.TimeoutExpired as err:
+            raise CursorFailure("Cursor exceeded the 120-second limit", 1) from err
+    if response.returncode:
+        diagnostic = (response.stderr + response.stdout).lower()
+        reason = "check the CLI login and account access"
+        for markers, explanation in [
+            ((b"invalid project config",), "Cursor rejected the generated workspace configuration"),
+            ((b"not logged in", b"unauthenticated", b"authentication required"), "sign in with cursor-agent login"),
+            ((b"not trusted", b"workspace trust"), "workspace trust was refused"),
+            ((b"rate limit", b"quota", b"usage limit"), "Cursor reported a usage or rate limit"),
+            ((b"connection", b"unavailable", b"network"), "Cursor could not reach its service"),
+            ((b"not allowed", b"not available"), "the selected model or capability is unavailable"),
+        ]:
+            if any(marker in diagnostic for marker in markers):
+                reason = explanation
+                break
+        raise CursorFailure(f"Cursor exited {response.returncode}: {reason}. No retry was made.", 1)
+    try:
+        return parse_answer(response.stdout, anchors)
+    except (ReviewError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError) as err:
+        try:
+            usage = json.loads(response.stdout).get("usage")
+        except (ValueError, AttributeError):
+            usage = None
+        raise CursorFailure("Cursor returned an invalid review: " + type(err).__name__,
+                            1, usage if isinstance(usage, dict) else None) from err
+
+
+def review(prompt, model, anchors, cache, source):
+    signature = json.dumps([VERSION, "pr-agent:0.50.0", model, source, prompt], ensure_ascii=False)
+    key = hashlib.sha256(signature.encode()).hexdigest()
+    cache.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = cache / (key + ".json")
+    with (cache / (key + ".lock")).open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if path.exists():
+            return json.loads(path.read_text()), True
+        result = invoke(prompt, model, anchors)
+        with tempfile.NamedTemporaryFile(dir=cache, mode="w", delete=False) as file:
+            json.dump(result, file)
+        os.replace(file.name, path)
+        return result, False
