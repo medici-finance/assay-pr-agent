@@ -4,7 +4,11 @@ A standalone, single-pass reviewer for GitHub pull requests, GitLab merge reques
 
 ## Request a review in a PR or MR
 
-Post a new comment containing just `/review` on an open GitHub PR or GitLab MR. That comment is the entire request. The receiver uses the PR or MR number from the event and posts a summary on the reviewed head with its configured reviewer account. Requesters do not need to create a tracking issue, add a role label or approve a separate posting step. An edit, push, approval, ordinary comment, internal GitLab note or bot response spends zero model tokens. Each accepted comment gets one durable queue entry. After a restart, queued requests continue. A request interrupted after it started stays recorded; a fresh `/review` can request another attempt. The worker processes requests one at a time and reuses successful results.
+Post a new comment containing just `/review` on an open GitHub PR or GitLab MR. The service polls the configured projects every two minutes by default. It accepts new requests from the numeric human account IDs you configure and posts the result on the reviewed head. A poll uses zero model tokens. Requests run one at a time with the existing prompt budget and cache.
+
+Assay’s `deskmonitor pr` supplies the open change numbers. Batched `deskread comments --change` calls read their conversations on every cycle, including changes with no new commits. The poller skips old commands, edits detectable from the forge timestamps, bot responses and ordinary messages. For GitLab, Assay v1.0.91 omits the internal-note flag. Only an otherwise eligible command gets a single [GitLab note lookup](https://docs.gitlab.com/api/notes/#retrieve-a-merge-request-note), using the existing Assay reviewer credential and instance. Internal and system notes cannot start a review.
+
+Each project starts watching at its first activation. Keep the state volume across restarts to pick up requests posted during downtime on still-open changes. Queued reviews survive a restart. A review interrupted after starting needs a fresh `/review` to run again. Duplicate reads do not incur another model call. A deleted comment or a change closed between polls may never be observed.
 
 ### Docker setup
 
@@ -14,37 +18,99 @@ The image contains Cursor Agent, Assay’s released forge tools, ShellCheck and 
 docker build --platform linux/amd64 -t assay-pr-agent .
 ```
 
-Provide a persistent state volume, one trusted checkout per project and a dedicated Assay reviewer configuration that can already read and comment on the chosen projects. Mount the actual checkout including its Git objects. The container runs as UID 10001. Give that user read access to the checkouts and read/write access to its dedicated Assay credential cache. Configure the reviewer roster, role credentials and forge mapping for the instance before accepting requests. Supply only the credentials needed by this reviewer. Scanner coverage depends on having the reviewed head available in the checkout.
+### Interactive setup
 
-Start interactively with the paths below adjusted for your host. The setup asks for the public HTTPS receiver URL, each project's forge and full URL, its container checkout path, allowed human account IDs and its webhook secret. It saves the answers to a mode-0600 file on the state volume. Reuse that volume on subsequent starts.
+Run the setup command once with a writable state volume and your checkouts mounted at the paths the reviewer will use:
 
 ```sh
-docker run -it --rm --platform linux/amd64 -p 127.0.0.1:8787:8787 \
-  -v review-state:/state -v /path/to/checkouts:/repos:ro \
-  -v /path/to/reviewer-assay-config:/home/reviewer/.config/assay \
-  -e CURSOR_API_KEY assay-pr-agent
+docker run --rm -it --platform linux/amd64 \
+  -v review-state:/state -v /path/to/checkouts:/repos:ro assay-pr-agent setup
 ```
 
-For an unattended container, pass the same settings as environment variables. Example Docker env file (one variable per line; keep real secrets outside Git):
+Enter the projects, checkout paths inside the container, visibility, numeric IDs allowed to request reviews, and the responsible operator’s `login:numeric-id`. Setup asks for a Cursor API key and only the credentials for the forges you selected. For GitHub, have the App ID, installation ID and private PEM ready. For GitLab, have the reviewer token ready. You can accept the defaults of 120 seconds between polls, 6,000 estimated input tokens per review and Cursor’s default model.
+
+For each credential, choose **paste** to enter it with terminal echo disabled, **import** to copy a readable file into the volume, or **mount** to keep using an external file. For import or mount, add the source volume to the setup command (for example, `-v /path/to/secrets:/run/secrets:ro`) and enter the file’s absolute path **inside** the container. With **mount**, provide the same file path when running the service. With **import**, the source mount is only needed during setup.
+
+Start the reviewer with the same volumes. No configuration environment variables are required:
+
+```sh
+docker run --rm --platform linux/amd64 \
+  -v review-state:/state -v /path/to/checkouts:/repos:ro assay-pr-agent
+```
+
+The active settings and imported or pasted credentials are in `/state/setup/`. Credential files are plaintext, owner-readable and writable (0600), inside a private directory (0700). Protect the volume and its backups. Setup checks the local files and credential formats offline. The poller checks forge access during normal operation.
+
+To change settings or rotate credentials, run the setup command again, or run `docker exec -it <container> cursor-review-setup`. Existing settings and credentials can be kept without displaying their values. Restart the reviewer to load the new setup. Cancelling before the save keeps the previous configuration active. An explicit environment setting takes precedence over its saved value.
+
+### Standalone Docker credentials
+
+Mount the checkout for each project read-only and a writable volume at `/state` for the request queue, cache and Assay audit records. The container runs as UID 10001. It generates the reviewer configuration on first start and updates it from the supplied settings on restart. You can use it without installing Assay on the host.
+
+| Docker setting | What to supply |
+|---|---|
+| `CURSOR_API_KEY` | Cursor API key for headless inference. |
+| `REVIEW_OPERATOR` | The responsible human’s forge `login:numeric-id`. Assay uses this for posting attribution. The project’s `requester_ids` separately control who can request reviews. |
+| `REVIEW_GITHUB_APP_ID`, `REVIEW_GITHUB_INSTALLATION_ID` | Numeric IDs for the GitHub App and the installation covering your repositories. Use a reviewer installation with access to read PRs and diffs and write PR conversation comments. |
+| `REVIEW_GITHUB_PRIVATE_KEY` **or** `REVIEW_GITHUB_PRIVATE_KEY_FILE` | The App’s unencrypted RSA PEM or an absolute path to the mounted PEM. The value accepts actual line breaks or literal `\n`. |
+| `REVIEW_GITLAB_TOKEN` **or** `REVIEW_GITLAB_TOKEN_FILE` | A dedicated GitLab reviewer token with API permission to read MRs and post notes, or an absolute path to the mounted token. |
+| `REVIEW_PROJECTS` | JSON project list. Each entry has a forge, full HTTPS URL, checkout path, allowed human account IDs and optional `visibility` (`private` by default, `internal`, or `public`). Set the actual visibility to authorize posting on public or internal projects. |
+
+Supply only the providers you use. Each container supports a GitHub App installation on github.com and one GitLab instance. The poller derives `GITLAB_API_BASE` from the configured GitLab projects. An explicit value must match their HTTPS instance and end in `/api/v4`.
+
+For example, this `review.env` uses both providers and reads the keys from a mounted secrets directory:
 
 ```dotenv
-REVIEW_PUBLIC_URL=https://review.example.com
-REVIEW_PROJECTS=[{"provider":"github","url":"https://github.com/example/api","checkout":"/repos/api","requester_ids":[101],"secret_env":"REVIEW_SECRET_GITHUB"},{"provider":"gitlab","url":"https://gitlab.example.com/example/web","checkout":"/repos/web","requester_ids":[202],"secret_env":"REVIEW_SECRET_GITLAB"}]
-REVIEW_SECRET_GITHUB=replace-with-a-unique-random-GitHub-secret
-REVIEW_SECRET_GITLAB=replace-with-a-different-random-GitLab-secret
+REVIEW_OPERATOR=alice:101
+REVIEW_GITHUB_APP_ID=123456
+REVIEW_GITHUB_INSTALLATION_ID=789012
+REVIEW_GITHUB_PRIVATE_KEY_FILE=/run/secrets/github-reviewer.pem
+REVIEW_GITLAB_TOKEN_FILE=/run/secrets/gitlab-reviewer-token
+REVIEW_PROJECTS=[{"provider":"github","url":"https://github.com/example/api","checkout":"/repos/api","requester_ids":[101],"visibility":"public"},{"provider":"gitlab","url":"https://gitlab.example.com/example/web","checkout":"/repos/web","requester_ids":[202],"visibility":"private"}]
+REVIEW_POLL_SECONDS=120
 REVIEW_MAX_INPUT_TOKENS=6000
 ```
 
-Use `--env-file /path/to/reviewer.env` in place of `-it` and keep the same mounts, port and Cursor API key. `REVIEW_PROJECTS` takes precedence over saved settings. `REVIEW_MODEL` selects a Cursor model. Each project URL must use the `owner/project` form supported by the pinned Assay posting tool.
+```sh
+docker run --rm --platform linux/amd64 --env-file review.env -e CURSOR_API_KEY \
+  -v review-state:/state -v /path/to/checkouts:/repos:ro \
+  -v /path/to/reviewer-secrets:/run/secrets:ro assay-pr-agent
+```
 
-Put an HTTPS reverse proxy in front of port 8787, forwarding the body and provider headers unchanged. Startup prints the exact webhook URL for each project. Register each URL once:
+For environment-only credentials, omit the two `_FILE` lines and the secrets volume. Pass `-e REVIEW_GITHUB_PRIVATE_KEY -e REVIEW_GITLAB_TOKEN` to forward exported values. For Argo CD or Flux, the same container accepts Kubernetes Secret volumes via `_FILE` or Secret-backed environment variables via `env.valueFrom.secretKeyRef`. Mount files readable by UID 10001. Choose one source per credential. The agent reads them at startup, so restart or roll the deployment after rotation.
 
-| Project settings | Events and verification |
-|---|---|
-| GitHub → Settings → Webhooks | Select JSON, enter the project’s secret and choose **Issue comments**. A pull request conversation comment arrives as `issue_comment`. The receiver verifies the SHA-256 signature. [GitHub webhook setup](https://docs.github.com/en/webhooks/using-webhooks/creating-webhooks) |
-| GitLab → Settings → Webhooks | Enter the project's **Secret token** and enable **Comments** (called **Note events** by the API). Disable the default push trigger. The receiver checks the secret token and the MR target. [GitLab webhook setup](https://docs.gitlab.com/user/project/integrations/webhooks/) |
+For example, this Pod spec fragment mounts the GitHub App key and injects the GitLab token. The other settings from `review.env` can come from a ConfigMap.
 
-An accepted delivery returns HTTP 202 once queued. Ignored and duplicate deliveries return 204. Keep `/state` across container replacements for deduplication and cache reuse. The queue and cache are for a single persistent service instance. Runtime logs show review state, publication outcome and Cursor invocation count. A webhook secret authenticates delivery; the Assay reviewer credentials authorize reading and posting.
+```yaml
+spec:
+  containers:
+    - name: reviewer
+      # Add to the reviewer's existing container settings.
+      env:
+        - name: REVIEW_GITHUB_PRIVATE_KEY_FILE
+          value: /run/secrets/reviewer/github.pem
+        - name: REVIEW_GITLAB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: reviewer-credentials
+              key: gitlab-token
+      volumeMounts:
+        - name: reviewer-key
+          mountPath: /run/secrets/reviewer
+          readOnly: true
+  volumes:
+    - name: reviewer-key
+      secret:
+        secretName: reviewer-credentials
+        items:
+          - key: github-private-key
+            path: github.pem
+```
+
+Assay uses mode-0600 runtime copies of the supplied credentials. In Docker these live in `/dev/shm`; incoming keys are excluded from the project settings and review database. Keep one service instance per state volume. The normal `/review` path uses GitLab’s token without rotating it. `REVIEW_MODEL` selects the Cursor model.
+
+On an unconfigured interactive first start, the container runs setup before polling. Deployments with an existing Assay reviewer configuration can still mount it at `/home/reviewer/.config/assay` and omit the standalone setup variables. When supplying credentials alongside a mounted roster, its existing repository and identity rules apply.
+
+**Upgrading from v0.1.0.** Stop the old receiver and start the polling image with the same state volume. It reads the existing project settings, request queue and cache. You can remove the forge webhooks, reverse proxy, published port, `REVIEW_PUBLIC_URL` and webhook secrets. The polling container only needs outbound connections.
 
 ### Container CI
 
@@ -78,7 +144,7 @@ The local form compares the merge base to committed `HEAD`, or to an explicit `-
 
 - `--estimate` makes zero Cursor calls. It performs the same diff preparation and static checks as a review.
 - The default limit is **6,000 estimated input tokens** for the complete user-supplied prompt. An oversized review returns `over-budget` before invoking Cursor. Repeat `--path path/to/file` to explicitly select a smaller scope. The JSON lists the omitted paths.
-- Each run can launch Cursor **once**, with a 120-second timeout and at most three accepted findings. There is no model fallback, repair prompt, automatic retry or polling. The cap covers the submitted prompt. Cursor controls its own system context, output and billed usage. `cursor_usage` is populated only if the CLI supplies it.
+- Each run can launch Cursor **once**, with a 120-second timeout and at most three accepted findings. There is no model fallback, repair prompt, automatic retry or model polling. The cap covers the submitted prompt. Cursor controls its own system context, output and billed usage. `cursor_usage` is populated only if the CLI supplies it.
 - Successful results are cached under `~/.cache/cursor-pr-review` (or `XDG_CACHE_HOME`). Identical evidence, scope identity, model selection and prompt reuse the result. The lock serializes duplicate local requests. For CI reuse across jobs, provide a persistent, trusted `--cache-dir`. Each ephemeral runner otherwise starts cold. Use an explicit model for reproducible comparisons.
 - JSON keeps scanner findings separate from model findings. A source file with no usable patch or head-side location (including a whole-file deletion) is listed as omitted. Missing scanner evidence stays visible even when the model finds nothing.
 - Exit 0 means the requested full review/estimate completed, including a review with findings. Exit 2 means partial coverage, budget refusal, a model/tool error or a publication failure. Inspect `state`, `checks` and `findings` when using this in CI.
@@ -89,9 +155,32 @@ ShellCheck and actionlint run on the reviewed head’s Git blobs in a temporary 
 
 To reuse Assay’s Go linters, pass `--go-report path/to/report.json` from its [pinned analysis action](https://github.com/medici-finance/assay/tree/main/actions/go-analysis). Supply an artifact from a trusted producer. The runner checks the `go-analysis/v1` schema, source SHA, coverage count, totals and gate, then imports new and worsened findings for the selected files. Scanner diagnostics outside the shown hunks remain in the report. Only diagnostics located in the supplied patch consume model context.
 
+### Use the Go report in a comment-triggered review
+
+In container setup, enter the project's trusted Go analysis workflow or job. Alternatively, add the optional `go_analysis` field to its entry in `REVIEW_PROJECTS`. Leave it blank for projects without an Assay producer. Only enable a producer whose CI definition and artifact publication your team controls. A contributor who can replace the producer could also fabricate its findings.
+
+| Project | Example setting | CI setup |
+|---|---|---|
+| GitHub | `"go_analysis": "go-lint.yml"` | Use the workflow filename or numeric ID. Run the [Assay action](https://github.com/medici-finance/assay/tree/v1.0.91/actions/go-analysis) on the PR source head. Give the existing reviewer App **Actions: read**. The worker reads the latest run of that workflow for the source SHA and its exact attempt's `go-analysis-lint-<sha>-<run-id>-<attempt>` artifact. |
+| GitLab | `"go_analysis": "go-lint"` | Use the exact job name in the MR head pipeline in the target project. Run the Assay scanner against the MR source head with `GITHUB_REPOSITORY="$CI_PROJECT_PATH"` (the existing report format reads this variable). Have that job publish the sanitized report at the artifact root as `report.json`, using `artifacts: {when: always, paths: [report.json]}`. The reviewer needs access to read the pipeline, job and artifact. |
+
+The worker looks up the report only when processing an authorized `/review`. It accepts a completed scan from a failed lint job, verifies the repository and analyzed source SHA, then imports new and worsened findings for changed paths. Findings inside the shown hunks share the existing Cursor prompt and token budget. The summary includes imported findings outside the hunks as well.
+
+If CI is still running or the report is missing, expired, unreadable, invalid or for a different head, the summary marks Go analysis as `could not check`. The rest of the review proceeds with the existing one-call ceiling. A new `/review` after CI finishes can pick up the report. Ordinary polls and CI completion never trigger a model call.
+
+### Qualgen history advisories
+
+The container includes the checksum-verified Assay Qualgen v1.0.91 release. On startup and then every 24 hours a background worker runs `qualgen mine` against each project's mounted checkout. Keep a full checkout of the trusted integration branch and refresh it as part of your deployment. The miner reads local Git history and stores its results under `/state/qualgen`. A changed tip extends the previous snapshot when history permits. An unchanged tip skips mining. Reviews can still read the last completed snapshot during a refresh.
+
+Set `REVIEW_QUALGEN_INTERVAL_SECONDS` in Docker or enter the refresh interval during setup. Use `0` to disable mining and advisories. Keep the state volume private to the reviewer. It contains historical file and commit data.
+
+An authorized GitHub or GitLab `/review` runs `qualgen check` for the changed paths and adds its notices to the posted summary. A notice can identify a frequently co-changed file that is missing from the change. The summary identifies the mined commit and marks paths with insufficient history. Live reference notices are included only when the checkout is at the reviewed head. While the first snapshot is being built, the review reports that history is unavailable. The comment shows up to 20 entries; the JSON includes the full advisory list.
+
+Qualgen uses local CPU, disk and Git history. Its output goes directly into the summary, outside the Cursor prompt, token estimate and model cache key. An over-budget review or a model failure can still publish historical advisories.
+
 ### GitHub Actions and GitLab CI
 
-To run the CLI explicitly in a PR or MR pipeline, use the pipeline event's commit references. This command invokes a review. Use the webhook receiver above for comment-only operation:
+To run the CLI explicitly in a PR or MR pipeline, use the pipeline event's commit references. This command invokes a review. Use the polling service above for comment-only operation:
 
 ```sh
 cursor-review --ci --max-input-tokens 4000 > review.json
@@ -103,7 +192,7 @@ GitHub uses a `pull_request` event and its recorded base and head SHAs. Fetch su
 
 Add `--post` to the `--change` command to post the reviewed commit and findings as a single ordinary comment. Assay handles GitHub/GitLab routing, reviewer custody, repeated identical comments and the current-head check via `deskpost comment ... --kind mr --head SHA`. A stale head is refused. Publication requires the configured Assay reviewer role. A failed post can be retried with the same model and cache without paying again for an unchanged prompt. No write happens by default.
 
-The standalone receiver supports `/review`. For additional upstream PR-Agent chat commands such as `/ask` and `/improve`, see [GitHub integration](https://docs.pr-agent.ai/installation/github/) and [GitLab integration](https://docs.pr-agent.ai/installation/gitlab/). GitLab pipeline jobs alone do not receive comment events. The upstream comment server and this CLI are separate entry points.
+The standalone poller supports `/review`. For additional upstream PR-Agent chat commands such as `/ask` and `/improve`, see [GitHub integration](https://docs.pr-agent.ai/installation/github/) and [GitLab integration](https://docs.pr-agent.ai/installation/gitlab/). GitLab pipeline jobs alone do not receive comment events. The upstream comment server and this CLI are separate entry points.
 
 ## Verification
 
@@ -111,4 +200,4 @@ The standalone receiver supports `/review`. For additional upstream PR-Agent cha
 uv run --frozen python -m unittest discover -s tests -v
 ```
 
-The fixtures exercise GitHub and GitLab event payloads, the Assay forge envelope/command contract, caching, the budget cutoff, incomplete inputs and Cursor failure handling. Install ShellCheck to run the integration fixtures. Tests substitute a local executable for inference and never post externally.
+The fixtures exercise GitHub and GitLab polling, restart handling, the Assay forge envelope/command contract, caching, the budget cutoff, incomplete inputs and Cursor failure handling. Install ShellCheck to run the integration fixtures. Tests substitute a local executable for inference and never post externally.

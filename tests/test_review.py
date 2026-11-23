@@ -96,10 +96,8 @@ class ReviewTest(unittest.TestCase):
     def test_forge_read_and_post_arguments(self):
         for host in ("https://github.com/org/repo/pull/1","https://gitlab.com/org/repo/-/merge_requests/1"):
             calls = []
-            original_run = source.run
             def fake(args):
-                if args[0] != "deskread":
-                    return original_run(args)
+                self.assertEqual(args[0], "deskread")
                 kind = args[1]
                 calls.append(kind)
                 detail = {"change":{"url":host,"headSha":self.head,"baseRef":"main","changedFiles":1}}
@@ -108,7 +106,7 @@ class ReviewTest(unittest.TestCase):
                     "patch":"@@ -0,0 +1,2 @@\n+#!/bin/sh\n+echo $argument\n"}]}}
                 item = dict(detail if kind=="change" else files,repo="org/repo",number=1)
                 return json.dumps({"schema":1,"kind":kind,"items":[item],"partial":[]})
-            with patch.object(source,"run",side_effect=fake),patch.object(cli,"run") as post:
+            with patch.object(source,"run_desk",side_effect=fake),patch.object(cli,"run_desk") as post:
                 code,result = self.check("--change","org/repo#1","--post")
                 self.assertEqual(code,0,result)
                 self.assertEqual(result["source"],host)

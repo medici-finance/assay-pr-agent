@@ -1,4 +1,5 @@
 import argparse
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -9,9 +10,14 @@ import tempfile
 from unidiff.errors import UnidiffParseError
 import yaml
 
+from . import history
+from .setup import apply_saved_setup, state_dir
+from .config import load_config
+from .credentials import forge_credentials, standalone_requested
+from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .engine import CursorFailure, pack, review, tokens
-from .source import ReviewError, ci_refs, forge_change, local_change, run
+from .source import ReviewError, ci_refs, forge_change, local_change, run_desk
 
 
 def publish(address, head, report):
@@ -28,9 +34,11 @@ def publish(address, head, report):
         body.append("No model findings in the reviewed scope.")
     for check in report["checks"]:
         if check["state"] != "complete":
-            body.append(f"- {check['tool']}: could not check {check.get('path', '')}")
+            body.append(f"- {check['tool']}: could not check {check.get('path') or check.get('reason', '')}")
         for item in check["findings"]:
             body.append(f"- {item['path']}:{item['line']} — {item['rule']} {item.get('message', '')}")
+    if "qualgen" in report:
+        body.extend(["", *history.summary(report["qualgen"]), ""])
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {path}")
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
@@ -38,7 +46,7 @@ def publish(address, head, report):
         # A finding may quote a multiline source fragment, including forge quick actions.
         tmp.write("\n".join(" ".join(line.splitlines()) for line in body) + "\n")
         tmp.flush()
-        run(["deskpost", "comment", repo, number, "--kind", "mr", "--head", head,
+        run_desk(["deskpost", "comment", repo, number, "--kind", "mr", "--head", head,
              "--body-file", tmp.name])
 
 
@@ -52,9 +60,12 @@ def parser():
     p.add_argument("--head", help="Local head revision (default HEAD with --base)")
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="Checkout for local Git and scanners")
     p.add_argument("--path", action="append", default=[], help="Limit review to an exact changed path; repeatable")
-    p.add_argument("--go-report", type=Path, help="Assay go-analysis/v1 JSON for this head")
+    evidence = p.add_mutually_exclusive_group()
+    evidence.add_argument("--go-analysis-producer", help="Trusted CI producer for --expected-change-url")
+    evidence.add_argument("--go-report", type=Path, help="Assay go-analysis/v1 JSON for this head")
+    p.add_argument("--qualgen-store", type=Path, help="Read the poller’s mined Qualgen history for this project")
     p.add_argument("--model", help="Explicit Cursor model (otherwise the CLI default)")
-    p.add_argument("--max-input-tokens", type=int, default=6000, help="Preflight estimate limit (default 6000)")
+    p.add_argument("--max-input-tokens", type=int, help="Preflight estimate limit (default 6000)")
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling Cursor")
     p.add_argument("--cache-dir", type=Path, default=Path(os.getenv("XDG_CACHE_HOME", Path.home()/".cache"))/"cursor-pr-review")
     p.add_argument("--post", action="store_true", help="Publish a head-bound summary using deskpost with --change")
@@ -67,6 +78,8 @@ def execute(args):
     root = args.repo.resolve()
     if args.expected_change_url and not args.change:
         raise ReviewError("--expected-change-url requires --change")
+    if args.go_analysis_producer and not args.expected_change_url:
+        raise ReviewError("--go-analysis-producer requires --expected-change-url")
     if args.change:
         change = forge_change(args.change, args.expected_change_url)
     else:
@@ -79,8 +92,12 @@ def execute(args):
         raise ReviewError("--path must name a file changed in this review")
     files = sorted((f for f in change.files if f.path in selected), key=lambda f: f.path)
     checks = scan_files(root, change.head, files)
+    go = None
     if args.go_report:
         go = go_report(args.go_report, change.head)
+    elif args.go_analysis_producer:
+        go = forge_go_report(change.identity, args.go_analysis_producer, change.head, root)
+    if go is not None:
         go["findings"] = [row for row in go["findings"] if row["path"] in selected]
         checks.append(go)
 
@@ -91,6 +108,8 @@ def execute(args):
               "estimated_input_tokens": estimated, "max_input_tokens": args.max_input_tokens,
               "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
               "findings": [], "cursor_usage": None}
+    if args.qualgen_store:
+        report["qualgen"] = history.screen(root, args.qualgen_store, selected, change.head)
     if estimated > args.max_input_tokens:
         return dict(report, state="over-budget"), 2
     if args.estimate:
@@ -133,9 +152,30 @@ def main():
     args.cache_dir = args.cache_dir.resolve()
     if args.go_report:
         args.go_report = args.go_report.resolve()
+    if args.qualgen_store:
+        args.qualgen_store = args.qualgen_store.resolve()
     old = Path.cwd()
     try:
-        with tempfile.TemporaryDirectory(prefix="pr-agent-settings-") as clean:
+        with ExitStack() as stack:
+            state = state_dir().resolve()
+            if args.change and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
+                apply_saved_setup(state)
+            if args.max_input_tokens is None:
+                args.max_input_tokens = int(os.getenv("REVIEW_MAX_INPUT_TOKENS", "6000"))
+            if args.model is None:
+                args.model = os.getenv("REVIEW_MODEL")
+            if args.change and standalone_requested():
+                state.mkdir(mode=0o700, parents=True, exist_ok=True)
+                projects = load_config(state)
+                slug, _, number = args.change.rpartition("#")
+                project = next((p for p in projects.values() if p.slug == slug), None)
+                if project is None or not number.isdecimal():
+                    raise ReviewError("Use a --change address from the configured review projects")
+                if args.expected_change_url and args.expected_change_url != project.change_url(number):
+                    raise ReviewError("Configured project and expected change URL differ")
+                args.expected_change_url = project.change_url(number)
+                stack.enter_context(forge_credentials(projects, state))
+            clean = stack.enter_context(tempfile.TemporaryDirectory(prefix="pr-agent-settings-"))
             # deskread/deskpost discover their configured forge from the caller's checkout.
             # Compute the upstream imports here, then restore cwd before touching the forge.
             os.chdir(clean)

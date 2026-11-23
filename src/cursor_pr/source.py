@@ -1,5 +1,6 @@
 """Read a forge snapshot with Assay, or compare two immutable local Git revisions."""
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -15,6 +16,22 @@ def run(args, *, cwd=None, timeout=45, data=None, env=None):
     if result.returncode:
         raise ReviewError(f"{Path(args[0]).name} {args[1]} exited {result.returncode}")
     return result.stdout
+
+
+def run_desk(args, *, env=None, **kwargs):
+    env = dict(os.environ if env is None else env)
+    if "REVIEW_ASSAY_HOME" in env:
+        env["HOME"] = env["REVIEW_ASSAY_HOME"]
+    return run(args, env=env, **kwargs)
+
+
+def reviewer_token(provider, slug, checkout):
+    custody = run_desk(["desktoken", "--no-rotate", "--forge", provider, "reviewer", "--repo", slug],
+                       cwd=checkout).decode().strip()
+    token = Path(custody).read_text().strip()
+    if not token:
+        raise ReviewError("Empty reviewer credential")
+    return token
 
 
 def valid_sha(value):
@@ -39,7 +56,7 @@ class Change:
 
 def desk(kind, address):
     repo, number = address.rsplit("#", 1)
-    data = json.loads(run(["deskread", kind, "--change", address]))
+    data = json.loads(run_desk(["deskread", kind, "--change", address]))
     items = data.get("items") or []
     if (data.get("schema") != 1 or data.get("kind") != kind or data.get("partial")
             or len(items) != 1 or items[0].get("repo") != repo or items[0].get("number") != int(number)):

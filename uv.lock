@@ -429,16 +429,14 @@ name = "cursor-pr-review"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "pr-agent" },
-    { name = "starlette" },
-    { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx" },
     { name = "pr-agent", specifier = "==0.50.0" },
-    { name = "starlette" },
-    { name = "uvicorn" },
 ]
 
 [[package]]
