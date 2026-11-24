@@ -1,6 +1,36 @@
-# Cursor PR review
+# Assay PR Agent
 
-A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It builds on [PR-Agent](https://github.com/the-pr-agent/pr-agent). The PR-Agent contributors provide the review prompt, line-numbered diff formatter and token estimator used here. We ship their [MIT-licensed](https://github.com/the-pr-agent/pr-agent/blob/main/LICENSE) Python package in the container, with its original license notice. Cursor Agent performs inference. Assay’s installed `deskread` and `deskpost` handle authenticated forge access when you use a change number. Local and CI runs require only the Git objects.
+A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It builds on [PR-Agent](https://github.com/the-pr-agent/pr-agent). The PR-Agent contributors provide the review prompt, line-numbered diff formatter and token estimator used here. We ship their [MIT-licensed](https://github.com/the-pr-agent/pr-agent/blob/main/LICENSE) Python package in the container, with its original license notice. Choose Cursor Agent, Claude Code, or Codex CLI for inference. Assay’s installed `deskread` and `deskpost` handle authenticated forge access when you use a change number. Local and CI runs require only the Git objects.
+
+## Install with Docker Compose
+
+From this repository, run:
+
+```sh
+./install.sh
+```
+
+Open the one-time local setup link printed by the installer. Select GitHub or GitLab, enter your project URL and authorized requester IDs, and leave the checkout path blank for automatic sync. Choose Cursor, Claude, or Codex and supply the selected provider's API key and the forge credentials. The browser accepts pasted keys and local key files. Configuration is saved to a private Docker volume. After setup exits, the installer starts the checkout sync sidecar and reviewer. Reconfigure with `./install.sh --configure`, inspect progress with `docker compose logs sync reviewer`, and stop with `docker compose down`.
+
+The default install builds this checkout for Linux amd64. Set `REVIEW_IMAGE` to a published image that contains this installer to pull it instead. The v0.2.0 image predates this installation flow. The browser setup port is published only on `127.0.0.1:8765` and closes after saving. The URL contains a temporary setup credential. Give the link only to the person configuring this instance.
+
+### Review provider
+
+| `REVIEW_PROVIDER` | Command | Credential |
+|---|---|---|
+| `cursor` (default) | `cursor-agent -p --mode=ask` | `CURSOR_API_KEY` |
+| `claude` | `claude -p` with tools disabled and one turn | `ANTHROPIC_API_KEY` |
+| `codex` | `codex exec` in an ephemeral read-only session with shell and web search disabled | `CODEX_API_KEY` |
+
+Each credential also supports a `_FILE` setting. Use `REVIEW_MODEL` to specify a model offered by the selected provider. The agent launches at most one provider CLI per eligible uncached request, with the same prompt estimate and timeout. CLIs control their own system context, internal requests and billing. Output includes `provider`, `model_invocations` and available `model_usage`. The cache separates providers and Cursor teams.
+
+Cursor setup uses the CLI's `team list` and `team switch` commands. With multiple eligible teams you choose a numeric ID. With one, the installer selects it automatically. An empty membership list uses personal scope. An account with memberships but no selectable team fails setup. The service rechecks the supplied key at startup and verifies the active team in an isolated Cursor configuration. For environment-only deployment set `REVIEW_CURSOR_TEAM_ID` when the key has multiple eligible teams. A failed membership lookup or selection stops startup before any review. These checks use Cursor's account service without starting an inference request.
+
+### Automatic repository sync
+
+Compose runs Kubernetes `git-sync` in a separate container with write access to the checkout volume. For each managed project it refreshes the remote default branch with full history, using the existing Assay reviewer credential, and atomically switches the `current` symlink. The reviewer mounts the volume read-only. Allow repository contents read access for the GitHub App or GitLab repository read access for its token. The sync interval defaults to 120 seconds (`REVIEW_SYNC_SECONDS` on the sync service). Polling uses the forge's PR/MR diff directly. When a requested review needs a shell or workflow scan and its commit is missing locally, the reviewer uses git-sync to fetch just that change ref into a temporary checkout, verifies its SHA, and discards it after scanning. A moved or unavailable ref is reported as incomplete coverage.
+
+In `REVIEW_PROJECTS`, use `"managed": true` in place of a checkout path for a managed clone, or keep your existing absolute `checkout` and bind mount. With Compose, mount custom checkout paths in both services. The sync service leaves operator-managed checkouts alone. Private repositories retain a local copy of their history on the checkout volume.
 
 ## Request a review in a PR or MR
 
@@ -12,7 +42,7 @@ Each project starts watching at its first activation. Keep the state volume acro
 
 ### Docker setup
 
-The image contains Cursor Agent, Assay’s released forge tools, ShellCheck and actionlint. Use an **amd64 Linux** runner or Docker’s amd64 emulation. To build from source:
+The image includes all three provider CLIs, git-sync, Qualgen, Assay’s released forge tools, ShellCheck and actionlint. Use an **amd64 Linux** runner or Docker’s amd64 emulation. To build from source:
 
 ```sh
 docker build --platform linux/amd64 -t assay-pr-agent .
@@ -27,7 +57,7 @@ docker run --rm -it --platform linux/amd64 \
   -v review-state:/state -v /path/to/checkouts:/repos:ro assay-pr-agent setup
 ```
 
-Enter the projects, checkout paths inside the container, visibility, numeric IDs allowed to request reviews, and the responsible operator’s `login:numeric-id`. Setup asks for a Cursor API key and only the credentials for the forges you selected. For GitHub, have the App ID, installation ID and private PEM ready. For GitLab, have the reviewer token ready. You can accept the defaults of 120 seconds between polls, 6,000 estimated input tokens per review and Cursor’s default model.
+Enter the projects, checkout paths inside the container, visibility, numeric IDs allowed to request reviews, and the responsible operator’s `login:numeric-id`. Setup asks for the chosen provider’s API key and credentials for the forges you selected. For GitHub, have the App ID, installation ID and private PEM ready. For GitLab, have the reviewer token ready. You can accept the defaults of 120 seconds between polls, 6,000 estimated input tokens per review and the selected CLI’s default model.
 
 For each credential, choose **paste** to enter it with terminal echo disabled, **import** to copy a readable file into the volume, or **mount** to keep using an external file. For import or mount, add the source volume to the setup command (for example, `-v /path/to/secrets:/run/secrets:ro`) and enter the file’s absolute path **inside** the container. With **mount**, provide the same file path when running the service. With **import**, the source mount is only needed during setup.
 
@@ -38,7 +68,7 @@ docker run --rm --platform linux/amd64 \
   -v review-state:/state -v /path/to/checkouts:/repos:ro assay-pr-agent
 ```
 
-The active settings and imported or pasted credentials are in `/state/setup/`. Credential files are plaintext, owner-readable and writable (0600), inside a private directory (0700). Protect the volume and its backups. Setup checks the local files and credential formats offline. The poller checks forge access during normal operation.
+The active settings and imported or pasted credentials are in `/state/setup/`. Credential files are plaintext, owner-readable and writable (0600), inside a private directory (0700). Protect the volume and its backups. Setup checks local files and credential formats; Cursor team selection requires account service access. The poller checks forge access during normal operation.
 
 To change settings or rotate credentials, run the setup command again, or run `docker exec -it <container> cursor-review-setup`. Existing settings and credentials can be kept without displaying their values. Restart the reviewer to load the new setup. Cancelling before the save keeps the previous configuration active. An explicit environment setting takes precedence over its saved value.
 
@@ -170,7 +200,7 @@ If CI is still running or the report is missing, expired, unreadable, invalid or
 
 ### Qualgen history advisories
 
-The container includes the checksum-verified Assay Qualgen v1.0.91 release. On startup and then every 24 hours a background worker runs `qualgen mine` against each project's mounted checkout. Keep a full checkout of the trusted integration branch and refresh it as part of your deployment. The miner reads local Git history and stores its results under `/state/qualgen`. A changed tip extends the previous snapshot when history permits. An unchanged tip skips mining. Reviews can still read the last completed snapshot during a refresh.
+The container includes the checksum-verified Assay Qualgen v1.0.91 release. On startup and then every 24 hours a background worker runs `qualgen mine` against each project's mounted checkout. Use a managed checkout or keep a full checkout of the trusted integration branch refreshed in your deployment. The miner reads local Git history and stores its results under `/state/qualgen`. A changed tip extends the previous snapshot when history permits. An unchanged tip skips mining. Reviews can still read the last completed snapshot during a refresh.
 
 Set `REVIEW_QUALGEN_INTERVAL_SECONDS` in Docker or enter the refresh interval during setup. Use `0` to disable mining and advisories. Keep the state volume private to the reviewer. It contains historical file and commit data.
 

@@ -25,10 +25,14 @@ def run_desk(args, *, env=None, **kwargs):
     return run(args, env=env, **kwargs)
 
 
-def reviewer_token(provider, slug, checkout):
+def reviewer_token_file(provider, slug, checkout):
     custody = run_desk(["desktoken", "--no-rotate", "--forge", provider, "reviewer", "--repo", slug],
                        cwd=checkout).decode().strip()
-    token = Path(custody).read_text().strip()
+    return Path(custody)
+
+
+def reviewer_token(provider, slug, checkout):
+    token = reviewer_token_file(provider, slug, checkout).read_text().strip()
     if not token:
         raise ReviewError("Empty reviewer credential")
     return token

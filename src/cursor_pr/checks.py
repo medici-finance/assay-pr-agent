@@ -46,18 +46,23 @@ def import_go_report(value, head, *, repository=None):
     return {"tool": "go-analysis", "state": "complete", "findings": findings}
 
 
+def scanner(path):
+    if path.endswith((".sh", ".bash")):
+        return "shellcheck", ["--norc", "--format=json1", "-"]
+    if re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", path):
+        return "actionlint", ["-shellcheck=", "-pyflakes=", "-format", "{{json .}}", "-"]
+
+
 def scan_files(root, head, files):
     checks = []
     for file in files:
         path = file.path
         if file.status in ("removed", "deleted", "D") or file.absent:
             continue
-        if path.endswith((".sh", ".bash")):
-            tool, args = "shellcheck", ["--norc", "--format=json1", "-"]
-        elif re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", path):
-            tool, args = "actionlint", ["-shellcheck=", "-pyflakes=", "-format", "{{json .}}", "-"]
-        else:
+        command = scanner(path)
+        if not command:
             continue
+        tool, args = command
         result = {"tool": tool, "path": path, "state": "could-not-check", "findings": []}
         checks.append(result)
         if not shutil.which(tool):

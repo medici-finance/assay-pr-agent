@@ -42,8 +42,8 @@ def tip(repo):
 
 
 def qualgen(mode, repo, tracking, *args, timeout):
-    # The released binary needs only the local checkout and its tracking directory.
-    return subprocess.run(["qualgen", mode, "--repo", str(repo), "--out", str(tracking), *args],
+    # git-sync uses a relative gitdir in a linked worktree. go-git needs its physical path.
+    return subprocess.run(["qualgen", mode, "--repo", str(repo.resolve()), "--out", str(tracking), *args],
                           cwd=tracking, env={"PATH": os.environ["PATH"]}, check=True, text=True,
                           encoding="utf-8", capture_output=True, timeout=timeout).stdout
 

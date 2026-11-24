@@ -1,0 +1,139 @@
+:root {
+  color-scheme: light;
+  --ink: #192820;
+  --green: #245e45;
+  --line: #c9d3ca;
+  font: 17px/1.5 "Inter",system-ui,sans-serif;
+  background: #f6f8f4;
+  color: var(--ink);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: .65rem;
+  padding: 1.2rem clamp(1.3rem,6vw,6rem);
+  border-bottom: 1px solid var(--line);
+  font-weight: 650;
+  background: #fff;
+}
+
+.mark {
+  display: grid;
+  place-items: center;
+  width: 1.7rem;
+  height: 1.7rem;
+  background: var(--green);
+  color: white;
+  font: bold 23px monospace;
+  border-radius: 5px;
+}
+
+main {
+  max-width: 43rem;
+  margin: clamp(2.5rem,8vw,7rem) auto;
+  padding: 0 1.4rem;
+}
+
+h1 {
+  font-size: clamp(2.1rem,5vw,3.4rem);
+  letter-spacing: -.055em;
+  line-height: 1.1;
+  margin: 0 0 1.4rem;
+}
+
+p {
+  color: #46584e;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+form {
+  margin-top: 2rem;
+  padding: clamp(1rem,4vw,2rem);
+  border: 1px solid var(--line);
+  border-radius: .6rem;
+  background: white;
+}
+
+label {
+  font-weight: 640;
+  display: block;
+  margin-bottom: .7rem;
+  overflow-wrap: anywhere;
+}
+
+input,textarea,select {
+  font: inherit;
+  border: 1px solid #849589;
+  border-radius: .32rem;
+  width: 100%;
+  padding: .7rem;
+  background: #fcfdfb;
+}
+
+textarea {
+  resize: vertical;
+}
+
+button {
+  font: inherit;
+  font-weight: 600;
+  background: var(--green);
+  color: white;
+  border: 0;
+  border-radius: .35rem;
+  padding: .65rem 1.1rem;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #18432f;
+}
+
+.actions {
+  margin-top: 1.3rem;
+}
+
+button span {
+  margin-left: 1rem;
+}
+
+button:disabled {
+  opacity: .6;
+}
+
+:focus-visible {
+  outline: 3px solid #45845f;
+  outline-offset: 3px;
+}
+
+::selection {
+  background: #cee8ce;
+}
+
+#upload {
+  margin: 1rem 0;
+  color: var(--green);
+  font-size: .88rem;
+}
+
+#file {
+  margin-top: .35rem;
+}
+
+textarea {
+  -webkit-text-security: disc;
+}
+
+[hidden] {
+  display: none!important;
+}
