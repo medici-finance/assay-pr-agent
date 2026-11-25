@@ -75,19 +75,23 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        # Attachable setup manager, equivalent to compose service "setup".
+        # Setup wizard sidecar. Unlike compose's attachable manager, the browser
+        # wizard runs directly and is restarted after each session so the HTTP
+        # port is always available; read its setup key from the container log.
         - name: setup
           image: ghcr.io/medici-finance/assay-pr-agent:main
           imagePullPolicy: Always
-          # Restart the manager in place if stdin closes, like compose's
-          # restart: unless-stopped, without bouncing the whole pod.
           command: ["/bin/sh", "-c"]
           args:
             - |
               while true; do
-                cursor-review-container manage
+                reauth=""
+                # /state/.reauth forces a fresh provider sign-in next session.
+                if [ -f /state/.reauth ]; then rm -f /state/.reauth; reauth="--reauth"; fi
+                cursor-review-container setup --web $reauth
                 sleep 1
               done
+          # Provider CLI sign-in (login mode) needs a terminal: kubectl attach -it.
           stdin: true
           tty: true
           ports:

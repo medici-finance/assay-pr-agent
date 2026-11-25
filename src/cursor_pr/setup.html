@@ -6,6 +6,9 @@
 <form id="registration" method="post" target="_blank" rel="noopener noreferrer" hidden>
 <input type="hidden" name="manifest"><button type="submit">Register App on GitHub</button></form>
 <a id="external" target="_blank" rel="noopener noreferrer" hidden>Install GitHub App</a>
+<form id="unlock" method="post" action="/login" autocomplete="off" hidden><label for="secret">Setup key</label>
+<input id="secret" type="password" autocomplete="off" spellcheck="false">
+<div class="actions"><button type="submit">Unlock</button><button type="button" id="reprint" class="secondary">Print key to console</button></div></form>
 <form id="questions" hidden><label id="question" for="answer"></label><input id="answer" autocomplete="off" spellcheck="false">
 <textarea id="multi" aria-labelledby="question" rows="6" hidden></textarea>
 <select id="choices" aria-labelledby="question" hidden></select>
