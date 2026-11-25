@@ -17,7 +17,7 @@ from .credentials import SETUP_INPUTS, forge_credentials
 from .discovery import poll_project
 from .manager import ConfigurationWatch
 from .login import auth_mode, ensure_session, login_directory
-from . import history, setup, providers
+from . import buildinfo, history, setup, providers
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +116,7 @@ def cycle(projects, state, jobs, since, runner=run_review):
 
 
 def container_main():
+    print(buildinfo.banner(), flush=True)
     if sys.argv[1:2] == ["manage"]:
         from .manager import console
         return console()

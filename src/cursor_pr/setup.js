@@ -1,10 +1,9 @@
-const key = location.hash.slice(1);
-history.replaceState(null, "", "/");
-const form = document.querySelector("#questions"), label = document.querySelector("label");
+const form = document.querySelector("#questions"), label = document.querySelector("#question");
 const message = document.querySelector("#message"), answer = document.querySelector("#answer");
 const multi = document.querySelector("#multi"), button = form.querySelector("button");
 const choices = document.querySelector("#choices"), upload = document.querySelector("#upload");
 const file = document.querySelector("#file");
+const unlock = document.querySelector("#unlock"), secret = document.querySelector("#secret");
 file.onchange = async () => {
   const chosen = file.files[0];
   if (chosen && chosen.size <= (step.upload ? 900000 : 24000)) (step.multiline ? multi : answer).value = await chosen.text();
@@ -30,13 +29,40 @@ quit.onclick = async () => {
     await load().catch(fail);
   }
 };
-async function api(method, data) {
-  const res = await fetch("/step", {method, headers: {"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+// The installer console prints a random setup key; it is kept in a session cookie.
+async function api(method, data, path = "/step") {
+  const res = await fetch(path, {method, headers: {"Content-Type": "application/json"},
     body: data === undefined ? undefined : JSON.stringify(data), cache: "no-store"});
-  if (!res.ok) throw Error("Reopen the setup link printed in your terminal.");
+  if (res.status === 401) throw Error("key");
+  if (!res.ok) throw Error("The installer refused the request. Open http://127.0.0.1:8765/ in this browser and try again.");
   return res;
 }
-function fail(error) { form.hidden = true; message.textContent = error.message; }
+function show_unlock(text) {
+  form.hidden = true; quit.hidden = true; unlock.hidden = false; message.textContent = text; secret.focus();
+}
+function fail(error) {
+  form.hidden = true;
+  if (error.message === "key") return show_unlock("Enter the setup key printed in the installer console.");
+  message.textContent = error.message;
+}
+unlock.addEventListener("submit", async event => {
+  event.preventDefault();
+  const submit = unlock.querySelector('button[type="submit"]');
+  submit.disabled = true;
+  try {
+    await api("POST", {key: secret.value.trim()}, "/login");
+    secret.value = ""; unlock.hidden = true; await load();
+  } catch (error) {
+    if (error.message === "key") show_unlock("That key was not accepted. The setup key is printed in the installer console.");
+    else { secret.value = ""; fail(error); }
+  } finally { submit.disabled = false; }
+});
+document.querySelector("#reprint").onclick = async () => {
+  const res = await fetch("/print-key", {method: "POST", cache: "no-store"});
+  message.textContent = res.ok ? "Setup key printed to the installer console. Copy it from there."
+    : res.status === 429 ? "The key was printed a moment ago; copy it from the installer console."
+    : "The installer refused the request. Open http://127.0.0.1:8765/ in this browser.";
+};
 async function load() {
   if (quitting) return;
   const view = await (await api("GET")).json();
