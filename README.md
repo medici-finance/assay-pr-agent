@@ -11,7 +11,9 @@ docker compose up -d --build
 docker compose attach setup
 ```
 
-Press **Enter** in the attached terminal and open the one-time local URL it prints. Set the repository, permitted requester IDs and review provider in the browser. Follow the provider’s sign-in prompts in the same terminal. Leave checkout paths blank for automatic sync. The sync and review services wait for the first save and reload subsequent saves between cycles. To detach, press **Ctrl-P**, then **Ctrl-Q**. Reattach with the same command to add or remove repositories, change the billing team, replace forge credentials, or press **r** for a fresh provider login.
+Press **Enter** in the attached terminal and open the one-time local URL it prints. Set the repository, permitted requester IDs and review provider in the browser. Follow the provider’s sign-in prompts in the same terminal. Leave checkout paths blank for automatic sync. The sync and review services wait for the first save and reload subsequent saves between cycles.
+
+To return to your shell, type **q** and press **Enter** at the manager menu or while the browser wizard is waiting for an answer. You can also click **Quit setup** in the browser, or enter **/quit** at a terminal wizard prompt. Quitting closes the installer and discards unfinished edits. The reviewer and sync services keep running with the last saved configuration. To reopen setup, run `docker compose start setup && docker compose attach setup`. Press **r** for a fresh provider login.
 
 The setup service publishes its browser port on `127.0.0.1:8765` and opens the listener during a wizard session. For a remote Docker host, forward that loopback port to port 8765 on your workstation. Treat the one-time link as a credential. The setup service disables Docker log retention for interactive sign-in. Use `docker compose logs sync reviewer` for worker logs. The optional `./install.sh` builds or pulls the image and attaches to the same manager.
 

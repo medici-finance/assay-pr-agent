@@ -10,5 +10,5 @@ if [ -n "${REVIEW_IMAGE:-}" ]; then
 else
     docker compose up -d --build
 fi
-echo 'Press Enter to open setup. Detach with Ctrl-P followed by Ctrl-Q.'
+echo 'Press Enter to open setup, or type q and press Enter to quit.'
 exec docker compose attach setup

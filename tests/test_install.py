@@ -110,6 +110,16 @@ else:
                 headers["Origin"] = "http://127.0.0.1:8765"
                 self.assertEqual(request("POST", headers, answer)[0], 200)
                 self.assertEqual(request("POST", headers, answer)[0], 409)
+                for _ in range(50):
+                    current = json.loads(request(headers=bearer)[1])
+                    if current["status"] == "question":
+                        break
+                    time.sleep(0.02)
+                quit_step = json.dumps({"action": "quit", "id": current["id"]})
+                self.assertEqual(request("POST", headers, json.dumps({"action": "quit", "id": view["id"]}))[0], 409)
+                self.assertEqual(request("POST", headers, quit_step)[0], 200)
+                self.assertEqual(child.wait(timeout=5), 0)
+                self.assertFalse((Path(tmp) / "setup").exists())
             finally:
                 child.terminate()
                 child.wait(timeout=5)
