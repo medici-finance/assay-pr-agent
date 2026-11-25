@@ -23,7 +23,9 @@ def team_command(args, key, directory):
     if not executable:
         raise ValueError("Cursor CLI is missing")
     env = {k: os.environ[k] for k in ("PATH", "HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE") if k in os.environ}
-    env.update(CURSOR_API_KEY=key, HOME=str(directory), CURSOR_CONFIG_DIR=str(directory))
+    env.update(HOME=str(directory), XDG_CONFIG_HOME=str(directory / ".config"), CURSOR_CONFIG_DIR=str(directory))
+    if key:
+        env["CURSOR_API_KEY"] = key
     try:
         run = subprocess.run([executable, "team", *args, "--format", "json"], cwd=directory, env=env,
                              timeout=30, capture_output=True, check=True, stdin=subprocess.DEVNULL)
@@ -66,6 +68,13 @@ def select_team(key, requested, directory, pick=None):
 
 @contextmanager
 def cursor_account():
+    if provider() == "cursor" and os.getenv("REVIEW_AUTH_MODE") == "login":
+        from .login import login_directory, login_env
+        from .setup import state_dir
+        directory = Path(login_env("cursor", login_directory(state_dir()))["HOME"])
+        select_team(None, os.getenv("REVIEW_CURSOR_TEAM_ID", ""), directory)
+        yield
+        return
     if provider() != "cursor" or not os.getenv("CURSOR_API_KEY"):
         if provider() == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
             raise ValueError("Selecting a Cursor team requires CURSOR_API_KEY")

@@ -1,5 +1,6 @@
 """Poll configured forges and process explicit review requests serially."""
 import argparse
+import fcntl
 from contextlib import ExitStack, closing
 from datetime import datetime, timezone
 import json
@@ -9,12 +10,12 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
-import time
 import threading
 
 from .config import load_config
 from .credentials import SETUP_INPUTS, forge_credentials
 from .discovery import poll_project
+from .manager import ConfigurationWatch
 from .login import auth_mode, ensure_session, login_directory
 from . import history, setup, providers
 
@@ -80,7 +81,8 @@ def run_review(project, number, state):
     env.pop("REVIEW_MANAGED_PROJECT", None)
     if project.managed:
         env["REVIEW_MANAGED_PROJECT"] = json.dumps(dict(provider=project.provider, url=project.url,
-                                                       managed=True, requester_ids=sorted(project.requesters)))
+                                                       managed=True, requester_ids=sorted(project.requesters),
+                                                       gitlab_base=project.url.removesuffix("/" + project.slug)))
     for key in ("REVIEW_PROJECTS", *SETUP_INPUTS):
         env.pop(key, None)
     for key in list(env):
@@ -114,6 +116,9 @@ def cycle(projects, state, jobs, since, runner=run_review):
 
 
 def container_main():
+    if sys.argv[1:2] == ["manage"]:
+        from .manager import console
+        return console()
     if sys.argv[1:2] == ["setup"]:
         return setup.main(sys.argv[2:])
     if sys.argv[1:2] == ["login"]:
@@ -132,6 +137,7 @@ def main():
     args = parser.parse_args()
     state = args.state_dir.resolve()
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    watch = ConfigurationWatch(state)
     with ExitStack() as stack:
         try:
             fresh = not any((state / p).exists() for p in ("setup", "projects.json", "hooks.json"))
@@ -144,8 +150,9 @@ def main():
             backend = providers.provider()
             if auth_mode(backend) == "login":
                 directory = login_directory(state)
+                if os.getenv("REVIEW_LOGIN_PROFILE"):
+                    stack.enter_context(setup.locked(directory, fcntl.LOCK_SH))
                 ensure_session(backend, directory, interactive=first_install)
-                os.environ["REVIEW_LOGIN_DIR"] = str(directory)
             if args.interval is None:
                 args.interval = int(os.getenv("REVIEW_POLL_SECONDS", "120"))
             if args.interval < 1:
@@ -165,9 +172,12 @@ def main():
         if mine_seconds:
             threading.Thread(target=history.mine_periodically, args=(projects, state, mine_seconds),
                              name="qualgen-miner", daemon=True).start()
-        while True:
+        while not watch.changed():
+            if watch.enabled and any(p.managed and not p.checkout.is_dir() for p in projects.values()):
+                watch.wait(2)
+                continue
             cycle(projects, state, jobs, since)
-            time.sleep(args.interval)
+            watch.wait(args.interval)
 
 
 if __name__ == "__main__":

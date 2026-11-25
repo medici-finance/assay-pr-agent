@@ -5,8 +5,12 @@ x-reviewer: &reviewer
 services:
   setup:
     <<: *reviewer
-    profiles: [setup]
-    command: [setup, --web]
+    stdin_open: true
+    tty: true
+    logging:
+      driver: "none"
+    restart: unless-stopped
+    command: [manage]
     ports: ["127.0.0.1:8765:8765"]
     volumes: ["state:/state", "repos:/repos:ro", "provider-login:/model-auth"]
     environment:
@@ -15,6 +19,8 @@ services:
   sync:
     <<: *reviewer
     command: [sync]
+    environment:
+      REVIEW_WATCH_SETUP: "1"
     healthcheck:
       test: ["CMD", "test", "-f", "/tmp/sync-ready"]
       interval: 5s
@@ -25,12 +31,13 @@ services:
   reviewer:
     <<: *reviewer
     environment:
+      REVIEW_WATCH_SETUP: "1"
       REVIEW_LOGIN_DIR: /model-auth
     restart: unless-stopped
     volumes: ["state:/state", "repos:/repos:ro", "provider-login:/model-auth"]
     depends_on:
       sync:
-        condition: service_healthy
+        condition: service_started
 volumes:
   provider-login:
   state:

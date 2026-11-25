@@ -1,14 +1,14 @@
 const key = location.hash.slice(1);
 history.replaceState(null, "", "/");
-const form = document.querySelector("form"), label = document.querySelector("label");
+const form = document.querySelector("#questions"), label = document.querySelector("label");
 const message = document.querySelector("#message"), answer = document.querySelector("#answer");
-const multi = document.querySelector("#multi"), button = document.querySelector("button");
+const multi = document.querySelector("#multi"), button = form.querySelector("button");
 const choices = document.querySelector("#choices"), upload = document.querySelector("#upload");
 const file = document.querySelector("#file");
 file.onchange = async () => {
   const chosen = file.files[0];
-  if (chosen && chosen.size <= 24000) (step.multiline ? multi : answer).value = await chosen.text();
-  else message.textContent = "Choose a key file smaller than 24 KB.";
+  if (chosen && chosen.size <= (step.upload ? 900000 : 24000)) (step.multiline ? multi : answer).value = await chosen.text();
+  else message.textContent = "This file is too large to import.";
   file.value = "";
 };
 let step;
@@ -21,13 +21,25 @@ async function api(method, data) {
 function fail(error) { form.hidden = true; message.textContent = error.message; }
 async function load() {
   const view = await (await api("GET")).json();
+  const registration = document.querySelector("#registration"), external = document.querySelector("#external");
+  registration.hidden = view.status !== "register";
+  external.hidden = !view.link;
+  if (view.link) external.href = view.link;
+  if (view.status === "register") {
+    form.hidden = true;
+    registration.action = view.action;
+    registration.elements.manifest.value = JSON.stringify(view.manifest);
+    message.textContent = "Register the App in GitHub, then return to this tab.";
+    setTimeout(() => load().catch(fail), 800);
+    return;
+  }
   if (["working","starting"].includes(view.status)) {
-    form.hidden = true; message.textContent = "Checking configuration…";
+    form.hidden = true; message.textContent = view.label || "Checking configuration…";
     setTimeout(() => load().catch(fail), 250); return;
   }
   if (view.status !== "question") {
     form.hidden = true; message.textContent = view.status === "complete"
-      ? "Configuration saved. Return to the installer terminal to finish setup." : view.label;
+      ? "Configuration saved. You can return to the installer terminal." : view.label;
     return;
   }
   step = view; label.textContent = view.label; label.htmlFor = view.multiline ? "multi" : "answer";
@@ -41,7 +53,7 @@ async function load() {
   choices.replaceChildren(...items.map(item => new Option(item.label, item.value)));
   if (view.label.startsWith("Forge (")) label.textContent = "Where is your repository hosted?";
   if (view.label.startsWith("Review provider (")) label.textContent = "Which CLI should review changes?";
-  if (view.label.startsWith("Authentication method")) message.textContent = "After saving, return to the installer terminal to finish CLI sign-in.";
+  if (view.label.startsWith("Authentication method")) message.textContent = "For CLI sign-in, follow the provider’s instructions in the attached installer terminal.";
   if (view.label.startsWith("Checkout path")) message.textContent = "Leave this blank to let the sync container maintain a checkout.";
   if (view.label.startsWith("Human requester")) message.textContent = "Only these accounts can trigger a paid review. Use the numeric user IDs from your GitHub or GitLab profiles.";
   if (view.label.startsWith("Responsible human")) message.textContent = "Enter the operator’s forge username and numeric ID, for example alice:12345.";
@@ -49,7 +61,7 @@ async function load() {
   if (options.includes(prior)) choices.value = prior;
   choices.hidden = !items.length;
   if (items.length) { answer.hidden = true; label.htmlFor = "choices"; }
-  upload.hidden = !view.secret;
+  upload.hidden = !view.secret && !view.upload;
   form.hidden = false; button.disabled = false; (items.length ? choices : view.multiline ? multi : answer).focus();
 }
 form.addEventListener("submit", async event => {

@@ -35,7 +35,8 @@ class Project:
 
 def https_url(value):
     url = urlsplit(value)
-    if (url.scheme != "https" or not url.hostname or url.username is not None
+    if (any(c.isspace() or not c.isprintable() for c in value)
+            or url.scheme != "https" or not url.hostname or url.username is not None
             or url.password is not None or url.query or url.fragment):
         raise ValueError("Expected an HTTPS URL without credentials, query or fragment")
     if url.hostname in (".", "..") or not re.fullmatch(r"[a-zA-Z0-9.:-]+", url.netloc):
@@ -43,9 +44,33 @@ def https_url(value):
     return value.rstrip("/")
 
 
+def gitlab_base(value):
+    url = https_url(value)
+    if url.endswith("/api/v4"):
+        url = url[:-7]
+    parts = urlsplit(url)
+    if not parts.hostname or parts.port == 0 or ":" in parts.hostname:
+        raise ValueError("Expected a GitLab hostname and optional HTTPS port")
+    if any(not re.fullmatch(r"[A-Za-z0-9_.-]+", segment) or segment in (".", "..")
+           for segment in parts.path.split("/")[1:]):
+        raise ValueError("Invalid GitLab installation path")
+    return url
+
+
+def project_base(row):
+    url = https_url(row["url"])
+    base = row.get("gitlab_base") or os.getenv("REVIEW_GITLAB_BASE_URL") or os.getenv("GITLAB_API_BASE")
+    return gitlab_base(base or ("https://" + urlsplit(url).netloc))
+
+
 def project_from(row):
     url = https_url(row["url"])
     slug = urlsplit(url).path.strip("/")
+    if row["provider"] == "gitlab":
+        prefix = project_base(row) + "/"
+        if not url.startswith(prefix):
+            raise ValueError("GitLab base URL must match the project URL")
+        slug = url[len(prefix):]
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", slug):
         raise ValueError("deskread and deskpost require an owner/project slug")
     if any(part in (".", "..") for part in slug.split("/")):
@@ -58,7 +83,7 @@ def project_from(row):
     managed = row.get("managed", False)
     if type(managed) is not bool:
         raise ValueError("managed must be true or false")
-    checkout = (Path("/repos") / row["provider"] / urlsplit(url).netloc / slug / "current"
+    checkout = (Path("/repos") / row["provider"] / urlsplit(url).netloc / urlsplit(url).path.strip("/") / "current"
                 if managed else Path(row["checkout"]))
     if not checkout.is_absolute() or (not managed and not checkout.is_dir()):
         raise ValueError("checkout must be an existing absolute directory on the poller")
@@ -76,14 +101,24 @@ def project_from(row):
     return Project(row["provider"], url, slug, checkout, frozenset(ids), visibility, producer, managed, settings)
 
 
-def prompt_config(*, visibility=False):
+def prompt_config(*, visibility=False, default_gitlab=None):
     rows = []
     while True:
         provider = prompt("Forge (github/gitlab): ").strip().lower()
-        url = prompt("Full HTTPS project URL: ").strip()
+        base = ""
+        if provider == "gitlab":
+            default = default_gitlab or os.getenv("REVIEW_GITLAB_BASE_URL") or os.getenv("GITLAB_API_BASE") or "https://gitlab.com"
+            base = gitlab_base(prompt(f"GitLab base URL [{default}]: ").strip() or default)
+            default_gitlab = base
+            repo = prompt(f"Project path on {base} (group/project or full HTTPS URL): ").strip()
+            url = repo if repo.startswith("https://") else base + "/" + repo
+        else:
+            url = prompt("Full HTTPS project URL: ").strip()
         checkout = prompt("Checkout path inside container (Enter to sync automatically): ").strip()
         ids = [int(x.strip()) for x in prompt("Human requester numeric IDs (comma-separated): ").split(",")]
         rows.append(dict(provider=provider, url=url, checkout=checkout, requester_ids=ids))
+        if base:
+            rows[-1]["gitlab_base"] = base
         if not checkout:
             rows[-1]["managed"] = True
         if visibility or "REVIEW_OPERATOR" in os.environ:
@@ -125,7 +160,7 @@ def load_config(state):
     projects = parse_projects(rows)
     if save:
         with tempfile.NamedTemporaryFile(mode="w", dir=state, delete=False) as temp:
-            json.dump({"projects": [{k: row[k] for k in ("provider", "url", "checkout", "requester_ids", "visibility", "go_analysis", "managed", "scanner_ci") if k in row}
+            json.dump({"projects": [{k: row[k] for k in ("provider", "url", "checkout", "requester_ids", "visibility", "go_analysis", "managed", "scanner_ci", "gitlab_base") if k in row}
                                     for row in rows]}, temp)
         os.replace(temp.name, path)
     return projects

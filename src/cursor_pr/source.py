@@ -1,6 +1,7 @@
 """Read a forge snapshot with Assay, or compare two immutable local Git revisions."""
 import json
 import os
+from .gitlab_tls import local_url
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -20,6 +21,9 @@ def run(args, *, cwd=None, timeout=45, data=None, env=None):
 
 def run_desk(args, *, env=None, **kwargs):
     env = dict(os.environ if env is None else env)
+    if "REVIEW_GITLAB_LOCAL_CA" in env:
+        env["SSL_CERT_FILE"] = env["REVIEW_GITLAB_LOCAL_CA"]
+        env["GITLAB_API_BASE"] = local_url(env["GITLAB_API_BASE"])
     if "REVIEW_ASSAY_HOME" in env:
         env["HOME"] = env["REVIEW_ASSAY_HOME"]
     return run(args, env=env, **kwargs)

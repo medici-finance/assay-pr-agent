@@ -4,31 +4,52 @@ A standalone, single-pass reviewer for GitHub pull requests, GitLab merge reques
 
 ## Install with Docker Compose
 
-From this repository, run:
+Start the containers from this checkout, then attach to the installer:
 
 ```sh
-./install.sh
+docker compose up -d --build
+docker compose attach setup
 ```
 
-Open the one-time local setup link printed by the installer. Select GitHub or GitLab, enter your project URL and authorized requester IDs, and leave the checkout path blank for automatic sync. Choose Cursor, Claude, or Codex and supply the forge credentials. For Codex or Claude, choose CLI sign-in or provide an API key. After saving, return to the terminal to finish the provider’s sign-in. The browser accepts pasted keys and local key files. Configuration is saved to a private Docker volume. After setup exits, the installer starts the checkout sync sidecar and reviewer. Reconfigure with `./install.sh --configure`, inspect progress with `docker compose logs sync reviewer`, and stop with `docker compose down`.
+Press **Enter** in the attached terminal and open the one-time local URL it prints. Set the repository, permitted requester IDs and review provider in the browser. Follow the provider’s sign-in prompts in the same terminal. Leave checkout paths blank for automatic sync. The sync and review services wait for the first save and reload subsequent saves between cycles. To detach, press **Ctrl-P**, then **Ctrl-Q**. Reattach with the same command to add or remove repositories, change the billing team, replace forge credentials, or press **r** for a fresh provider login.
 
-The default install builds this checkout for Linux amd64. Set `REVIEW_IMAGE` to a published image that supports your chosen authentication method to pull it instead. The v0.3.0 image has browser setup with API-key authentication. Build this checkout to use the new CLI sign-in flow. The browser setup port is published only on `127.0.0.1:8765` and closes after saving. The URL contains a temporary setup credential. Give the link only to the person configuring this instance.
+The setup service publishes its browser port on `127.0.0.1:8765` and opens the listener during a wizard session. For a remote Docker host, forward that loopback port to port 8765 on your workstation. Treat the one-time link as a credential. The setup service disables Docker log retention for interactive sign-in. Use `docker compose logs sync reviewer` for worker logs. The optional `./install.sh` builds or pulls the image and attaches to the same manager.
+
+To run just the manager from a locally built image, without Compose:
+
+```sh
+docker build --platform linux/amd64 -t assay-pr-agent .
+docker run -dit --name review-setup --platform linux/amd64 --log-driver none \
+  -p 127.0.0.1:8765:8765 -e REVIEW_SETUP_BIND=0.0.0.0 \
+  -v review-state:/state -v review-repos:/repos:ro assay-pr-agent manage
+docker attach review-setup
+```
+
+Use the same state and checkout volumes for the sync and reviewer containers. Compose manages all three services for you. The attachable manager is available when building this checkout.
+
+### Connect a forge
+
+- **GitHub** — Choose **create** and register the private App under the personal or organization account that owns the repositories. Approve the permissions on GitHub, return to setup, and install the App on the selected repositories. The installer exchanges the single-use manifest code for the App ID and private key and verifies the installation ID against each repository. It requests contents and Actions read access and pull request write access. Review discovery still uses polling. Choose **existing** to import an existing App. [GitHub manifest flow](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest)
+- **GitLab** — Enter the HTTPS **base URL** of the instance (default `https://gitlab.com`), including its port or installation path, for example `https://git.example:8443/gitlab`. Enter the project as `group/project`. Choose **create** and supply an authorized personal access token with `api` scope once. Setup creates a Reporter project access token, or a group access token for multiple projects in the same group, with `api` and `read_repository` scopes. Project creation requires a Maintainer or Owner, group creation requires a group Owner, and the instance must support access tokens. The reviewer stores the resulting service token. The bootstrap PAT is used only for creation. For projects spanning groups, choose **existing** and supply a token with the required access. GitLab applies its token expiry policy. [Project access tokens](https://docs.gitlab.com/api/project_access_tokens/) · [Group access tokens](https://docs.gitlab.com/api/group_access_tokens/)
+- **GitLab TLS** — Import a PEM private CA bundle if the instance uses private PKI. You can also import a PEM X.509 certificate revocation list (CRL). Setup applies trust to token creation, API reads and artifacts. Assay tools and git-sync use a container-local HAProxy TLS connection to the configured instance with hostname, chain and CRL verification. Replace the CRL in the manager before it expires. A missing applicable or expired CRL blocks the verified connection. If a TLS setting is supplied via a mounted file, roll both workers after replacing it.
+
+If setup stops after creating a remote credential, select **create** again for the same scope to resume from the protected state volume. Replacing an active credential creates a new one. After the workers have switched, revoke the old token or retire the old App in the forge.
 
 ### Review provider
 
 | `REVIEW_PROVIDER` | Command | Credential |
 |---|---|---|
-| `cursor` (default) | `cursor-agent -p --mode=ask` | `CURSOR_API_KEY` |
+| `cursor` (default) | `cursor-agent -p --mode=ask` | Cursor CLI login or `CURSOR_API_KEY` |
 | `claude` | `claude -p` with tools disabled and one turn | Claude subscription login or `ANTHROPIC_API_KEY` |
 | `codex` | `codex exec` in an ephemeral read-only session with shell and web search disabled | ChatGPT device login or `CODEX_API_KEY` |
 
-For new Codex and Claude configurations the wizard defaults to CLI sign-in. Existing API-key configurations keep their current method. In the terminal the container runs `codex login --device-auth` or `claude auth login --claudeai`. Follow the CLI’s link in your own browser and enter the code where the provider directs you. Codex device login may need to be enabled by your workspace administrator. For Claude, sign in directly to the bundled Claude Code CLI with your own subscription. Configure your own forge requester IDs for this installation. Each person using subscription billing should use their own signed-in instance. The CLI handles the authorization code and stores its own session. [Codex authentication](https://developers.openai.com/codex/auth/) · [Claude authentication](https://code.claude.com/docs/en/authentication) · [Using Claude Code in other products](https://code.claude.com/docs/en/legal-and-compliance#can-customers-offer-claude-code-in-their-products)
+For new provider configurations the wizard defaults to CLI sign-in. Existing API-key configurations keep their current method. In the terminal the container runs `cursor-agent login`, `codex login --device-auth` or `claude auth login --claudeai`. Follow the CLI’s link in your own browser and enter the code where the provider directs you. Codex device login may need to be enabled by your workspace administrator. For Claude, sign in directly to the bundled Claude Code CLI with your own subscription. Configure your own forge requester IDs for this installation. Each person using subscription billing should use their own signed-in instance. The CLI handles the authorization code and stores its own session. [Codex authentication](https://developers.openai.com/codex/auth/) · [Claude authentication](https://code.claude.com/docs/en/authentication) · [Using Claude Code in other products](https://code.claude.com/docs/en/legal-and-compliance#can-customers-offer-claude-code-in-their-products)
 
-Compose shares the writable `provider-login` volume between setup and reviewer. Protect it like a credential. The sync sidecar has no mount for this volume. The reviewer checks sign-in on startup. To switch provider accounts or renew a session, run `docker compose run --rm --no-deps setup login --force` with the same Compose project and image. Then run `./install.sh` again. For plain Docker the default location is inside the existing state volume at `/state/provider-login`. To mount a separate writable directory, set `REVIEW_LOGIN_DIR` identically for setup and reviewer.
+Compose shares the writable `provider-login` volume between setup and reviewer. Protect it like a credential. The sync sidecar has no mount for this volume. The reviewer checks sign-in on startup. To switch accounts, attach to setup and press **r**. Use the browser to confirm the repository list and Cursor team. For plain Docker the default location is inside the existing state volume at `/state/provider-login`. To mount a separate writable directory, set `REVIEW_LOGIN_DIR` identically for setup and reviewer.
 
-For an environment-only deployment set `REVIEW_PROVIDER=codex` or `claude` and `REVIEW_AUTH_MODE=login`, then run the image once with `-it`, the persistent volumes, and the `login` command before starting the reviewer. For unattended API-key provisioning, set `REVIEW_AUTH_MODE=api-key` (the environment default). Each API key also supports a `_FILE` setting. Use `REVIEW_MODEL` to specify a model offered by the selected provider. The agent launches at most one provider CLI per eligible uncached request, with the same prompt estimate and timeout. CLIs control their own system context, internal requests and billing. Output includes `provider`, `model_invocations` and available `model_usage`. The cache separates providers and Cursor teams.
+For an environment-only deployment set `REVIEW_PROVIDER` to `cursor`, `codex` or `claude` and `REVIEW_AUTH_MODE=login`, then run the image once with `-it`, the persistent volumes, and the `login` command before starting the reviewer. For unattended API-key provisioning, set `REVIEW_AUTH_MODE=api-key` (the environment default). Each API key also supports a `_FILE` setting. Use `REVIEW_MODEL` to specify a model offered by the selected provider. The agent launches at most one provider CLI per eligible uncached request, with the same prompt estimate and timeout. CLIs control their own system context, internal requests and billing. Output includes `provider`, `model_invocations` and available `model_usage`. The cache separates providers and Cursor teams.
 
-Cursor setup uses the CLI's `team list` and `team switch` commands. With multiple eligible teams you choose a numeric ID. With one, the installer selects it automatically. An empty membership list uses personal scope. An account with memberships but no selectable team fails setup. The service rechecks the supplied key at startup and verifies the active team in an isolated Cursor configuration. For environment-only deployment set `REVIEW_CURSOR_TEAM_ID` when the key has multiple eligible teams. A failed membership lookup or selection stops startup before any review. These checks use Cursor's account service without starting an inference request.
+Cursor setup uses the CLI's `team list` and `team switch` commands. With multiple eligible teams you choose a numeric ID. With one, the installer selects it automatically. An empty membership list uses personal scope. An account with memberships but no selectable team fails setup. The service rechecks the configured account at startup and verifies the active team in an isolated Cursor configuration. For environment-only deployment set `REVIEW_CURSOR_TEAM_ID` when the account has multiple eligible teams. A failed membership lookup or selection stops startup before any review. These checks use Cursor's account service without starting an inference request.
 
 ### Automatic repository sync
 
@@ -74,7 +95,7 @@ docker run --rm --platform linux/amd64 \
 
 The active settings and imported or pasted credentials are in `/state/setup/`. Credential files are plaintext, owner-readable and writable (0600), inside a private directory (0700). Protect the volume and its backups. Setup checks local files and credential formats; Cursor team selection requires account service access. The poller checks forge access during normal operation.
 
-To change settings or rotate credentials, run the setup command again, or run `docker exec -it <container> cursor-review-setup`. Existing settings and credentials can be kept without displaying their values. Restart the reviewer to load the new setup. Cancelling before the save keeps the previous configuration active. An explicit environment setting takes precedence over its saved value.
+To change settings or rotate credentials, run the setup command again, or run `docker exec -it <container> cursor-review-setup`. Existing settings and credentials can be kept without displaying their values. The Compose workers reload on save. For plain Docker, restart the sync and reviewer containers. Cancelling before the save keeps the previous configuration active. An explicit environment setting takes precedence over its saved value.
 
 ### Standalone Docker credentials
 
@@ -87,6 +108,8 @@ Mount the checkout for each project read-only and a writable volume at `/state` 
 | `REVIEW_GITHUB_APP_ID`, `REVIEW_GITHUB_INSTALLATION_ID` | Numeric IDs for the GitHub App and the installation covering your repositories. Use a reviewer installation with access to read PRs and diffs and write PR conversation comments. |
 | `REVIEW_GITHUB_PRIVATE_KEY` **or** `REVIEW_GITHUB_PRIVATE_KEY_FILE` | The App’s unencrypted RSA PEM or an absolute path to the mounted PEM. The value accepts actual line breaks or literal `\n`. |
 | `REVIEW_GITLAB_TOKEN` **or** `REVIEW_GITLAB_TOKEN_FILE` | A dedicated GitLab reviewer token with API permission to read MRs and post notes, or an absolute path to the mounted token. |
+| `REVIEW_GITLAB_BASE_URL` | HTTPS GitLab installation URL, including optional port and path prefix. An entry in `REVIEW_PROJECTS` can specify `gitlab_base`. |
+| `REVIEW_GITLAB_CA_FILE`, `REVIEW_GITLAB_CRL_FILE` | Optional absolute paths to a PEM private CA bundle and PEM CRL. The corresponding variables without `_FILE` accept inline PEM. Supply the same paths to setup, sync and reviewer. |
 | `REVIEW_PROJECTS` | JSON project list. Each entry has a forge, full HTTPS URL, checkout path, allowed human account IDs and optional `visibility` (`private` by default, `internal`, or `public`). Set the actual visibility to authorize posting on public or internal projects. |
 
 Supply only the providers you use. Each container supports a GitHub App installation on github.com and one GitLab instance. The poller derives `GITLAB_API_BASE` from the configured GitLab projects. An explicit value must match their HTTPS instance and end in `/api/v4`.
