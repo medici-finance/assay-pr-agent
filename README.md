@@ -63,7 +63,7 @@ In `REVIEW_PROJECTS`, use `"managed": true` in place of a checkout path for a ma
 
 Post a new comment containing just `/review` on an open GitHub PR or GitLab MR. The service polls the configured projects every two minutes by default. It accepts new requests from the numeric human account IDs you configure and posts the result on the reviewed head. A poll uses zero model tokens. Requests run one at a time with the existing prompt budget and cache.
 
-Assay’s `deskmonitor pr` supplies the open change numbers. Batched `deskread comments --change` calls read their conversations on every cycle, including changes with no new commits. The poller skips old commands, edits detectable from the forge timestamps, bot responses and ordinary messages. For GitLab, Assay v1.0.91 omits the internal-note flag. Only an otherwise eligible command gets a single [GitLab note lookup](https://docs.gitlab.com/api/notes/#retrieve-a-merge-request-note), using the existing Assay reviewer credential and instance. Internal and system notes cannot start a review.
+Assay’s `deskmonitor pr` supplies the open change numbers. Batched `deskread comments --change` calls read their conversations on every cycle, including changes with no new commits. The poller skips old commands, edits detectable from the forge timestamps, bot responses and ordinary messages. For GitLab, Assay v1.0.94 omits the internal-note flag. Only an otherwise eligible command gets a single [GitLab note lookup](https://docs.gitlab.com/api/notes/#retrieve-a-merge-request-note), using the existing Assay reviewer credential and instance. Internal and system notes cannot start a review.
 
 Each project starts watching at its first activation. Keep the state volume across restarts to pick up requests posted during downtime on still-open changes. Queued reviews survive a restart. A review interrupted after starting needs a fresh `/review` to run again. Duplicate reads do not incur another model call. A deleted comment or a change closed between polls may never be observed.
 
@@ -222,7 +222,7 @@ In container setup, enter the project's trusted Go analysis workflow or job. Alt
 
 | Project | Example setting | CI setup |
 |---|---|---|
-| GitHub | `"go_analysis": "go-lint.yml"` | Use the workflow filename or numeric ID. Run the [Assay action](https://github.com/medici-finance/assay/tree/v1.0.91/actions/go-analysis) on the PR source head. Give the existing reviewer App **Actions: read**. The worker reads the latest run of that workflow for the source SHA and its exact attempt's `go-analysis-lint-<sha>-<run-id>-<attempt>` artifact. |
+| GitHub | `"go_analysis": "go-lint.yml"` | Use the workflow filename or numeric ID. Run the [Assay action](https://github.com/medici-finance/assay/tree/v1.0.94/actions/go-analysis) on the PR source head. Give the existing reviewer App **Actions: read**. The worker reads the latest run of that workflow for the source SHA and its exact attempt's `go-analysis-lint-<sha>-<run-id>-<attempt>` artifact. |
 | GitLab | `"go_analysis": "go-lint"` | Use the exact job name in the MR head pipeline in the target project. Run the Assay scanner against the MR source head with `GITHUB_REPOSITORY="$CI_PROJECT_PATH"` (the existing report format reads this variable). Have that job publish the sanitized report at the artifact root as `report.json`, using `artifacts: {when: always, paths: [report.json]}`. The reviewer needs access to read the pipeline, job and artifact. |
 
 The worker looks up the report only when processing an authorized `/review`. It accepts a completed scan from a failed lint job, verifies the repository and analyzed source SHA, then imports new and worsened findings for changed paths. Findings inside the shown hunks share the existing Cursor prompt and token budget. The summary includes imported findings outside the hunks as well.
@@ -264,7 +264,7 @@ The posted summary identifies CI versus local results. The JSON report includes 
 
 ### Qualgen history advisories
 
-The container includes the checksum-verified Assay Qualgen v1.0.91 release. On startup and then every 24 hours a background worker runs `qualgen mine` against each project's mounted checkout. Use a managed checkout or keep a full checkout of the trusted integration branch refreshed in your deployment. The miner reads local Git history and stores its results under `/state/qualgen`. A changed tip extends the previous snapshot when history permits. An unchanged tip skips mining. Reviews can still read the last completed snapshot during a refresh.
+The container includes the checksum-verified Assay Qualgen v1.0.94 release. On startup and then every 24 hours a background worker runs `qualgen mine` against each project's mounted checkout. Use a managed checkout or keep a full checkout of the trusted integration branch refreshed in your deployment. The miner reads local Git history and stores its results under `/state/qualgen`. A changed tip extends the previous snapshot when history permits. An unchanged tip skips mining. Reviews can still read the last completed snapshot during a refresh.
 
 Set `REVIEW_QUALGEN_INTERVAL_SECONDS` in Docker or enter the refresh interval during setup. Use `0` to disable mining and advisories. Keep the state volume private to the reviewer. It contains historical file and commit data.
 

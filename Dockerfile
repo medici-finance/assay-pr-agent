@@ -1,4 +1,4 @@
-FROM ghcr.io/medici-finance/assay/desk-tools:v1.0.91 AS assay
+FROM ghcr.io/medici-finance/assay/desk-tools:v1.0.94 AS assay
 FROM ghcr.io/astral-sh/uv:0.9.26 AS uv
 FROM rhysd/actionlint:1.7.7 AS actionlint
 FROM registry.k8s.io/git-sync/git-sync:v4.8.0 AS sync
@@ -10,8 +10,8 @@ ARG TARGETARCH
 RUN test "$TARGETARCH" = amd64 || (echo 'Assay release requires --platform linux/amd64' >&2 && exit 1)
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl haproxy curl git gh shellcheck bash gzip tar && rm -rf /var/lib/apt/lists/*
 RUN curl --fail --silent --show-error --location --retry 3 \
-      https://github.com/medici-finance/assay/releases/download/v1.0.91/qualgen-linux-amd64 -o /usr/local/bin/qualgen \
-    && echo '835d4188bc3d5f8d7c9ccc9ca49a3f907101a78c659020442e7783463f2b975f  /usr/local/bin/qualgen' | sha256sum -c - \
+      https://github.com/medici-finance/assay/releases/download/v1.0.94/qualgen-linux-amd64 -o /usr/local/bin/qualgen \
+    && echo 'cc3cf51fb2ee2f03e9e704385b59ae4ea57757e6bd9b66e613fec2abd62ce01e  /usr/local/bin/qualgen' | sha256sum -c - \
     && chmod 0755 /usr/local/bin/qualgen && qualgen --version
 RUN curl -fsSL --retry 3 https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-x86_64 -o /usr/local/bin/hadolint \
     && echo 'c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507  /usr/local/bin/hadolint' | sha256sum -c - \
