@@ -401,7 +401,9 @@ def configure_locked(state, force_login):
             secrets[TOKEN] = SECRETS[TOKEN]
         if "gitlab" in forges:
             # GitLab username lookups need the reviewer token, which only exists now.
-            token = accounts.saved_token() or (bundle / secrets[TOKEN]).read_text().strip()
+            # Only the token this run produced: an environment PAT belongs to its own
+            # instance, never to a base URL typed into the wizard.
+            token = (bundle / secrets[TOKEN]).read_text().strip()
             verify = gitlab_tls.context(bundle)
             rows = accounts.resolve(rows, token=token, verify=verify, notice=print)
             settings["REVIEW_OPERATOR"] = accounts.resolve_operator(

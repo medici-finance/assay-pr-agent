@@ -101,6 +101,15 @@ class InteractiveSetupTests(unittest.TestCase):
         setup.apply_saved_setup(self.state)
         self.assertEqual(load_config(self.state).popitem()[1].requesters, frozenset({13}))
 
+    def test_gitlab_lookup_never_sends_the_environment_token(self):
+        from cursor_pr import accounts
+        # A key holder may type any base URL; the container's own PAT must not reach it.
+        with patch.dict(os.environ, {"REVIEW_GITLAB_TOKEN": "env-pat"}), \
+                patch.object(accounts, "gitlab_id", return_value=13) as gitlab:
+            self.configure(self.project("gitlab", requesters="alice") + ["owner", "", "", "", "codex", "", "", "paste"],
+                           ["pasted-token"])
+        self.assertEqual({c.args[2] for c in gitlab.call_args_list}, {"pasted-token"})
+
     def test_cancel_and_reconfigure_keep_active_setup_and_env_precedence(self):
         initial = self.project("gitlab")+["owner:13","","","","","","api-key","paste","paste"]
         self.configure(initial, ["old-cursor","gl-key"])
