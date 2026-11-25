@@ -152,10 +152,10 @@ def hidden(label, multiline):
     termios.tcsetattr(fd, termios.TCSANOW, quiet)
     try:
         print(label, end=": ", file=sys.stderr, flush=True)
-        lines = [input().strip()]
+        lines = [dialog.terminal_input().strip()]
         if multiline and lines[0].startswith("-----BEGIN ") and "-----END " not in lines[0]:
             while not lines[-1].startswith("-----END "):
-                lines.append(input().strip())
+                lines.append(dialog.terminal_input().strip())
         return "\n".join(lines)
     finally:
         termios.tcsetattr(fd, termios.TCSANOW, saved)
@@ -461,7 +461,10 @@ def main(argv=None):
         else:
             if not sys.stdin.isatty():
                 parser.exit(2, "Setup needs an interactive terminal. Use docker run -it or docker exec -it.\n")
+            print("Type /quit at a setup prompt to return to your shell.", flush=True)
             configure(state, force_login=args.reauth)
+    except dialog.QuitSetup:
+        return dialog.QUIT_MANAGER if os.getenv("REVIEW_SETUP_MANAGER") == "1" else 0
     except (KeyboardInterrupt, EOFError):
         parser.exit(1, "\nSetup cancelled.\n")
     except (ValueError, OSError, subprocess.TimeoutExpired) as err:

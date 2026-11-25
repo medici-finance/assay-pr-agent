@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import secrets
+import select
+import sys
 import threading
 import re
 from urllib.parse import parse_qs, urlsplit
@@ -35,8 +37,23 @@ class Session:
             if not self.cv.wait_for(lambda: self.answer is not None, timeout=3600):
                 self.nonce = None
                 raise ValueError("GitHub registration expired. Start setup again.")
-            code, self.answer = self.answer, None
-            return code
+            return self.take_answer()
+
+    def take_answer(self):
+        answer, self.answer = self.answer, None
+        if answer is dialog.QuitSetup:
+            raise dialog.QuitSetup
+        return answer
+
+    def quit(self, step_id):
+        with self.cv:
+            if self.view["status"] not in ("register", "question") or self.view["id"] != step_id:
+                return False
+            self.nonce = None
+            self.answer = dialog.QuitSetup
+            self.view = {"id": step_id, "status": "working"}
+            self.cv.notify_all()
+            return True
 
     def callback(self, query):
         state, code = query.get("state", []), query.get("code", [])
@@ -58,8 +75,7 @@ class Session:
             self.messages = []
             self.cv.notify_all()
             self.cv.wait_for(lambda: self.answer is not None)
-            answer, self.answer = self.answer, None
-            return answer
+            return self.take_answer()
 
     def submit(self, data):
         with self.cv:
@@ -77,6 +93,8 @@ class Session:
         try:
             setup.configure(state, force_login=force_login)
             result = {"status": "complete"}
+        except dialog.QuitSetup:
+            result = {"status": "quit", "label": "Setup closed."}
         except (ValueError, OSError, EOFError) as err:
             result = {"status": "error", "label": str(err)}
         except Exception:
@@ -145,14 +163,31 @@ def serve(state, *, force_login=False):
                 data = json.loads(self.rfile.read(size))
                 if not isinstance(data, dict):
                     return self.reply(400)
-                self.reply(200 if session.submit(data) else 409)
+                accepted = session.quit(data.get("id")) if data.get("action") == "quit" else session.submit(data)
+                self.reply(200 if accepted else 409)
             except (ValueError, UnicodeError):
                 self.reply(400)
 
+    class Server(ThreadingHTTPServer):
+        def service_actions(self):
+            with session.cv:
+                status = session.view["status"]
+                if status == "quit":
+                    threading.Thread(target=self.shutdown, daemon=True).start()
+                elif status in ("register", "question") and sys.stdin.isatty():
+                    # Provider login owns the terminal during a working step.
+                    if select.select([sys.stdin], [], [], 0)[0]:
+                        if sys.stdin.readline().strip().lower() in ("q", "quit", "/quit"):
+                            session.quit(session.view["id"])
+
     bind = os.getenv("REVIEW_SETUP_BIND", "127.0.0.1")
-    with ThreadingHTTPServer((bind, port), Handler) as server:
+    with Server((bind, port), Handler) as server:
         worker = threading.Thread(target=session.run, args=(state, force_login), daemon=True)
         worker.start()
         print(f"Open http://127.0.0.1:{port}/#{key} to configure the reviewer.", flush=True)
+        if sys.stdin.isatty():
+            print("At a browser question, type q here or click Quit setup to return to your shell.", flush=True)
         server.serve_forever()
+    if session.view["status"] == "quit":
+        raise dialog.QuitSetup
     return int(session.view["status"] != "complete")

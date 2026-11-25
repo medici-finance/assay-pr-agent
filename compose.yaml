@@ -9,7 +9,7 @@ services:
     tty: true
     logging:
       driver: "none"
-    restart: unless-stopped
+    restart: on-failure
     command: [manage]
     ports: ["127.0.0.1:8765:8765"]
     volumes: ["state:/state", "repos:/repos:ro", "provider-login:/model-auth"]

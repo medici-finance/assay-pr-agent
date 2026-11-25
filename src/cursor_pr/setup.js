@@ -12,6 +12,24 @@ file.onchange = async () => {
   file.value = "";
 };
 let step;
+const quit = document.querySelector("#quit");
+let quitting = false;
+quit.onclick = async () => {
+  quitting = true;
+  quit.disabled = true;
+  try {
+    await api("POST", {id: step.id, action: "quit"});
+    document.querySelector("#registration").hidden = true;
+    document.querySelector("#external").hidden = true;
+    form.hidden = quit.hidden = true;
+    answer.value = multi.value = "";
+    message.textContent = "Setup closed. You can close this tab.";
+  } catch (error) {
+    quitting = false;
+    quit.disabled = false;
+    await load().catch(fail);
+  }
+};
 async function api(method, data) {
   const res = await fetch("/step", {method, headers: {"Authorization": "Bearer " + key, "Content-Type": "application/json"},
     body: data === undefined ? undefined : JSON.stringify(data), cache: "no-store"});
@@ -20,7 +38,11 @@ async function api(method, data) {
 }
 function fail(error) { form.hidden = true; message.textContent = error.message; }
 async function load() {
+  if (quitting) return;
   const view = await (await api("GET")).json();
+  if (quitting) return;
+  step = view;
+  quit.hidden = !["question", "register"].includes(view.status);
   const registration = document.querySelector("#registration"), external = document.querySelector("#external");
   registration.hidden = view.status !== "register";
   external.hidden = !view.link;
@@ -42,7 +64,7 @@ async function load() {
       ? "Configuration saved. You can return to the installer terminal." : view.label;
     return;
   }
-  step = view; label.textContent = view.label; label.htmlFor = view.multiline ? "multi" : "answer";
+  label.textContent = view.label; label.htmlFor = view.multiline ? "multi" : "answer";
   message.textContent = view.messages.join("\n");
   multi.hidden = !view.multiline; answer.hidden = view.multiline; answer.type = view.secret ? "password" : "text";
   const options = view.label.startsWith("Forge (") ? ["github","gitlab"] :

@@ -4,15 +4,19 @@ import subprocess
 import sys
 import time
 
+from .dialog import QUIT_MANAGER
+
 
 def console():
     if not sys.stdin.isatty():
         raise SystemExit("The manager needs a terminal. Start the container with -dit, then attach.")
     while True:
-        print("\nAssay PR Agent   [Enter] Configure in browser   [r] Re-authenticate and configure   [t] Terminal setup",
+        print("\nAssay PR Agent   [Enter] Configure in browser   [r] Re-authenticate and configure   [t] Terminal setup   [q] Quit",
               flush=True)
         try:
             choice = input().strip().lower()
+            if choice in ("q", "quit", "/quit"):
+                return
             if choice not in ("", "r", "t"):
                 continue
             args = ["cursor-review-container", "setup"]
@@ -20,7 +24,8 @@ def console():
                 args.append("--web")
             if choice == "r":
                 args.append("--reauth")
-            subprocess.run(args, check=False)
+            if subprocess.run(args, env={**os.environ, "REVIEW_SETUP_MANAGER": "1"}).returncode == QUIT_MANAGER:
+                return
         except KeyboardInterrupt:
             print("\nReturned to manager.", flush=True)
         except EOFError:
