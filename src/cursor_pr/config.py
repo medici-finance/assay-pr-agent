@@ -8,6 +8,8 @@ import sys
 import tempfile
 from urllib.parse import urlsplit
 
+from .dialog import prompt
+
 
 @dataclass(frozen=True)
 class Project:
@@ -18,6 +20,7 @@ class Project:
     requesters: frozenset[int]
     visibility: str = "private"
     go_analysis: str = ""
+    managed: bool = False
 
     @property
     def key(self):
@@ -33,6 +36,8 @@ def https_url(value):
     if (url.scheme != "https" or not url.hostname or url.username is not None
             or url.password is not None or url.query or url.fragment):
         raise ValueError("Expected an HTTPS URL without credentials, query or fragment")
+    if url.hostname in (".", "..") or not re.fullmatch(r"[a-zA-Z0-9.:-]+", url.netloc):
+        raise ValueError("Invalid project host")
     return value.rstrip("/")
 
 
@@ -41,13 +46,19 @@ def project_from(row):
     slug = urlsplit(url).path.strip("/")
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", slug):
         raise ValueError("deskread and deskpost require an owner/project slug")
+    if any(part in (".", "..") for part in slug.split("/")):
+        raise ValueError("Invalid project slug")
     if row["provider"] not in ("github", "gitlab"):
         raise ValueError("Provider must be github or gitlab")
     ids = row["requester_ids"]
     if not isinstance(ids, list) or not ids or any(type(i) is not int or i <= 0 for i in ids):
         raise ValueError("requester_ids must list positive numeric IDs of human reviewers")
-    checkout = Path(row["checkout"])
-    if not checkout.is_absolute() or not checkout.is_dir():
+    managed = row.get("managed", False)
+    if type(managed) is not bool:
+        raise ValueError("managed must be true or false")
+    checkout = (Path("/repos") / row["provider"] / urlsplit(url).netloc / slug / "current"
+                if managed else Path(row["checkout"]))
+    if not checkout.is_absolute() or (not managed and not checkout.is_dir()):
         raise ValueError("checkout must be an existing absolute directory on the poller")
     visibility = row.get("visibility", "private")
     if visibility not in ("private", "internal", "public"):
@@ -58,24 +69,26 @@ def project_from(row):
         raise ValueError("go_analysis must name a CI producer")
     if row["provider"] == "github" and producer and not re.fullmatch(r"[\w.-]+\.ya?ml|[1-9][0-9]*", producer):
         raise ValueError("go_analysis must be a GitHub workflow filename or numeric ID")
-    return Project(row["provider"], url, slug, checkout, frozenset(ids), visibility, producer)
+    return Project(row["provider"], url, slug, checkout, frozenset(ids), visibility, producer, managed)
 
 
 def prompt_config(*, visibility=False):
     rows = []
     while True:
-        provider = input("Forge (github/gitlab): ").strip().lower()
-        url = input("Full HTTPS project URL: ").strip()
-        checkout = input("Trusted checkout path inside this service: ").strip()
-        ids = [int(x.strip()) for x in input("Human requester numeric IDs (comma-separated): ").split(",")]
+        provider = prompt("Forge (github/gitlab): ").strip().lower()
+        url = prompt("Full HTTPS project URL: ").strip()
+        checkout = prompt("Checkout path inside container (Enter to sync automatically): ").strip()
+        ids = [int(x.strip()) for x in prompt("Human requester numeric IDs (comma-separated): ").split(",")]
         rows.append(dict(provider=provider, url=url, checkout=checkout, requester_ids=ids))
+        if not checkout:
+            rows[-1]["managed"] = True
         if visibility or "REVIEW_OPERATOR" in os.environ:
-            rows[-1]["visibility"] = input("Project visibility (private/internal/public) [private]: ").strip() or "private"
+            rows[-1]["visibility"] = prompt("Project visibility (private/internal/public) [private]: ").strip() or "private"
         label = "GitHub Actions workflow filename or ID" if provider == "github" else "GitLab CI job name"
-        producer = input(f"Trusted Go analysis {label} (blank to skip): ").strip()
+        producer = prompt(f"Trusted Go analysis {label} (blank to skip): ").strip()
         if producer:
             rows[-1]["go_analysis"] = producer
-        if input("Add another project? [y/N] ").strip().lower() not in ("y", "yes"):
+        if prompt("Add another project? [y/N] ").strip().lower() not in ("y", "yes"):
             return {"projects": rows}
 
 
@@ -108,7 +121,7 @@ def load_config(state):
     projects = parse_projects(rows)
     if save:
         with tempfile.NamedTemporaryFile(mode="w", dir=state, delete=False) as temp:
-            json.dump({"projects": [{k: row[k] for k in ("provider", "url", "checkout", "requester_ids", "visibility", "go_analysis") if k in row}
+            json.dump({"projects": [{k: row[k] for k in ("provider", "url", "checkout", "requester_ids", "visibility", "go_analysis", "managed") if k in row}
                                     for row in rows]}, temp)
         os.replace(temp.name, path)
     return projects

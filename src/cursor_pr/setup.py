@@ -12,13 +12,14 @@ import termios
 from urllib.parse import urlsplit
 import uuid
 
+from . import dialog, providers
 from .config import parse_projects, prompt_config
 from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secret, validate_operator, validate_pem, validate_token
 
 CURSOR = "CURSOR_API_KEY"
-SECRETS = {CURSOR: "cursor.key", KEY: "github.pem", TOKEN: "gitlab.token"}
+SECRETS = {CURSOR: "cursor.key", "ANTHROPIC_API_KEY": "claude.key", "CODEX_API_KEY": "codex.key", KEY: "github.pem", TOKEN: "gitlab.token"}
 SETTINGS = ("REVIEW_OPERATOR", APP_ID, INSTALL_ID, "REVIEW_MODEL", "REVIEW_MAX_INPUT_TOKENS",
-            "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS")
+            "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER", "REVIEW_CURSOR_TEAM_ID")
 
 
 def state_dir():
@@ -51,12 +52,18 @@ def gitlab_hosts(rows):
     return {urlsplit(row["url"]).netloc for row in rows if row["provider"] == "gitlab"}
 
 
-def apply_saved_setup(state):
+def load_provider_key(selected):
+    name = providers.KEYS[selected]
+    if name + "_FILE" in os.environ:
+        os.environ[name] = validate_token(read_secret(name))
+        del os.environ[name + "_FILE"]
+
+
+def apply_saved_setup(state, *, sync_only=False):
     """Snapshot one complete setup; explicitly supplied container settings win."""
-    if CURSOR + "_FILE" in os.environ:
-        os.environ[CURSOR] = validate_token(read_secret(CURSOR))
-        os.environ.pop(CURSOR + "_FILE")
     if not (state / "setup").is_symlink():
+        if not sync_only:
+            load_provider_key(providers.provider())
         return
     with locked(state, fcntl.LOCK_SH):
         bundle = active_bundle(state)
@@ -64,16 +71,21 @@ def apply_saved_setup(state):
         values = {k: config["settings"][k] for k in SETTINGS if k in config["settings"]}
         values["REVIEW_PROJECTS"] = json.dumps(config["projects"])
         effective = json.loads(os.getenv("REVIEW_PROJECTS", values["REVIEW_PROJECTS"]))
-        providers = {row["provider"] for row in effective}
+        forges = {row["provider"] for row in effective}
+        selected = providers.provider(os.environ.get("REVIEW_PROVIDER", values.get("REVIEW_PROVIDER", "cursor")))
+        if not sync_only:
+            load_provider_key(selected)
         for name, location in config["secrets"].items():
             if name not in SECRETS:
                 raise ValueError("Unknown credential in saved setup")
             if name in os.environ or name + "_FILE" in os.environ:
                 continue
-            if name == KEY and "github" not in providers:
+            if name in providers.KEYS.values() and (sync_only or name != providers.KEYS[selected]):
+                continue
+            if name == KEY and "github" not in forges:
                 continue
             if name == TOKEN:
-                if "gitlab" not in providers:
+                if "gitlab" not in forges:
                     continue
                 if gitlab_hosts(effective) != gitlab_hosts(config["projects"]):
                     raise ValueError("Supply a new GitLab credential when changing GitLab instances")
@@ -85,7 +97,7 @@ def apply_saved_setup(state):
 
 def ask(label, default=""):
     suffix = f" [{default}]" if default else ""
-    return input(f"{label}{suffix}: ").strip() or default
+    return dialog.prompt(f"{label}{suffix}: ").strip() or default
 
 
 def number(value):
@@ -99,10 +111,12 @@ def retry(reader):
         try:
             return reader()
         except (ValueError, OSError) as err:
-            print(err, file=sys.stderr)
+            dialog.notice(err)
 
 
 def hidden(label, multiline):
+    if dialog.browser.get():
+        return dialog.browser.get().ask(label, secret=True, multiline=multiline)
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     quiet = list(saved)
@@ -120,12 +134,31 @@ def hidden(label, multiline):
         print(file=sys.stderr)
 
 
+def credential_copy(name, bundle, old, location):
+    path = old / location
+    value = path.read_text().strip()
+    value = validate_pem(value) if name == KEY else validate_token(value)
+    if Path(location).is_absolute():
+        return location
+    private_file(bundle / SECRETS[name], value)
+    return SECRETS[name]
+
+
 def credential(name, label, bundle, old, previous_location):
     choices = ["paste", "import", "mount"]
     default = "import" if name == KEY else "paste"
     if previous_location:
         choices.append("keep")
         default = "keep"
+    if dialog.browser.get():
+        if previous_location:
+            mode = ask(f"Keep existing {label}? (y/n)", "y").lower()
+            if mode in ("y", "yes"):
+                return credential_copy(name, bundle, old, previous_location)
+        value = hidden(label, name == KEY)
+        value = validate_pem(value) if name == KEY else validate_token(value)
+        private_file(bundle / SECRETS[name], value)
+        return SECRETS[name]
     mode = ask(f"{label} source ({'/'.join(choices)})", default).lower()
     if mode not in choices:
         raise ValueError("Choose one of " + ", ".join(choices))
@@ -155,20 +188,32 @@ def project_rows():
     return rows
 
 
+def pick_cursor_team(teams):
+    options = [{"value": i, "label": f"{t['name']} ({i})"} for i, t in teams.items()]
+    if dialog.browser.get():
+        return dialog.browser.get().ask("Which Cursor team should pay for reviews?", choices=options)
+    dialog.notice("Eligible Cursor teams: " + ", ".join(item["label"] for item in options))
+    while True:
+        selected = ask("Cursor billing team ID")
+        if selected in teams:
+            return selected
+        dialog.notice("Enter one of the displayed team IDs.")
+
+
 def configure(state):
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     with locked(state, fcntl.LOCK_SH):
         old = active_bundle(state)
         prev = json.loads((old / "settings.json").read_text()) if old else {}
-    print("Configure the reviewer. Paste or import saves a private copy on the state volume. "
-          "Mount saves a path to a file you will provide at each start.")
+    if not dialog.browser.get():
+        dialog.notice("Paste or import saves a private copy on the state volume. Mount uses a file you supply at each start.")
     if old:
-        print("Configured projects:", ", ".join(p["url"] for p in prev["projects"]))
+        dialog.notice("Configured projects: " + ", ".join(p["url"] for p in prev["projects"]))
     rows = prev.get("projects") if old and ask("Keep this project list? (y/n)", "y").lower() in ("y","yes") else None
     if rows is None:
         rows = retry(project_rows)
     projects = parse_projects(rows)
-    providers = {p.provider for p in projects.values()}
+    forges = {p.provider for p in projects.values()}
     previous = prev.get("settings", {})
     settings = {}
 
@@ -176,24 +221,32 @@ def configure(state):
         settings[name] = retry(lambda: validate(ask(label, previous.get(name, default))))
 
     setting("REVIEW_OPERATOR", "Responsible human (forge login:numeric-id)", validate_operator)
-    if "github" in providers:
+    if "github" in forges:
         setting(APP_ID, "GitHub App ID", number)
         setting(INSTALL_ID, "GitHub App installation ID", number)
-    setting("REVIEW_POLL_SECONDS", "Seconds between polls", number, "120")
-    setting("REVIEW_MAX_INPUT_TOKENS", "Maximum estimated input tokens per review", number, "6000")
-    setting("REVIEW_QUALGEN_INTERVAL_SECONDS", "Seconds between Qualgen history refreshes (0 disables)",
-            lambda value: "0" if value == "0" else number(value), "86400")
-    model = ask("Cursor model (auto for Cursor's default)", previous.get("REVIEW_MODEL", "auto"))
+    defaults = {"REVIEW_POLL_SECONDS": "120", "REVIEW_MAX_INPUT_TOKENS": "6000",
+                "REVIEW_QUALGEN_INTERVAL_SECONDS": "86400"}
+    if dialog.browser.get() and ask("Use recommended settings (2-minute polling, 6,000 input tokens, daily history refresh)? (y/n)", "y").lower() in ("y", "yes"):
+        settings.update(defaults)
+    else:
+        setting("REVIEW_POLL_SECONDS", "Seconds between polls", number, "120")
+        setting("REVIEW_MAX_INPUT_TOKENS", "Maximum estimated input tokens per review", number, "6000")
+        setting("REVIEW_QUALGEN_INTERVAL_SECONDS", "Seconds between Qualgen history refreshes (0 disables)",
+                lambda value: "0" if value == "0" else number(value), "86400")
+    backend = retry(lambda: providers.provider(ask("Review provider (cursor/claude/codex)", previous.get("REVIEW_PROVIDER", "cursor"))))
+    settings["REVIEW_PROVIDER"] = backend
+    model = ask(providers.LABELS[backend] + " model (auto for default)",
+                previous.get("REVIEW_MODEL", "auto") if backend == previous.get("REVIEW_PROVIDER", "cursor") else "auto")
     if model != "auto":
         settings["REVIEW_MODEL"] = model
     bundle = Path(tempfile.mkdtemp(dir=state, prefix=".review-setup-"))
     link = state / (".setup-link-" + uuid.uuid4().hex)
     committed = False
     try:
-        required = {CURSOR: "Cursor API key"}
-        if "github" in providers:
+        required = {providers.KEYS[backend]: providers.LABELS[backend] + " API key"}
+        if "github" in forges:
             required[KEY] = "GitHub App PEM"
-        if "gitlab" in providers:
+        if "gitlab" in forges:
             required[TOKEN] = "GitLab reviewer token"
         secrets = {}
         for name, label in required.items():
@@ -201,6 +254,12 @@ def configure(state):
             if name == TOKEN and gitlab_hosts(rows) != gitlab_hosts(prev.get("projects", [])):
                 prev_path = None
             secrets[name] = retry(lambda: credential(name, label, bundle, old, prev_path))
+        if backend == "cursor":
+            key = (bundle / secrets[CURSOR]).read_text().strip()
+            with tempfile.TemporaryDirectory(prefix="review-team-check-") as temp:
+                chosen = providers.select_team(key, os.getenv("REVIEW_CURSOR_TEAM_ID", ""), Path(temp), pick_cursor_team)
+            if chosen:
+                settings["REVIEW_CURSOR_TEAM_ID"] = chosen
         private_file(bundle / "settings.json", json.dumps(
             {"projects": rows, "settings": settings, "secrets": secrets}, indent=2))
         with locked(state, fcntl.LOCK_EX):
@@ -222,7 +281,11 @@ def configure(state):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Configure projects, credentials and review costs interactively")
     parser.add_argument("--state-dir", type=Path, default=state_dir())
+    parser.add_argument("--web", action="store_true", help="Open the local browser wizard")
     args = parser.parse_args(argv)
+    if args.web:
+        from .web_setup import serve
+        return serve(args.state_dir.resolve())
     if not sys.stdin.isatty():
         parser.exit(2, "Setup needs an interactive terminal. Use docker run -it or docker exec -it.\n")
     try:

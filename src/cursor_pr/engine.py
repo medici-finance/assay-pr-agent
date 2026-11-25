@@ -16,6 +16,7 @@ import yaml
 from unidiff import PatchSet
 
 from .source import ReviewError
+from .providers import KEYS, LABELS, provider
 
 VERSION = "1"
 MAX_FINDINGS = 3
@@ -107,41 +108,79 @@ def parse_answer(raw, anchors):
 
 
 def invoke(prompt, model, anchors):
-    executable = shutil.which("cursor-agent") or shutil.which("agent")
+    backend = provider()
+    label = LABELS[backend]
+    executable = (shutil.which("cursor-agent") or shutil.which("agent")) if backend == "cursor" else shutil.which(backend)
     if not executable:
-        raise CursorFailure("Cursor Agent CLI is not installed", 0)
+        raise CursorFailure(f"{label} CLI is not installed", 0)
     # Retain login discovery, but keep unrelated forge and CI secrets out of the child.
     env = {k: os.environ[k] for k in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR",
-           "XDG_CONFIG_HOME", "CURSOR_API_KEY", "SSL_CERT_FILE", "HTTPS_PROXY", "NO_PROXY")
+           "XDG_CONFIG_HOME", KEYS[backend], "SSL_CERT_FILE", "HTTPS_PROXY", "NO_PROXY")
            if k in os.environ}
     with tempfile.TemporaryDirectory(prefix="cursor-review-") as workspace:
-        config = Path(workspace, ".cursor")
-        config.mkdir()
-        (config / "cli.json").write_text(json.dumps({"permissions": {"allow": [], "deny": [
-            "Shell(*)", "Read(**)", "Write(**)", "WebFetch(*)", "Mcp(*:*)"]}}))
-        argv = [executable, "-p", "--mode=ask", "--output-format", "json", "--trust"]
+        if backend == "cursor":
+            if os.getenv("CURSOR_CONFIG_DIR"):
+                env["CURSOR_CONFIG_DIR"] = os.environ["CURSOR_CONFIG_DIR"]
+                if env.get("CURSOR_API_KEY"):
+                    env["HOME"] = env["CURSOR_CONFIG_DIR"]
+            config = Path(workspace, ".cursor")
+            config.mkdir()
+            (config / "cli.json").write_text(json.dumps({"permissions": {"allow": [], "deny": [
+                "Shell(*)", "Read(**)", "Write(**)", "WebFetch(*)", "Mcp(*:*)"]}}))
+            argv = [executable, "-p", "--mode=ask", "--output-format", "json", "--trust"]
+        else:
+            env.update(HOME=workspace, XDG_CONFIG_HOME=workspace)
+            if not env.get(KEYS[backend]):
+                raise CursorFailure(f"Set {KEYS[backend]} for {label}", 0)
+            if backend == "claude":
+                argv = [executable, "-p", "--bare", "--output-format", "json", "--tools", "",
+                        "--strict-mcp-config", "--no-session-persistence", "--max-turns", "1"]
+            else:
+                env["CODEX_HOME"] = workspace
+                argv = [executable, "exec", "--json", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only",
+                        "--ignore-user-config", "--ignore-rules", "--disable", "shell_tool",
+                        "--disable", "unified_exec", "--disable", "multi_agent", "--disable", "apps",
+                        "-c", 'web_search="disabled"', "-c", 'approval_policy="never"',
+                        "--output-last-message", str(Path(workspace, "answer"))]
         if model:
             argv += ["--model", model]
         try:
-            response = subprocess.run([*argv, prompt], cwd=workspace, env=env,
-                                      capture_output=True, timeout=120)
+            if backend == "cursor":
+                argv.append(prompt)
+            elif backend == "codex":
+                argv.append("-")
+            response = subprocess.run(argv, input=None if backend == "cursor" else prompt.encode(),
+                                      cwd=workspace, env=env, capture_output=True, timeout=120)
+            if not response.returncode and backend == "codex":
+                answer = Path(workspace, "answer")
+                if not answer.is_file() or answer.stat().st_size > 32768:
+                    raise CursorFailure("Codex did not return a bounded final message", 1)
+                try:
+                    events = [json.loads(line) for line in response.stdout.splitlines() if line.strip()]
+                    completed = [event for event in events if event.get("type") == "turn.completed"]
+                    if len(completed) != 1:
+                        raise ValueError("Missing completed turn")
+                    response.stdout = json.dumps(dict(type="result", subtype="success", is_error=False,
+                                                      result=answer.read_text(), usage=completed[0].get("usage")))
+                except (AttributeError, ValueError, OSError):
+                    raise CursorFailure("Codex did not return one completed review turn", 1) from None
         except subprocess.TimeoutExpired as err:
-            raise CursorFailure("Cursor exceeded the 120-second limit", 1) from err
+            raise CursorFailure(f"{label} exceeded the 120-second limit", 1) from err
     if response.returncode:
         diagnostic = (response.stderr + response.stdout).lower()
-        reason = "check the CLI login and account access"
+        reason = "check the CLI credentials and account access"
         for markers, explanation in [
-            ((b"invalid project config",), "Cursor rejected the generated workspace configuration"),
-            ((b"not logged in", b"unauthenticated", b"authentication required"), "sign in with cursor-agent login"),
+            ((b"invalid project config",), f"{label} rejected the workspace configuration"),
+            ((b"not logged in", b"unauthenticated", b"authentication required"), f"check the {label} credentials"),
             ((b"not trusted", b"workspace trust"), "workspace trust was refused"),
-            ((b"rate limit", b"quota", b"usage limit"), "Cursor reported a usage or rate limit"),
-            ((b"connection", b"unavailable", b"network"), "Cursor could not reach its service"),
+            ((b"rate limit", b"quota", b"usage limit"), f"{label} reported a usage or rate limit"),
+            ((b"connection", b"unavailable", b"network"), f"{label} could not reach its service"),
             ((b"not allowed", b"not available"), "the selected model or capability is unavailable"),
         ]:
             if any(marker in diagnostic for marker in markers):
                 reason = explanation
                 break
-        raise CursorFailure(f"Cursor exited {response.returncode}: {reason}. No retry was made.", 1)
+        raise CursorFailure(f"{label} exited {response.returncode}: {reason}. No retry was made.", 1)
     try:
         return parse_answer(response.stdout, anchors)
     except (ReviewError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError) as err:
@@ -149,12 +188,14 @@ def invoke(prompt, model, anchors):
             usage = json.loads(response.stdout).get("usage")
         except (ValueError, AttributeError):
             usage = None
-        raise CursorFailure("Cursor returned an invalid review: " + type(err).__name__,
+        raise CursorFailure(f"{label} returned an invalid review: " + type(err).__name__,
                             1, usage if isinstance(usage, dict) else None) from err
 
 
 def review(prompt, model, anchors, cache, source):
     signature = json.dumps([VERSION, "pr-agent:0.50.0", model, source, prompt], ensure_ascii=False)
+    if provider() != "cursor" or os.getenv("REVIEW_CURSOR_TEAM_ID"):
+        signature = json.dumps([provider(), os.getenv("REVIEW_CURSOR_TEAM_ID") if provider() == "cursor" else None, signature])
     key = hashlib.sha256(signature.encode()).hexdigest()
     cache.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = cache / (key + ".json")

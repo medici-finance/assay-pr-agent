@@ -10,26 +10,28 @@ import tempfile
 from unidiff.errors import UnidiffParseError
 import yaml
 
-from . import history
-from .setup import apply_saved_setup, state_dir
-from .config import load_config
+from . import history, providers
+from .setup import apply_saved_setup, load_provider_key, state_dir
+from .config import load_config, project_from
 from .credentials import forge_credentials, standalone_requested
 from .artifacts import forge_go_report
-from .checks import go_report, scan_files
+from .checks import go_report, scan_files, scanner
+from .sync import scan_checkout
 from .engine import CursorFailure, pack, review, tokens
 from .source import ReviewError, ci_refs, forge_change, local_change, run_desk
 
 
 def publish(address, head, report):
     repo, number = address.rsplit("#", 1)
-    body = [f"Cursor review of {head}", report["state"]]
+    label = providers.LABELS[report.get("provider", "cursor")]
+    body = [f"{label} review of {head}", report["state"]]
     for issue in report["findings"]:
         body.append(f"- {issue['path']}:{issue['line']} — {issue['title']}. {issue['message']}")
     if report["state"] == "over-budget":
-        body.append(f"Skipped Cursor. Estimated prompt {report['estimated_input_tokens']} tokens "
+        body.append(f"Skipped {label}. Estimated prompt {report['estimated_input_tokens']} tokens "
                     f"exceeds the limit of {report['max_input_tokens']}.")
     elif report["state"] == "model-unavailable":
-        body.append("Cursor could not complete the review.")
+        body.append(f"{label} could not complete the review.")
     elif not report["findings"]:
         body.append("No model findings in the reviewed scope.")
     for check in report["checks"]:
@@ -51,7 +53,7 @@ def publish(address, head, report):
 
 
 def parser():
-    p = argparse.ArgumentParser(description="Run one bounded Cursor review and emit a JSON report.")
+    p = argparse.ArgumentParser(description="Run one bounded code review and emit a JSON report.")
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--change", help="Assay-configured GitHub PR or GitLab MR, e.g. 'org/repo#42'")
     mode.add_argument("--base", help="Local base revision to compare against")
@@ -64,9 +66,9 @@ def parser():
     evidence.add_argument("--go-analysis-producer", help="Trusted CI producer for --expected-change-url")
     evidence.add_argument("--go-report", type=Path, help="Assay go-analysis/v1 JSON for this head")
     p.add_argument("--qualgen-store", type=Path, help="Read the poller’s mined Qualgen history for this project")
-    p.add_argument("--model", help="Explicit Cursor model (otherwise the CLI default)")
+    p.add_argument("--model", help="Explicit provider model (otherwise the CLI default)")
     p.add_argument("--max-input-tokens", type=int, help="Preflight estimate limit (default 6000)")
-    p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling Cursor")
+    p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling the model")
     p.add_argument("--cache-dir", type=Path, default=Path(os.getenv("XDG_CACHE_HOME", Path.home()/".cache"))/"cursor-pr-review")
     p.add_argument("--post", action="store_true", help="Publish a head-bound summary using deskpost with --change")
     return p
@@ -91,7 +93,15 @@ def execute(args):
     if not selected <= paths:
         raise ReviewError("--path must name a file changed in this review")
     files = sorted((f for f in change.files if f.path in selected), key=lambda f: f.path)
-    checks = scan_files(root, change.head, files)
+    project = getattr(args, "managed_project", None)
+    if project and any(scanner(f.path) and not f.absent and f.status not in ("removed", "deleted", "D") for f in files):
+        number = args.change.rsplit("#", 1)[1]
+        if args.expected_change_url != project.change_url(number):
+            raise ReviewError("Managed checkout and reviewed project differ")
+        with scan_checkout(root, project, number, change.head) as checkout:
+            checks = scan_files(checkout, change.head, files)
+    else:
+        checks = scan_files(root, change.head, files)
     go = None
     if args.go_report:
         go = go_report(args.go_report, change.head)
@@ -104,10 +114,13 @@ def execute(args):
     prompt, anchors, unseen, has_text = pack(files, checks)
     estimated = tokens(prompt) if has_text else 0
     omitted = sorted(set(unseen) | (paths - selected))
-    report = {"source": change.identity, "head": change.head, "model": args.model or "cursor-default",
+    backend = providers.provider()
+    report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
               "estimated_input_tokens": estimated, "max_input_tokens": args.max_input_tokens,
               "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
               "findings": [], "cursor_usage": None}
+    if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
+        report["cursor_team_id"] = os.environ["REVIEW_CURSOR_TEAM_ID"]
     if args.qualgen_store:
         report["qualgen"] = history.screen(root, args.qualgen_store, selected, change.head)
     if estimated > args.max_input_tokens:
@@ -136,6 +149,13 @@ def execute(args):
 
 def run_request(args):
     report, code = execute(args)
+    backend = report["provider"]
+    if backend != "cursor":
+        report["model_invocations"] = report["cursor_invocations"]
+        report["model_usage"] = report["cursor_usage"]
+        report.update(cursor_invocations=0, cursor_usage=None)
+    else:
+        report.update(model_invocations=report["cursor_invocations"], model_usage=report["cursor_usage"])
     if args.post:
         try:
             publish(args.change, report["head"], report)
@@ -160,10 +180,16 @@ def main():
             state = state_dir().resolve()
             if args.change and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
                 apply_saved_setup(state)
+            elif not args.change:
+                load_provider_key(providers.provider())
+            if not args.estimate and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
+                stack.enter_context(providers.cursor_account())
             if args.max_input_tokens is None:
                 args.max_input_tokens = int(os.getenv("REVIEW_MAX_INPUT_TOKENS", "6000"))
             if args.model is None:
                 args.model = os.getenv("REVIEW_MODEL")
+            if args.change and os.getenv("CURSOR_REVIEW_POLLER_CHILD") == "1" and os.getenv("REVIEW_MANAGED_PROJECT"):
+                args.managed_project = project_from(json.loads(os.environ["REVIEW_MANAGED_PROJECT"]))
             if args.change and standalone_requested():
                 state.mkdir(mode=0o700, parents=True, exist_ok=True)
                 projects = load_config(state)
@@ -174,6 +200,7 @@ def main():
                 if args.expected_change_url and args.expected_change_url != project.change_url(number):
                     raise ReviewError("Configured project and expected change URL differ")
                 args.expected_change_url = project.change_url(number)
+                args.managed_project = project if project.managed else None
                 stack.enter_context(forge_credentials(projects, state))
             clean = stack.enter_context(tempfile.TemporaryDirectory(prefix="pr-agent-settings-"))
             # deskread/deskpost discover their configured forge from the caller's checkout.

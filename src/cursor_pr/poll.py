@@ -15,7 +15,7 @@ import threading
 from .config import load_config
 from .credentials import SETUP_INPUTS, forge_credentials
 from .discovery import poll_project
-from . import history, setup
+from . import history, setup, providers
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +74,10 @@ def run_review(project, number, state):
         argv.extend(["--model", os.environ["REVIEW_MODEL"]])
     env = dict(os.environ)
     env["CURSOR_REVIEW_POLLER_CHILD"] = "1"
+    env.pop("REVIEW_MANAGED_PROJECT", None)
+    if project.managed:
+        env["REVIEW_MANAGED_PROJECT"] = json.dumps(dict(provider=project.provider, url=project.url,
+                                                       managed=True, requester_ids=sorted(project.requesters)))
     for key in ("REVIEW_PROJECTS", *SETUP_INPUTS):
         env.pop(key, None)
     for key in list(env):
@@ -84,8 +88,8 @@ def run_review(project, number, state):
         report = json.loads(result.stdout)
     except ValueError:
         return "failed"
-    log.info("Review %s state=%s publication=%s cursor_invocations=%s", address, report["state"],
-             report.get("publication"), report.get("cursor_invocations"))
+    log.info("Review %s state=%s publication=%s provider=%s model_invocations=%s", address, report["state"],
+             report.get("publication"), report.get("provider", "cursor"), report.get("model_invocations"))
     return report["state"] if report.get("publication") == "posted-or-already-present" else "failed"
 
 
@@ -109,6 +113,9 @@ def cycle(projects, state, jobs, since, runner=run_review):
 def container_main():
     if sys.argv[1:2] == ["setup"]:
         return setup.main(sys.argv[2:])
+    if sys.argv[1:2] == ["sync"]:
+        from .sync import main as sync
+        return sync()
     return main()
 
 
@@ -136,6 +143,7 @@ def main():
                 raise ValueError("REVIEW_MAX_INPUT_TOKENS must be positive")
             mine_seconds = history.interval()
             projects = load_config(state)
+            stack.enter_context(providers.cursor_account())
             stack.enter_context(forge_credentials(projects, state))
         except (ValueError, KeyError, TypeError, EOFError, OSError) as err:
             parser.exit(2, f"Polling configuration: {err}\n")

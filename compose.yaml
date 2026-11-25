@@ -1,0 +1,33 @@
+x-reviewer: &reviewer
+  platform: linux/amd64
+  image: ${REVIEW_IMAGE:-assay-pr-agent:local}
+  build: .
+services:
+  setup:
+    <<: *reviewer
+    profiles: [setup]
+    command: [setup, --web]
+    ports: ["127.0.0.1:8765:8765"]
+    volumes: ["state:/state", "repos:/repos:ro"]
+    environment:
+      REVIEW_SETUP_BIND: 0.0.0.0
+  sync:
+    <<: *reviewer
+    command: [sync]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/sync-ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+    restart: unless-stopped
+    volumes: ["state:/state", "repos:/repos"]
+  reviewer:
+    <<: *reviewer
+    restart: unless-stopped
+    volumes: ["state:/state", "repos:/repos:ro"]
+    depends_on:
+      sync:
+        condition: service_healthy
+volumes:
+  state:
+  repos:

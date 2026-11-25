@@ -17,3 +17,6 @@ cursor-review = "cursor_pr.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+cursor_pr = ["setup.html", "setup.css", "setup.js"]
