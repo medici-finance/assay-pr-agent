@@ -22,7 +22,8 @@ class ManagerTests(unittest.TestCase):
     def test_manifest_callback_is_single_use_and_bound_to_registration(self):
         session = Session()
         nonce, form = provision.manifest("acme", False)
-        self.assertEqual(form["manifest"]["hook_attributes"], {"active": False})
+        self.assertEqual(form["manifest"]["hook_attributes"],
+                         {"url": "https://github.com/medici-finance/assay-pr-agent", "active": False})
         self.assertIn("/organizations/acme/settings/apps/new", form["action"])
         result = []
         worker = threading.Thread(target=lambda: result.append(session.register(nonce, form)), daemon=True)
