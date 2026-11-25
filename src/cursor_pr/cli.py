@@ -6,11 +6,12 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 
 from unidiff.errors import UnidiffParseError
 import yaml
 
-from . import history, providers
+from . import history, providers, scanners
 from .login import auth_mode
 from .setup import apply_saved_setup, load_provider_key, state_dir
 from .config import load_config, project_from
@@ -40,6 +41,8 @@ def publish(address, head, report):
             body.append(f"- {check['tool']}: could not check {check.get('path') or check.get('reason', '')}")
         for item in check["findings"]:
             body.append(f"- {item['path']}:{item['line']} — {item['rule']} {item.get('message', '')}")
+    if report.get("static_checks"):
+        body.extend(["", *scanners.summary(report["static_checks"]), ""])
     if "qualgen" in report:
         body.extend(["", *history.summary(report["qualgen"]), ""])
     for path in report["omitted"]:
@@ -66,6 +69,7 @@ def parser():
     evidence = p.add_mutually_exclusive_group()
     evidence.add_argument("--go-analysis-producer", help="Trusted CI producer for --expected-change-url")
     evidence.add_argument("--go-report", type=Path, help="Assay go-analysis/v1 JSON for this head")
+    p.add_argument("--scanner-ci", type=json.loads, help="Per-tool trusted CI report settings for a forge change")
     p.add_argument("--qualgen-store", type=Path, help="Read the poller’s mined Qualgen history for this project")
     p.add_argument("--model", help="Explicit provider model (otherwise the CLI default)")
     p.add_argument("--max-input-tokens", type=int, help="Preflight estimate limit (default 6000)")
@@ -95,14 +99,28 @@ def execute(args):
         raise ReviewError("--path must name a file changed in this review")
     files = sorted((f for f in change.files if f.path in selected), key=lambda f: f.path)
     project = getattr(args, "managed_project", None)
-    if project and any(scanner(f.path) and not f.absent and f.status not in ("removed", "deleted", "D") for f in files):
-        number = args.change.rsplit("#", 1)[1]
-        if args.expected_change_url != project.change_url(number):
-            raise ReviewError("Managed checkout and reviewed project differ")
-        with scan_checkout(root, project, number, change.head) as checkout:
-            checks = scan_files(checkout, change.head, files)
-    else:
-        checks = scan_files(root, change.head, files)
+    wanted = scanners.inputs(files) if args.change else set()
+    static = scanners.ci_results(args.expected_change_url, change.head, root, wanted, args.scanner_ci or {})
+    missing = sorted(wanted - static.keys())
+    needs_checkout = missing or any(scanner(f.path) and not f.absent and f.status not in ("removed", "deleted", "D")
+                                    for f in files)
+    with ExitStack() as stack:
+        checkout = root
+        if project and needs_checkout:
+            number = args.change.rsplit("#", 1)[1]
+            if args.expected_change_url != project.change_url(number):
+                raise ReviewError("Managed checkout and reviewed project differ")
+            checkout = stack.enter_context(scan_checkout(root, project, number, change.head))
+        checks = scan_files(checkout, change.head, files)
+        deadline = time.monotonic() + 180
+        for tool, path in missing:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                static[tool, path] = scanners.local(checkout, change.head, tool, path, state_dir() / "osv-db",
+                                                    timeout=min(90, remaining))
+            else:
+                static[tool, path] = {"tool": tool, "path": path, "source": "local", "state": "could-not-check",
+                                      "findings": [], "reason": "static check time budget exhausted"}
     go = None
     if args.go_report:
         go = go_report(args.go_report, change.head)
@@ -120,6 +138,8 @@ def execute(args):
               "estimated_input_tokens": estimated, "max_input_tokens": args.max_input_tokens,
               "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
               "findings": [], "cursor_usage": None}
+    if static:
+        report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
         report["cursor_team_id"] = os.environ["REVIEW_CURSOR_TEAM_ID"]
     if args.qualgen_store:
@@ -143,7 +163,7 @@ def execute(args):
         report.update(answer, cache_hit=cached, cursor_invocations=int(not cached))
         if cached:
             report["cursor_usage"] = None
-    incomplete = bool(omitted or any(c["state"] != "complete" for c in checks))
+    incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
     report["state"] = "partial" if incomplete else ("reviewed" if has_text else "empty")
     return report, 2 if incomplete else 0
 
@@ -201,6 +221,8 @@ def main():
                 if args.expected_change_url and args.expected_change_url != project.change_url(number):
                     raise ReviewError("Configured project and expected change URL differ")
                 args.expected_change_url = project.change_url(number)
+                if args.scanner_ci is None:
+                    args.scanner_ci = project.scanner_ci
                 args.managed_project = project if project.managed else None
                 stack.enter_context(forge_credentials(projects, state))
             clean = stack.enter_context(tempfile.TemporaryDirectory(prefix="pr-agent-settings-"))

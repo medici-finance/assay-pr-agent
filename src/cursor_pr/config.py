@@ -1,5 +1,5 @@
 """First-start settings for polling projects."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -9,6 +9,7 @@ import tempfile
 from urllib.parse import urlsplit
 
 from .dialog import prompt
+from .scanners import ci_config
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,7 @@ class Project:
     visibility: str = "private"
     go_analysis: str = ""
     managed: bool = False
+    scanner_ci: dict = field(default_factory=dict)
 
     @property
     def key(self):
@@ -69,7 +71,9 @@ def project_from(row):
         raise ValueError("go_analysis must name a CI producer")
     if row["provider"] == "github" and producer and not re.fullmatch(r"[\w.-]+\.ya?ml|[1-9][0-9]*", producer):
         raise ValueError("go_analysis must be a GitHub workflow filename or numeric ID")
-    return Project(row["provider"], url, slug, checkout, frozenset(ids), visibility, producer, managed)
+    settings = row.get("scanner_ci", {})
+    ci_config(settings, row["provider"])
+    return Project(row["provider"], url, slug, checkout, frozenset(ids), visibility, producer, managed, settings)
 
 
 def prompt_config(*, visibility=False):
@@ -121,7 +125,7 @@ def load_config(state):
     projects = parse_projects(rows)
     if save:
         with tempfile.NamedTemporaryFile(mode="w", dir=state, delete=False) as temp:
-            json.dump({"projects": [{k: row[k] for k in ("provider", "url", "checkout", "requester_ids", "visibility", "go_analysis", "managed") if k in row}
+            json.dump({"projects": [{k: row[k] for k in ("provider", "url", "checkout", "requester_ids", "visibility", "go_analysis", "managed", "scanner_ci") if k in row}
                                     for row in rows]}, temp)
         os.replace(temp.name, path)
     return projects
