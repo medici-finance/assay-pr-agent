@@ -42,8 +42,10 @@ class BuildInfoTests(unittest.TestCase):
             self.assertIsNone(buildinfo.load(path))
             path.write_text(json.dumps({"sha": "", "tags": "", "built_at": ""}))
             self.assertIsNone(buildinfo.load(path))
-        self.assertEqual(buildinfo.banner(None),
-                         "Assay PR Agent build: unknown (no build record in this image)")
+        # Inside a published image the default record exists, so force the no-record path.
+        with patch("cursor_pr.buildinfo.load", return_value=None):
+            self.assertEqual(buildinfo.banner(),
+                             "Assay PR Agent build: unknown (no build record in this image)")
 
     def test_container_startup_prints_banner_before_dispatch(self):
         build = buildinfo.Build("abc123", ("main", "latest"), "2026-11-25T18:42:10Z")

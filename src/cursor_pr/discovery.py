@@ -71,7 +71,7 @@ def is_request(project, number, note, since):
 
 
 def public_gitlab_request(project, number, note):
-    # deskread v1.0.91 omits note visibility and rounds GitLab timestamps to
+    # deskread v1.0.94 omits note visibility and rounds GitLab timestamps to
     # seconds. Check both on this single candidate before a public response.
     base = os.environ.get("GITLAB_API_BASE", "").rstrip("/")
     if base != project.url.removesuffix("/" + project.slug) + "/api/v4":
