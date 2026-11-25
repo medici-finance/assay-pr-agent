@@ -1,4 +1,5 @@
 import argparse
+import fcntl
 from contextlib import ExitStack
 import json
 import os
@@ -12,8 +13,8 @@ from unidiff.errors import UnidiffParseError
 import yaml
 
 from . import history, providers, scanners
-from .login import auth_mode
-from .setup import apply_saved_setup, load_provider_key, state_dir
+from .login import auth_mode, login_directory
+from .setup import locked, apply_saved_setup, load_provider_key, state_dir
 from .config import load_config, project_from
 from .credentials import forge_credentials, standalone_requested
 from .artifacts import forge_go_report
@@ -203,6 +204,8 @@ def main():
                 apply_saved_setup(state)
             elif not args.change and auth_mode(providers.provider()) == "api-key":
                 load_provider_key(providers.provider())
+            if os.getenv("REVIEW_LOGIN_PROFILE") and auth_mode(providers.provider()) == "login":
+                stack.enter_context(locked(login_directory(state), fcntl.LOCK_SH))
             if not args.estimate and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
                 stack.enter_context(providers.cursor_account())
             if args.max_input_tokens is None:

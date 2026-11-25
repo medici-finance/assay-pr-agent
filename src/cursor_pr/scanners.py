@@ -121,7 +121,7 @@ READ_ERRORS = (ReviewError, OSError, ValueError, KeyError, TypeError, AttributeE
 def ci_path(path, url, configured_root):
     if path.startswith("file:///"):
         path = urlsplit(path).path
-    slug = "/".join(urlsplit(url).path.strip("/").split("/")[:2])
+    slug = "/".join(urlsplit(url).path.split("/-/merge_requests/")[0].split("/pull/")[0].split("/")[-2:])
     repo = slug.split("/")[1]
     roots = [configured_root] if configured_root else (
         [f"/home/runner/work/{repo}/{repo}", f"/__w/{repo}/{repo}"] if "/-/merge_requests/" not in url

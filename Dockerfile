@@ -8,7 +8,7 @@ RUN npm install --prefix /opt/model-clis @openai/codex@0.171.0 @anthropic-ai/cla
 FROM python:3.12-slim-trixie
 ARG TARGETARCH
 RUN test "$TARGETARCH" = amd64 || (echo 'Assay release requires --platform linux/amd64' >&2 && exit 1)
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl curl git gh shellcheck bash gzip tar && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl haproxy curl git gh shellcheck bash gzip tar && rm -rf /var/lib/apt/lists/*
 RUN curl --fail --silent --show-error --location --retry 3 \
       https://github.com/medici-finance/assay/releases/download/v1.0.91/qualgen-linux-amd64 -o /usr/local/bin/qualgen \
     && echo '835d4188bc3d5f8d7c9ccc9ca49a3f907101a78c659020442e7783463f2b975f  /usr/local/bin/qualgen' | sha256sum -c - \

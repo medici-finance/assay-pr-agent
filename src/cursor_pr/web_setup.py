@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import secrets
 import threading
+import re
+from urllib.parse import parse_qs, urlsplit
 
 from . import dialog, setup
 
@@ -15,14 +17,44 @@ class Session:
         self.view = {"id": 0, "status": "starting"}
         self.messages = []
         self.answer = None
+        self.nonce = None
 
     def message(self, text):
         self.messages.append(text)
 
-    def ask(self, label, *, secret=False, multiline=False, choices=None):
+    def choose(self, label, values):
+        answer = self.ask(label, choices=[{"value": v, "label": v} for v in values])
+        if answer not in values:
+            raise ValueError("Select one of the displayed options")
+        return answer
+
+    def register(self, nonce, form):
+        with self.cv:
+            self.nonce = nonce
+            self.view = {"id": self.view["id"] + 1, "status": "register", **form}
+            if not self.cv.wait_for(lambda: self.answer is not None, timeout=3600):
+                self.nonce = None
+                raise ValueError("GitHub registration expired. Start setup again.")
+            code, self.answer = self.answer, None
+            return code
+
+    def callback(self, query):
+        state, code = query.get("state", []), query.get("code", [])
+        with self.cv:
+            if (self.nonce is None or len(state) != 1 or not state[0].isascii()
+                    or not secrets.compare_digest(state[0], self.nonce) or len(code) != 1
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", code[0])):
+                return False
+            self.nonce = None
+            self.answer = code[0]
+            self.view = {"id": self.view["id"], "status": "working"}
+            self.cv.notify_all()
+            return True
+
+    def ask(self, label, *, secret=False, multiline=False, choices=None, link=None, upload=False):
         with self.cv:
             self.view = {"id": self.view["id"] + 1, "status": "question", "label": label.strip(),
-                         "secret": secret, "multiline": multiline, "messages": self.messages, "choices": choices}
+                         "secret": secret, "multiline": multiline, "messages": self.messages, "choices": choices, "link": link, "upload": upload}
             self.messages = []
             self.cv.notify_all()
             self.cv.wait_for(lambda: self.answer is not None)
@@ -40,10 +72,10 @@ class Session:
             self.cv.notify_all()
             return True
 
-    def run(self, state):
+    def run(self, state, force_login=False):
         token = dialog.browser.set(self)
         try:
-            setup.configure(state)
+            setup.configure(state, force_login=force_login)
             result = {"status": "complete"}
         except (ValueError, OSError, EOFError) as err:
             result = {"status": "error", "label": str(err)}
@@ -56,7 +88,7 @@ class Session:
             self.cv.notify_all()
 
 
-def serve(state):
+def serve(state, *, force_login=False):
     session = Session()
     key = secrets.token_urlsafe(32)
     port = 8765
@@ -72,7 +104,7 @@ def serve(state):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; form-action 'none'; base-uri 'none'")
+            self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; form-action https://github.com; base-uri 'none'")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -84,6 +116,11 @@ def serve(state):
         def do_GET(self):
             if self.headers.get("Host") not in hosts:
                 return self.reply(403)
+            url = urlsplit(self.path)
+            if url.path == "/github/callback":
+                if not session.callback(parse_qs(url.query)):
+                    return self.reply(403)
+                return self.reply(200, b"GitHub registration received. Return to the installer tab.", "text/plain")
             assets = {"/": ("setup.html", "text/html"), "/setup.js": ("setup.js", "text/javascript"),
                       "/setup.css": ("setup.css", "text/css")}
             if self.path in assets:
@@ -103,7 +140,7 @@ def serve(state):
                 return self.reply(403)
             try:
                 size = int(self.headers.get("Content-Length", 0))
-                if not 0 < size <= 32768:
+                if not 0 < size <= 1048576:
                     return self.reply(413)
                 data = json.loads(self.rfile.read(size))
                 if not isinstance(data, dict):
@@ -114,7 +151,7 @@ def serve(state):
 
     bind = os.getenv("REVIEW_SETUP_BIND", "127.0.0.1")
     with ThreadingHTTPServer((bind, port), Handler) as server:
-        worker = threading.Thread(target=session.run, args=(state,), daemon=True)
+        worker = threading.Thread(target=session.run, args=(state, force_login), daemon=True)
         worker.start()
         print(f"Open http://127.0.0.1:{port}/#{key} to configure the reviewer.", flush=True)
         server.serve_forever()

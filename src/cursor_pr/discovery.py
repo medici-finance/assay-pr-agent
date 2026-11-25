@@ -5,10 +5,11 @@ from itertools import batched
 import json
 import logging
 import os
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 import httpx
 
+from .gitlab_tls import client_options
 from .source import ReviewError, reviewer_token, run_desk
 
 log = logging.getLogger(__name__)
@@ -73,11 +74,11 @@ def public_gitlab_request(project, number, note):
     # deskread v1.0.91 omits note visibility and rounds GitLab timestamps to
     # seconds. Check both on this single candidate before a public response.
     base = os.environ.get("GITLAB_API_BASE", "").rstrip("/")
-    if base != "https://" + urlsplit(project.url).netloc + "/api/v4":
+    if base != project.url.removesuffix("/" + project.slug) + "/api/v4":
         raise ReviewError("GITLAB_API_BASE must match the project's HTTPS instance /api/v4")
     token = reviewer_token("gitlab", project.slug, project.checkout)
     url = f"{base}/projects/{quote(project.slug, safe='')}/merge_requests/{number}/notes/{note['databaseId']}"
-    response = httpx.get(url, headers={"PRIVATE-TOKEN": token}, follow_redirects=False, timeout=15)
+    response = httpx.get(url, headers={"PRIVATE-TOKEN": token}, follow_redirects=False, timeout=15, **client_options())
     if response.status_code == 404:
         return False
     response.raise_for_status()

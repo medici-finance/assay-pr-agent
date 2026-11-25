@@ -121,7 +121,9 @@ def invoke(prompt, model, anchors):
            if k in os.environ}
     with tempfile.TemporaryDirectory(prefix="cursor-review-") as workspace:
         if backend == "cursor":
-            if os.getenv("CURSOR_CONFIG_DIR"):
+            if auth_mode(backend) == "login":
+                env = login_env(backend, login_directory(state_dir()))
+            elif os.getenv("CURSOR_CONFIG_DIR"):
                 env["CURSOR_CONFIG_DIR"] = os.environ["CURSOR_CONFIG_DIR"]
                 if env.get("CURSOR_API_KEY"):
                     env["HOME"] = env["CURSOR_CONFIG_DIR"]

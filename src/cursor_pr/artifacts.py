@@ -10,6 +10,7 @@ import zlib
 
 import httpx
 
+from .gitlab_tls import client_options
 from .checks import import_go_report
 from .source import ReviewError, reviewer_token
 
@@ -130,19 +131,26 @@ def gitlab(client, base, repository, number, job, head, headers, *, scanner=None
 
 def fetch_report(url, producer, head, checkout, *, scanner=None):
     target = urlsplit(url)
+    base = os.getenv("GITLAB_API_BASE", "").rstrip("/")
+    site = base.removesuffix("/api/v4")
+    path = target.path
+    if "/-/merge_requests/" in path:
+        if not site or not base.endswith("/api/v4") or not url.startswith(site + "/"):
+            raise ReviewError("The analysis host does not match the configured forge")
+        path = url[len(site):]
     match = re.fullmatch(
-        r"/([\w.-]+/[\w.-]+)/(pull|-/merge_requests)/([1-9][0-9]*)", target.path)
+        r"/([\w.-]+/[\w.-]+)/(pull|-/merge_requests)/([1-9][0-9]*)", path)
     if not match:
         raise ReviewError("Invalid change URL")
     slug, kind, number = match.groups()
     provider = "github" if kind == "pull" else "gitlab"
-    base = "https://" + target.netloc + "/api/v4"
     if (target.scheme != "https" or target.username is not None or target.query or target.fragment
-            or (provider == "github" and target.netloc != "github.com")
-            or (provider == "gitlab" and base != os.getenv("GITLAB_API_BASE", "").rstrip("/"))):
+            or (provider == "github" and target.netloc != "github.com")):
         raise ReviewError("The analysis host does not match the configured forge")
     token = reviewer_token(provider, slug, checkout)
-    with httpx.Client(timeout=15, follow_redirects=False) as client:
+    options = client_options() if provider == "gitlab" else {}
+    mounts = {"https://" + target.netloc: httpx.HTTPTransport(**options)} if options else {}
+    with httpx.Client(timeout=15, follow_redirects=False, mounts=mounts) as client:
         if provider == "github":
             return github(client, slug, producer, number, head, {"Authorization": "Bearer " + token}, scanner=scanner)
         return gitlab(client, base, slug, number, producer, head, {"PRIVATE-TOKEN": token}, scanner=scanner)
@@ -151,7 +159,7 @@ def fetch_report(url, producer, head, checkout, *, scanner=None):
 def forge_go_report(url, producer, head, checkout):
     try:
         raw = fetch_report(url, producer, head, checkout)
-        slug = urlsplit(url).path.strip("/").split("/")[:2]
+        slug = urlsplit(url).path.split("/-/merge_requests/")[0].split("/pull/")[0].split("/")[-2:]
         return import_go_report(json.loads(raw), head, repository="/".join(slug))
     except ReviewError as error:
         reason = str(error)

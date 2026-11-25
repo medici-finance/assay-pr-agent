@@ -87,3 +87,41 @@ else:
                     else:
                         self.assertNotIn("CODEX_API_KEY", os.environ)
                         self.assertEqual(os.environ["REVIEW_AUTH_MODE"], "login")
+
+    def test_cursor_native_login_selects_team_and_review_uses_that_session(self):
+        fixture = """#!/usr/bin/env python3
+from pathlib import Path
+import json, os, sys
+root = Path(os.environ["CURSOR_CONFIG_DIR"])
+assert root == Path.home() and "CURSOR_API_KEY" not in os.environ and "REVIEW_GITLAB_TOKEN" not in os.environ
+args = sys.argv[1:]
+if args[0] == "status":
+    print(json.dumps({"isAuthenticated": (root/"logged-in").exists()}))
+elif args == ["login"]:
+    assert os.environ["NO_OPEN_BROWSER"] == "1"
+    (root/"logged-in").touch()
+elif args[:2] == ["team", "list"]:
+    assert (root/"logged-in").is_file()
+    print(json.dumps({"teams": [{"id": i, "name": str(i), "isSelectable": True,
+        "isActive": (root/"team").exists() and (root/"team").read_text()==str(i)} for i in [7, 9]]}))
+elif args[:2] == ["team", "switch"]:
+    (root/"team").write_text(args[2])
+    print(json.dumps({"status":"switched", "team":{"id":int(args[2])}}))
+else:
+    assert args[0] == "-p" and (root/"team").read_text() == "9"
+    print(json.dumps({"type":"result","subtype":"success","is_error":False,
+        "result": json.dumps({"review":{"key_issues_to_review":[]}})}))
+"""
+        from cursor_pr import providers
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "cursor-agent"
+            binary.write_text(fixture)
+            binary.chmod(0o755)
+            with patch.dict(os.environ, {"PATH": tmp + os.pathsep + os.environ["PATH"], "REVIEW_PROVIDER": "cursor",
+                    "REVIEW_AUTH_MODE": "login", "REVIEW_LOGIN_DIR": tmp, "REVIEW_CURSOR_TEAM_ID": "9",
+                    "CURSOR_API_KEY": "unused", "REVIEW_GITLAB_TOKEN": "unused"}, clear=True):
+                with patch("sys.stdin.isatty", return_value=True):
+                    setup.check_login(root, interactive=True)
+                with providers.cursor_account():
+                    self.assertEqual(engine.invoke("input", None, {})["findings"], [])
