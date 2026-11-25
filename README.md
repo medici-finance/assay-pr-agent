@@ -32,7 +32,7 @@ Cursor setup uses the CLI's `team list` and `team switch` commands. With multipl
 
 ### Automatic repository sync
 
-Compose runs Kubernetes `git-sync` in a separate container with write access to the checkout volume. For each managed project it refreshes the remote default branch with full history, using the existing Assay reviewer credential, and atomically switches the `current` symlink. The reviewer mounts the volume read-only. Allow repository contents read access for the GitHub App or GitLab repository read access for its token. The sync interval defaults to 120 seconds (`REVIEW_SYNC_SECONDS` on the sync service). Polling uses the forge's PR/MR diff directly. When a requested review needs a shell or workflow scan and its commit is missing locally, the reviewer uses git-sync to fetch just that change ref into a temporary checkout, verifies its SHA, and discards it after scanning. A moved or unavailable ref is reported as incomplete coverage.
+Compose runs Kubernetes `git-sync` in a separate container with write access to the checkout volume. For each managed project it refreshes the remote default branch with full history, using the existing Assay reviewer credential, and atomically switches the `current` symlink. The reviewer mounts the volume read-only. Allow repository contents read access for the GitHub App or GitLab repository read access for its token. The sync interval defaults to 120 seconds (`REVIEW_SYNC_SECONDS` on the sync service). Polling uses the forge's PR/MR diff directly. When a requested review needs a local static scan and its commit is missing locally, the reviewer uses git-sync to fetch just that change ref into a temporary checkout, verifies its SHA, and discards it after scanning. A moved or unavailable ref is reported as incomplete coverage.
 
 In `REVIEW_PROJECTS`, use `"managed": true` in place of a checkout path for a managed clone, or keep your existing absolute `checkout` and bind mount. With Compose, mount custom checkout paths in both services. The sync service leaves operator-managed checkouts alone. Private repositories retain a local copy of their history on the checkout volume.
 
@@ -46,7 +46,7 @@ Each project starts watching at its first activation. Keep the state volume acro
 
 ### Docker setup
 
-The image includes all three provider CLIs, git-sync, Qualgen, Assay’s released forge tools, ShellCheck and actionlint. Use an **amd64 Linux** runner or Docker’s amd64 emulation. To build from source:
+The image includes all three provider CLIs, git-sync, Qualgen, Assay’s released forge tools, ShellCheck, actionlint, Hadolint, zizmor and OSV-Scanner. Use an **amd64 Linux** runner or Docker’s amd64 emulation. To build from source:
 
 ```sh
 docker build --platform linux/amd64 -t assay-pr-agent .
@@ -201,6 +201,39 @@ In container setup, enter the project's trusted Go analysis workflow or job. Alt
 The worker looks up the report only when processing an authorized `/review`. It accepts a completed scan from a failed lint job, verifies the repository and analyzed source SHA, then imports new and worsened findings for changed paths. Findings inside the shown hunks share the existing Cursor prompt and token budget. The summary includes imported findings outside the hunks as well.
 
 If CI is still running or the report is missing, expired, unreadable, invalid or for a different head, the summary marks Go analysis as `could not check`. The rest of the review proceeds with the existing one-call ceiling. A new `/review` after CI finishes can pick up the report. Ordinary polls and CI completion never trigger a model call.
+
+### Hadolint, zizmor and OSV-Scanner
+
+On an authorized GitHub or GitLab `/review`, the reviewer selects non-deleted files by path. Hadolint checks Dockerfiles and Containerfiles, including names such as `Dockerfile.release` and `build.dockerfile`. Zizmor audits GitHub Actions workflow and action definition files, including those stored in GitLab repositories. OSV-Scanner checks recognized dependency files such as `go.mod`, `Cargo.lock`, `uv.lock`, `requirements.txt`, and `package-lock.json`. Findings are scoped to changed files and can include existing issues on unchanged lines in those files.
+
+The reviewer first looks for a completed producer at the reviewed **source commit**. The defaults work on both forges without additional reviewer configuration:
+
+| Tool | GitHub workflow | GitHub artifact / GitLab job | File inside artifact |
+|---|---|---|---|
+| Hadolint | `hadolint.yml` | `hadolint` | `hadolint.json` (Hadolint JSON) |
+| zizmor | `zizmor.yml` | `zizmor` | `zizmor.sarif` (SARIF 2.1.0) |
+| OSV-Scanner | `osv-scanner.yml` | `osv-scanner` | `osv-scanner.json` (OSV JSON) |
+
+Reuse an existing CI job by pointing `scanner_ci` in its project entry (`REVIEW_PROJECTS` or `projects.json`) at its native reports. For example, a GitHub project whose trusted workflow checks every Dockerfile can include:
+
+```json
+"scanner_ci": {
+  "hadolint": {
+    "producer": "lint.yml",
+    "artifact": "lint-results",
+    "report": "reports/hadolint.json",
+    "all_paths": true
+  }
+}
+```
+
+The GitHub reviewer App needs Actions read permission to retrieve artifacts. The GitLab reviewer token needs access to the target project’s CI jobs and artifacts. For GitLab, `producer` is the job name and `report` is the project-relative artifact path. GitHub reads the named artifact from the current workflow attempt. A `pull_request` workflow commonly checks out a synthetic merge commit even though the API reports the PR head. For non-push workflows, check out the source revision, run `git rev-parse HEAD > review-head.txt` in the same checkout as the scanner, and upload that file at the artifact root next to the native report. The reviewer compares it to the reviewed SHA. A missing or mismatched stamp triggers local fallback. GitLab verifies the target project, MR pipeline SHA and job commit. Configure producers whose scope and output you trust. The importer recognizes repository-relative paths and standard GitHub and GitLab checkout paths. Set `source_root` to the absolute CI checkout directory for custom runners.
+
+By default only paths evidenced in the native report get reused. For example, an empty Hadolint JSON array cannot tell the reviewer which files CI checked. Set `all_paths: true` only for a producer that checks **every applicable changed file** and reports scanner errors as job failures. A successful report from that producer can cover clean files. A failed producer only supplies paths with actual findings. Missing, stale, expired, malformed or incomplete evidence falls back per uncovered file.
+
+Local checks read regular Git blobs at the reviewed SHA. They run in temporary directories without forge or model credentials. OSV compares dependencies locally and caches public advisory databases in `/state/osv-db`. By default it can download or refresh those databases. To operate offline, prepopulate `/state/osv-db/osv-scalibr/<ecosystem>/all.zip` and set `REVIEW_OSV_DOWNLOAD_DATABASES=0` on the reviewer. An unavailable database, missing blob or timeout is reported as incomplete coverage. [OSV offline database guide](https://google.github.io/osv-scanner/usage/offline-mode/)
+
+The posted summary identifies CI versus local results. The JSON report includes the findings under `static_checks`. These three scanners contribute **zero model tokens**. Their output is outside the review prompt, token estimate and model cache key, including when the model review is skipped or fails.
 
 ### Qualgen history advisories
 

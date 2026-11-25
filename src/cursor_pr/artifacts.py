@@ -1,4 +1,4 @@
-"""Read an Assay report from the configured CI producer for one reviewed change."""
+"""Read size-limited reports from CI producers for one reviewed change."""
 import io
 import json
 import os
@@ -42,7 +42,7 @@ def download(client, url, headers):
     raise ReviewError("Too many artifact redirects")
 
 
-def github(client, repository, workflow, number, head, headers):
+def github(client, repository, workflow, number, head, headers, *, scanner=None):
     base = f"https://api.github.com/repos/{repository}/actions"
     response = client.get(f"{base}/workflows/{quote(workflow, safe='')}/runs",
                           params={"head_sha": head, "per_page": 1}, headers=headers)
@@ -56,24 +56,45 @@ def github(client, repository, workflow, number, head, headers):
     run_id = positive_id(run["id"])
     attempt = positive_id(run["run_attempt"])
     name = f"go-analysis-lint-{head}-{run_id}-{attempt}"
+    if scanner:
+        if run.get("conclusion") not in ("success", "failure"):
+            raise ReviewError("Scanner workflow did not finish normally")
+        name = scanner["artifact"].replace("{attempt}", str(attempt))
     response = client.get(f"{base}/runs/{run_id}/artifacts", params={"name": name}, headers=headers)
     response.raise_for_status()
     matches = [a for a in response.json()["artifacts"] if a["name"] == name and not a["expired"]]
     if len(matches) != 1:
         raise ReviewError("The current run has no unique unexpired report")
+    if scanner and attempt > 1 and "{attempt}" not in scanner["artifact"]:
+        response = client.get(f"{base}/runs/{run_id}/attempts/{attempt}", headers=headers)
+        response.raise_for_status()
+        start = response.json()["run_started_at"]
+        if not start or matches[0]["created_at"] < start:
+            raise ReviewError("Artifact predates this workflow attempt")
     artifact = positive_id(matches[0]["id"])
     data = download(client, f"{base}/artifacts/{artifact}/zip", headers)
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        entries = archive.infolist()
-        if (len(entries) != 1 or entries[0].filename != "report.json"
-                or entries[0].file_size > LIMIT or entries[0].flag_bits & 1
-                or entries[0].compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)):
+        if scanner:
+            # Actions pull_request runs advertise the source head even when checkout uses the merge ref.
+            if run.get("event") != "push" or "review-head.txt" in archive.namelist():
+                if report_member(archive, "review-head.txt").decode("ascii").strip() != head:
+                    raise ReviewError("Report did not scan the reviewed checkout")
+            return report_member(archive, scanner["report"]), run["conclusion"] == "success"
+        if len(archive.infolist()) != 1:
             raise ReviewError("Unexpected Go analysis archive")
-        with archive.open(entries[0]) as member:
-            return member.read(LIMIT + 1)
+        return report_member(archive, "report.json")
 
 
-def gitlab(client, base, repository, number, job, head, headers):
+def report_member(archive, name):
+    entries = [item for item in archive.infolist() if item.filename == name]
+    if (len(entries) != 1 or entries[0].file_size > LIMIT or entries[0].flag_bits & 1
+            or entries[0].compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)):
+        raise ReviewError("Missing or invalid report in CI archive")
+    with archive.open(entries[0]) as member:
+        return member.read(LIMIT + 1)
+
+
+def gitlab(client, base, repository, number, job, head, headers, *, scanner=None):
     base += "/projects/" + quote(repository, safe="")
     response = client.get(f"{base}/merge_requests/{number}", headers=headers)
     response.raise_for_status()
@@ -82,6 +103,8 @@ def gitlab(client, base, repository, number, job, head, headers):
     if (mr.get("sha") != head or not pipeline
             or positive_id(pipeline["project_id"]) != positive_id(mr["target_project_id"])):
         raise ReviewError("No target-project pipeline for this MR head")
+    if scanner and pipeline.get("sha") != head:
+        raise ReviewError("Pipeline is not for this source commit")
     pipeline_id = positive_id(pipeline["id"])
     # Pipelines can have hundreds of jobs. Never select an older retried job.
     page = 1
@@ -94,33 +117,42 @@ def gitlab(client, base, repository, number, job, head, headers):
                 if row["status"] not in ("success", "failed"):
                     raise ReviewError("The analysis job has not finished")
                 job_id = positive_id(row["id"])
+                if scanner:
+                    if row.get("commit", {}).get("id") != head:
+                        raise ReviewError("Job is not for this source commit")
+                    path = quote(scanner["report"], safe="/")
+                    return download(client, f"{base}/jobs/{job_id}/artifacts/{path}", headers), row["status"] == "success"
                 return download(client, f"{base}/jobs/{job_id}/artifacts/report.json", headers)
         if not response.headers.get("X-Next-Page") or page >= 20:
             raise ReviewError("The configured Go analysis job was not found")
         page += 1
 
 
+def fetch_report(url, producer, head, checkout, *, scanner=None):
+    target = urlsplit(url)
+    match = re.fullmatch(
+        r"/([\w.-]+/[\w.-]+)/(pull|-/merge_requests)/([1-9][0-9]*)", target.path)
+    if not match:
+        raise ReviewError("Invalid change URL")
+    slug, kind, number = match.groups()
+    provider = "github" if kind == "pull" else "gitlab"
+    base = "https://" + target.netloc + "/api/v4"
+    if (target.scheme != "https" or target.username is not None or target.query or target.fragment
+            or (provider == "github" and target.netloc != "github.com")
+            or (provider == "gitlab" and base != os.getenv("GITLAB_API_BASE", "").rstrip("/"))):
+        raise ReviewError("The analysis host does not match the configured forge")
+    token = reviewer_token(provider, slug, checkout)
+    with httpx.Client(timeout=15, follow_redirects=False) as client:
+        if provider == "github":
+            return github(client, slug, producer, number, head, {"Authorization": "Bearer " + token}, scanner=scanner)
+        return gitlab(client, base, slug, number, producer, head, {"PRIVATE-TOKEN": token}, scanner=scanner)
+
+
 def forge_go_report(url, producer, head, checkout):
     try:
-        target = urlsplit(url)
-        match = re.fullmatch(
-            r"/([\w.-]+/[\w.-]+)/(pull|-/merge_requests)/([1-9][0-9]*)", target.path)
-        if not match:
-            raise ReviewError("Invalid change URL")
-        slug, kind, number = match.groups()
-        provider = "github" if kind == "pull" else "gitlab"
-        base = "https://" + target.netloc + "/api/v4"
-        if (target.scheme != "https" or target.username is not None or target.query or target.fragment
-                or (provider == "github" and target.netloc != "github.com")
-                or (provider == "gitlab" and base != os.getenv("GITLAB_API_BASE", "").rstrip("/"))):
-            raise ReviewError("The analysis host does not match the configured forge")
-        token = reviewer_token(provider, slug, checkout)
-        with httpx.Client(timeout=15, follow_redirects=False) as client:
-            if provider == "github":
-                raw = github(client, slug, producer, number, head, {"Authorization": "Bearer " + token})
-            else:
-                raw = gitlab(client, base, slug, number, producer, head, {"PRIVATE-TOKEN": token})
-        return import_go_report(json.loads(raw), head, repository=slug)
+        raw = fetch_report(url, producer, head, checkout)
+        slug = urlsplit(url).path.strip("/").split("/")[:2]
+        return import_go_report(json.loads(raw), head, repository="/".join(slug))
     except ReviewError as error:
         reason = str(error)
     except httpx.HTTPStatusError as error:

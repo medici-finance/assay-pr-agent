@@ -13,6 +13,15 @@ RUN curl --fail --silent --show-error --location --retry 3 \
       https://github.com/medici-finance/assay/releases/download/v1.0.91/qualgen-linux-amd64 -o /usr/local/bin/qualgen \
     && echo '835d4188bc3d5f8d7c9ccc9ca49a3f907101a78c659020442e7783463f2b975f  /usr/local/bin/qualgen' | sha256sum -c - \
     && chmod 0755 /usr/local/bin/qualgen && qualgen --version
+RUN curl -fsSL --retry 3 https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-x86_64 -o /usr/local/bin/hadolint \
+    && echo 'c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507  /usr/local/bin/hadolint' | sha256sum -c - \
+    && curl -fsSL --retry 3 https://github.com/zizmorcore/zizmor/releases/download/v1.33.1/zizmor-x86_64-unknown-linux-gnu.tar.gz -o /tmp/zizmor.tgz \
+    && echo '3e6a301c7a820a2501915f5a9de8c0486da82bdec7965f068477538a98743d43  /tmp/zizmor.tgz' | sha256sum -c - \
+    && tar -xOzf /tmp/zizmor.tgz zizmor > /usr/local/bin/zizmor && rm /tmp/zizmor.tgz \
+    && curl -fsSL --retry 3 https://github.com/google/osv-scanner/releases/download/v2.7.1/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner \
+    && echo 'fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8  /usr/local/bin/osv-scanner' | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/hadolint /usr/local/bin/zizmor /usr/local/bin/osv-scanner \
+    && hadolint --version && zizmor --version && osv-scanner --version
 COPY --from=assay /usr/local/bin/deskmonitor /usr/local/bin/deskread /usr/local/bin/deskpost /usr/local/bin/desktoken /usr/local/bin/
 COPY --from=actionlint /usr/local/bin/actionlint /usr/local/bin/actionlint
 COPY --from=sync /git-sync /usr/local/bin/git-sync

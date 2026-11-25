@@ -67,6 +67,8 @@ def run_review(project, number, state):
             "--post", "--cache-dir", str(state / "cache")]
     if history.interval():
         argv.extend(["--qualgen-store", str(history.store_for(state, project))])
+    if project.scanner_ci:
+        argv.extend(["--scanner-ci", json.dumps(project.scanner_ci)])
     if project.go_analysis:
         argv.extend(["--go-analysis-producer", project.go_analysis])
     if os.getenv("REVIEW_MAX_INPUT_TOKENS"):
