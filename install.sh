@@ -24,5 +24,6 @@ if [ "$configure" = true ]; then
     docker compose run --rm --no-deps --service-ports setup
     docker compose up -d --force-recreate sync reviewer
 else
+    docker compose run --rm --no-deps setup login
     docker compose up -d sync reviewer
 fi

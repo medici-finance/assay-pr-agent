@@ -15,6 +15,7 @@ import threading
 from .config import load_config
 from .credentials import SETUP_INPUTS, forge_credentials
 from .discovery import poll_project
+from .login import auth_mode, ensure_session, login_directory
 from . import history, setup, providers
 
 log = logging.getLogger(__name__)
@@ -113,6 +114,8 @@ def cycle(projects, state, jobs, since, runner=run_review):
 def container_main():
     if sys.argv[1:2] == ["setup"]:
         return setup.main(sys.argv[2:])
+    if sys.argv[1:2] == ["login"]:
+        return setup.login_main(sys.argv[2:])
     if sys.argv[1:2] == ["sync"]:
         from .sync import main as sync
         return sync()
@@ -130,11 +133,17 @@ def main():
     with ExitStack() as stack:
         try:
             fresh = not any((state / p).exists() for p in ("setup", "projects.json", "hooks.json"))
-            if (fresh and sys.stdin.isatty() and "REVIEW_PROJECTS" not in os.environ
+            first_install = (fresh and sys.stdin.isatty() and "REVIEW_PROJECTS" not in os.environ
                     and not any(k in os.environ for k in SETUP_INPUTS)
-                    and not (Path.home() / ".config/assay/roster.env").exists()):
+                    and not (Path.home() / ".config/assay/roster.env").exists())
+            if first_install:
                 setup.configure(state)
             setup.apply_saved_setup(state)
+            backend = providers.provider()
+            if auth_mode(backend) == "login":
+                directory = login_directory(state)
+                ensure_session(backend, directory, interactive=first_install)
+                os.environ["REVIEW_LOGIN_DIR"] = str(directory)
             if args.interval is None:
                 args.interval = int(os.getenv("REVIEW_POLL_SECONDS", "120"))
             if args.interval < 1:
@@ -145,7 +154,7 @@ def main():
             projects = load_config(state)
             stack.enter_context(providers.cursor_account())
             stack.enter_context(forge_credentials(projects, state))
-        except (ValueError, KeyError, TypeError, EOFError, OSError) as err:
+        except (ValueError, KeyError, TypeError, EOFError, OSError, subprocess.TimeoutExpired) as err:
             parser.exit(2, f"Polling configuration: {err}\n")
         jobs = Jobs(state)
         since = {key: jobs.activated(key) for key in projects}

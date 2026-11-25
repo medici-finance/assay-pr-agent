@@ -8,8 +8,9 @@ services:
     profiles: [setup]
     command: [setup, --web]
     ports: ["127.0.0.1:8765:8765"]
-    volumes: ["state:/state", "repos:/repos:ro"]
+    volumes: ["state:/state", "repos:/repos:ro", "provider-login:/model-auth"]
     environment:
+      REVIEW_LOGIN_DIR: /model-auth
       REVIEW_SETUP_BIND: 0.0.0.0
   sync:
     <<: *reviewer
@@ -23,11 +24,14 @@ services:
     volumes: ["state:/state", "repos:/repos"]
   reviewer:
     <<: *reviewer
+    environment:
+      REVIEW_LOGIN_DIR: /model-auth
     restart: unless-stopped
-    volumes: ["state:/state", "repos:/repos:ro"]
+    volumes: ["state:/state", "repos:/repos:ro", "provider-login:/model-auth"]
     depends_on:
       sync:
         condition: service_healthy
 volumes:
+  provider-login:
   state:
   repos:

@@ -31,6 +31,19 @@ class InteractiveSetupTests(unittest.TestCase):
             with patch("cursor_pr.providers.team_command", return_value={"teams": []}):
                 setup.configure(self.state)
 
+    def test_new_cli_install_defaults_to_login_and_keeps_it_on_edit(self):
+        for backend in ("codex", "claude"):
+            with self.subTest(backend=backend):
+                self.state = self.root / backend
+                self.configure(self.project("gitlab") + ["owner:13", "", "", "", backend, "", "", "paste"],
+                               ["fixture-forge"])
+                config = json.loads((self.state/"setup/settings.json").read_text())
+                self.assertEqual(config["settings"]["REVIEW_AUTH_MODE"], "login")
+                self.assertEqual(set(config["secrets"]), {"REVIEW_GITLAB_TOKEN"})
+                self.configure(["y", "", "", "", "", "", "", "", "keep"])
+                edited = json.loads((self.state/"setup/settings.json").read_text())
+                self.assertEqual(edited, config)
+
     def test_both_forges_import_paste_and_external_mount(self):
         pem = self.root/"app.pem"
         pem.write_bytes(subprocess.check_output(["openssl","genrsa","2048"], stderr=subprocess.DEVNULL))
