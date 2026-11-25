@@ -101,6 +101,15 @@ button:hover {
 
 .actions {
   margin-top: 1.3rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: .7rem;
+}
+
+button.secondary {
+  background: #fff;
+  color: var(--green);
+  border: 1px solid var(--green);
 }
 
 button span {

@@ -1,7 +1,9 @@
 # pr-agent on Kubernetes with Flux
 
 This mirrors `compose.yaml`: one pod with the `setup`, `sync`, and `reviewer`
-containers sharing the `state`, `repos`, and `model-auth` volumes.
+containers sharing the `state`, `repos`, and `model-auth` volumes. Instead of
+compose's attachable manager, the `setup` container runs the browser wizard
+directly as a sidecar.
 
 ## Deploy
 
@@ -18,20 +20,41 @@ Change `sourceRef.name` in `k8s/flux.yaml` if your GitRepository is not named
 
 ## Configure
 
-Attach to the setup console and press **Enter**:
+The wizard exits after each session and the sidecar restarts it, so the setup
+port is always available. Each session generates a random **setup key** and
+prints it to the log. Read the current one:
 
 ```sh
-kubectl attach -it deploy/pr-agent
+kubectl -n pr-agent logs deploy/pr-agent -c setup | grep 'Setup key'
 ```
 
-It prints a one-time URL. In a second terminal, forward the setup port:
+In a second terminal, forward the setup port, open `http://127.0.0.1:8765/` in
+your browser and enter the key. The page keeps it in a session cookie; click
+**Print key to console** to have the current key printed to the log again. Keep
+the local port at `8765`; the wizard checks the `Host` header.
 
 ```sh
-kubectl port-forward svc/pr-agent 8765:8765
+kubectl port-forward -n pr-agent svc/pr-agent 8765:8765
 ```
 
-Open the printed URL in your browser. Keep the local port at `8765`; the
-wizard checks the `Host` header. Detach with **Ctrl-P**, **Ctrl-Q**.
+If you choose provider **login** (Cursor, Claude or Codex), the browser asks you
+to continue in the installer terminal when the provider CLI signs in:
+
+```sh
+kubectl attach -it -n pr-agent deploy/pr-agent -c setup
+```
+
+Finish the sign-in there and detach with **Ctrl-P**, **Ctrl-Q**. `sync` and
+`reviewer` wait for the first setup to complete and reload when the wizard saves
+a configuration.
+
+To change projects or credentials later, fetch the key from the log again. To
+switch the provider account, request a fresh sign-in and end the current session
+with **Quit setup** in the browser; the next session runs with `--reauth`:
+
+```sh
+kubectl exec -n pr-agent deploy/pr-agent -c setup -- touch /state/.reauth
+```
 
 ## Notes
 
@@ -44,8 +67,9 @@ wizard checks the `Host` header. Detach with **Ctrl-P**, **Ctrl-Q**.
 - The setup wizard writes credentials to `/state` and `/model-auth`. For
   environment-only credentials, see the Kubernetes Secret example in the main
   `README.md`.
-- The one-time setup URL is printed to the attached terminal and may appear in
-  container logs; treat it as a credential and restrict log access.
+- Each wizard session prints a random setup key to the `setup` container log.
+  It is valid until that session ends, so treat container logs as a credential
+  and restrict log access.
 - The compose `sync` healthcheck is intentionally not a Kubernetes readiness
   probe: it would mark the pod not-ready before setup completes and block the
   setup Service.

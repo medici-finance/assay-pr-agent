@@ -84,20 +84,49 @@ else:
             child = subprocess.Popen(["cursor-review-container", "setup", "--web", "--state-dir", tmp],
                                      stdout=subprocess.PIPE, text=True)
             try:
-                link = child.stdout.readline().strip().split()[1]
-                bearer = {"Authorization": "Bearer " + link.split("#")[1]}
-                def request(method="GET", headers=None, body=None):
+                # The console prints a fresh random key per wizard session; the URL carries nothing.
+                def read_line():
+                    line = child.stdout.readline()
+                    self.assertTrue(line, "installer exited before printing the setup key")
+                    return line.strip()
+                first = read_line()
+                while not first.startswith("Setup key: "):  # the build banner is printed first
+                    first = read_line()
+                key = first.split(": ", 1)[1]
+                self.assertRegex(key, r"^[A-Za-z0-9_-]{43}$")  # secrets.token_urlsafe(32)
+                second = child.stdout.readline().strip()
+                self.assertIn("http://127.0.0.1:8765/", second)
+
+                def request(method="GET", path="/step", headers=None, body=None):
                     conn = http.client.HTTPConnection("127.0.0.1", 8765, timeout=5)
                     try:
-                        conn.request(method, "/step", headers=headers or {}, body=body)
+                        conn.request(method, path, headers=headers or {}, body=body)
                         res = conn.getresponse()
-                        return res.status, res.read()
+                        return res.status, res.read(), res.getheader("Set-Cookie")
                     finally:
                         conn.close()
-                self.assertEqual(request()[0], 403)
-                self.assertEqual(request(headers={**bearer, "Host": "other.invalid"})[0], 403)
+
+                origin = {"Origin": "http://127.0.0.1:8765", "Content-Type": "application/json"}
+                # Without the cookie the page is asked for the console key; wrong Host is refused outright.
+                self.assertEqual(request()[0], 401)
+                self.assertEqual(request(headers={"Cookie": "pr_agent_setup=" + key, "Host": "other.invalid"})[0], 403)
+                self.assertEqual(request("POST", "/login", {**origin, "Origin": "http://other.invalid"},
+                                         json.dumps({"key": key}))[0], 403)
+                self.assertEqual(request("POST", "/login", origin, json.dumps({"key": "wrong"}))[0], 401)
+                status, _, issued = request("POST", "/login", origin, json.dumps({"key": key}))
+                self.assertEqual(status, 200)
+                self.assertTrue(issued.startswith("pr_agent_setup=" + key + ";"), issued)
+                self.assertIn("HttpOnly", issued)
+                self.assertIn("SameSite=Strict", issued)
+                auth = {"Cookie": issued.split(";")[0]}
+                # The page can ask the console to print the key again, at most once per interval.
+                self.assertEqual(request("POST", "/print-key", headers={"Origin": "http://other.invalid"})[0], 403)
+                self.assertEqual(request("POST", "/print-key", headers={"Origin": "http://127.0.0.1:8765"})[0], 204)
+                self.assertEqual(child.stdout.readline().strip(), first)
+                self.assertEqual(child.stdout.readline().strip(), second)
+                self.assertEqual(request("POST", "/print-key", headers={"Origin": "http://127.0.0.1:8765"})[0], 429)
                 for _ in range(50):
-                    status, body = request(headers=bearer)
+                    status, body, _ = request(headers=auth)
                     self.assertEqual(status, 200)
                     view = json.loads(body)
                     if view["status"] == "question":
@@ -105,19 +134,18 @@ else:
                     time.sleep(0.02)
                 self.assertEqual(view["status"], "question")
                 answer = json.dumps({"id": view["id"], "answer": "gitlab"})
-                headers = {**bearer, "Content-Type": "application/json", "Origin": "http://other.invalid"}
-                self.assertEqual(request("POST", headers, answer)[0], 403)
-                headers["Origin"] = "http://127.0.0.1:8765"
-                self.assertEqual(request("POST", headers, answer)[0], 200)
-                self.assertEqual(request("POST", headers, answer)[0], 409)
+                headers = {**auth, **origin}
+                self.assertEqual(request("POST", "/step", {**headers, "Origin": "http://other.invalid"}, answer)[0], 403)
+                self.assertEqual(request("POST", "/step", headers, answer)[0], 200)
+                self.assertEqual(request("POST", "/step", headers, answer)[0], 409)
                 for _ in range(50):
-                    current = json.loads(request(headers=bearer)[1])
+                    current = json.loads(request(headers=auth)[1])
                     if current["status"] == "question":
                         break
                     time.sleep(0.02)
                 quit_step = json.dumps({"action": "quit", "id": current["id"]})
-                self.assertEqual(request("POST", headers, json.dumps({"action": "quit", "id": view["id"]}))[0], 409)
-                self.assertEqual(request("POST", headers, quit_step)[0], 200)
+                self.assertEqual(request("POST", "/step", headers, json.dumps({"action": "quit", "id": view["id"]}))[0], 409)
+                self.assertEqual(request("POST", "/step", headers, quit_step)[0], 200)
                 self.assertEqual(child.wait(timeout=5), 0)
                 self.assertFalse((Path(tmp) / "setup").exists())
             finally:
