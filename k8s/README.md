@@ -35,8 +35,8 @@ wizard checks the `Host` header. Detach with **Ctrl-P**, **Ctrl-Q**.
 
 ## Notes
 
-- Image: `ghcr.io/medici-finance/assay-pr-agent:main` (linux/amd64). Pin a
-  digest or `sha-<commit>` tag for reproducible deployments.
+- Image: `ghcr.io/medici-finance/assay-pr-agent:main` (linux/amd64); `latest` is an
+  alias of `main`. Pin a digest or `sha-<commit>` tag for reproducible deployments.
 - If the GHCR package is private, uncomment `imagePullSecrets` and create the
   pull secret.
 - The three PVCs are `ReadWriteOnce`; the Deployment uses one replica and the

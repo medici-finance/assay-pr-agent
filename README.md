@@ -75,6 +75,8 @@ The image includes all three provider CLIs, git-sync, Qualgen, Assay’s release
 docker build --platform linux/amd64 -t assay-pr-agent .
 ```
 
+Add `--build-arg REVIEW_BUILD_SHA=$(git rev-parse HEAD)` to have a local image report its commit; otherwise the startup banner shows `commit unknown` and the build time.
+
 ### Interactive setup
 
 Run the setup command once with a writable state volume and your checkouts mounted at the paths the reviewer will use:
@@ -173,7 +175,7 @@ On an unconfigured interactive first start, the container runs setup before poll
 
 ### Container CI
 
-Pushes to `main` or any Git tag build the linux/amd64 image, run the test suite inside it with networking disabled and publish the tested image. GitHub publishes to `ghcr.io/medici-finance/assay-pr-agent`; GitLab uses the project's container registry. Every build gets a `sha-<commit>` tag plus `main` or the Git tag. Reserved or registry-incompatible Git tags map to `git-ref-<hash>`.
+Pushes to `main` or any Git tag build the linux/amd64 image, run the test suite inside it with networking disabled and publish the tested image. GitHub publishes to `ghcr.io/medici-finance/assay-pr-agent`; GitLab uses the project's container registry. Every build gets a `sha-<commit>` tag plus `main` and `latest` for the default branch, or the Git tag. Reserved or registry-incompatible Git tags map to `git-ref-<hash>`. The commit, tags and build time are baked into the image, and the container prints them as its first line at startup.
 
 Set the GitHub Actions repository variable `CONTAINER_RUNNER` to a Docker-capable Linux x64 runner label registered for this repository. The default is `ubuntu-latest`. GitLab uses its available untagged runners; the included Docker-in-Docker job requires a runner configured for privileged DinD with its TLS client certificate volume shared. Neither pipeline uses a Cursor API key.
 
