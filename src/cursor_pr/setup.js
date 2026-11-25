@@ -103,8 +103,8 @@ async function load() {
   if (view.label.startsWith("Review provider (")) label.textContent = "Which CLI should review changes?";
   if (view.label.startsWith("Authentication method")) message.textContent = "For CLI sign-in, follow the provider’s instructions in the attached installer terminal.";
   if (view.label.startsWith("Checkout path")) message.textContent = "Leave this blank to let the sync container maintain a checkout.";
-  if (view.label.startsWith("Human requester")) message.textContent = "Only these accounts can trigger a paid review. Use the numeric user IDs from your GitHub or GitLab profiles.";
-  if (view.label.startsWith("Responsible human")) message.textContent = "Enter the operator’s forge username and numeric ID, for example alice:12345.";
+  if (view.label.startsWith("Human requester")) message.textContent = "Only these accounts can trigger a paid review. Enter GitHub or GitLab usernames (or numeric IDs); the installer looks the IDs up on the forge.";
+  if (view.label.startsWith("Responsible human")) message.textContent = "Enter the operator’s forge username, or username:numeric ID, for example alice or alice:12345.";
   const prior = view.label.match(/\[([^\]]+)\]:?$/)?.[1];
   if (options.includes(prior)) choices.value = prior;
   choices.hidden = !items.length;

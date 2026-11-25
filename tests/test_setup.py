@@ -23,8 +23,8 @@ class InteractiveSetupTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def project(self, provider, again="n", producer=""):
-        return [provider] + ([""] if provider == "gitlab" else []) + [f"https://{provider}.com/org/{provider}", str(self.checkout), "13,27", "public", producer, again]
+    def project(self, provider, again="n", producer="", requesters="13,27"):
+        return [provider] + ([""] if provider == "gitlab" else []) + [f"https://{provider}.com/org/{provider}", str(self.checkout), requesters, "public", producer, again]
 
     def configure(self, answers, secrets=()):
         with patch("builtins.input", side_effect=[*answers, "", ""]), patch.object(setup, "hidden", side_effect=secrets):
@@ -76,6 +76,30 @@ class InteractiveSetupTests(unittest.TestCase):
             runtime = Path(os.environ["ASSAY_CONFIG_HOME"])
             self.assertEqual((runtime/"gitlab-reviewer.token").read_text().strip(),"rotated-fixture")
             self.assertEqual((runtime/"reviewer-app.pem").read_bytes(),(config/"github.pem").read_bytes())
+
+    def test_usernames_are_stored_as_numeric_ids(self):
+        from cursor_pr import accounts
+        pem = subprocess.check_output(["openssl", "genrsa", "2048"], stderr=subprocess.DEVNULL).decode()
+        with patch.object(accounts, "github_id", return_value=13) as github:
+            self.configure(self.project("github", requesters="alice,27")
+                           + ["owner", "41", "42", "", "", "", "codex", "", "", "paste"], [pem])
+        self.assertEqual([c.args for c in github.call_args_list], [("alice",), ("owner",)])
+        config = json.loads((self.state/"setup/settings.json").read_text())
+        self.assertEqual(config["projects"][0]["requester_ids"], [13, 27])
+        self.assertEqual(config["settings"]["REVIEW_OPERATOR"], "owner:13")
+
+    def test_gitlab_usernames_resolve_after_the_reviewer_token_is_pasted(self):
+        from cursor_pr import accounts
+        with patch.object(accounts, "gitlab_id", return_value=13) as gitlab:
+            self.configure(self.project("gitlab", requesters="alice") + ["owner", "", "", "", "codex", "", "", "paste"],
+                           ["fixture-forge"])
+        self.assertEqual([c.args for c in gitlab.call_args_list],
+                         [("alice", "https://gitlab.com", "fixture-forge"), ("owner", "https://gitlab.com", "fixture-forge")])
+        config = json.loads((self.state/"setup/settings.json").read_text())
+        self.assertEqual(config["projects"][0]["requester_ids"], [13])
+        self.assertEqual(config["settings"]["REVIEW_OPERATOR"], "owner:13")
+        setup.apply_saved_setup(self.state)
+        self.assertEqual(load_config(self.state).popitem()[1].requesters, frozenset({13}))
 
     def test_cancel_and_reconfigure_keep_active_setup_and_env_precedence(self):
         initial = self.project("gitlab")+["owner:13","","","","","","api-key","paste","paste"]

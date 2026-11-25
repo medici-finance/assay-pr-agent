@@ -61,7 +61,7 @@ In `REVIEW_PROJECTS`, use `"managed": true` in place of a checkout path for a ma
 
 ## Request a review in a PR or MR
 
-Post a new comment containing just `/review` on an open GitHub PR or GitLab MR. The service polls the configured projects every two minutes by default. It accepts new requests from the numeric human account IDs you configure and posts the result on the reviewed head. A poll uses zero model tokens. Requests run one at a time with the existing prompt budget and cache.
+Post a new comment containing just `/review` on an open GitHub PR or GitLab MR. The service polls the configured projects every two minutes by default. It accepts new requests from the human accounts you configure and posts the result on the reviewed head. Setup takes GitHub or GitLab usernames and stores their numeric account IDs. A poll uses zero model tokens. Requests run one at a time with the existing prompt budget and cache.
 
 Assay’s `deskmonitor pr` supplies the open change numbers. Batched `deskread comments --change` calls read their conversations on every cycle, including changes with no new commits. The poller skips old commands, edits detectable from the forge timestamps, bot responses and ordinary messages. For GitLab, Assay v1.0.94 omits the internal-note flag. Only an otherwise eligible command gets a single [GitLab note lookup](https://docs.gitlab.com/api/notes/#retrieve-a-merge-request-note), using the existing Assay reviewer credential and instance. Internal and system notes cannot start a review.
 
@@ -86,7 +86,7 @@ docker run --rm -it --platform linux/amd64 \
   -v review-state:/state -v /path/to/checkouts:/repos:ro assay-pr-agent setup
 ```
 
-Enter the projects, checkout paths inside the container, visibility, numeric IDs allowed to request reviews, and the responsible operator’s `login:numeric-id`. Setup asks for the selected authentication method and credentials for the forges you selected. For GitHub, have the App ID, installation ID and private PEM ready. For GitLab, have the reviewer token ready. You can accept the defaults of 120 seconds between polls, 6,000 estimated input tokens per review and the selected CLI’s default model.
+Enter the projects, checkout paths inside the container, visibility, the GitHub or GitLab usernames (or numeric IDs) allowed to request reviews, and the responsible operator’s username. Setup looks the numeric account IDs up on the forge; GitLab lookups use the reviewer token. With both forges configured, enter the operator as `username:numeric-id`. Setup asks for the selected authentication method and credentials for the forges you selected. For GitHub, have the App ID, installation ID and private PEM ready. For GitLab, have the reviewer token ready. You can accept the defaults of 120 seconds between polls, 6,000 estimated input tokens per review and the selected CLI’s default model.
 
 For each credential, choose **paste** to enter it with terminal echo disabled, **import** to copy a readable file into the volume, or **mount** to keep using an external file. For import or mount, add the source volume to the setup command (for example, `-v /path/to/secrets:/run/secrets:ro`) and enter the file’s absolute path **inside** the container. With **mount**, provide the same file path when running the service. With **import**, the source mount is only needed during setup.
 
@@ -108,7 +108,7 @@ Mount the checkout for each project read-only and a writable volume at `/state` 
 | Docker setting | What to supply |
 |---|---|
 | `CURSOR_API_KEY` | Cursor API key for headless inference. |
-| `REVIEW_OPERATOR` | The responsible human’s forge `login:numeric-id`. Assay uses this for posting attribution. The project’s `requester_ids` separately control who can request reviews. |
+| `REVIEW_OPERATOR` | The responsible human’s forge `login:numeric-id` (the setup wizard also accepts a bare username and looks up the ID). Assay uses this for posting attribution. The project’s `requester_ids` separately control who can request reviews. |
 | `REVIEW_GITHUB_APP_ID`, `REVIEW_GITHUB_INSTALLATION_ID` | Numeric IDs for the GitHub App and the installation covering your repositories. Use a reviewer installation with access to read PRs and diffs and write PR conversation comments. |
 | `REVIEW_GITHUB_PRIVATE_KEY` **or** `REVIEW_GITHUB_PRIVATE_KEY_FILE` | The App’s unencrypted RSA PEM or an absolute path to the mounted PEM. The value accepts actual line breaks or literal `\n`. |
 | `REVIEW_GITLAB_TOKEN` **or** `REVIEW_GITLAB_TOKEN_FILE` | A dedicated GitLab reviewer token with API permission to read MRs and post notes, or an absolute path to the mounted token. |

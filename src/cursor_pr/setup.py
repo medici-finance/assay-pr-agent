@@ -13,10 +13,10 @@ import termios
 from urllib.parse import urlsplit
 import uuid
 
-from . import dialog, providers, provision, gitlab_tls
+from . import accounts, dialog, providers, provision, gitlab_tls
 from .login import auth_mode, ensure_session, login_directory, login_env
 from .config import parse_projects, project_base, prompt_config
-from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secret, validate_operator, validate_pem, validate_token
+from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secret, validate_pem, validate_token
 
 CURSOR = "CURSOR_API_KEY"
 SECRETS = {CURSOR: "cursor.key", "ANTHROPIC_API_KEY": "claude.key", "CODEX_API_KEY": "codex.key", KEY: "github.pem", TOKEN: "gitlab.token", **gitlab_tls.NAMES}
@@ -212,7 +212,8 @@ def project_rows(default_gitlab=None):
 
 
 def validate_rows(rows):
-    projects = parse_projects(rows).values()
+    # Usernames are resolved to account IDs once the forge credentials are known.
+    projects = parse_projects(accounts.shape(rows)).values()
     if any(urlsplit(p.url).netloc != "github.com" for p in projects if p.provider == "github"):
         raise ValueError("GitHub projects must be on github.com")
     if len(gitlab_instances(rows)) > 1:
@@ -278,7 +279,7 @@ def configure_locked(state, force_login):
         rows = prev["projects"]
     if rows is None:
         rows = retry(project_rows)
-    projects = parse_projects(rows)
+    projects = parse_projects(accounts.shape(rows))
     forges = {p.provider for p in projects.values()}
     previous = prev.get("settings", {})
     settings = {}
@@ -286,7 +287,8 @@ def configure_locked(state, force_login):
     def setting(name, label, validate, default=""):
         settings[name] = retry(lambda: validate(ask(label, previous.get(name, default))))
 
-    setting("REVIEW_OPERATOR", "Responsible human (forge login:numeric-id)", validate_operator)
+    setting("REVIEW_OPERATOR", "Responsible human (forge username or username:numeric-id)",
+            lambda value: accounts.resolve_operator(value, forges))
     create = set()
     if session:
         for forge in sorted(forges):
@@ -397,6 +399,16 @@ def configure_locked(state, force_login):
             private_file(bundle / SECRETS[TOKEN], token)
             pending.append(path)
             secrets[TOKEN] = SECRETS[TOKEN]
+        if "gitlab" in forges:
+            # GitLab username lookups need the reviewer token, which only exists now.
+            token = accounts.saved_token() or (bundle / secrets[TOKEN]).read_text().strip()
+            verify = gitlab_tls.context(bundle)
+            rows = accounts.resolve(rows, token=token, verify=verify, notice=print)
+            settings["REVIEW_OPERATOR"] = accounts.resolve_operator(
+                settings["REVIEW_OPERATOR"], forges, base=next(iter(gitlab_instances(rows))), token=token, verify=verify)
+        if accounts.pending(rows):
+            raise ValueError("GitLab usernames need the reviewer token; enter numeric IDs for: " + ", ".join(accounts.pending(rows)))
+        projects = parse_projects(rows)
         private_file(bundle / "settings.json", json.dumps(
             {"projects": rows, "settings": settings, "secrets": secrets}, indent=2))
         with locked(state, fcntl.LOCK_EX):
