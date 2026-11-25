@@ -27,7 +27,7 @@ async function load() {
   }
   if (view.status !== "question") {
     form.hidden = true; message.textContent = view.status === "complete"
-      ? "Configuration saved. Start or restart the reviewer to use these settings." : view.label;
+      ? "Configuration saved. Return to the installer terminal to finish setup." : view.label;
     return;
   }
   step = view; label.textContent = view.label; label.htmlFor = view.multiline ? "multi" : "answer";
@@ -35,11 +35,13 @@ async function load() {
   multi.hidden = !view.multiline; answer.hidden = view.multiline; answer.type = view.secret ? "password" : "text";
   const options = view.label.startsWith("Forge (") ? ["github","gitlab"] :
     view.label.startsWith("Review provider (") ? ["cursor","claude","codex"] :
+    view.label.startsWith("Authentication method") ? ["login","api-key"] :
     view.label.startsWith("Project visibility") ? ["private","internal","public"] : [];
-  const items = view.choices || options.map(value => ({value, label: {github:"GitHub",gitlab:"GitLab",cursor:"Cursor",claude:"Claude",codex:"Codex"}[value] || value}));
+  const items = view.choices || options.map(value => ({value, label: {github:"GitHub",gitlab:"GitLab",cursor:"Cursor",claude:"Claude",codex:"Codex",login:"Sign in with the CLI", "api-key":"Provide an API key"}[value] || value}));
   choices.replaceChildren(...items.map(item => new Option(item.label, item.value)));
   if (view.label.startsWith("Forge (")) label.textContent = "Where is your repository hosted?";
   if (view.label.startsWith("Review provider (")) label.textContent = "Which CLI should review changes?";
+  if (view.label.startsWith("Authentication method")) message.textContent = "After saving, return to the installer terminal to finish CLI sign-in.";
   if (view.label.startsWith("Checkout path")) message.textContent = "Leave this blank to let the sync container maintain a checkout.";
   if (view.label.startsWith("Human requester")) message.textContent = "Only these accounts can trigger a paid review. Use the numeric user IDs from your GitHub or GitLab profiles.";
   if (view.label.startsWith("Responsible human")) message.textContent = "Enter the operator’s forge username and numeric ID, for example alice:12345.";

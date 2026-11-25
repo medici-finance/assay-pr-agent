@@ -16,6 +16,8 @@ import yaml
 from unidiff import PatchSet
 
 from .source import ReviewError
+from .login import auth_mode, login_directory, login_env
+from .setup import state_dir
 from .providers import KEYS, LABELS, provider
 
 VERSION = "1"
@@ -130,13 +132,17 @@ def invoke(prompt, model, anchors):
             argv = [executable, "-p", "--mode=ask", "--output-format", "json", "--trust"]
         else:
             env.update(HOME=workspace, XDG_CONFIG_HOME=workspace)
-            if not env.get(KEYS[backend]):
+            use_login = auth_mode(backend) == "login"
+            if use_login:
+                env = login_env(backend, login_directory(state_dir()))
+            elif not env.get(KEYS[backend]):
                 raise CursorFailure(f"Set {KEYS[backend]} for {label}", 0)
             if backend == "claude":
-                argv = [executable, "-p", "--bare", "--output-format", "json", "--tools", "",
+                argv = [executable, "-p", "--safe-mode" if use_login else "--bare", "--output-format", "json", "--tools", "",
                         "--strict-mcp-config", "--no-session-persistence", "--max-turns", "1"]
             else:
-                env["CODEX_HOME"] = workspace
+                if not use_login:
+                    env["CODEX_HOME"] = workspace
                 argv = [executable, "exec", "--json", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only",
                         "--ignore-user-config", "--ignore-rules", "--disable", "shell_tool",
                         "--disable", "unified_exec", "--disable", "multi_agent", "--disable", "apps",

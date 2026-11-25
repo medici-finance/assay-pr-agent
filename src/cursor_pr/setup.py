@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import termios
@@ -13,13 +14,14 @@ from urllib.parse import urlsplit
 import uuid
 
 from . import dialog, providers
+from .login import auth_mode, ensure_session, login_directory
 from .config import parse_projects, prompt_config
 from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secret, validate_operator, validate_pem, validate_token
 
 CURSOR = "CURSOR_API_KEY"
 SECRETS = {CURSOR: "cursor.key", "ANTHROPIC_API_KEY": "claude.key", "CODEX_API_KEY": "codex.key", KEY: "github.pem", TOKEN: "gitlab.token"}
 SETTINGS = ("REVIEW_OPERATOR", APP_ID, INSTALL_ID, "REVIEW_MODEL", "REVIEW_MAX_INPUT_TOKENS",
-            "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER", "REVIEW_CURSOR_TEAM_ID")
+            "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER", "REVIEW_CURSOR_TEAM_ID", "REVIEW_AUTH_MODE")
 
 
 def state_dir():
@@ -62,7 +64,7 @@ def load_provider_key(selected):
 def apply_saved_setup(state, *, sync_only=False):
     """Snapshot one complete setup; explicitly supplied container settings win."""
     if not (state / "setup").is_symlink():
-        if not sync_only:
+        if not sync_only and auth_mode(providers.provider()) == "api-key":
             load_provider_key(providers.provider())
         return
     with locked(state, fcntl.LOCK_SH):
@@ -73,14 +75,17 @@ def apply_saved_setup(state, *, sync_only=False):
         effective = json.loads(os.getenv("REVIEW_PROJECTS", values["REVIEW_PROJECTS"]))
         forges = {row["provider"] for row in effective}
         selected = providers.provider(os.environ.get("REVIEW_PROVIDER", values.get("REVIEW_PROVIDER", "cursor")))
-        if not sync_only:
+        if selected != values.get("REVIEW_PROVIDER", "cursor"):
+            values.pop("REVIEW_AUTH_MODE", None)
+        mode = auth_mode(selected, os.getenv("REVIEW_AUTH_MODE", values.get("REVIEW_AUTH_MODE", "api-key")))
+        if not sync_only and mode == "api-key":
             load_provider_key(selected)
         for name, location in config["secrets"].items():
             if name not in SECRETS:
                 raise ValueError("Unknown credential in saved setup")
             if name in os.environ or name + "_FILE" in os.environ:
                 continue
-            if name in providers.KEYS.values() and (sync_only or name != providers.KEYS[selected]):
+            if name in providers.KEYS.values() and (sync_only or mode == "login" or name != providers.KEYS[selected]):
                 continue
             if name == KEY and "github" not in forges:
                 continue
@@ -239,11 +244,20 @@ def configure(state):
                 previous.get("REVIEW_MODEL", "auto") if backend == previous.get("REVIEW_PROVIDER", "cursor") else "auto")
     if model != "auto":
         settings["REVIEW_MODEL"] = model
+    mode = "api-key"
+    if backend in ("claude", "codex"):
+        default = "login"
+        if backend == previous.get("REVIEW_PROVIDER"):
+            default = previous.get("REVIEW_AUTH_MODE", "api-key")
+        mode = retry(lambda: auth_mode(backend, ask("Authentication method (login/api-key)", default)))
+        settings["REVIEW_AUTH_MODE"] = mode
     bundle = Path(tempfile.mkdtemp(dir=state, prefix=".review-setup-"))
     link = state / (".setup-link-" + uuid.uuid4().hex)
     committed = False
     try:
-        required = {providers.KEYS[backend]: providers.LABELS[backend] + " API key"}
+        required = {}
+        if mode == "api-key":
+            required[providers.KEYS[backend]] = providers.LABELS[backend] + " API key"
         if "github" in forges:
             required[KEY] = "GitHub App PEM"
         if "gitlab" in forges:
@@ -278,19 +292,48 @@ def configure(state):
           "Start or restart the reviewer using this state volume.")
 
 
+def check_login(state, *, interactive=False, force=False):
+    # The login subprocess needs only the selected provider and the mode, never forge secrets.
+    settings = {}
+    if (state / "setup").is_symlink():
+        with locked(state, fcntl.LOCK_SH):
+            settings = json.loads((active_bundle(state) / "settings.json").read_text())["settings"]
+    saved = settings.get("REVIEW_PROVIDER", "cursor")
+    backend = providers.provider(os.getenv("REVIEW_PROVIDER", saved))
+    default = settings.get("REVIEW_AUTH_MODE", "api-key") if backend == saved else "api-key"
+    if auth_mode(backend, os.getenv("REVIEW_AUTH_MODE", default)) == "login":
+        ensure_session(backend, login_directory(state), interactive=interactive, force=force)
+
+
+def login_main(argv=None):
+    parser = argparse.ArgumentParser(description="Sign in with the configured provider CLI")
+    parser.add_argument("--state-dir", type=Path, default=state_dir())
+    parser.add_argument("--force", action="store_true", help="Sign in again even if the current session is valid")
+    args = parser.parse_args(argv)
+    try:
+        check_login(args.state_dir.resolve(), interactive=True, force=args.force)
+    except (ValueError, OSError, subprocess.TimeoutExpired) as err:
+        parser.exit(2, f"Provider login: {err}\n")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Configure projects, credentials and review costs interactively")
     parser.add_argument("--state-dir", type=Path, default=state_dir())
     parser.add_argument("--web", action="store_true", help="Open the local browser wizard")
     args = parser.parse_args(argv)
-    if args.web:
-        from .web_setup import serve
-        return serve(args.state_dir.resolve())
-    if not sys.stdin.isatty():
-        parser.exit(2, "Setup needs an interactive terminal. Use docker run -it or docker exec -it.\n")
+    state = args.state_dir.resolve()
     try:
-        configure(args.state_dir.resolve())
+        if args.web:
+            from .web_setup import serve
+            result = serve(state)
+            if result:
+                return result
+        else:
+            if not sys.stdin.isatty():
+                parser.exit(2, "Setup needs an interactive terminal. Use docker run -it or docker exec -it.\n")
+            configure(state)
+        check_login(state, interactive=True)
     except (KeyboardInterrupt, EOFError):
         parser.exit(1, "\nSetup cancelled.\n")
-    except (ValueError, OSError) as err:
+    except (ValueError, OSError, subprocess.TimeoutExpired) as err:
         parser.exit(2, f"Setup failed: {err}\n")

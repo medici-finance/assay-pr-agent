@@ -11,6 +11,7 @@ from unidiff.errors import UnidiffParseError
 import yaml
 
 from . import history, providers
+from .login import auth_mode
 from .setup import apply_saved_setup, load_provider_key, state_dir
 from .config import load_config, project_from
 from .credentials import forge_credentials, standalone_requested
@@ -180,7 +181,7 @@ def main():
             state = state_dir().resolve()
             if args.change and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
                 apply_saved_setup(state)
-            elif not args.change:
+            elif not args.change and auth_mode(providers.provider()) == "api-key":
                 load_provider_key(providers.provider())
             if not args.estimate and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
                 stack.enter_context(providers.cursor_account())
