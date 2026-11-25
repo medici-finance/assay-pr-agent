@@ -46,7 +46,9 @@ def manifest(owner, personal):
     return state, {
         "action": f"https://github.com{prefix}/settings/apps/new?state={state}",
         "manifest": {"url": "https://github.com/medici-finance/assay-pr-agent",
-                     "redirect_url": CALLBACK, "public": False, "hook_attributes": {"active": False},
+                     "redirect_url": CALLBACK, "public": False,
+                     # GitHub rejects the manifest without a webhook URL, even inactive.
+                     "hook_attributes": {"url": "https://github.com/medici-finance/assay-pr-agent", "active": False},
                      "default_events": [], "default_permissions": {
                          "contents": "read", "pull_requests": "write", "actions": "read"}},
     }

@@ -8,7 +8,7 @@ import sys
 import tempfile
 from urllib.parse import urlsplit
 
-from .dialog import prompt
+from .dialog import notice, prompt
 from .scanners import ci_config
 
 
@@ -102,6 +102,7 @@ def project_from(row):
 
 
 def prompt_config(*, visibility=False, default_gitlab=None):
+    from .accounts import lookup, requester_id
     rows = []
     while True:
         provider = prompt("Forge (github/gitlab): ").strip().lower()
@@ -115,7 +116,14 @@ def prompt_config(*, visibility=False, default_gitlab=None):
         else:
             url = prompt("Full HTTPS project URL: ").strip()
         checkout = prompt("Checkout path inside container (Enter to sync automatically): ").strip()
-        ids = [int(x.strip()) for x in prompt("Human requester numeric IDs (comma-separated): ").split(",")]
+        while True:
+            try:
+                ids = [lookup(provider, requester_id(x), base=base or None, notice=notice)
+                       for x in prompt("Human requester usernames or numeric IDs (comma-separated): ").split(",")]
+            except ValueError as err:
+                notice(err)
+            else:
+                break
         rows.append(dict(provider=provider, url=url, checkout=checkout, requester_ids=ids))
         if base:
             rows[-1]["gitlab_base"] = base
@@ -153,7 +161,10 @@ def load_config(state):
         rows = json.loads((path if path.exists() else legacy).read_text())["projects"]
         save = not path.exists()
     elif sys.stdin.isatty():
-        rows = prompt_config()["projects"]
+        from . import accounts
+        rows = accounts.resolve(prompt_config()["projects"], token=accounts.saved_token(), notice=notice)
+        if accounts.pending(rows):
+            raise ValueError("Looking up GitLab usernames needs REVIEW_GITLAB_TOKEN; enter numeric IDs instead")
         save = True
     else:
         raise ValueError("Run cursor-review-setup with a TTY or set REVIEW_PROJECTS")
