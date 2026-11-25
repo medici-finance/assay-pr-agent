@@ -35,5 +35,15 @@ RUN uv sync --frozen --no-dev --no-editable && useradd --create-home --uid 10001
 ENV DESK_LOOP=pr-review-desk DESK_TOOLS_BIN=/usr/local/bin HOME=/home/reviewer PATH=/opt/model-clis/node_modules/.bin:/opt/reviewer/.venv/bin:/home/reviewer/.local/bin:$PATH REVIEW_STATE_DIR=/state
 USER reviewer
 RUN curl -fsSL https://cursor.com/install -o /tmp/install-cursor.sh && bash /tmp/install-cursor.sh && rm /tmp/install-cursor.sh && cursor-agent --version && claude --version && codex --version && git-sync --version
+# Build record written by ci/publish-image.sh; local builds fall back to the build time.
+USER root
+ARG REVIEW_BUILD_SHA=
+ARG REVIEW_BUILD_TAGS=
+ARG REVIEW_BUILD_TIMESTAMP=
+RUN printf '{"sha":"%s","tags":"%s","built_at":"%s"}\n' \
+        "${REVIEW_BUILD_SHA:-unknown}" "${REVIEW_BUILD_TAGS:-}" \
+        "${REVIEW_BUILD_TIMESTAMP:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" > build-info.json \
+    && chmod 0644 build-info.json
+USER reviewer
 VOLUME /state
 ENTRYPOINT ["cursor-review-container"]
