@@ -144,6 +144,15 @@ class PollTests(unittest.TestCase):
                 self.assertEqual(argv[argv.index("--go-analysis-producer")+1], producer)
                 self.assertEqual(argv[argv.index("--expected-change-url")+1], project.change_url(3))
 
+    def test_publication_failure_reason_is_logged(self):
+        with patch("cursor_pr.poll.subprocess.run") as run:
+            run.return_value.stdout = json.dumps({
+                "state": "reviewed", "publication": "failed",
+                "publication_error": "deskpost comment exited 4: budget gate"}).encode()
+            with self.assertLogs("cursor_pr.poll", level="WARNING") as logs:
+                self.assertEqual(run_review(self.gh, 3, self.state), "failed")
+        self.assertIn("deskpost comment exited 4: budget gate", "\n".join(logs.output))
+
     def test_real_command_path_with_stubbed_executables(self):
         # Only the external forge and model binaries are replaced. Exercise the installed
         # isolated CLI subprocess, parser, prompt, cache, publication and head checks.

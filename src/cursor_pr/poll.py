@@ -95,6 +95,9 @@ def run_review(project, number, state):
         return "failed"
     log.info("Review %s state=%s publication=%s provider=%s model_invocations=%s", address, report["state"],
              report.get("publication"), report.get("provider", "cursor"), report.get("model_invocations"))
+    if report.get("publication") == "failed":
+        log.warning("Review %s publication failed: %r", address,
+                    report.get("publication_error", "reason not reported"))
     return report["state"] if report.get("publication") == "posted-or-already-present" else "failed"
 
 

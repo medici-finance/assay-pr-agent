@@ -186,8 +186,8 @@ def run_request(args):
     if args.post:
         try:
             publish(args.change, report["head"], report)
-        except (ReviewError, OSError, subprocess.TimeoutExpired):
-            return dict(report, publication="failed"), 2
+        except (ReviewError, OSError, subprocess.TimeoutExpired) as err:
+            return dict(report, publication="failed", publication_error=str(err) or type(err).__name__), 2
         report["publication"] = "posted-or-already-present"
     return report, code
 

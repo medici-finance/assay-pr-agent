@@ -137,6 +137,23 @@ class ReviewTest(unittest.TestCase):
                 self.assertEqual(post.call_args.args[0][:8],
                                  ["deskpost","comment","org/repo","1","--kind","mr","--head",self.head])
 
+    def test_failed_post_reports_reason(self):
+        def fake(args):
+            self.assertEqual(args[0], "deskread")
+            kind = args[1]
+            detail = {"change":{"url":"https://github.com/org/repo/pull/1","headSha":self.head,
+                                "baseRef":"main","changedFiles":1}}
+            files = {"changeFiles":{"complete":True,"changedFiles":1,"files":[{
+                "filename":"example.sh","patchAbsent":False,"status":"added",
+                "patch":"@@ -0,0 +1,2 @@\n+#!/bin/sh\n+echo $argument\n"}]}}
+            item = dict(detail if kind=="change" else files,repo="org/repo",number=1)
+            return json.dumps({"schema":1,"kind":kind,"items":[item],"partial":[]})
+        with patch.object(source,"run_desk",side_effect=fake), \
+             patch.object(cli,"run_desk",side_effect=source.ReviewError("deskpost comment exited 4: budget gate")):
+            code,report = self.check("--change","org/repo#1","--post")
+        self.assertEqual((code,report["publication"]), (2,"failed"))
+        self.assertEqual(report["publication_error"], "deskpost comment exited 4: budget gate")
+
     def test_failed_cursor_keeps_scans(self):
         self.shim.write_text("#!/bin/sh\nexit 2\n")
         code,report = self.check("--base",self.base)
