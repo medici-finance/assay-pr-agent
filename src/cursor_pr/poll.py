@@ -12,9 +12,9 @@ import subprocess
 import sys
 import threading
 
-from .config import load_config
+from .config import DEFAULT_VISUAL_MAX_INPUT_TOKENS, load_config
 from .credentials import SETUP_INPUTS, forge_credentials
-from .discovery import poll_project
+from .discovery import COMMANDS, poll_project
 from .manager import ConfigurationWatch
 from .login import auth_mode, ensure_session, login_directory
 from . import buildinfo, history, setup, providers
@@ -28,7 +28,11 @@ class Jobs:
         with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("""CREATE TABLE IF NOT EXISTS requests (
                 project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,
-                status TEXT NOT NULL, PRIMARY KEY(project, number, comment))""")
+                status TEXT NOT NULL, command TEXT NOT NULL DEFAULT 'review',
+                PRIMARY KEY(project, number, comment))""")
+            # A state volume from before /visual-review holds reviews only.
+            if "command" not in {row[1] for row in db.execute("PRAGMA table_info(requests)")}:
+                db.execute("ALTER TABLE requests ADD COLUMN command TEXT NOT NULL DEFAULT 'review'")
             db.execute("""CREATE TABLE IF NOT EXISTS activations (
                 project TEXT PRIMARY KEY, since TEXT NOT NULL)""")
 
@@ -44,36 +48,42 @@ class Jobs:
             return db.execute("SELECT 1 FROM requests WHERE project=? AND number=? AND comment=?",
                               (project, number, comment)).fetchone() is not None
 
-    def enqueue(self, project, number, comment, status="queued"):
+    def enqueue(self, project, number, comment, status="queued", command="review"):
         with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("INSERT OR IGNORE INTO requests VALUES (?,?,?,?)",
-                       (project, number, comment, status))
+            db.execute("INSERT OR IGNORE INTO requests VALUES (?,?,?,?,?)",
+                       (project, number, comment, status, command))
 
     def next(self):
         with closing(sqlite3.connect(self.path)) as db, db:
             return db.execute("""UPDATE requests SET status='started' WHERE rowid=(
                 SELECT rowid FROM requests WHERE status='queued' ORDER BY rowid LIMIT 1)
-                RETURNING project, number, comment""").fetchone()
+                RETURNING project, number, comment, command""").fetchone()
 
     def finish(self, job, status):
         with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?",
+            db.execute("UPDATE requests SET status=? WHERE project=? AND number=? AND comment=? AND command=?",
                        (status, *job))
 
 
-def run_review(project, number, state):
+def run_review(project, number, state, command="review"):
     address = f"{project.slug}#{number}"
     argv = [sys.executable, "-I", "-m", "cursor_pr.cli", "--repo", str(project.checkout),
             "--change", address, "--expected-change-url", project.change_url(number),
             "--post", "--cache-dir", str(state / "cache")]
+    if command not in COMMANDS.values():
+        raise ValueError("Unknown review command")
+    if command == "visual-review":
+        argv.append("--visual")
     if history.interval():
         argv.extend(["--qualgen-store", str(history.store_for(state, project))])
     if project.scanner_ci:
         argv.extend(["--scanner-ci", json.dumps(project.scanner_ci)])
     if project.go_analysis:
         argv.extend(["--go-analysis-producer", project.go_analysis])
-    if os.getenv("REVIEW_MAX_INPUT_TOKENS"):
-        argv.extend(["--max-input-tokens", os.environ["REVIEW_MAX_INPUT_TOKENS"]])
+    # Each command has its own budget; the child resolves the saved one when the environment is silent.
+    budget = "REVIEW_MAX_INPUT_TOKENS" if command == "review" else "REVIEW_VISUAL_MAX_INPUT_TOKENS"
+    if os.getenv(budget):
+        argv.extend(["--max-input-tokens", os.environ[budget]])
     if os.getenv("REVIEW_MODEL"):
         argv.extend(["--model", os.environ["REVIEW_MODEL"]])
     env = dict(os.environ)
@@ -92,8 +102,8 @@ def run_review(project, number, state):
         report = json.loads(result.stdout)
     except ValueError:
         return "failed"
-    log.info("Review %s state=%s publication=%s provider=%s model_invocations=%s", address, report["state"],
-             report.get("publication"), report.get("provider", "cursor"), report.get("model_invocations"))
+    log.info("Review %s command=%s state=%s publication=%s provider=%s model_invocations=%s", address, command,
+             report["state"], report.get("publication"), report.get("provider", "cursor"), report.get("model_invocations"))
     if report.get("publication") == "failed":
         log.warning("Review %s publication failed: %r", address,
                     report.get("publication_error", "reason not reported"))
@@ -107,11 +117,11 @@ def cycle(projects, state, jobs, since, runner=run_review):
         except Exception:
             log.exception("Poll failed for %s; will retry next cycle", project.key)
     while job := jobs.next():
-        key, number, comment = job
+        key, number, comment, command = job
         status = "failed"
         if key in projects:
             try:
-                status = runner(projects[key], number, state)
+                status = runner(projects[key], number, state, command)
             except Exception:
                 log.exception("Review failed for %s #%d comment %d", key, number, comment)
         jobs.finish(job, status)
@@ -133,7 +143,7 @@ def container_main():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Poll GitHub and GitLab for /review comments")
+    parser = argparse.ArgumentParser(description="Poll GitHub and GitLab for /review and /visual-review comments")
     parser.add_argument("--state-dir", type=Path, default=setup.state_dir())
     parser.add_argument("--interval", type=int,
                         help="seconds to wait after each cycle (default 120)")
@@ -160,6 +170,7 @@ def main():
             if args.interval < 1:
                 raise ValueError("poll interval must be positive")
             setup.max_input_tokens(state)
+            setup.max_input_tokens(state, "REVIEW_VISUAL_MAX_INPUT_TOKENS", DEFAULT_VISUAL_MAX_INPUT_TOKENS)
             mine_seconds = history.interval()
             projects = load_config(state)
             stack.enter_context(providers.cursor_account())

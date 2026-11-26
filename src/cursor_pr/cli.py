@@ -16,30 +16,19 @@ from . import history, providers, scanners
 from .scanners import fence
 from .login import auth_mode, login_directory
 from .setup import locked, apply_saved_setup, load_provider_key, max_input_tokens, state_dir
-from .config import DEFAULT_MAX_INPUT_TOKENS, load_config, project_from
+from .config import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_VISUAL_MAX_INPUT_TOKENS, load_config, project_from
 from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import go_report, scan_files, scanner
 from .sync import scan_checkout
 from .engine import CursorFailure, pack, review, tokens
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment
+from . import visual
 
 
-def publish(address, head, report, *, project=None, state=None):
-    _, number = address.rsplit("#", 1)
-    label = providers.LABELS[report.get("provider", "cursor")]
-    body = [f"{label} review of {head}", report["state"]]
-    # Paths come from the PR and titles/messages from the model: quote them as code
-    # so the reviewer identity never posts a Markdown link or @mention for an attacker.
-    for issue in report["findings"]:
-        body.append(f"- {fence(issue['path'])}:{issue['line']} — {fence(issue['title'])}. {fence(issue['message'])}")
-    if report["state"] == "over-budget":
-        body.append(f"Skipped {label}. Estimated prompt {report['estimated_input_tokens']} tokens "
-                    f"exceeds the limit of {report['max_input_tokens']}.")
-    elif report["state"] == "model-unavailable":
-        body.append(f"{label} could not complete the review.")
-    elif not report["findings"]:
-        body.append("No model findings in the reviewed scope.")
+def evidence(report):
+    """Scanner and history findings. None of it comes from the model or enters a prompt."""
+    body = []
     for check in report["checks"]:
         if check["state"] != "complete":
             body.append(f"- {check['tool']}: could not check {fence(check.get('path') or check.get('reason', ''))}")
@@ -50,11 +39,33 @@ def publish(address, head, report, *, project=None, state=None):
         body.extend(["", *scanners.summary(report["static_checks"]), ""])
     if "qualgen" in report:
         body.extend(["", *history.summary(report["qualgen"]), ""])
-    for path in report["omitted"]:
-        body.append(f"- Outside review coverage: {fence(path)}")
-    body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
-    # A finding may quote a multiline source fragment, including forge quick actions.
-    text = "\n".join(" ".join(line.splitlines()) for line in body) + "\n"
+    return body
+
+
+def publish(address, head, report, *, project=None, state=None):
+    _, number = address.rsplit("#", 1)
+    if "map" in report:
+        text = "\n".join(visual.comment(report, evidence(report))) + "\n"
+    else:
+        label = providers.LABELS[report.get("provider", "cursor")]
+        body = [f"{label} review of {head}", report["state"]]
+        # Paths come from the PR and titles/messages from the model: quote them as code
+        # so the reviewer identity never posts a Markdown link or @mention for an attacker.
+        for issue in report["findings"]:
+            body.append(f"- {fence(issue['path'])}:{issue['line']} — {fence(issue['title'])}. {fence(issue['message'])}")
+        if report["state"] == "over-budget":
+            body.append(f"Skipped {label}. Estimated prompt {report['estimated_input_tokens']} tokens "
+                        f"exceeds the limit of {report['max_input_tokens']}.")
+        elif report["state"] == "model-unavailable":
+            body.append(f"{label} could not complete the review.")
+        elif not report["findings"]:
+            body.append("No model findings in the reviewed scope.")
+        body += evidence(report)
+        for path in report["omitted"]:
+            body.append(f"- Outside review coverage: {fence(path)}")
+        body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
+        # A finding may quote a multiline source fragment, including forge quick actions.
+        text = "\n".join(" ".join(line.splitlines()) for line in body) + "\n"
     post_comment(project, int(number), head, text, state if state is not None else state_dir())
 
 
@@ -68,6 +79,8 @@ def parser():
     p.add_argument("--head", help="Local head revision (default HEAD with --base)")
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="Checkout for local Git and scanners")
     p.add_argument("--path", action="append", default=[], help="Limit review to an exact changed path; repeatable")
+    p.add_argument("--visual", action="store_true",
+                   help="Map where the diff is worth reading and explain the change, instead of hunting for issues")
     evidence = p.add_mutually_exclusive_group()
     evidence.add_argument("--go-analysis-producer", help="Trusted CI producer for --expected-change-url")
     evidence.add_argument("--go-report", type=Path, help="Assay go-analysis/v1 JSON for this head")
@@ -75,7 +88,8 @@ def parser():
     p.add_argument("--qualgen-store", type=Path, help="Read the poller’s mined Qualgen history for this project")
     p.add_argument("--model", help="Explicit provider model (otherwise the CLI default)")
     p.add_argument("--max-input-tokens", type=int,
-                   help=f"Preflight estimate limit (default {DEFAULT_MAX_INPUT_TOKENS}, or the saved REVIEW_MAX_INPUT_TOKENS setting)")
+                   help=f"Preflight estimate limit (default {DEFAULT_MAX_INPUT_TOKENS}, or the saved REVIEW_MAX_INPUT_TOKENS setting; "
+                        f"{DEFAULT_VISUAL_MAX_INPUT_TOKENS} or REVIEW_VISUAL_MAX_INPUT_TOKENS with --visual)")
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling the model")
     p.add_argument("--cache-dir", type=Path, default=Path(os.getenv("XDG_CACHE_HOME", Path.home()/".cache"))/"cursor-pr-review")
     p.add_argument("--post", action="store_true", help="Publish a head-bound summary with --change")
@@ -133,7 +147,10 @@ def execute(args):
         go["findings"] = [row for row in go["findings"] if row["path"] in selected]
         checks.append(go)
 
-    prompt, anchors, unseen, has_text = pack(files, checks)
+    if args.visual:
+        prompt, anchors, unseen, has_text = visual.pack(files)
+    else:
+        prompt, anchors, unseen, has_text = pack(files, checks)
     estimated = tokens(prompt) if has_text else 0
     omitted = sorted(set(unseen) | (paths - selected))
     backend = providers.provider()
@@ -141,6 +158,9 @@ def execute(args):
               "estimated_input_tokens": estimated, "max_input_tokens": args.max_input_tokens,
               "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
               "findings": [], "cursor_usage": None}
+    if args.visual:
+        # The map costs no tokens and stays in the report when the model is skipped or fails.
+        report["map"] = dict(visual.survey(files), shown=sorted(path for path, lines in anchors.items() if lines))
     if static:
         report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
@@ -153,8 +173,9 @@ def execute(args):
         return dict(report, state="estimate"), 0
     if has_text:
         try:
-            answer, cached = review(prompt, args.model, anchors, args.cache_dir,
-                                    change.identity)
+            # The visual prompt has its own parser and cache namespace.
+            options = {"parse": visual.parse_answer, "version": visual.VERSION} if args.visual else {}
+            answer, cached = review(prompt, args.model, anchors, args.cache_dir, change.identity, **options)
         except CursorFailure as err:
             return dict(report, state="model-unavailable", error=str(err),
                         cursor_invocations=err.invocations, cursor_usage=err.usage), 2
@@ -212,7 +233,9 @@ def main():
             if not args.estimate and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
                 stack.enter_context(providers.cursor_account())
             if args.max_input_tokens is None:
-                args.max_input_tokens = max_input_tokens(state)
+                args.max_input_tokens = (max_input_tokens(state, "REVIEW_VISUAL_MAX_INPUT_TOKENS",
+                                                          DEFAULT_VISUAL_MAX_INPUT_TOKENS)
+                                         if args.visual else max_input_tokens(state))
             if args.model is None:
                 args.model = os.getenv("REVIEW_MODEL")
             if args.change:

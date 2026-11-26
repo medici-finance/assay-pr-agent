@@ -31,6 +31,22 @@ class CursorFailure(ReviewError):
         self.usage = usage
 
 
+def parsed(f):
+    """One file's text patch as unidiff sees it."""
+    # Parse under a fixed synthetic name; the source envelope owns the actual filename.
+    patch = PatchSet("--- a/file\n+++ b/file\n" + f.patch.rstrip("\n") + "\n")
+    if len(patch) != 1 or not patch[0]:
+        raise ReviewError("Incomplete or unrecognized patch in " + f.path)
+    return patch[0]
+
+
+def parse_patch(f):
+    """Head-side line numbers and added/removed counts for one file's text patch."""
+    lines = [line for hunk in parsed(f) for line in hunk]
+    head = {line.target_line_no for line in lines if line.target_line_no is not None}
+    return head, sum(line.is_added for line in lines), sum(line.is_removed for line in lines)
+
+
 def pack(files, checks):
     from pr_agent.algo.git_patch_processing import decouple_and_convert_to_hunks_with_lines_numbers
     from pr_agent.algo.types import FilePatchInfo
@@ -49,12 +65,7 @@ def pack(files, checks):
         if f.absent or not f.patch:
             omitted.append(f.path)
             continue
-        # Parse under a fixed synthetic name; the source envelope owns the actual filename.
-        parsed = PatchSet("--- a/file\n+++ b/file\n" + f.patch.rstrip("\n") + "\n")
-        if len(parsed) != 1 or not parsed[0]:
-            raise ReviewError("Incomplete or unrecognized patch in " + f.path)
-        for hunk in parsed[0]:
-            anchors[f.path].update(line.target_line_no for line in hunk if line.target_line_no is not None)
+        anchors[f.path], _, _ = parse_patch(f)
         if not anchors[f.path]:
             omitted.append(f.path)
             continue
@@ -77,19 +88,26 @@ def tokens(prompt):
     return len(TokenEncoder.get_token_encoder("gpt-4o").encode(prompt, disallowed_special=()))
 
 
-def parse_answer(raw, anchors):
+def answer(raw):
+    """The model's text and usage from one successful terminal result."""
     value = json.loads(raw)
     if value.get("type") != "result" or value.get("subtype") != "success" or value.get("is_error") is not False:
         raise ReviewError("Cursor did not return a successful terminal result")
-    answer = value["result"].strip()
+    text = value["result"].strip()
     # In Auto mode the CLI can prepend its own routing notice to the model text.
-    answer = re.sub(r"^> Auto routed to [^\r\n]+\r?\n\s*\n", "", answer, count=1)
-    fenced = re.fullmatch(r"\x60{3}(?:ya?ml|json)?\s*\n(.*?)\n\x60{3}", answer, re.S)
+    text = re.sub(r"^> Auto routed to [^\r\n]+\r?\n\s*\n", "", text, count=1)
+    fenced = re.fullmatch(r"\x60{3}(?:ya?ml|json)?\s*\n(.*?)\n\x60{3}", text, re.S)
     if fenced:
-        answer = fenced.group(1)
-    if len(answer) > 32_768:
+        text = fenced.group(1)
+    if len(text) > 32_768:
         raise ReviewError("Cursor answer exceeds the review size limit")
-    issues = yaml.safe_load(answer)["review"]["key_issues_to_review"]
+    usage = value.get("usage")
+    return text, usage if isinstance(usage, dict) else None
+
+
+def parse_answer(raw, anchors):
+    text, usage = answer(raw)
+    issues = yaml.safe_load(text)["review"]["key_issues_to_review"]
     if not isinstance(issues, list) or len(issues) > MAX_FINDINGS:
         raise ReviewError("Invalid Cursor finding list")
     clean = []
@@ -105,11 +123,10 @@ def parse_answer(raw, anchors):
         if not header or not body:
             raise ReviewError("Empty review finding")
         clean.append({"path": path, "line": start, "end_line": end, "title": header, "message": body})
-    usage = value.get("usage")
-    return {"findings": clean, "cursor_usage": usage if isinstance(usage, dict) else None}
+    return {"findings": clean, "cursor_usage": usage}
 
 
-def invoke(prompt, model, anchors):
+def invoke(prompt, model, anchors, parse=parse_answer):
     backend = provider()
     label = LABELS[backend]
     executable = (shutil.which("cursor-agent") or shutil.which("agent")) if backend == "cursor" else shutil.which(backend)
@@ -190,7 +207,7 @@ def invoke(prompt, model, anchors):
                 break
         raise CursorFailure(f"{label} exited {response.returncode}: {reason}. No retry was made.", 1)
     try:
-        return parse_answer(response.stdout, anchors)
+        return parse(response.stdout, anchors)
     except (ReviewError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError) as err:
         try:
             usage = json.loads(response.stdout).get("usage")
@@ -200,8 +217,8 @@ def invoke(prompt, model, anchors):
                             1, usage if isinstance(usage, dict) else None) from err
 
 
-def review(prompt, model, anchors, cache, source):
-    signature = json.dumps([VERSION, "pr-agent:0.50.0", model, source, prompt], ensure_ascii=False)
+def review(prompt, model, anchors, cache, source, *, parse=parse_answer, version=VERSION):
+    signature = json.dumps([version, "pr-agent:0.50.0", model, source, prompt], ensure_ascii=False)
     if provider() != "cursor" or os.getenv("REVIEW_CURSOR_TEAM_ID"):
         signature = json.dumps([provider(), os.getenv("REVIEW_CURSOR_TEAM_ID") if provider() == "cursor" else None, signature])
     key = hashlib.sha256(signature.encode()).hexdigest()
@@ -211,7 +228,7 @@ def review(prompt, model, anchors, cache, source):
         fcntl.flock(lock, fcntl.LOCK_EX)
         if path.exists():
             return json.loads(path.read_text()), True
-        result = invoke(prompt, model, anchors)
+        result = invoke(prompt, model, anchors, parse=parse)
         with tempfile.NamedTemporaryFile(dir=cache, mode="w", delete=False) as file:
             json.dump(result, file)
         os.replace(file.name, path)

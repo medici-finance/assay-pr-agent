@@ -1,0 +1,517 @@
+import contextlib
+import io
+import json
+import os
+import re
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from cursor_pr import cli, engine, source, visual
+from cursor_pr.config import DEFAULT_VISUAL_MAX_INPUT_TOKENS
+from test_hardening import outside_code_spans
+
+CREDIT = "[visual-review](https://gitlab.com/thorchain/misc/visual-review)"
+HOSTILE = "@all [click](https://evil.example) `x`"
+ANSWER = {"visual": {
+    "summary": "Gives the fee a floor of one.",
+    "changes": [{"title": "Floor the fee before returning it", "files": ["app.py", "app.py"]},
+                {"title": "Store the floor", "files": ["migrations/0002.sql"]}],
+    "hotspots": [{"file": "app.py", "line": 2, "end_line": 3, "severity": "careful",
+                  "title": "Integer division", "why": "Rounding now happens before the maximum."},
+                 {"file": "migrations/0002.sql", "line": 1, "end_line": 1, "severity": "verify",
+                  "title": "New column without default", "why": "Existing rows need one."}]}}
+
+
+def hunk(added=0, removed=0):
+    """One hunk with a leading context line, so head lines run from 1 to added + 1."""
+    return ("@@ -1,%d +1,%d @@\n keep\n" % (removed + 1, added + 1) + "".join(f"+added {i}\n" for i in range(added))
+            + "".join(f"-gone {i}\n" for i in range(removed)))
+
+
+class VisualTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.git("init", "-q", "-b", "main")
+        self.write({"app.py": "def fee(depth):\n    return depth / 100\n", "legacy.py": "old = 1\n"})
+        self.git("add", ".")
+        self.git("commit", "-qm", "base")
+        self.base = self.git("rev-parse", "HEAD")
+        self.write({"app.py": "def fee(depth):\n    floor = depth // 100\n    return max(floor, 1)\n",
+                    "migrations/0002.sql": "ALTER TABLE fees ADD floor INTEGER;\n",
+                    "test_app.py": "def test_fee():\n    assert fee(50) == 1\n",
+                    "README.md": "# Fees\n\nThe fee has a floor.\n", ".github/workflows/ci.yml": "on: push\njobs: {}\n",
+                    "deploy.sh": "#!/bin/sh\necho $1\n", "package-lock.json": '{"lockfileVersion": 3}\n'})
+        (self.root/"logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00")
+        self.git("add", ".")
+        self.git("rm", "-q", "legacy.py")
+        self.git("commit", "-qm", "change")
+        self.head = self.git("rev-parse", "HEAD")
+        self.calls, self.answer = self.root/"calls", self.root/"answer"
+        self.answer.write_text(json.dumps(ANSWER))
+        # The provider CLI records each prompt and answers with whatever the test staged.
+        shim = self.root/"cursor-agent"
+        shim.write_text("#!/usr/bin/env python3\nimport json,pathlib,sys\n"
+                        f"with open({str(self.calls)!r}, 'a') as f: f.write(sys.argv[-1] + '\\n\\x00\\n')\n"
+                        "print(json.dumps(dict(type='result', subtype='success', is_error=False,\n"
+                        f"                      result=pathlib.Path({str(self.answer)!r}).read_text())))\n")
+        shim.chmod(0o700)
+        env = patch.dict(os.environ, {"PATH": str(self.root)+os.pathsep+os.environ["PATH"],
+                                      "REVIEW_STATE_DIR": str(self.root/"state")})
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ("REVIEW_MAX_INPUT_TOKENS", "REVIEW_VISUAL_MAX_INPUT_TOKENS", "REVIEW_MODEL"):
+            os.environ.pop(name, None)
+        # Linters depend on the host. One test supplies their findings by hand instead.
+        scanner = patch.object(cli, "scan_files", return_value=[])
+        scanner.start()
+        self.addCleanup(scanner.stop)
+
+    def git(self, *args):
+        return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.org",
+                                        *args], cwd=self.root, text=True).strip()
+
+    def write(self, files):
+        for path, body in files.items():
+            (self.root/path).parent.mkdir(parents=True, exist_ok=True)
+            (self.root/path).write_text(body)
+
+    def check(self, *args, visual_mode=True):
+        argv = ["cursor-review", "--repo", str(self.root), "--cache-dir", str(self.root/"cache"),
+                *(["--visual"] if visual_mode else []), "--base", self.base, *args]
+        out = io.StringIO()
+        with patch("sys.argv", argv), contextlib.redirect_stdout(out):
+            code = cli.main()
+        return code, json.loads(out.getvalue())
+
+    def prompts(self):
+        return self.calls.read_text().split("\n\x00\n")[:-1] if self.calls.exists() else []
+
+    def test_kinds_follow_the_path_and_the_first_match_wins(self):
+        # (path, kind, shown to the model). A name that could be source, such as latest.js or
+        # security.py, stays Logic even though it contains a test or document name.
+        for path, kind, narrated in (
+                ("src/app/manager.go", "Logic", True), ("scripts/deploy.sh", "Logic", True), ("latest.py", "Logic", True),
+                ("requests.py", "Logic", True), ("src/latest.js", "Logic", True), ("web/greatest.ts", "Logic", True),
+                ("attest.swift", "Logic", True), ("contest.kt", "Logic", True), ("app/security.py", "Logic", True),
+                ("src/support/go.py", "Logic", True), ("app/authors.py", "Logic", True), ("licensed.py", "Logic", True),
+                ("notice.js", "Logic", True), ("readme.py", "Logic", True), ("governance.go", "Logic", True),
+                ("db/schema.sql", "Schema", True), ("api/migrations/0001.py", "Schema", True),
+                ("internal/manager_test.go", "Tests", True), ("app.spec.tsx", "Tests", True),
+                ("tests/e2e/x.ts", "Tests", True), ("UserTest.java", "Tests", True), ("UserTests.cs", "Tests", True),
+                (".github/workflows/ci.yml", "Config & CI", True), ("requirements.txt", "Config & CI", True),
+                (".dockerignore", "Config & CI", True),
+                ("docs/fees.md", "Docs", True), ("k8s/README.md", "Docs", True), ("CHANGELOG.rst", "Docs", True),
+                ("SECURITY.md", "Docs", True), ("CONTRIBUTING", "Docs", True), ("CODE_OF_CONDUCT.md", "Docs", True),
+                # Counted in the map, never sent to the model.
+                ("go.sum", "Dependencies", False), ("web/package-lock.json", "Dependencies", False),
+                ("pkg/api/api.pb.go", "Generated", False), ("vendor/x/y_test.go", "Generated", False),
+                ("testdata/golden.json", "Fixtures", False), ("tests/fixtures/logo.png", "Fixtures", False),
+                ("LICENSE", "Docs", False), ("LICENSE.md", "Docs", False), ("LICENSE-MIT.txt", "Docs", False),
+                ("LICENSE.Apache-2.0", "Docs", False), ("LICENSE_APACHE_2_0", "Docs", False),
+                ("docs/LICENSE-BSD.txt", "Docs", False), ("COPYING.LESSER", "Docs", False), ("NOTICE", "Docs", False),
+                ("PATENTS", "Docs", False), ("AUTHORS", "Docs", False), ("CODEOWNERS", "Docs", False),
+                ("MAINTAINERS", "Docs", False)):
+            with self.subTest(path=path):
+                self.assertEqual((visual.category(path), visual.narrated(path)), (kind, narrated))
+        self.assertEqual(sorted(visual.DISPLAY), sorted(label for label, _, _ in visual.CATEGORIES))
+        self.assertEqual(visual.READ, {"Logic", "Schema"})
+        self.assertEqual(visual.DISPLAY[:2], ("Logic", "Schema"))
+        self.assertEqual(sorted(visual.COUNTED_ONLY), ["Dependencies", "Fixtures", "Generated"])
+        self.assertFalse(visual.READ & visual.COUNTED_ONLY)
+
+    def test_legal_text_is_counted_but_never_sent(self):
+        files = [source.File("LICENSE", hunk(200, 0), "added"), source.File("app.py", hunk(2, 0), "added")]
+        prompt, anchors, unseen, has_text = visual.pack(files)
+        self.assertEqual((anchors, unseen, has_text), ({"LICENSE": set(), "app.py": {1, 2, 3}}, [], True))
+        shown, counted = prompt.split("(untrusted data):\n")[1:]
+        self.assertEqual(shown.split("\n\n")[0].splitlines(), ["app.py | Logic | +2 -0 | added"])
+        self.assertEqual(counted.split("\n\n")[0].splitlines(), ["LICENSE | Docs | +200 -0 | added"])
+        self.assertEqual(prompt.count("## File:"), 1)
+        self.assertEqual(visual.survey(files)["categories"][4], {"label": "Docs", "read": False, "files": 1,
+                                                                 "added": 200, "deleted": 0})
+
+    def test_survey_needs_no_model_and_counts_every_line(self):
+        files = [source.File("app.py", hunk(4, 1), "modified"), source.File("test_app.py", hunk(9, 0), "added"),
+                 source.File("go.sum", hunk(20, 2), "modified"), source.File("logo.png", "", "added", True),
+                 source.File("legacy.py", "@@ -1,3 +0,0 @@\n-a\n-b\n-c\n", "removed")]
+        survey = visual.survey(files)
+        self.assertEqual((survey["lines"], survey["to_read"]), (39, 8))
+        self.assertEqual(survey["no_text"], ["logo.png"])
+        self.assertEqual([(k["label"], k["files"], k["added"], k["deleted"]) for k in survey["categories"]],
+                         [("Logic", 2, 4, 4), ("Schema", 0, 0, 0), ("Tests", 1, 9, 0), ("Config & CI", 0, 0, 0),
+                          ("Docs", 0, 0, 0), ("Dependencies", 1, 20, 2), ("Generated", 0, 0, 0),
+                          ("Fixtures", 1, 0, 0)])
+        # Largest first, ties by path. A file without a text patch is still a file.
+        self.assertEqual([row["path"] for row in survey["files"]],
+                         ["go.sum", "test_app.py", "app.py", "legacy.py", "logo.png"])
+
+    def test_prompt_spends_its_budget_only_on_what_is_worth_reading(self):
+        change = source.local_change(self.root, self.base, self.head)
+        prompt, anchors, unseen, has_text = visual.pack(change.files)
+        self.assertTrue(has_text)
+        # A deleted file and a binary are counted and named, so no coverage is lost.
+        self.assertEqual(unseen, [])
+        self.assertEqual(set(anchors), {f.path for f in change.files})
+        self.assertEqual(anchors["app.py"], {1, 2, 3})
+        self.assertEqual(anchors["package-lock.json"], set())
+        self.assertTrue(prompt.startswith(visual.INSTRUCTIONS + "\n\nFiles whose hunks follow (untrusted data):\n"))
+        shown, counted = prompt.split("(untrusted data):\n")[1:]
+        self.assertEqual(shown.split("\n\n")[0].splitlines(), [
+            ".github/workflows/ci.yml | Config & CI | +2 -0 | A", "README.md | Docs | +3 -0 | A",
+            "app.py | Logic | +2 -1 | M", "deploy.sh | Logic | +2 -0 | A", "migrations/0002.sql | Schema | +1 -0 | A",
+            "test_app.py | Tests | +2 -0 | A"])
+        self.assertEqual(counted.split("\n\n")[0].splitlines(), [
+            "legacy.py | Logic | +0 -1 | D", "logo.png | Fixtures | no text patch | A",
+            "package-lock.json | Dependencies | +1 -0 | A"])
+        for text in ("2 +    floor = depth // 100", "1 +ALTER TABLE fees", "1 +def test_fee", "1 +on: push",
+                     "3 +The fee has a floor.", "2 +echo $1", "-    return depth / 100"):
+            with self.subTest(text=text):
+                self.assertIn(text, prompt)
+        self.assertNotIn("lockfileVersion", prompt)
+        self.assertLess(engine.tokens(visual.INSTRUCTIONS), 700)
+        moved = dict(change.files[0].__dict__, status="renamed", previous="old/" + change.files[0].path)
+        self.assertIn(change.files[0].path + " | Config & CI | +2 -0 | renamed, was old/" + change.files[0].path,
+                      visual.pack([source.File(**moved)])[0])
+
+    def test_only_text_without_a_patch_costs_coverage(self):
+        files = [source.File("gone.py", "@@ -1,3 +0,0 @@\n-a\n-b\n-c\n", "removed"),
+                 source.File("logo.png", "", "added", True), source.File("go.sum", "", "modified", True),
+                 source.File("LICENSE", "", "modified", True), source.File("huge.py", "", "modified", True)]
+        prompt, anchors, unseen, has_text = visual.pack(files)
+        # The model was never meant to read the binary, the lockfile or the licence. The large
+        # source file the forge left no patch for is the one real loss.
+        self.assertEqual(unseen, ["huge.py"])
+        self.assertFalse(has_text)
+        self.assertNotIn("__new hunk__", prompt)
+        self.assertEqual([line for line in prompt.splitlines() if " | " in line],
+                         ["gone.py | Logic | +0 -3 | removed", "logo.png | Fixtures | no text patch | added",
+                          "go.sum | Dependencies | no text patch | modified",
+                          "LICENSE | Docs | no text patch | modified", "huge.py | Logic | no text patch | modified"])
+        self.assertEqual(visual.survey(files)["no_text"], ["LICENSE", "go.sum", "huge.py", "logo.png"])
+
+    def test_hunks_show_each_line_once_with_its_head_number(self):
+        # Real Git output: a replacement, a file that ends without a newline, and two-digit numbers.
+        app = next(f for f in source.local_change(self.root, self.base, self.head).files if f.path == "app.py")
+        body = visual.hunks(app).splitlines()
+        self.assertEqual(body[:2], ["## File: app.py", "@@ -1,2 +1,3 @@"])
+        self.assertEqual(sorted(body[2:]), ["  -    return depth / 100", "1  def fee(depth):",
+                                            "2 +    floor = depth // 100", "3 +    return max(floor, 1)"])
+        self.write({"big.py": "".join(f"line {i}\n" for i in range(1, 61))})
+        self.git("add", ".")
+        self.git("commit", "-qm", "more")
+        start = self.git("rev-parse", "HEAD")
+        lines = [f"line {i}\n" for i in range(1, 61)]
+        lines[9], lines[59] = "changed ten\n", "last without newline"
+        self.write({"big.py": "".join(lines)})
+        self.git("add", ".")
+        self.git("commit", "-qm", "tail")
+        big = next(f for f in source.local_change(self.root, start, "HEAD").files if f.path == "big.py")
+        self.assertEqual(visual.hunks(big).splitlines(), [
+            "## File: big.py", "@@ -7,7 +7,7 @@ line 6", " 7  line 7", " 8  line 8", " 9  line 9", "   -line 10",
+            "10 +changed ten", "11  line 11", "12  line 12", "13  line 13", "@@ -57,4 +57,4 @@ line 56",
+            "57  line 57", "58  line 58", "59  line 59", "   -line 60", "60 +last without newline"])
+        # The number on every surviving line is a line a hotspot may cite, and nothing else is.
+        for f in (app, big):
+            with self.subTest(path=f.path):
+                prompt, anchors, _, _ = visual.pack([f])
+                numbers = {int(m.group(1)) for m in re.finditer(r"^\s*(\d+) ", prompt, re.M)}
+                self.assertEqual(numbers, anchors[f.path])
+        self.assertNotIn("No newline", visual.hunks(big))
+        # Every line of each patch appears exactly once: no second copy of the context lines
+        # as in the review prompt, and no "no newline" marker.
+        for f in source.local_change(self.root, start, "HEAD").files:
+            body = sum(sum(line.is_added or line.is_removed or line.is_context for line in hunk) for hunk in engine.parsed(f))
+            self.assertEqual(len(visual.hunks(f).splitlines()), body + 1 + len(engine.parsed(f)), f.path)
+
+    def test_answer_is_checked_against_the_change_before_it_is_trusted(self):
+        anchors = {"app.py": {1, 2, 3, 4}, "logo.png": set()}
+
+        def envelope(result):
+            return json.dumps(dict(type="result", subtype="success", is_error=False, result=result))
+
+        def answer(**changes):
+            value = {"summary": "Gives the fee a floor.", "changes": [{"title": "Floor the fee", "files": ["app.py"]}],
+                     "hotspots": [{"file": "app.py", "line": 2, "end_line": 3, "severity": "careful",
+                                   "title": "Integer division", "why": "Rounding moved."}]}
+            return json.dumps({"visual": dict(value, **changes)})
+        clean = visual.parse_answer(envelope(answer()), anchors)
+        self.assertEqual(clean, {"cursor_usage": None, "visual": {
+            "summary": "Gives the fee a floor.", "changes": [{"title": "Floor the fee", "paths": ["app.py"]}],
+            "hotspots": [{"path": "app.py", "line": 2, "end_line": 3, "severity": "careful",
+                          "title": "Integer division", "why": "Rounding moved."}]}})
+        # A change may name a file the model was only told about, such as a binary.
+        binary = visual.parse_answer(envelope(answer(changes=[{"title": "Logo", "files": ["logo.png", "app.py", "app.py"]}])), anchors)
+        self.assertEqual(binary["visual"]["changes"], [{"title": "Logo", "paths": ["app.py", "logo.png"]}])
+        # The provider's routing notice and a code fence around the object are not part of the answer.
+        usage = {"inputTokens": 4}
+        wrapped = json.dumps(dict(type="result", subtype="success", is_error=False, usage=usage,
+                                  result="> Auto routed to Example Model\n\n```json\n" + answer() + "\n```"))
+        self.assertEqual(visual.parse_answer(wrapped, anchors), dict(clean, cursor_usage=usage))
+        look = dict(file="app.py", line=2, end_line=3, severity="look", title="Title", why="Why.")
+        for name, changes in (
+                ("unknown file in a change", {"changes": [{"title": "Floor", "files": ["elsewhere.py"]}]}),
+                ("empty change", {"changes": [{"title": "Floor", "files": []}]}),
+                ("blank change title", {"changes": [{"title": " ", "files": ["app.py"]}]}),
+                ("line outside the hunk", {"hotspots": [dict(look, line=9, end_line=9)]}),
+                ("line in a file with no hunks", {"hotspots": [dict(look, file="logo.png", line=1, end_line=1)]}),
+                ("unknown file in a hotspot", {"hotspots": [dict(look, file="x.py")]}),
+                ("range over a gap", {"hotspots": [dict(look, line=1, end_line=9)]}),
+                ("reversed range", {"hotspots": [dict(look, line=3, end_line=2)]}),
+                ("boolean line", {"hotspots": [dict(look, line=True)]}),
+                ("line zero", {"hotspots": [dict(look, line=0, end_line=3)]}),
+                ("unknown severity", {"hotspots": [dict(look, severity="blocker")]}),
+                ("blank reason", {"hotspots": [dict(look, why=" ")]}),
+                ("too many changes", {"changes": [{"title": "Change", "files": ["app.py"]}] * (visual.MAX_CHANGES + 1)}),
+                ("too many hotspots", {"hotspots": [look] * (visual.MAX_HOTSPOTS + 1)}),
+                ("blank summary", {"summary": " "}), ("missing summary", {"summary": None}),
+                ("missing hotspots", {"hotspots": None}), ("missing changes", {"changes": "none"})):
+            with self.subTest(name=name), self.assertRaises(source.ReviewError):
+                visual.parse_answer(envelope(answer(**changes)), anchors)
+        for result in (json.dumps({"review": {"key_issues_to_review": []}}), json.dumps({"visual": "none"}),
+                       '{"visual": {"summary": "No lists."}}', "Not JSON", "[]"):
+            # invoke() turns any of these into a failed review; none is posted.
+            with self.subTest(result=result), self.assertRaises((source.ReviewError, ValueError)):
+                visual.parse_answer(envelope(result), anchors)
+        with self.assertRaises(source.ReviewError):
+            visual.parse_answer(envelope("x" * 32769), anchors)
+
+    def test_estimate_map_and_cache(self):
+        code, report = self.check("--estimate")
+        self.assertEqual((code, report["state"]), (0, "estimate"))
+        self.assertEqual(report["max_input_tokens"], DEFAULT_VISUAL_MAX_INPUT_TOKENS)
+        self.assertNotIn("visual", report)
+        self.assertEqual(report["map"]["shown"], [".github/workflows/ci.yml", "README.md", "app.py", "deploy.sh",
+                                                  "migrations/0002.sql", "test_app.py"])
+        self.assertEqual((report["map"]["lines"], report["map"]["to_read"]), (15, 7))
+        self.assertFalse(self.calls.exists())
+        code, report = self.check()
+        self.assertEqual((code, report["state"]), (0, "reviewed"))
+        self.assertEqual((report["model_invocations"], report["cache_hit"]), (1, False))
+        self.assertEqual(report["estimated_input_tokens"], engine.tokens(self.prompts()[0]))
+        self.assertEqual(report["omitted"], [])
+        self.assertEqual(report["map"]["no_text"], ["logo.png"])
+        self.assertEqual([c["paths"] for c in report["visual"]["changes"]], [["app.py"], ["migrations/0002.sql"]])
+        self.assertTrue(self.check()[1]["cache_hit"])
+        self.assertEqual(len(self.prompts()), 1)
+
+    def test_budget_is_the_visual_one_and_over_it_only_the_map_is_left(self):
+        code, report = self.check("--max-input-tokens", "1")
+        self.assertEqual((code, report["state"]), (2, "over-budget"))
+        self.assertEqual((report["map"]["lines"], report["map"]["to_read"]), (15, 7))
+        self.assertNotIn("visual", report)
+        self.assertFalse(self.calls.exists())
+        with patch.dict(os.environ, {"REVIEW_MAX_INPUT_TOKENS": "1", "REVIEW_VISUAL_MAX_INPUT_TOKENS": "2"}):
+            self.assertEqual(self.check()[1]["state"], "over-budget")
+        with patch.dict(os.environ, {"REVIEW_MAX_INPUT_TOKENS": "1", "REVIEW_VISUAL_MAX_INPUT_TOKENS": "6_000"}):
+            self.assertEqual(self.check()[1]["state"], "reviewed")
+        bundle = self.root/"state/.review-setup-fixture"
+        bundle.mkdir(parents=True)
+        settings = bundle/"settings.json"
+        settings.write_text(json.dumps({"settings": {"REVIEW_MAX_INPUT_TOKENS": "1", "REVIEW_VISUAL_MAX_INPUT_TOKENS": "3"},
+                                        "projects": [], "secrets": {}}))
+        (self.root/"state/setup").symlink_to(bundle.name)
+        self.assertEqual(self.check()[1]["state"], "over-budget")
+        self.assertEqual(self.check("--max-input-tokens", "100000")[1]["state"], "reviewed")
+        # A setup saved before the visual command existed has no visual budget; the default applies.
+        settings.write_text(json.dumps({"settings": {"REVIEW_MAX_INPUT_TOKENS": "1"}, "projects": [], "secrets": {}}))
+        self.assertEqual(self.check("--estimate")[1]["max_input_tokens"], DEFAULT_VISUAL_MAX_INPUT_TOKENS)
+
+    def test_each_command_has_its_own_prompt_and_cache_entry(self):
+        self.answer.write_text(json.dumps({"review": {"key_issues_to_review": []}}))
+        code, report = self.check(visual_mode=False)
+        # /review cannot cover a deleted file or a binary, so it reports partial coverage.
+        self.assertEqual((code, report["state"]), (2, "partial"))
+        self.assertNotIn("map", report)
+        self.answer.write_text(json.dumps(ANSWER))
+        code, report = self.check()
+        self.assertEqual((code, report["state"]), (0, "reviewed"))
+        review_prompt, visual_prompt = self.prompts()
+        self.assertIn("key_issues_to_review", review_prompt)
+        self.assertNotIn("key_issues_to_review", visual_prompt)
+        self.assertTrue(visual_prompt.startswith(visual.INSTRUCTIONS))
+        # Neither command reuses the other's answer, and each is reused for itself.
+        self.assertEqual((self.check(visual_mode=False)[1]["cache_hit"], self.check()[1]["cache_hit"]), (True, True))
+        self.assertEqual(len(self.prompts()), 2)
+        # A rejected answer costs the one call and leaves the map in the report.
+        self.answer.write_text(json.dumps({"review": {"key_issues_to_review": []}}))
+        code, report = self.check("--model", "another-model")
+        self.assertEqual((code, report["state"], report["model_invocations"]), (2, "model-unavailable", 1))
+        self.assertEqual(report["map"]["to_read"], 7)
+        self.assertEqual(len(self.prompts()), 3)
+
+    def test_scope_can_be_narrowed_to_paths(self):
+        code, report = self.check("--estimate", "--path", "app.py", "--path", "migrations/0002.sql")
+        self.assertEqual(code, 0)
+        self.assertEqual([row["path"] for row in report["map"]["files"]], ["app.py", "migrations/0002.sql"])
+        self.assertEqual((report["map"]["lines"], report["map"]["to_read"]), (4, 4))
+        self.assertEqual(report["omitted"], [".github/workflows/ci.yml", "README.md", "deploy.sh", "legacy.py", "logo.png",
+                                             "package-lock.json", "test_app.py"])
+
+
+class VisualCommentTests(unittest.TestCase):
+    def setUp(self):
+        self.files = [source.File("app.py", hunk(4, 1), "modified"), source.File("test_app.py", hunk(9, 0), "added"),
+                      source.File("go.sum", hunk(20, 2), "modified"),
+                      source.File("legacy.py", "@@ -1,3 +0,0 @@\n-a\n-b\n-c\n", "removed"),
+                      source.File("logo.png", "", "added", True)]
+        self.report = {"provider": "cursor", "state": "reviewed", "head": "a"*40, "omitted": ["legacy.py", "logo.png"],
+                       "map": dict(visual.survey(self.files), shown=["app.py", "test_app.py"]),
+                       "visual": {"summary": "Gives the fee a floor.",
+                                  "changes": [{"title": "Floor the fee", "paths": ["app.py", "test_app.py", "x", "y", "z", "w", "v"]}],
+                                  "hotspots": [{"path": "app.py", "line": 2, "end_line": 2, "severity": "look", "title": "Glance", "why": "Low stakes."},
+                                               {"path": "app.py", "line": 3, "end_line": 4, "severity": "verify", "title": "Check", "why": "Must be right."},
+                                               {"path": "app.py", "line": 1, "end_line": 1, "severity": "careful", "title": "Invariant", "why": "Relies on it."}]}}
+
+    def text(self, report=None, evidence=()):
+        return "\n".join(visual.comment(self.report if report is None else report, evidence))
+
+    def test_comment_leads_with_the_map_and_ranks_attention_by_severity(self):
+        text = self.text(evidence=["- shellcheck: 0 CI, 1 local, 1 findings, 0 incomplete."])
+        self.assertEqual(text.splitlines()[:2], ["Cursor visual review of " + "a"*40, "reviewed"])
+        lines = text.split("```\n")[1].splitlines()
+        self.assertEqual(lines[0], "8 lines to read of 39 changed · 5 files")
+        header, *rows = lines[2:11]
+        self.assertEqual(header, "Where the diff is" + " "*25 + "lines  share")
+        self.assertEqual([row[:13].strip() for row in rows], list(visual.DISPLAY))
+        self.assertEqual([(row[37:47].strip(), row[47:54].strip()) for row in rows],
+                         [("8", "21%"), ("0", "0%"), ("9", "23%"), ("0", "0%"), ("0", "0%"), ("22", "56%"),
+                          ("0", "0%"), ("0", "0%")])
+        self.assertEqual([row[:13].strip() for row in rows if row.endswith("  read")], ["Logic", "Schema"])
+        self.assertEqual([visual.width(row) for row in rows], [60, 60, 54, 54, 54, 54, 54, 54])
+        self.assertTrue(all(set(row[13:37].strip()) <= set("█▏▎▍▌▋▊▉") for row in rows))
+        self.assertEqual([row[13:37].strip() for row in rows],
+                         ["████▉", "", "█████▌", "", "", "█████████████▌", "", ""])
+        row = lambda path, added, deleted, bar: f"{path:<46}  {added:>6}  {deleted:>6}  {bar}"
+        self.assertEqual(lines[11:], [
+            "", "Read first · 2 files · 8 lines",
+            row("app.py", "+4", "-1", "█"*16), row("legacy.py", "+0", "-3", "█████████▋"),
+            "", "Tests · 1 file · 9 lines",
+            row("test_app.py", "+9", "-0", "█"*16),
+            "", "Prompt covers 2 files (14 lines); 3 are only counted."])
+        self.assertLess(text.index("**What changed**"), text.index("**What to check**"))
+        self.assertIn("**What changed** — AI-generated from the diff. Check it against the code.\n\n` Gives the fee a floor. `\n",
+                      text)
+        self.assertIn("- ` Floor the fee ` — ` app.py `, ` test_app.py `, ` x `, ` y `, ` z ` +2 more", text)
+        # The model's own order gives way to severity: verify, then careful, then look.
+        ranked = [line for line in text.splitlines() if line.startswith("- **")]
+        self.assertEqual([line.split(" ")[1] for line in ranked], ["**verify**", "**careful**", "**look**"])
+        self.assertIn("- **verify** ` app.py `:3-4 — ` Check `. ` Must be right. `", text)
+        self.assertIn("- **careful** ` app.py `:1 — ` Invariant `. ` Relies on it. `", text)
+        self.assertIn("<details><summary>Static checks and history</summary>\n\n"
+                      "- shellcheck: 0 CI, 1 local, 1 findings, 0 incomplete.\n</details>\n\n"
+                      "- Outside review coverage: ` legacy.py `\n- Outside review coverage: ` logo.png `\n\n"
+                      "Visual review after THORChain's " + CREDIT + ". "
+                      "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent).", text)
+        self.assertEqual(text.count(CREDIT), 1)
+        self.assertNotIn("<details>", self.text())
+
+    def test_a_small_share_stays_visible_and_an_empty_change_says_so(self):
+        files = [source.File("app.py", hunk(1000, 0), "added"), source.File("test_app.py", hunk(1, 0), "added")]
+        lines = "\n".join(visual.chart({"map": dict(visual.survey(files), shown=[]) })).splitlines()
+        tests = next(line for line in lines if line.startswith("Tests"))
+        self.assertEqual((tests[13:37].strip(), tests[47:54].strip()), ("▏", "<1%"))
+        self.assertIn("No file is shown to the model; everything is only counted.", lines)
+        everything = "\n".join(visual.chart({"map": dict(visual.survey(files), shown=["app.py", "test_app.py"])}))
+        self.assertIn("Prompt covers all 2 files (1,001 lines).", everything)
+        blank = "\n".join(visual.chart({"map": dict(visual.survey([source.File("logo.png", "", "added", True)]), shown=[])}))
+        self.assertIn("No changed lines to read · 1 file", blank)
+
+    def test_only_a_successful_model_run_is_presented_as_generated(self):
+        for state, line in (("over-budget", "Skipped Cursor. Estimated prompt 9 tokens exceeds the limit of 1."),
+                            ("model-unavailable", "Cursor could not complete the review."),
+                            ("empty", "No changed file has text the model can read.")):
+            with self.subTest(state=state):
+                report = {k: v for k, v in self.report.items() if k != "visual"}
+                text = self.text(dict(report, state=state, estimated_input_tokens=9, max_input_tokens=1))
+                self.assertIn(line, text)
+                for absent in ("AI-generated", "What to check", "What changed", "<details>", "Nothing flagged"):
+                    self.assertNotIn(absent, text)
+                self.assertIn("Where the diff is", text)
+        text = self.text(dict(self.report, provider="codex", state="model-unavailable") | {"visual": None})
+        self.assertIn("Codex could not complete the review.", text)
+        quiet = self.text(dict(self.report, visual={"summary": "Rewording only.", "changes": [], "hotspots": []}))
+        self.assertIn("No changes listed.", quiet)
+        self.assertIn("Nothing flagged. This is a reading of the diff, not a clean bill of health.", quiet)
+
+    def test_attacker_text_stays_inert_on_both_forges(self):
+        report = dict(self.report, visual={"summary": HOSTILE, "changes": [{"title": HOSTILE, "paths": [HOSTILE]}],
+                                           "hotspots": [dict(path=HOSTILE, line=2, end_line=2, severity="look",
+                                                             title=HOSTILE, why=HOSTILE)]},
+                       map=dict(self.report["map"], files=[dict(row, path=HOSTILE) for row in self.report["map"]["files"]],
+                                shown=[HOSTILE]),
+                       omitted=["legacy.py", HOSTILE])
+        lines = visual.comment(report)
+        body = "\n".join(lines)
+        # The trusted reviewer identity never posts a mention or a link for an attacker.
+        self.assertNotIn("@all", outside_code_spans(body))
+        self.assertNotIn("evil.example", outside_code_spans(body))
+        self.assertIn("- Outside review coverage: `` " + HOSTILE + " ``", body)
+        self.assertIn("- **look** `` " + HOSTILE + " ``:2 — `` " + HOSTILE + " ``. `` " + HOSTILE + " ``", body)
+        # Paths and model text are collapsed to one line, so nothing can start a quick action
+        # or leave the map block early.
+        quick = dict(report, map=dict(report["map"], files=report["map"]["files"]
+                                      + [{"path": "a\n/merge_feature b", "category": "Logic", "added": 1, "deleted": 0}]))
+        self.assertIn("a /merge_feature b", "".join(visual.chart(quick)))
+        self.assertNotIn("\n/merge", "\n".join(visual.comment(quick)))
+        # The hostile path does reach the comment, but only ever inside a code span or the map block.
+        chart = "\n".join(visual.chart(report))
+        self.assertEqual(chart.count(HOSTILE), 3)
+        self.assertNotIn(HOSTILE, outside_code_spans(body))
+        self.assertEqual(visual.clip("a\n/merge_feature x\t/y", 40), "a /merge_feature x /y")
+        self.assertEqual(visual.clip("dir/" + "n"*60 + ".py", 10), "…nnnnnn.py")
+        self.assertEqual(visual.clip("dir/" + "n"*60 + ".py", 12), "…nnnnnnnn.py")
+        # A wide character is never cut in half, so the line can end a column short.
+        self.assertEqual(visual.clip("组件" * 40, 10), "…组件组件")
+        for limit in range(2, 30):
+            self.assertLessEqual(visual.width(visual.clip("组件/" + "宽" * 80, limit)), limit)
+
+    def test_backticks_and_wide_paths_cannot_break_the_map_block(self):
+        files = self.files + [source.File("```mermaid", hunk(1, 0), "added"),
+                              source.File("组件/" + "宽" * 80 + ".py", hunk(1, 0), "added")]
+        report = dict(self.report, map=dict(visual.survey(files), shown=["app.py", "```mermaid"]))
+        lines = visual.comment(report)
+        fence = next(line for line in lines if set(line) == {"`"})
+        # Longer than any backtick run inside, so a path cannot close the block and open its own.
+        self.assertEqual(fence, "````")
+        self.assertEqual(lines.count(fence), 2)
+        chart = visual.chart(report)
+        self.assertTrue(any(line.startswith("```mermaid") for line in chart))
+        self.assertLessEqual(max(visual.width(line) for line in chart), 84)
+        self.assertTrue(all(not line.endswith(" ") for line in chart[11:]))
+
+    def test_evidence_is_collapsed_and_quotes_hostile_tool_output(self):
+        report = dict(self.report, checks=[
+            {"tool": "shellcheck", "state": "could-not-check", "path": HOSTILE, "findings": []},
+            {"tool": "actionlint", "state": "complete", "path": "ci.yml", "findings": [
+                {"path": "ci.yml", "line": 3, "rule": HOSTILE, "message": "unpinned\n/merge"}]}])
+        body = "\n".join(visual.comment(report, cli.evidence(report)))
+        self.assertIn("<details><summary>Static checks and history</summary>\n\n"
+                      "- shellcheck: could not check `` " + HOSTILE + " ``\n"
+                      "- ` ci.yml `:3 — `` " + HOSTILE + " `` ` unpinned /merge `\n</details>", body)
+        self.assertNotIn("@all", outside_code_spans(body))
+        self.assertNotIn("\n/merge", body)
+
+
+class VisualPostTests(unittest.TestCase):
+    def test_publish_posts_the_visual_comment_as_one_body(self):
+        bodies = []
+        report = {"provider": "cursor", "state": "reviewed", "head": "a"*40, "omitted": [], "checks": [],
+                  "map": dict(visual.survey([source.File("app.py", hunk(2, 0), "added")]), shown=["app.py"]),
+                  "visual": {"summary": "Adds a fee.", "changes": [], "hotspots": []}}
+        project, state = object(), Path("/state")
+        # The same path as a review: one comment for the reviewed head of the configured project.
+        with patch.object(cli, "post_comment", side_effect=lambda *args: bodies.append(args)) as post:
+            cli.publish("org/repo#7", "a"*40, report, project=project, state=state)
+        post.assert_called_once()
+        self.assertEqual(bodies[0][:3], (project, 7, "a"*40))
+        self.assertIs(bodies[0][4], state)
+        body = bodies[0][3]
+        self.assertEqual(body, "\n".join(visual.comment(report)) + "\n")
+        self.assertTrue(body.startswith("Cursor visual review of " + "a"*40 + "\nreviewed\n\n```\n"))
+        self.assertTrue(body.endswith("Visual review after THORChain's " + CREDIT + ". "
+                                       "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent).\n"))

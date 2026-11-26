@@ -1,6 +1,6 @@
 # Assay PR Agent
 
-A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It builds on [PR-Agent](https://github.com/the-pr-agent/pr-agent). The PR-Agent contributors provide the review prompt, line-numbered diff formatter and token estimator used here. We ship their [MIT-licensed](https://github.com/the-pr-agent/pr-agent/blob/main/LICENSE) Python package in the container, with its original license notice. Choose Cursor Agent, Claude Code, or Codex CLI for inference. The `pr-agent-forge` helper uses Assay’s Go library for authenticated forge access when you use a change number. Local and CI runs require only the Git objects.
+A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It builds on [PR-Agent](https://github.com/the-pr-agent/pr-agent). The PR-Agent contributors provide the review prompt, line-numbered diff formatter and token estimator used here. We ship their [MIT-licensed](https://github.com/the-pr-agent/pr-agent/blob/main/LICENSE) Python package in the container, with its original license notice. Choose Cursor Agent, Claude Code, or Codex CLI for inference. The `pr-agent-forge` helper uses Assay’s Go library for authenticated forge access when you use a change number. Local and CI runs require only the Git objects. A `/visual-review` comment asks instead for a map of where a diff is worth reading and a short explanation of the change.
 
 ## Install with Docker Compose
 
@@ -67,6 +67,20 @@ The helper lists open changes and reads their conversations on every cycle, incl
 
 Each project starts watching at its first activation. Keep the state volume across restarts to pick up requests posted during downtime on still-open changes. Queued reviews survive a restart. A review interrupted after starting needs a fresh `/review` to run again. Duplicate reads do not incur another model call. A deleted comment or a change closed between polls may never be observed.
 
+### Request a visual review
+
+Post a new comment containing just `/visual-review`. The same accounts, polling, queue, cache and head check apply. Where `/review` hunts for defects, a visual review shows a reviewer where to spend attention. The idea and the three-part layout come from THORChain's [visual-review](https://gitlab.com/thorchain/misc/visual-review), an agent skill that publishes a page with narrated video. This is an independent implementation for one forge comment, with no video, page or host, so nothing is published outside the forges.
+
+The comment has three parts.
+
+1. **Where the diff is**, at zero model tokens. Every changed line is counted by kind, in the same order on every comment: Logic, Schema (migrations and interface definitions), Tests, Config & CI, Docs, Dependencies (lockfiles), Generated and Fixtures. A file's kind follows its path. The headline number is **lines to read**, the Logic and Schema lines. Under it are the largest files to read and the tests that changed. A deleted file or a binary is counted and does not count against coverage.
+2. **What changed**: a summary of one or two sentences and at most eight one-line changes, each naming its files.
+3. **What to check**: at most six places, ranked `verify`, `careful`, `look`. A place says where to look, not that the code is wrong. Each cites head lines the model was shown; a citation outside the shown hunks or the change fails the whole answer.
+
+The reading of the diff is labelled AI-generated. Paths and model text are quoted as code, as for `/review`, and the static checks and Qualgen advisories follow in a collapsed section.
+
+A visual review runs the same scanners, Qualgen history and head-bound publication as `/review`, and makes at most one provider call. The call has its own budget, `REVIEW_VISUAL_MAX_INPUT_TOKENS`: **12,000 estimated input tokens** by default, with the same precedence as the review budget (environment, saved setup, then the default) and the same `--max-input-tokens` override. Its instructions take about 470 tokens where the review rubric takes about 3,300, and each hunk is shown once instead of as a new-and-old pair, so the larger budget reads several times more of the change: a 342-line change that `/review` estimates at 13,300 tokens estimates about 11,100 as a visual prompt. Dependencies, generated code, fixtures and licence files are counted in the map but never sent to the model, so they do not use the budget. Over the limit the comment still carries the map and says the model was skipped. `--estimate` and the cache behave as for `/review`, and the two commands never share a cache entry.
+
 ### Docker setup
 
 The image includes all three provider CLIs, git-sync, Qualgen, the Go forge helper, ShellCheck, actionlint, Hadolint, zizmor and OSV-Scanner. Use an **amd64 Linux** runner or Docker’s amd64 emulation. To build from source:
@@ -86,7 +100,7 @@ docker run --rm -it --platform linux/amd64 \
   -v review-state:/state -v /path/to/checkouts:/repos:ro assay-pr-agent setup
 ```
 
-Enter the projects, checkout paths inside the container, visibility, the GitHub or GitLab usernames (or numeric IDs) allowed to request reviews, and the responsible operator’s username. Setup looks the numeric account IDs up on the forge; GitLab lookups use the reviewer token. With both forges configured, enter the operator as `username:numeric-id`. Setup asks for the selected authentication method and credentials for the forges you selected. For GitHub, have the App ID, installation ID and private PEM ready. For GitLab, have the reviewer token ready. You can accept the defaults of 120 seconds between polls, 6,000 estimated input tokens per review and the selected CLI’s default model.
+Enter the projects, checkout paths inside the container, visibility, the GitHub or GitLab usernames (or numeric IDs) allowed to request reviews, and the responsible operator’s username. Setup looks the numeric account IDs up on the forge; GitLab lookups use the reviewer token. With both forges configured, enter the operator as `username:numeric-id`. Setup asks for the selected authentication method and credentials for the forges you selected. For GitHub, have the App ID, installation ID and private PEM ready. For GitLab, have the reviewer token ready. You can accept the defaults of 120 seconds between polls, 6,000 estimated input tokens per review, 12,000 per visual review and the selected CLI’s default model.
 
 For each credential, choose **paste** to enter it with terminal echo disabled, **import** to copy a readable file into the volume, or **mount** to keep using an external file. For import or mount, add the source volume to the setup command (for example, `-v /path/to/secrets:/run/secrets:ro`) and enter the file’s absolute path **inside** the container. With **mount**, provide the same file path when running the service. With **import**, the source mount is only needed during setup.
 
@@ -130,6 +144,7 @@ REVIEW_GITLAB_TOKEN_FILE=/run/secrets/gitlab-reviewer-token
 REVIEW_PROJECTS=[{"provider":"github","url":"https://github.com/example/api","checkout":"/repos/api","requester_ids":[101],"visibility":"public"},{"provider":"gitlab","url":"https://gitlab.example.com/example/web","checkout":"/repos/web","requester_ids":[202],"visibility":"private"}]
 REVIEW_POLL_SECONDS=120
 REVIEW_MAX_INPUT_TOKENS=6000
+REVIEW_VISUAL_MAX_INPUT_TOKENS=12000
 ```
 
 ```sh
@@ -195,6 +210,7 @@ Run the installed executable from any checkout, or use `--repo` to point it at t
 
 ```sh
 cursor-review --repo /path/to/checkout --base main --estimate
+cursor-review --repo /path/to/checkout --base main --visual --estimate
 cursor-review --repo /path/to/checkout --base main --max-input-tokens 4000
 cursor-review --repo /path/to/checkout --change 'org/repo#42' --estimate
 cursor-review --repo /path/to/checkout --change 'org/repo#42' --model MODEL
@@ -206,6 +222,7 @@ The local form compares the merge base to committed `HEAD`, or to an explicit `-
 
 - `--estimate` makes zero Cursor calls. It performs the same diff preparation and static checks as a review.
 - The limit is **6,000 estimated input tokens** by default for the complete user-supplied prompt. The saved setup's `REVIEW_MAX_INPUT_TOKENS` setting (asked during setup, or set as an environment variable) changes it; `--max-input-tokens` overrides both for one run. An oversized review returns `over-budget` before invoking Cursor. Repeat `--path path/to/file` to explicitly select a smaller scope. The JSON lists the omitted paths.
+- `/visual-review` has its own limit, **12,000 estimated input tokens** by default, from `REVIEW_VISUAL_MAX_INPUT_TOKENS` in the same three ways. Lockfiles, generated code, fixtures and licence files never count against it.
 - Each run can launch Cursor **once**, with a 120-second timeout and at most three accepted findings. There is no model fallback, repair prompt, automatic retry or model polling. The cap covers the submitted prompt. Cursor controls its own system context, output and billed usage. `cursor_usage` is populated only if the CLI supplies it.
 - Successful results are cached under `~/.cache/cursor-pr-review` (or `XDG_CACHE_HOME`). The container image sets `XDG_CACHE_HOME=/tmp/.cache` because its root filesystem is read-only, and its poller passes `--cache-dir /state/cache` for the reviews it runs. Identical evidence, scope identity, model selection and prompt reuse the result. The lock serializes duplicate local requests. For CI reuse across jobs, provide a persistent, trusted `--cache-dir`. Each ephemeral runner otherwise starts cold. Use an explicit model for reproducible comparisons.
 - JSON keeps scanner findings separate from model findings. A source file with no usable patch or head-side location (including a whole-file deletion) is listed as omitted. Missing scanner evidence stays visible even when the model finds nothing.
@@ -287,7 +304,7 @@ GitHub uses a `pull_request` event and its recorded base and head SHAs. Fetch su
 
 Add `--post` to the `--change` command to post the reviewed commit and findings as a single ordinary comment. The helper checks visibility and the current head before publishing under the configured reviewer credential. The agent stores a receipt on its state volume to suppress identical retries for the same head, including after restart. A failed post can be retried with the same model and cache without paying again for an unchanged prompt. No write happens by default.
 
-The standalone poller supports `/review`. For additional upstream PR-Agent chat commands such as `/ask` and `/improve`, see [GitHub integration](https://docs.pr-agent.ai/installation/github/) and [GitLab integration](https://docs.pr-agent.ai/installation/gitlab/). GitLab pipeline jobs alone do not receive comment events. The upstream comment server and this CLI are separate entry points.
+The standalone poller supports `/review` and `/visual-review`. For additional upstream PR-Agent chat commands such as `/ask` and `/improve`, see [GitHub integration](https://docs.pr-agent.ai/installation/github/) and [GitLab integration](https://docs.pr-agent.ai/installation/gitlab/). GitLab pipeline jobs alone do not receive comment events. The upstream comment server and this CLI are separate entry points.
 
 ## Verification
 
@@ -295,8 +312,8 @@ The standalone poller supports `/review`. For additional upstream PR-Agent chat 
 uv run --frozen python -m unittest discover -s tests -v
 ```
 
-The fixtures exercise GitHub and GitLab polling, restart handling, the Assay forge envelope/command contract, caching, the budget cutoff, incomplete inputs and Cursor failure handling. Install ShellCheck to run the integration fixtures. Tests substitute a local executable for inference and never post externally.
+The fixtures exercise GitHub and GitLab polling, restart handling, the Assay forge envelope/command contract, caching, the budget cutoff, incomplete inputs, Cursor failure handling, and the visual review's map, prompt, answer checks and comment. Install ShellCheck to run the integration fixtures. Tests substitute a local executable for inference and never post externally.
 
 ## License
 
-This repository is licensed under the [Apache License 2.0](LICENSE). The license covers this project's own source. Third-party software that the image downloads or bundles keeps its own license and terms: the provider CLIs, PR-Agent, Assay’s forge library and Qualgen, and the scanners.
+This repository is licensed under the [Apache License 2.0](LICENSE). The license covers this project's own source. Third-party software that the image downloads or bundles keeps its own license and terms: the provider CLIs, PR-Agent, Assay’s forge library and Qualgen, and the scanners. The `/visual-review` command takes its format from THORChain's MIT-licensed [visual-review](https://gitlab.com/thorchain/misc/visual-review); none of its code is included.

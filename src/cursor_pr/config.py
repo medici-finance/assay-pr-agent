@@ -13,6 +13,10 @@ from .scanners import ci_config
 
 # Prompt budget when neither REVIEW_MAX_INPUT_TOKENS nor the saved setup supplies one.
 DEFAULT_MAX_INPUT_TOKENS = 6000
+# A visual review explains the whole change, so its budget is its own. Its instructions are
+# far shorter than the review rubric and each hunk is shown once, so twice the budget reads
+# several times more of the change.
+DEFAULT_VISUAL_MAX_INPUT_TOKENS = 12000
 
 
 @dataclass(frozen=True)
