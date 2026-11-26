@@ -14,7 +14,25 @@ from cursor_pr.web_setup import Session
 SAVED = {"REVIEW_OPERATOR": "alice:13", "REVIEW_GITHUB_APP_ID": "41", "REVIEW_GITHUB_INSTALLATION_ID": "42",
          "REVIEW_MODEL": "model-a", "REVIEW_MAX_INPUT_TOKENS": "6000", "REVIEW_POLL_SECONDS": "120",
          "REVIEW_QUALGEN_INTERVAL_SECONDS": "86400", "REVIEW_PROVIDER": "codex", "REVIEW_AUTH_MODE": "api-key"}
-CERTIFICATE = "-----BEGIN CERTIFICATE-----\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=\n-----END CERTIFICATE-----"
+# A self-signed fixture CA and its empty CRL, which TLS can load.
+CERTIFICATE = ("-----BEGIN CERTIFICATE-----\n"
+    "MIIBYDCCAQagAwIBAgIUBVyXEMpP575+xujoKHFlvoca0vQwCgYIKoZIzj0EAwIw\n"
+    "FTETMBEGA1UEAwwKZml4dHVyZS1jYTAgFw0yNjExMjYyMzU2NDNaGA8yMTI2MTEw\n"
+    "MjIzNTY0M1owFTETMBEGA1UEAwwKZml4dHVyZS1jYTBZMBMGByqGSM49AgEGCCqG\n"
+    "SM49AwEHA0IABEz5I50H+TlUcUvAxZGhn0kSYp8eOomNbQkV7upHhUHgyX4Es+o+\n"
+    "8EXYmJWPEEXNgoGw7Oh2or3KnV/KbODi5SyjMjAwMB0GA1UdDgQWBBTC6r8bfEDE\n"
+    "cwPCPKO5Gz+drZXQJjAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUC\n"
+    "IQDz6m9hNAXSJ9OB2wfgNmPsReCVdlyFKciRY8CkoTJKHQIgFhydjU3pnAT3LvZ0\n"
+    "o8RtYf/vuOMVzJu6sWFF4oQ3GeY=\n"
+    "-----END CERTIFICATE-----")
+REVOCATIONS = ("-----BEGIN X509 CRL-----\n"
+    "MIGuMFYCAQEwCgYIKoZIzj0EAwIwFTETMBEGA1UEAwwKZml4dHVyZS1jYRcNMjYx\n"
+    "MTI2MjM1NjQzWhgPMjEyNjExMDIyMzU2NDNaoA4wDDAKBgNVHRQEAwIBATAKBggq\n"
+    "hkjOPQQDAgNIADBFAiEAsU5UF7oZ9q3fU0YjQt+vkzN5hER/m0ThEU+fDecGoL0C\n"
+    "IBfTO5S47Ioiazhf3x4kzpwnJNXAMb/tksERuLXPKDAc\n"
+    "-----END X509 CRL-----")
+# Matches the PEM pattern but is not a certificate.
+NOT_A_CERTIFICATE = "-----BEGIN CERTIFICATE-----\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=\n-----END CERTIFICATE-----"
 
 
 def saved(state, checkout, *, values=SAVED, projects=None, secrets=None):
@@ -231,7 +249,7 @@ class SettingsTests(unittest.TestCase):
         view = settings.view(self.state)
         self.assertEqual([item(view, name)["state"] for name in ("REVIEW_GITLAB_TOKEN", setup.gitlab_tls.CA, setup.gitlab_tls.CRL)],
                          ["stored", "stored", "none"])
-        settings.save(self.state, {"name": setup.gitlab_tls.CRL, "value": CERTIFICATE.replace("CERTIFICATE", "X509 CRL")})
+        settings.save(self.state, {"name": setup.gitlab_tls.CRL, "value": REVOCATIONS})
         self.assertIn(setup.gitlab_tls.CRL, self.document()["secrets"])
         settings.save(self.state, {"name": setup.gitlab_tls.CA, "remove": True})
         self.assertNotIn(setup.gitlab_tls.CA, self.document()["secrets"])
@@ -241,6 +259,12 @@ class SettingsTests(unittest.TestCase):
             settings.save(self.state, {"name": "REVIEW_GITLAB_TOKEN", "remove": True})
         with self.assertRaisesRegex(ValueError, "CERTIFICATE data"):
             settings.save(self.state, {"name": setup.gitlab_tls.CA, "value": "not a certificate"})
+        before = (setup.active_bundle(self.state) / "settings.json").read_bytes()
+        with self.assertRaisesRegex(ValueError, "could not be loaded for TLS"):
+            settings.save(self.state, {"name": setup.gitlab_tls.CA, "value": NOT_A_CERTIFICATE})
+        self.assertEqual((setup.active_bundle(self.state) / "settings.json").read_bytes(), before)
+        self.assertEqual([p.name for p in self.state.iterdir() if p.name.startswith(".review-setup-")],
+                         [setup.active_bundle(self.state).name])
 
     def test_a_mounted_credential_stays_a_reference_until_replaced(self):
         external = self.root / "gitlab-pat"
@@ -335,3 +359,6 @@ class SettingsSessionTests(unittest.TestCase):
         self.assertTrue(session.quit(current))
         self.assertEqual(session.view["status"], "quit")
         self.assertIsNone(session.answer)
+        # A save that finishes after a quit from the terminal does not reopen the page.
+        self.assertIsNone(session.show(settings.view(self.state), "Saved."))
+        self.assertEqual(session.view["status"], "quit")

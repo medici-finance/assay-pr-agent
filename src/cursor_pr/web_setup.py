@@ -97,6 +97,8 @@ class Session:
 
     def show(self, page, *notices):
         with self.cv:
+            if self.view["status"] == "quit":
+                return None  # a quit from the terminal during a save still ends the session
             self.view = {"id": self.view["id"] + 1, "status": "settings", "messages": list(notices), **page}
             self.cv.notify_all()
             return self.view.copy()
@@ -269,6 +271,8 @@ def serve(state, *, force_login=False):
                     # Like the wizard, never echo an unexpected failure's details.
                     return self.reply(400, json.dumps({"error": "The setting could not be saved. Try again or use the setup wizard."}).encode())
                 view = session.show(page, "Saved. The sync and reviewer services reload it between cycles.")
+            if view is None:
+                return self.reply(409)
             self.reply(200, json.dumps(view).encode())
 
     class Server(ThreadingHTTPServer):

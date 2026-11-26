@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import ssl
 import tempfile
 
 from . import accounts, gitlab_tls, providers, setup
@@ -292,6 +293,11 @@ def save(state, change):
                 elif not Path(location).is_absolute():
                     # A mounted file stays a reference; a stored copy moves with its bundle.
                     shutil.copy(old / location, bundle / setup.SECRETS[secret])
+            if written.keys() & gitlab_tls.NAMES.keys():
+                try:
+                    gitlab_tls.context(bundle)  # as the wizard does: refuse PEM data that TLS cannot load
+                except ssl.SSLError:
+                    raise ValueError("The GitLab certificate files could not be loaded for TLS") from None
             private_file(bundle / "settings.json", json.dumps(config, indent=2))
             setup.commit(state, old, bundle)
         except BaseException:
