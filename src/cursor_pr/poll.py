@@ -36,6 +36,9 @@ class Jobs:
                 db.execute("UPDATE requests SET attempts=1 WHERE status='started'")
             db.execute("""CREATE TABLE IF NOT EXISTS activations (
                 project TEXT PRIMARY KEY, since TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS schedule (
+                project TEXT NOT NULL, number INTEGER NOT NULL, comments INTEGER NOT NULL, newest TEXT NOT NULL,
+                wait INTEGER NOT NULL, seen REAL NOT NULL, PRIMARY KEY(project, number))""")
             # Only the process holding the instance lock opens the queue, so a row still started
             # was left by a review that died with the previous process. Run it once more; a
             # request that keeps killing the poller must not loop.
@@ -76,6 +79,26 @@ class Jobs:
         with closing(sqlite3.connect(self.path)) as db:
             return db.execute("SELECT 1 FROM requests WHERE project=? AND number=? AND status IN ('queued','started')",
                               (project, number)).fetchone() is not None
+
+    def waiting(self, project, numbers, now, cap):
+        """Open changes whose saved read is not due yet. A change no longer open is forgotten."""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            saved = {number: (wait, seen) for number, wait, seen in db.execute(
+                "SELECT number, wait, seen FROM schedule WHERE project=?", (project,))}
+            db.executemany("DELETE FROM schedule WHERE project=? AND number=?",
+                           [(project, number) for number in saved if number not in numbers])
+        # A clock that moved back past the last read makes the saved times meaningless, so read now.
+        return {number for number, (wait, seen) in saved.items() if now >= seen and seen + min(wait, cap) > now}
+
+    def observed(self, project, number, comments, newest, active, now, interval, cap):
+        """Keep one complete read of a change. A first look, new comments or a request read again after one
+        interval; an unchanged conversation waits twice as long as before, never longer than the cap."""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            previous = db.execute("SELECT comments, newest, wait FROM schedule WHERE project=? AND number=?",
+                                  (project, number)).fetchone()
+            quiet = previous is not None and not active and list(previous[:2]) == [comments, newest]
+            db.execute("INSERT OR REPLACE INTO schedule VALUES (?,?,?,?,?,?)",
+                       (project, number, comments, newest, min(previous[2] * 2, cap) if quiet else interval, now))
 
     def finish(self, job, status):
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -120,12 +143,17 @@ def run_review(project, number, state):
     return report["state"] if report.get("publication") == "posted-or-already-present" else "failed"
 
 
-def cycle(projects, state, jobs, since, runner=run_review, ack=None):
+def cycle(projects, state, jobs, since, runner=run_review, ack=None, idle=None):
+    polled = [0, 0]
     for project in projects.values():
         try:
-            poll_project(project, state, jobs, since[project.key], ack)
+            counts = poll_project(project, state, jobs, since[project.key], ack, idle)
+            if idle is not None:
+                polled = [total + count for total, count in zip(polled, counts)]
         except Exception:
             log.exception("Poll failed for %s; will retry next cycle", project.key)
+    if idle is not None:
+        log.info("Read the comments of %d open changes; %d quiet ones are due in a later cycle", *polled)
     while job := jobs.next():
         key, number, comment = job
         status = "failed"
@@ -198,6 +226,9 @@ def main():
                 args.interval = int(os.getenv("REVIEW_POLL_SECONDS", "120"))
             if args.interval < 1:
                 raise ValueError("poll interval must be positive")
+            idle_max = int(os.getenv("REVIEW_POLL_IDLE_MAX_SECONDS", "900"))
+            if idle_max < 1:
+                raise ValueError("REVIEW_POLL_IDLE_MAX_SECONDS must be positive")
             setup.max_input_tokens(state)
             mine_seconds = history.interval()
             projects = load_config(state)
@@ -213,6 +244,10 @@ def main():
                 ack.finished(projects[key], number, comment, "failed")
         since = {key: jobs.activated(key) for key in projects}
         log.info("Polling %s with %d seconds between cycles", ", ".join(projects), args.interval)
+        # A cap no longer than the poll interval reads every change on every cycle, as before the schedule.
+        idle = (args.interval, idle_max) if idle_max > args.interval else None
+        if idle:
+            log.info("A quiet change is read again within %d seconds", idle_max)
         if mine_seconds:
             threading.Thread(target=history.mine_periodically, args=(projects, state, mine_seconds),
                              name="qualgen-miner", daemon=True).start()
@@ -220,7 +255,7 @@ def main():
             if watch.enabled and any(p.managed and not p.checkout.is_dir() for p in projects.values()):
                 watch.wait(2)
                 continue
-            cycle(projects, state, jobs, since)
+            cycle(projects, state, jobs, since, ack=ack, idle=idle)
             watch.wait(args.interval)
 
 

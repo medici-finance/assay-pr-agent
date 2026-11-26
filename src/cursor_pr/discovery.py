@@ -5,6 +5,7 @@ from itertools import batched
 import json
 import logging
 import os
+import time
 from urllib.parse import quote
 
 import httpx
@@ -45,9 +46,16 @@ def comment_threads(project, numbers):
                 or row.get("repo") != project.slug or not isinstance(row.get("comments"), list)):
             raise ReviewError("Mismatched deskread comments item")
         threads[number] = row["comments"]
-    if envelope.get("partial") or set(threads) != set(numbers):
+    complete = not envelope.get("partial") and set(threads) == set(numbers)
+    if not complete:
         log.warning("Incomplete comment read for %s; missing threads will be polled again", project.key)
-    return threads
+    return threads, complete
+
+
+def signature(notes):
+    # What tells a conversation with new comments from an unchanged one. The times are only compared.
+    return (len(notes), max((note["createdAt"] for note in notes
+                             if isinstance(note.get("createdAt"), str) and len(note["createdAt"]) <= 64), default=""))
 
 
 def is_request(project, number, note, since):
@@ -91,13 +99,22 @@ def public_gitlab_request(project, number, note):
             and bool(latest.get("created_at")) and latest["created_at"] == latest.get("updated_at"))
 
 
-def poll_project(project, state, jobs, since, ack=None):
-    for numbers in batched(open_changes(project, state), 16):
+def poll_project(project, state, jobs, since, ack=None, idle=None):
+    """Read new requests; return how many open changes were read and how many were left for a later cycle.
+
+    idle is (poll interval, cap). A change whose complete read found nothing new waits twice as long
+    before its next read, up to the cap. New comments or a request return it to the poll interval.
+    """
+    numbers = open_changes(project, state)
+    waiting = jobs.waiting(project.key, numbers, time.time(), idle[1]) if idle is not None else set()
+    due = [number for number in numbers if number not in waiting]
+    for numbers in batched(due, 16):
         try:
-            threads = comment_threads(project, numbers)
+            threads, complete = comment_threads(project, numbers)
         except Exception:
             log.exception("Comment read failed for %s changes %s", project.key, numbers)
             continue
+        active = set()
         for number, notes in threads.items():
             for note in notes:
                 if not is_request(project, number, note, since):
@@ -110,10 +127,18 @@ def poll_project(project, state, jobs, since, ack=None):
                         public = public_gitlab_request(project, number, note)
                     except (OSError, ValueError, ReviewError, httpx.HTTPError):
                         log.exception("Could not verify GitLab note %s!%d/%d", project.slug, number, comment)
+                        active.add(number)  # Look again next cycle, as before there was a schedule.
                         continue
                     if not public:
                         jobs.enqueue(project.key, number, comment, "ignored")
                         continue
                 jobs.enqueue(project.key, number, comment)
+                active.add(number)
                 if ack is not None:
                     ack.queued(project, number, comment)
+        # An incomplete read says nothing about the changes it asked for, so it never advances the schedule.
+        if idle is not None and complete:
+            now = time.time()
+            for number, notes in threads.items():
+                jobs.observed(project.key, number, *signature(notes), number in active, now, *idle)
+    return len(due), len(waiting)
