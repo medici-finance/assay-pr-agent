@@ -2,6 +2,77 @@
 
 A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It builds on [PR-Agent](https://github.com/the-pr-agent/pr-agent). The PR-Agent contributors provide the review prompt, line-numbered diff formatter and token estimator used here. We ship their [MIT-licensed](https://github.com/the-pr-agent/pr-agent/blob/main/LICENSE) Python package in the container, with its original license notice. Choose Cursor Agent, Claude Code, or Codex CLI for inference. Assay’s installed `deskread` and `deskpost` handle authenticated forge access when you use a change number. Local and CI runs require only the Git objects.
 
+## Security model
+
+The reviewer reads changes written by people who need no access to your deployment, and it posts under your reviewer identity. What sets it apart, at a glance:
+
+- Deterministic checks run first at zero model tokens: ShellCheck, actionlint, Hadolint, zizmor, OSV-Scanner and, when configured, Assay's Go analysis report.
+- One bounded model call per review, under a token budget of 6,000 estimated input tokens by default, with at most three findings.
+- Qualgen history advisories for the changed paths, published outside the prompt and the token estimate.
+- Hardened for hostile pull requests: listed requesters only, no model tools, untrusted input labelled, and a posted comment that is flattened and quoted as code.
+
+The rest of this section states what the code enforces, in the order a request meets it. The sections after it cover installation and operation.
+
+### Who can start a review
+
+Only a new comment on an open change can start a review, and only when all of these hold:
+
+- The body is `/review` and nothing else apart from surrounding whitespace. A quoted or decorated command such as `> /review` or `/review please` is an ordinary comment.
+- The author's numeric account ID is in the project's `requester_ids`. Setup resolves usernames to IDs once. The list is the control on who can spend model budget; nothing limits a listed account beyond one review per comment.
+- The comment is unedited, with equal created and updated timestamps, and is not older than the project's activation.
+- On GitHub, the author type is `User`, which refuses bots, organizations and mannequins, and the comment URL is that change's `#issuecomment-<id>`.
+- On GitLab, deskread v1.0.94 omits note visibility and rounds timestamps to seconds, so the one otherwise eligible note is looked up once through the API with the reviewer token. It must be a non-internal, non-system note on that merge request, by the same non-bot author, with the same body and unedited according to the API's timestamps.
+
+A failed GitLab lookup is retried on the next poll, and a note that fails a check is recorded as ignored. Each comment starts at most one review, and when the review starts the change must still be open at its configured URL. A poll never calls the model.
+
+### What the model can and cannot do
+
+One review runs the selected provider CLI once, with a 120-second timeout and no retry, fallback or second prompt. A prompt over the token limit returns `over-budget` before the CLI starts (see [Cost and coverage](#cost-and-coverage)). The answer must be one successful result of at most 32,768 characters with at most three findings. Tools are disabled per provider:
+
+- **Cursor** — `cursor-agent -p --mode=ask` in a temporary workspace holding a written `.cursor/cli.json` with an empty allow list and a deny list for shell, file read, file write, web fetch and MCP tools.
+- **Claude Code** — `claude -p --tools "" --strict-mcp-config --max-turns 1 --no-session-persistence`.
+- **Codex** — `codex exec --ephemeral --sandbox read-only`, with the shell tool, unified exec, multi-agent, apps and web search disabled and user configuration and rules ignored.
+
+The CLI receives an allow-listed environment: its own provider's key or sign-in profile and the path, locale, configuration, temporary, proxy and TLS settings. Forge credentials, CI secrets and other providers' keys never reach it, and no repository is present in its workspace.
+
+### Untrusted input and evidence binding
+
+The prompt contains three things: PR-Agent's review rubric, the scanner diagnostics that fall on shown lines, and the diff hunks. The change's title, description, reviews and other comments are not sent, and Hadolint, zizmor, OSV-Scanner and Qualgen output never enters it. The diagnostics and the patch follow a fixed instruction to use only that material and not to use tools, and each is labelled `untrusted data`. The file list is bracketed by two change reads and refused if the head moved in between, so the patch belongs to one head.
+
+A finding is accepted only if it names a reviewed file and cites a contiguous range of head lines that the shown hunks contain. One failing finding rejects the whole answer: the review ends as `model-unavailable` and its scanner results are still posted. A file name containing a control character, or a duplicate file name, stops the review before the model is called.
+
+### The posted comment
+
+The reviewer's only forge write is one ordinary comment, `deskpost comment ... --kind mr --head SHA` ([Publish a summary](#publish-a-summary)). It never submits a review verdict, approves, merges or edits a change. Assay posts it as the reviewer identity, refuses it if the head has moved and does not repeat an identical comment. `--kind mr` keeps a GitLab merge request from being confused with the issue of the same number.
+
+Every pull request path, model title and message, scanner rule and message, and Qualgen notice is quoted as a code span one backtick longer than any run of backticks inside it, so Markdown, links and `@mentions` in those strings stay literal. Line breaks are collapsed in every line of the comment, so none of those strings can add a line, start a forge quick action or open a multi-line construct. The comment shows at most 30 scanner rows of 450 characters and 20 Qualgen entries of 500 characters.
+
+### Local scanners
+
+ShellCheck, actionlint, Hadolint, zizmor and OSV-Scanner never read the checkout's working tree or follow a link. Each receives one immutable Git blob from the reviewed head: ShellCheck and actionlint on standard input in an empty temporary directory, the other three as a file in a temporary directory with an environment of only `PATH` and `HOME` (plus the advisory database cache for OSV-Scanner). Each run has a timeout and a size cap, and Hadolint, zizmor and OSV-Scanner refuse anything that is not a regular file, such as a symlink or a submodule. For a managed checkout whose reviewed commit is missing locally, the reviewer fetches only that change's ref into a temporary checkout, uses it only if its SHA matches, and discards it. Nothing from the change is built or executed.
+
+### CI artifacts
+
+Hadolint, zizmor, OSV-Scanner and the Go analysis report can come from CI instead. A report is accepted only from the producer named for the project (`go_analysis` only when you set it) and from a finished run for the reviewed source commit. Downloads are capped at 8 MiB, follow redirects by hand over HTTPS, and the forge token is dropped before any redirect target is requested. The Go report must carry the `go-analysis/v1` schema, the repository, the reviewed source SHA, complete coverage and agreeing totals, exit code and gate. Anything missing, stale or malformed is reported as `could not check` and the review goes on without it. [Use the Go report in a comment-triggered review](#use-the-go-report-in-a-comment-triggered-review) explains why the producer must be one your team controls.
+
+### Credential custody
+
+Forge access always runs as Assay's reviewer role. Reads and the post go through the desk tools, and where the agent calls a forge API itself (the GitLab note lookup, CI artifacts and git-sync) it first asks `desktoken --no-rotate` for the credential: on GitHub a minted or reused App installation token, on GitLab the standing custody file, with nothing rotated. Every forge and provider credential file the agent writes, including the standalone runtime copies in `/dev/shm`, is plaintext, mode 0600 and replaced by an atomic rename. The provider API key is removed from the environment given to the Assay desk tools, to the git commands that read reviewed blobs and to the local scanners.
+
+The state volume holds the setup's credentials, the request queue, the cache, Assay's audit records and Qualgen's history. Follow the existing advice to [protect the volume and its backups](#interactive-setup), to [treat the sign-in volume as a credential](#review-provider) and to [keep the state volume private](#qualgen-history-advisories).
+
+### Deployment hardening
+
+Discovery is polling only: there is no webhook, the reviewer and sync services publish no port, and the GitHub App is created with an inactive webhook and no events. The reviewer mounts the checkout volume read-only; only the sync service writes to it.
+
+`compose.yaml` and the Kubernetes manifests run every container with a read-only root filesystem, all capabilities dropped and no privilege escalation, with a 1 GiB temporary mount on `/tmp`. The manifests also set a non-root user, the runtime's default seccomp profile, no service account token and a `restricted` pod-security namespace, and define the `pr-agent-egress` NetworkPolicy: egress only, to cluster DNS and the public internet, with RFC1918, CGNAT and link-local ranges (which include cloud metadata addresses) blocked. [`k8s/README.md`](k8s/README.md) covers a forge or proxy on a private network and the policy's node-traffic limit.
+
+The image runs as UID 10001 and installs the Cursor Agent CLI from a release tarball pinned by version and SHA-256 digest, as it already does for Qualgen, Hadolint, zizmor and OSV-Scanner, instead of the `cursor.com/install` script that always fetches the current release. The plain `docker run` commands in this README do not pass the equivalent runtime flags.
+
+### Limits
+
+A finding is still model output written after reading attacker-supplied code, so findings are advisory: prompt injection can change what the one comment says inside its code spans, or talk the model out of reporting, and a person decides what to do with a change. The tool restrictions are flags and configuration that each provider CLI enforces, not a sandbox this agent applies to the CLI process, which controls its own system context and requests. ShellCheck and actionlint inherit the service environment apart from the provider API key, so a compromise of either tool would expose a forge credential the service holds. Only line breaks are removed from posted text; other control and formatting characters, such as bidirectional overrides, pass through. The state volume holds credentials and repository history, and credential custody, the forge data behind the trigger checks, and the head check, attribution and deduplication of posts are Assay desk tools' behaviour.
+
 ## Install with Docker Compose
 
 Start the containers from this checkout, then attach to the installer:
