@@ -78,11 +78,10 @@ def run_review(project, number, state):
         argv.extend(["--model", os.environ["REVIEW_MODEL"]])
     env = dict(os.environ)
     env["CURSOR_REVIEW_POLLER_CHILD"] = "1"
-    env.pop("REVIEW_MANAGED_PROJECT", None)
-    if project.managed:
-        env["REVIEW_MANAGED_PROJECT"] = json.dumps(dict(provider=project.provider, url=project.url,
-                                                       managed=True, requester_ids=sorted(project.requesters),
-                                                       gitlab_base=project.url.removesuffix("/" + project.slug)))
+    env["REVIEW_STATE_DIR"] = str(state)
+    env["REVIEW_FORGE_PROJECT"] = json.dumps(dict(provider=project.provider, url=project.url,
+        managed=project.managed, checkout=str(project.checkout), requester_ids=sorted(project.requesters),
+        visibility=project.visibility, gitlab_base=project.url.removesuffix("/" + project.slug)))
     for key in ("REVIEW_PROJECTS", *SETUP_INPUTS):
         env.pop(key, None)
     for key in list(env):
@@ -104,7 +103,7 @@ def run_review(project, number, state):
 def cycle(projects, state, jobs, since, runner=run_review):
     for project in projects.values():
         try:
-            poll_project(project, state, jobs, since[project.key])
+            poll_project(project, jobs, since[project.key])
         except Exception:
             log.exception("Poll failed for %s; will retry next cycle", project.key)
     while job := jobs.next():
@@ -134,7 +133,7 @@ def container_main():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Poll Assay for GitHub and GitLab /review comments")
+    parser = argparse.ArgumentParser(description="Poll GitHub and GitLab for /review comments")
     parser.add_argument("--state-dir", type=Path, default=setup.state_dir())
     parser.add_argument("--interval", type=int,
                         help="seconds to wait after each cycle (default 120)")
@@ -146,8 +145,7 @@ def main():
         try:
             fresh = not any((state / p).exists() for p in ("setup", "projects.json", "hooks.json"))
             first_install = (fresh and sys.stdin.isatty() and "REVIEW_PROJECTS" not in os.environ
-                    and not any(k in os.environ for k in SETUP_INPUTS)
-                    and not (Path.home() / ".config/assay/roster.env").exists())
+                    and not any(k in os.environ for k in SETUP_INPUTS))
             if first_install:
                 setup.configure(state)
             setup.apply_saved_setup(state)
@@ -165,7 +163,7 @@ def main():
             mine_seconds = history.interval()
             projects = load_config(state)
             stack.enter_context(providers.cursor_account())
-            stack.enter_context(forge_credentials(projects, state))
+            stack.enter_context(forge_credentials(projects))
         except (ValueError, KeyError, TypeError, EOFError, OSError, subprocess.TimeoutExpired) as err:
             parser.exit(2, f"Polling configuration: {err}\n")
         jobs = Jobs(state)

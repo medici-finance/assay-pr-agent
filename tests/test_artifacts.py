@@ -98,7 +98,7 @@ class ArtifactTests(unittest.TestCase):
             "--cache-dir", str(self.root / "cache"), "--max-input-tokens", str(budget)])
         posts = []
         with patch.object(cli, "forge_change", return_value=change), \
-             patch.object(cli, "run_desk", side_effect=lambda argv: posts.append(Path(argv[-1]).read_text())):
+             patch.object(cli, "post_comment", side_effect=lambda project, number, head, body, state: posts.append(body)):
             report, status = cli.run_request(args)
         self.assertEqual(len(posts), 1)
         self.lookup.assert_called_with(provider, SLUG, self.root)

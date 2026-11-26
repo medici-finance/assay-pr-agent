@@ -32,8 +32,7 @@ docker build --platform linux/amd64 \
 test_archive=$(mktemp)
 trap 'rm -f "$test_archive"' EXIT
 tar --exclude='__pycache__' -cf "$test_archive" tests k8s
-# Same posture as compose.yaml, so the suite runs against the hardened runtime. With no
-# network the real deskmonitor degrades exactly as it does behind a broken egress policy.
+# Test the hardened runtime with networking disabled. Forge fixtures use loopback.
 docker run -i --rm --platform linux/amd64 --network none --read-only --cap-drop ALL \
     --security-opt no-new-privileges:true --tmpfs /tmp:mode=1777,size=1g,exec \
     --entrypoint sh "$image" \
