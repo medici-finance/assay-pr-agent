@@ -27,15 +27,17 @@ docker build --platform linux/amd64 \
     --build-arg "REVIEW_BUILD_TAGS=$aliases" \
     --build-arg "REVIEW_BUILD_TIMESTAMP=$built_at" \
     -t "$image" .
-# Stream tests into the running image so this also works with a remote Docker daemon.
+# Stream the tests and the k8s manifest they assert on into the running image so this
+# also works with a remote Docker daemon.
 test_archive=$(mktemp)
 trap 'rm -f "$test_archive"' EXIT
-tar -cf "$test_archive" -C tests .
-# Same posture as compose.yaml, so the suite runs against the hardened runtime.
+tar --exclude='__pycache__' -cf "$test_archive" tests k8s
+# Same posture as compose.yaml, so the suite runs against the hardened runtime. With no
+# network the real deskmonitor degrades exactly as it does behind a broken egress policy.
 docker run -i --rm --platform linux/amd64 --network none --read-only --cap-drop ALL \
     --security-opt no-new-privileges:true --tmpfs /tmp:mode=1777,size=1g,exec \
     --entrypoint sh "$image" \
-    -ec 'mkdir -p /tmp/reviewer-tests && tar -xf - -C /tmp/reviewer-tests && python -m unittest discover -s /tmp/reviewer-tests -v' < "$test_archive"
+    -ec 'mkdir -p /tmp/reviewer-tests && tar -xf - -C /tmp/reviewer-tests && python -m unittest discover -s /tmp/reviewer-tests/tests -v' < "$test_archive"
 # shellcheck disable=SC2086  # aliases are space-separated registry tags
 for alias in $aliases; do
     docker tag "$image" "$IMAGE_REPOSITORY:$alias"
