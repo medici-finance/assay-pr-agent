@@ -23,7 +23,7 @@ from .checks import go_report, scan_files, scanner
 from .sync import scan_checkout
 from .engine import CursorFailure, pack, review, tokens
 from .source import ReviewError, ci_refs, forge_change, local_change, run_desk
-from . import forge_status, sarif
+from . import forge_status, inline, sarif
 
 
 def publish(address, head, report):
@@ -86,6 +86,8 @@ def parser():
     p.add_argument("--sarif", type=Path, help="Also write the findings as a SARIF 2.1.0 log at this path")
     p.add_argument("--forge-status", action="store_true",
                    help="Report the review on the reviewed head as a GitHub check run or GitLab commit status")
+    p.add_argument("--inline-comments", action="store_true",
+                   help="With --post, also comment on the reviewed head's lines for each model finding")
     return p
 
 
@@ -194,6 +196,7 @@ def run_request(args):
             return dict(report, publication="failed"), 2
         report["publication"] = "posted-or-already-present"
     report["forge_status"] = forge_status.outcome(args, report)
+    report.update(inline.outcome(args, report))
     return report, code
 
 

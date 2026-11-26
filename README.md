@@ -332,6 +332,22 @@ The default reviewer credentials cannot post it, and setup still requests the le
 
 To make it a required check on GitHub, add `assay-pr-agent/review` under **Require status checks before merging** on the protected branch, or under **Require status checks to pass before merging** in a ruleset. GitHub then blocks merging until the check succeeds on the pull request's latest commit, so every new push waits for a fresh `/review`. The check can be required from any source or from the reviewer App alone; in a ruleset, naming the App as the only accepted source takes **Commit statuses** write permission (`statuses: write`) on it as well. [Require status checks before merging](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging) · [REST API endpoints for check runs](https://docs.github.com/en/rest/checks/runs#create-a-check-run) · [GitLab commit statuses](https://docs.gitlab.com/api/commits/#set-commit-pipeline-status)
 
+### Post inline comments
+
+Add `--inline-comments`, or set `REVIEW_INLINE_COMMENTS=1` in the reviewer's environment, to place each model finding as an inline comment on the reviewed head after a successful `--post`. It is off by default and never runs for `--estimate`. **This path does not go through deskpost.** It bypasses Assay's body checks, trust gate, audit line, duplicate protection and posting budget, and deskpost writes no audit line for a comment posted this way. The summary comment stays the source of truth and keeps every deskpost check. The inline comments are an extra, posted by the reviewer credential directly, and that is the cost of having them.
+
+Three things stand in for what deskpost would do:
+
+- **Quoting.** A comment holds only the finding's title and message, each a code span sized to the longest backtick run inside it, with line breaks collapsed and cut at 255 and 2,000 characters. Nothing else from the report is posted, so no link or mention that a change author or the model wrote can become live.
+- **Head.** The head is read again with deskread immediately before the first write, and each post names the head: `commit_id` on GitHub, and the merge request's `diff_refs` on GitLab. A moved head is refused and recorded as `inline_publication: "stale"`.
+- **Repeat runs.** Each post ends with a hidden HTML comment naming the head and a digest of the finding. Before posting, the existing reviews or discussions are read, and a finding the reviewer identity already posted for this head is skipped.
+
+The reviewer identity is found differently on each forge. On GitLab it is the token's own user. A GitHub installation token cannot read its own identity, so on GitHub it is the author of the newest bot comment that carries the summary's first line. If no identity can be found, nothing is posted, because a duplicate is worse than a missing comment.
+
+GitHub gets one review with `event: "COMMENT"`, `commit_id` set to the reviewed head and one comment per finding (`path`, `line`, `side: "RIGHT"`). If GitHub refuses one of its lines, the review is retried as one review per finding. GitLab gets one discussion per finding, with a text position built from `diff_refs` and `new_line`. GitLab's documentation asks for both line numbers on an unchanged line, and the report has only the head-side one, so a finding on an unchanged context line may be refused there.
+
+The outcome is in the JSON report as `inline_publication`: `posted`, `already-present`, `stale`, `failed` or `skipped`, with `inline_posted` and `inline_refused` counts. A finding without a safe relative path or a line is left out and counted. A line the forge refuses is skipped and counted. No failure changes the exit code or the summary comment. When `--post` itself fails, nothing is attempted and the report has no `inline_*` keys. [Create a review for a pull request](https://docs.github.com/en/rest/pulls/reviews#create-a-review-for-a-pull-request) · [Create a merge request thread](https://docs.gitlab.com/api/discussions/#create-a-merge-request-thread)
+
 ## Verification
 
 ```sh

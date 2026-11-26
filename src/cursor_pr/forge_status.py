@@ -1,4 +1,5 @@
 """Report a reviewed forge change on its head: a GitHub check run or a GitLab commit status."""
+from contextlib import contextmanager
 import logging
 import os
 import re
@@ -88,23 +89,30 @@ def gitlab(value, url, title, detail):
     return body
 
 
-def post(address, value, checkout):
-    """Create the status on the reviewed head. Raises on any refusal; never logs the credential."""
-    url = value["source"]
+@contextmanager
+def connection(address, url, checkout):
+    """(client, provider, slug, GitLab API base, headers) as the reviewer. Never follows a redirect."""
     provider, slug, base = change(address, url)
-    title, detail, head = facts(value)
     token = reviewer_token(provider, slug, checkout)
     options = client_options() if provider == "gitlab" else {}
     mounts = {"https://" + urlsplit(url).netloc: httpx.HTTPTransport(**options)} if options else {}
+    # A redirect would carry the credential to another host, so it is an error and is not followed.
     with httpx.Client(timeout=15, follow_redirects=False, mounts=mounts) as client:
-        # A redirect would carry the credential to another host, so it is an error and not followed.
+        yield (client, provider, slug, base,
+               {"PRIVATE-TOKEN": token} if provider == "gitlab" else {"Authorization": "Bearer " + token})
+
+
+def post(address, value, checkout):
+    """Create the status on the reviewed head. Raises on any refusal; never logs the credential."""
+    url = value["source"]
+    title, detail, head = facts(value)
+    with connection(address, url, checkout) as (client, provider, slug, base, headers):
         if provider == "github":
-            response = client.post(f"https://api.github.com/repos/{slug}/check-runs",
-                                   headers={"Authorization": "Bearer " + token},
+            response = client.post(f"https://api.github.com/repos/{slug}/check-runs", headers=headers,
                                    json=github(value, url, title, detail, head))
         else:
-            response = client.post(f"{base}/projects/{quote(slug, safe='')}/statuses/{head}",
-                                   headers={"PRIVATE-TOKEN": token}, json=gitlab(value, url, title, detail))
+            response = client.post(f"{base}/projects/{quote(slug, safe='')}/statuses/{head}", headers=headers,
+                                   json=gitlab(value, url, title, detail))
         response.raise_for_status()
 
 
