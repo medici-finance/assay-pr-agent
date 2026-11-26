@@ -37,7 +37,10 @@ WORKDIR /opt/reviewer
 COPY pyproject.toml uv.lock ./
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable && useradd --create-home --uid 10001 reviewer && install -d -m 700 -o reviewer -g reviewer /state /repos /model-auth
-ENV DESK_LOOP=pr-review-desk DESK_TOOLS_BIN=/usr/local/bin HOME=/home/reviewer PATH=/opt/model-clis/node_modules/.bin:/opt/reviewer/.venv/bin:/home/reviewer/.local/bin:$PATH REVIEW_STATE_DIR=/state
+# The root filesystem is read-only at runtime, so XDG caches default to the
+# /tmp mount rather than $HOME/.cache. The poller passes --cache-dir /state/cache
+# for its own reviews; this covers a hand-run `cursor-review` in the container.
+ENV DESK_LOOP=pr-review-desk DESK_TOOLS_BIN=/usr/local/bin HOME=/home/reviewer XDG_CACHE_HOME=/tmp/.cache PATH=/opt/model-clis/node_modules/.bin:/opt/reviewer/.venv/bin:/home/reviewer/.local/bin:$PATH REVIEW_STATE_DIR=/state
 USER 10001
 # cursor.com/install always fetches the current release, so download that release's
 # tarball by version and digest instead, in the layout the installer produces.
