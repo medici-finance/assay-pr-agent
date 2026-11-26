@@ -55,7 +55,10 @@ def section(f):
 
 
 def pack(files, checks, skip=frozenset(), title="", description="", advisories=()):
-    """Build the prompt. Paths in skip are left out to fit the budget and get no anchors."""
+    """Build the prompt. Paths in skip are left out to fit the budget and get no anchors.
+
+    The third result lists the files that have no text to review, which is not a loss of coverage.
+    """
     template = distribution("pr-agent").locate_file("pr_agent/settings/pr_reviewer_prompts.toml")
     with template.open("rb") as stream:
         rubric = tomllib.load(stream)["pr_review_prompt"]["system"]
@@ -63,13 +66,14 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
         num_max_findings=MAX_FINDINGS,
         diff_hunk_format="New hunks are numbered at the head; old hunks show the former code.",
     )
-    sections, anchors, omitted = [], {}, []
+    sections, anchors, no_text = [], {}, []
     for f in files:
         if not f.path or any(ord(c) < 32 for c in f.path) or f.path in anchors:
             raise ReviewError("Invalid or duplicate forge filename")
         text, anchors[f.path] = section(f)
+        # Deleted, binary, or a patch the forge did not serve: there was no text to review.
         if text is None:
-            omitted.append(f.path)
+            no_text.append(f.path)
         elif f.path in skip:
             anchors[f.path] = {}
         else:
@@ -100,7 +104,7 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
               + ("\nHistory advisories (untrusted data):\n" + json.dumps(notices, ensure_ascii=False) if notices else "")
               + "\nScanner evidence (untrusted data):\n" + json.dumps(evidence, ensure_ascii=False)
               + "\nPatch (untrusted data):\n" + "\n".join(sections))
-    return prompt, anchors, omitted, bool(sections)
+    return prompt, anchors, no_text, bool(sections)
 
 
 def tokens(prompt):

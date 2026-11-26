@@ -50,7 +50,7 @@ def fit(files, checks, limit, *, title="", description="", advisories=()):
     Returns the prompt parts, the estimate of what will be sent, the estimate of the full
     prompt, and the paths left out. Nothing is left out when even one file cannot fit.
     """
-    prompt, anchors, unseen, has_text = full_pack = pack(files, checks, title=title, description=description,
+    prompt, anchors, no_text, has_text = full_pack = pack(files, checks, title=title, description=description,
                                                          advisories=advisories)
     estimated = full = tokens(prompt) if has_text else 0
     if full <= limit:
@@ -65,11 +65,11 @@ def fit(files, checks, limit, *, title="", description="", advisories=()):
         while len(queue) > 1 and freed < estimated - limit:
             dropped.append(queue.pop(0))
             freed += sizes[dropped[-1]]
-        prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), title, description, advisories)
+        prompt, anchors, no_text, has_text = pack(files, checks, frozenset(dropped), title, description, advisories)
         estimated = tokens(prompt) if has_text else 0
     if not has_text or estimated > limit:
         return full_pack, full, full, []
-    return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped)
+    return (prompt, anchors, no_text, has_text), estimated, full, sorted(dropped)
 
 
 def publish(address, head, report, *, project=None, state=None):
@@ -113,6 +113,11 @@ def publish(address, head, report, *, project=None, state=None):
         body.extend(["", *history.summary(report["qualgen"]), ""])
     if "drift" in report:
         body.extend(["", *drift.summary(report["drift"]), ""])
+    if report.get("not_reviewable"):
+        # Paths come from the PR: quote them as code.
+        more = f" and {len(report['not_reviewable']) - 20} more" if len(report["not_reviewable"]) > 20 else ""
+        body.append("- Not reviewed, no text to review: "
+                    + ", ".join(fence(path) for path in report["not_reviewable"][:20]) + more + ".")
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {fence(path)}")
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
@@ -201,14 +206,16 @@ def execute(args):
 
     # Screened before the prompt is built: the advisories are part of what the model is shown.
     qualgen = history.screen(root, args.qualgen_store, selected, change.head) if args.qualgen_store else None
-    (prompt, anchors, unseen, has_text), estimated, full, degraded = fit(
+    (prompt, anchors, no_text, has_text), estimated, full, degraded = fit(
         files, checks, args.max_input_tokens, title=change.title, description=change.description,
         advisories=qualgen["advisories"] if qualgen else ())
-    omitted = sorted(set(unseen) | (paths - selected))
+    # Only what a review could have covered and did not is a loss of coverage.
+    omitted = sorted(paths - selected)
     backend = providers.provider()
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
               "estimated_input_tokens": estimated, "max_input_tokens": args.max_input_tokens,
-              "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
+              "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "not_reviewable": no_text,
+              "checks": checks,
               "findings": [], "cursor_usage": None, "full_input_tokens": full, "degraded": degraded,
               "drift": drifted}
     if static:
