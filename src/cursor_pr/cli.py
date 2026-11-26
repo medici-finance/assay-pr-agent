@@ -62,8 +62,8 @@ def publish(address, head, report):
 
 
 def record_head(path, head):
-    # The first line names the request and is the poller's; the head goes under it. Replaced whole,
-    # so a poller that stops meanwhile never finds part of a head.
+    # The first line names the request and is the poller's; the head goes under it, where a repeat of
+    # the request finds it. Replaced whole, so a poller that stops meanwhile never finds part of one.
     try:
         request = path.read_text().partition("\n")[0]
     except FileNotFoundError:
@@ -71,6 +71,28 @@ def record_head(path, head):
     with tempfile.NamedTemporaryFile("w", encoding="ascii", dir=path.parent, delete=False) as tmp:
         tmp.write(f"{request}\n{head}\n")
     os.replace(tmp.name, path)
+
+
+def record_outcome(path, outcome):
+    # The third line of the request's record, under the request and its head. The first outcome
+    # stands: a report that only failed to print, to a poller that has stopped reading, did not fail.
+    try:
+        request, head, done = (path.read_text().split("\n") + ["", "", ""])[:3]
+    except FileNotFoundError:
+        request, head, done = "", "", ""
+    if done:
+        return
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="ascii", dir=path.parent, delete=False) as tmp:
+            tmp.write(f"{request}\n{head}\n{outcome}\n")
+        os.replace(tmp.name, path)
+    except OSError as err:
+        print(f"cursor-review: could not record how the review ended: {err}", file=sys.stderr)
+
+
+def review_outcome(report):
+    # What the poller keeps for a finished review: its state once its result is on the change.
+    return report["state"] if report.get("publication") == "posted-or-already-present" else "failed"
 
 
 def parser():
@@ -81,7 +103,8 @@ def parser():
     mode.add_argument("--ci", action="store_true", help="Use provider CI event SHAs in the checkout")
     p.add_argument("--expected-change-url", help="Require this exact open forge change before reviewing")
     p.add_argument("--expected-head", help="Require the change to be at this head before reviewing")
-    p.add_argument("--record-head", type=Path, help="Write the head under review to this file before any other work")
+    p.add_argument("--record-head", type=Path,
+                   help="The request's record: add the head under review before any other work, the outcome last")
     p.add_argument("--head", help="Local head revision (default HEAD with --base)")
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="Checkout for local Git and scanners")
     p.add_argument("--path", action="append", default=[], help="Limit review to an exact changed path; repeatable")
@@ -102,9 +125,8 @@ def parser():
 def execute(args):
     if args.max_input_tokens < 1 or (args.head and not args.base) or (args.post and (not args.change or args.estimate)):
         raise ReviewError("Invalid budget or incompatible --head/--post options")
-    if (args.record_head and args.expected_head
-            or (args.record_head or args.expected_head) and not args.change):
-        raise ReviewError("--record-head and --expected-head need --change and exclude each other")
+    if (args.record_head or args.expected_head) and not args.change:
+        raise ReviewError("--record-head and --expected-head require --change")
     root = args.repo.resolve()
     if args.expected_change_url and not args.change:
         raise ReviewError("--expected-change-url requires --change")
@@ -116,10 +138,11 @@ def execute(args):
         base, head = ci_refs() if args.ci else (args.base, args.head or "HEAD")
         change = local_change(root, base, head)
 
-    if args.record_head:
-        record_head(args.record_head, change.head)
+    # Refused before the record is touched, so that a repeat keeps the head it was held to.
     if args.expected_head is not None and change.head != args.expected_head:
         raise ReviewError(f"Change is at {change.head}, not at {args.expected_head}, the head of its interrupted start")
+    if args.record_head:
+        record_head(args.record_head, change.head)
 
     paths = {f.path for f in change.files}
     selected = set(args.path) if args.path else paths
@@ -263,11 +286,16 @@ def main():
             from pr_agent.algo.token_handler import TokenEncoder  # noqa: F401
             os.chdir(args.repo)
             report, status = run_request(args)
+        if args.record_head:
+            # At once, before anything later can fail: a poller that has stopped no longer reads the report.
+            record_outcome(args.record_head, review_outcome(report))
         print(json.dumps(report, ensure_ascii=True, indent=2))
         return status
     except (ReviewError, OSError, ValueError, TypeError, KeyError, AttributeError,
             UnidiffParseError, yaml.YAMLError, subprocess.TimeoutExpired) as err:
         print(f"cursor-review: {err}", file=sys.stderr)
+        if args.record_head:
+            record_outcome(args.record_head, "failed")
         return 2
     finally:
         os.chdir(old)

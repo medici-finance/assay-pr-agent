@@ -1,5 +1,7 @@
 from contextlib import closing, nullcontext
 import io
+import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -11,7 +13,7 @@ from unittest.mock import Mock, patch
 
 from cursor_pr import cli
 from cursor_pr.config import project_from
-from cursor_pr.poll import Jobs, cycle, head_record, instance_lock, main, write_head_record
+from cursor_pr.poll import Jobs, cycle, head_record, instance_lock, main, run_review, write_head_record
 from cursor_pr.source import Change, ReviewError
 
 HOLDER = """from pathlib import Path
@@ -198,8 +200,49 @@ class QueueRestartTests(unittest.TestCase):
         with self.assertNoLogs("cursor_pr.poll", level="WARNING"):
             argv = self.run_cycle(jobs)
         self.assertEqual(argv[argv.index("--expected-head") + 1], "a" * 40)
-        self.assertNotIn("--record-head", argv)
+        self.assertEqual(argv[argv.index("--record-head") + 1], str(head_record(self.state)))
         self.assertEqual(self.sql("SELECT status, attempts FROM requests"), [("reviewed", 2)])
+
+    def outlived(self, starts, outcome):
+        # What a restart does with a request whose review finished after its poller stopped.
+        for path in (self.state / "requests.sqlite3", head_record(self.state)):
+            path.unlink(missing_ok=True)
+        jobs = Jobs(self.state)
+        jobs.enqueue(self.gh.key, 3, 81)
+        jobs.next()
+        if starts == 2:  # The first review was cut off with its poller. It is the retry that outlives one.
+            with self.assertLogs("cursor_pr.poll", level="WARNING"):
+                jobs = Jobs(self.state)
+            jobs.next()
+        cli.record_head(head_record(self.state), "a" * 40)
+        cli.record_outcome(head_record(self.state), outcome)  # The review child's last act.
+        jobs, logged = self.restart()
+        return (self.sql("SELECT status, attempts FROM requests"), logged, head_record(self.state).exists(), jobs.next())
+
+    def test_review_that_outlived_its_poller_is_kept_as_it_ended(self):
+        for outcome in ("reviewed", "partial", "over-budget"):
+            with self.subTest(outcome=outcome):
+                self.assertEqual(self.outlived(2, outcome), (
+                    [(outcome, 2)],
+                    [f"Review of {self.gh.key} #3 comment 81 finished after its poller stopped; {outcome}"],
+                    False, None))
+
+    def test_review_that_outlived_its_poller_without_publishing_is_not_repeated(self):
+        for starts in (1, 2):  # The poller is killed while the review publishes, and publishing fails.
+            with self.subTest(starts=starts):
+                self.assertEqual(self.outlived(starts, "failed"), (
+                    [("failed", starts)],
+                    [f"Review of {self.gh.key} #3 comment 81 finished after its poller stopped; "
+                     "it did not publish, so marked failed, a new /review retries it"],
+                    False, None))
+
+    def test_the_outcome_the_review_child_records_is_the_one_the_poller_keeps(self):
+        for report in ({"state": "reviewed", "publication": "posted-or-already-present"}, {"state": "reviewed"},
+                       {"state": "model-unavailable", "publication": "posted-or-already-present"},
+                       {"state": "partial", "publication": "failed"}):
+            with self.subTest(report=report), patch("cursor_pr.poll.subprocess.run") as run:
+                run.return_value.stdout = json.dumps(report).encode()
+                self.assertEqual(run_review(self.gh, 3, self.state), cli.review_outcome(report))
 
     def test_failed_retry_is_reported(self):
         jobs = Jobs(self.state)
@@ -238,6 +281,53 @@ class RecordedHeadTests(unittest.TestCase):
         record.write_text("acme/api 3 81\n\n")  # As the poller writes it for the request it started.
         self.review("--record-head", str(record))
         self.assertEqual(record.read_text(), "acme/api 3 81\n" + "b" * 40 + "\n")
+
+    def test_repeat_refused_at_another_head_leaves_the_record_as_it_was(self):
+        record = self.state / "requests.head"
+        record.write_text(f"acme/api 3 81\n{'a' * 40}\n\n")
+        with self.assertRaises(ReviewError):
+            self.review("--record-head", str(record), "--expected-head", "a" * 40)
+        self.assertEqual(record.read_text(), f"acme/api 3 81\n{'a' * 40}\n\n")
+
+    def enter(self, *options, failing=None):
+        # The review child's entry point, as the poller starts it, with the review itself replaced.
+        project = dict(provider="github", url="https://github.com/acme/api", checkout=str(self.state),
+                       requester_ids=[7])
+        argv = ["cursor-review", "--change", "acme/api#3", "--expected-change-url",
+                project_from(project).change_url(3), "--max-input-tokens", "6000", *options]
+        with patch("sys.argv", argv), patch("cursor_pr.cli.run_request", side_effect=failing, return_value=(
+                {"state": "reviewed", "publication": "posted-or-already-present"}, 0)) as request, \
+                patch.dict(os.environ, {"CURSOR_REVIEW_POLLER_CHILD": "1", "REVIEW_STATE_DIR": str(self.state),
+                                        "REVIEW_FORGE_PROJECT": json.dumps(project)}), \
+                patch("sys.stderr", new_callable=io.StringIO) as err:
+            code = cli.main()
+        return code, request, err.getvalue()
+
+    def test_review_records_how_it_ended_before_its_report_can_fail(self):
+        record = self.state / "requests.head"
+        record.write_text(f"acme/api 3 81\n{'b' * 40}\n\n")
+
+        class Gone:
+            # The poller that would have read the report has been killed.
+            def write(self, text):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        with patch("sys.stdout", Gone()):
+            code, request, err = self.enter("--record-head", str(record))
+        request.assert_called_once()
+        self.assertEqual((code, "Broken pipe" in err), (2, True))
+        self.assertEqual(record.read_text(), f"acme/api 3 81\n{'b' * 40}\nreviewed\n")  # Not a failed review.
+
+    def test_review_that_fails_records_that(self):
+        record = self.state / "requests.head"
+        record.write_text(f"acme/api 3 81\n{'b' * 40}\n\n")
+        code, request, err = self.enter("--record-head", str(record), failing=ReviewError("Forge is down"))
+        request.assert_called_once()
+        self.assertEqual((code, "Forge is down" in err), (2, True))
+        self.assertEqual(record.read_text(), f"acme/api 3 81\n{'b' * 40}\nfailed\n")
 
     def test_repeat_at_the_same_head_is_reviewed(self):
         self.assertEqual(self.review("--expected-head", "b" * 40)[0]["state"], "estimate")
