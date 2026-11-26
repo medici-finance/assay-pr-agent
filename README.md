@@ -202,6 +202,8 @@ cursor-review --repo /path/to/checkout --change 'org/repo#42' --model MODEL
 
 The local form compares the merge base to committed `HEAD`, or to an explicit `--head`. Both commits and their common ancestor must be available locally. The forge form uses an `owner/repo#number` address from the configured projects and requires `pr-agent-forge` on `PATH`. GitLab subgroup projects can use CI mode with local Git objects. It reads metadata before and after the file list, checks head and file-count consistency, and records missing patches as incomplete coverage.
 
+The prompt also carries the commit messages between the two revisions for a local or CI review, and a forge change's title and description when the forge helper reports them. They are cut at 256 and 1,500 characters, labelled untrusted, and counted in the token estimate.
+
 ### Cost and coverage
 
 - `--estimate` makes zero Cursor calls. It performs the same diff preparation and static checks as a review.
