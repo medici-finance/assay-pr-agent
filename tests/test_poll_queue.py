@@ -407,7 +407,11 @@ class RequestRowTests(unittest.TestCase):
         self.assertEqual((code, err), (2, "cursor-review: --queue and --request go together and require --change\n"))
         self.assertEqual(self.row()[0], "started")
 
-    def hang(self, review, cleanup_seconds=30):
+    WAITING = """
+    subprocess.run([sys.executable, "-c", "import sys, time; open(sys.argv[1], 'w').close(); time.sleep(60)",
+                    str(state / "waiting")])"""
+
+    def hang(self, review, cleanup_seconds=30, waiting=None):
         # The review child as the poller starts it, with a time limit of one second and a review that
         # waits on a command for a minute. The command says when it is running and the review says
         # when its cleanup ran.
@@ -424,9 +428,7 @@ def settings(**kwargs):
     finally:
         (state / "cleaned").touch()
         {review}
-def wait(args):
-    subprocess.run([sys.executable, "-c", "import sys, time; open(sys.argv[1], 'w').close(); time.sleep(60)",
-                    str(state / "waiting")])
+def wait(args):{waiting or self.WAITING}
 sys.argv[0] = "cursor-review"
 with patch("cursor_pr.cli.QUEUED_REVIEW_SECONDS", 1), patch("cursor_pr.cli.CLEANUP_SECONDS", {cleanup_seconds}), \\
         patch("cursor_pr.cli.tempfile.TemporaryDirectory", side_effect=settings), \\
@@ -451,14 +453,45 @@ with patch("cursor_pr.cli.QUEUED_REVIEW_SECONDS", 1), patch("cursor_pr.cli.CLEAN
 
     def test_queued_review_whose_cleanup_hangs_too_is_ended_outright(self):
         ended, took = self.hang("time.sleep(60)", cleanup_seconds=1)
-        self.assertEqual(ended.returncode, -signal.SIGALRM, ended.stderr)
+        self.assertEqual(ended.returncode, -signal.SIGKILL, ended.stderr)
         self.assertLess(took, 20)
         self.assertEqual(self.row()[0], "started")
 
+    def test_queued_review_stuck_where_no_handler_runs_is_ended_from_outside(self):
+        # As in a native call that never returns to the interpreter: the alarm is never delivered.
+        ended, took = self.hang("pass", cleanup_seconds=1, waiting="""
+    import signal
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    time.sleep(60)""")
+        self.assertEqual(ended.returncode, -signal.SIGKILL, ended.stderr)
+        self.assertNotIn("giving up", ended.stderr)  # It never got to unwind.
+        self.assertLess(took, 20)
+        self.assertEqual(self.row()[0], "started")
+
+    def test_watchdog_ends_with_the_review_and_never_holds_the_lock(self):
+        with patch("cursor_pr.cli.subprocess.Popen", wraps=subprocess.Popen) as started, \
+                patch("sys.stdout", new_callable=io.StringIO):
+            self.enter(*self.options)
+        self.assertEqual(started.call_count, 1)
+        self.assertNotIn("pass_fds", started.call_args.kwargs)  # Its descriptors are closed: no lock comes along.
+        self.assertFalse(started.call_args.kwargs.get("close_fds") is False)
+        self.assertEqual(self.row()[0], "reviewed")
+
+    def test_watchdog_ends_when_its_review_is_killed(self):
+        review = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        guard = subprocess.Popen([sys.executable, "-I", "-c", cli.WATCHDOG, "60", str(review.pid)], stdin=subprocess.PIPE)
+        guard.stdin.close()  # What the review's death does to the pipe.
+        self.assertEqual(guard.wait(timeout=20), 0)
+        self.assertIsNone(review.poll())  # Not ended by a watchdog whose review is gone already.
+        review.kill()
+        review.wait()
+
     def test_review_outside_the_queue_has_no_limit_of_its_own(self):
-        with patch("cursor_pr.cli.signal.alarm") as alarm, patch("sys.stdout", new_callable=io.StringIO):
+        with patch("cursor_pr.cli.signal.alarm") as alarm, patch("cursor_pr.cli.subprocess.Popen") as watchdog, \
+                patch("sys.stdout", new_callable=io.StringIO):
             self.enter()
-        alarm.assert_called_once_with(0)
+        alarm.assert_not_called()
+        watchdog.assert_not_called()
 
     def test_review_that_cannot_reach_its_row_still_reports_its_failure(self):
         code, _, err = self.enter("--queue", str(self.queue), "--request", self.KEY, "three", "81",

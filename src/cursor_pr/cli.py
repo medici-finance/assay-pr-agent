@@ -1,6 +1,6 @@
 import argparse
 import fcntl
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, contextmanager
 import json
 import os
 from pathlib import Path
@@ -66,16 +66,42 @@ def publish(address, head, report):
 # The longest a review started from the queue may run. Its waits have timeouts of their own. This is
 # for one that hangs anyway: it holds the poller's lock, and no poller starts until it is gone.
 QUEUED_REVIEW_SECONDS = 1800
+# How long it then has to unwind before it is ended from outside.
 CLEANUP_SECONDS = 30
+
+
+# Waits outside the review's interpreter, on a pipe only the review holds. The pipe closing means the
+# review has ended, however it did. Still open at the hard limit, the review is ended from here.
+WATCHDOG = """import os, select, signal, sys
+if not select.select([0], [], [], float(sys.argv[1]))[0]:
+    os.kill(int(sys.argv[2]), signal.SIGKILL)
+"""
 
 
 def out_of_time(signum, frame):
     # Unwinds like any exit: the command being waited on is killed and the temporary files go. The row
-    # is not settled and stays started, for the next poller. If the unwinding hangs as well, the
-    # second alarm ends the process outright.
-    signal.signal(signal.SIGALRM, signal.SIG_DFL)
-    signal.alarm(CLEANUP_SECONDS)
+    # is not settled and stays started, for the next poller.
     raise SystemExit(f"cursor-review: still running after {QUEUED_REVIEW_SECONDS} seconds, giving up")
+
+
+@contextmanager
+def time_limit():
+    # Two stops. The alarm asks the review to unwind. The watchdog does not ask: it also ends a review
+    # stuck where no handler runs, in a native call or in its own cleanup. It gets none of the
+    # review's descriptors, so it never holds the poller's lock.
+    guard = subprocess.Popen([sys.executable, "-I", "-c", WATCHDOG, str(QUEUED_REVIEW_SECONDS + CLEANUP_SECONDS),
+                              str(os.getpid())], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+    signal.signal(signal.SIGALRM, out_of_time)
+    signal.alarm(QUEUED_REVIEW_SECONDS)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        guard.kill()
+        guard.stdin.close()
+        guard.wait()
 
 
 def request_row(args):
@@ -275,11 +301,10 @@ def main():
     if args.qualgen_store:
         args.qualgen_store = args.qualgen_store.resolve()
     old = Path.cwd()
-    if args.request:
-        signal.signal(signal.SIGALRM, out_of_time)
-        signal.alarm(QUEUED_REVIEW_SECONDS)
     try:
         with ExitStack() as stack:
+            if args.request:
+                stack.enter_context(time_limit())
             state = state_dir().resolve()
             if args.change and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
                 apply_saved_setup(state)
@@ -329,8 +354,6 @@ def main():
             settle(args, "failed")
         return 2
     finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, signal.SIG_DFL)
         os.chdir(old)
 
 
