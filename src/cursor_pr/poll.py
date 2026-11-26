@@ -158,8 +158,7 @@ def main():
                 args.interval = int(os.getenv("REVIEW_POLL_SECONDS", "120"))
             if args.interval < 1:
                 raise ValueError("poll interval must be positive")
-            if int(os.getenv("REVIEW_MAX_INPUT_TOKENS", "6000")) < 1:
-                raise ValueError("REVIEW_MAX_INPUT_TOKENS must be positive")
+            setup.max_input_tokens(state)
             mine_seconds = history.interval()
             projects = load_config(state)
             stack.enter_context(providers.cursor_account())

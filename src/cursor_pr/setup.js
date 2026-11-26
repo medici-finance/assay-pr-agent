@@ -105,6 +105,7 @@ async function load() {
   if (view.label.startsWith("Checkout path")) message.textContent = "Leave this blank to let the sync container maintain a checkout.";
   if (view.label.startsWith("Human requester")) message.textContent = "Only these accounts can trigger a paid review. Enter GitHub or GitLab usernames (or numeric IDs); the installer looks the IDs up on the forge.";
   if (view.label.startsWith("Responsible human")) message.textContent = "Enter the operator’s forge username, or username:numeric ID, for example alice or alice:12345.";
+  if (view.label.startsWith("Maximum estimated")) message.textContent = "Reviews whose estimated prompt exceeds this many tokens are skipped as over-budget. Raise it for large pull requests.";
   const prior = view.label.match(/\[([^\]]+)\]:?$/)?.[1];
   if (options.includes(prior)) choices.value = prior;
   choices.hidden = !items.length;

@@ -11,6 +11,9 @@ from urllib.parse import urlsplit
 from .dialog import notice, prompt
 from .scanners import ci_config
 
+# Prompt budget when neither REVIEW_MAX_INPUT_TOKENS nor the saved setup supplies one.
+DEFAULT_MAX_INPUT_TOKENS = 6000
+
 
 @dataclass(frozen=True)
 class Project:
