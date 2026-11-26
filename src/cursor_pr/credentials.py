@@ -1,4 +1,4 @@
-"""Prepare Assay reviewer credentials from container settings before polling."""
+"""Prepare instance-bound reviewer credentials from the agent’s settings."""
 from contextlib import contextmanager, ExitStack
 import os
 from pathlib import Path
@@ -15,10 +15,6 @@ APP_ID = "REVIEW_GITHUB_APP_ID"
 INSTALL_ID = "REVIEW_GITHUB_INSTALLATION_ID"
 SECRET_INPUTS = (KEY, KEY + "_FILE", TOKEN, TOKEN + "_FILE", *(k for n in gitlab_tls.NAMES for k in (n, n + "_FILE")))
 SETUP_INPUTS = (*SECRET_INPUTS, APP_ID, INSTALL_ID, "REVIEW_OPERATOR")
-
-
-def standalone_requested():
-    return any(k in os.environ for k in SETUP_INPUTS)
 
 
 def read_secret(name):
@@ -77,39 +73,21 @@ def validate_operator(operator):
     return operator
 
 
-def write_roster(home, projects):
-    operator = validate_operator(os.getenv("REVIEW_OPERATOR", ""))
-    login = operator.split(":")[0]
-    config = home / ".config/assay"
-    config.mkdir(mode=0o700, parents=True, exist_ok=True)
-    repos = ",".join(p.slug + ":" + p.visibility for p in projects)
-    forges = ",".join(p.slug + "=" + p.provider for p in projects)
-    private_file(config / "roster.env", f"ASSAY_BLESS_LOGIN={operator}\n"
-                 f"ASSAY_HUMAN_LOGIN_MAP=review-operator:{login}\n"
-                 f"ASSAY_ALLOWED_REPOS={repos}\nASSAY_REPO_FORGES={forges}")
-
-
 @contextmanager
-def forge_credentials(projects, state):
-    if not standalone_requested():
-        yield
-        return
-    # /dev/shm is container-local tmpfs in Docker. Secret volume files may be
-    # read-only projections; Assay's credential directory also holds mutable caches.
+def forge_credentials(projects):
+    # Keep runtime copies separate from read-only secret projections and the state volume.
     ram = Path("/dev/shm")
     with tempfile.TemporaryDirectory(prefix="review-credentials-", dir=ram if ram.is_dir() else None) as directory, ExitStack() as stack:
         creds = Path(directory)
         configured = list(projects.values())
         providers = {p.provider for p in configured}
-        updates = {"ASSAY_CONFIG_HOME": directory, "DESK_LOOP": "pr-review-desk"}
+        updates = {"REVIEW_FORGE_DIR": directory}
         if "github" in providers:
             if any(urlsplit(p.url).netloc != "github.com" for p in configured if p.provider == "github"):
-                raise ValueError("The pinned Assay GitHub App backend requires github.com")
-            updates["REVIEWER_APP_ID"] = positive_id(APP_ID)
-            updates["REVIEWER_INSTALL_ID"] = positive_id(INSTALL_ID)
-            private_file(creds / "reviewer-app.pem", validate_pem(read_secret(KEY)))
-            updates["REVIEWER_APP"] = "reviewer-app"
-            updates["REVIEWER_PEM"] = str(creds / "reviewer-app.pem")
+                raise ValueError("GitHub App credentials require github.com")
+            updates["REVIEW_FORGE_APP_ID"] = positive_id(APP_ID)
+            updates["REVIEW_FORGE_INSTALL_ID"] = positive_id(INSTALL_ID)
+            private_file(creds / "github.pem", validate_pem(read_secret(KEY)))
         if "gitlab" in providers:
             bases = {p.url.removesuffix("/" + p.slug) + "/api/v4" for p in configured if p.provider == "gitlab"}
             base = os.getenv("GITLAB_API_BASE", "").rstrip("/")
@@ -124,21 +102,20 @@ def forge_credentials(projects, state):
                 if name in os.environ or name + "_FILE" in os.environ:
                     private_file(creds / filename, gitlab_tls.validate(name, read_secret(name)))
             updates.update(stack.enter_context(gitlab_tls.transport(updates["GITLAB_API_BASE"], creds)))
-            private_file(creds / "gitlab-reviewer.token", validate_token(read_secret(TOKEN)))
-        if not (Path.home() / ".config/assay/roster.env").exists():
-            # Keep audit records and Assay's write limits across container restarts.
-            home = state / "forge-home"
-            write_roster(home, configured)
-            updates["REVIEW_ASSAY_HOME"] = str(home)
-        previous = {k: os.environ.get(k) for k in updates}
-        for k in SECRET_INPUTS:
-            os.environ.pop(k, None)
+            private_file(creds / "gitlab.token", validate_token(read_secret(TOKEN)))
+        operator = os.getenv("REVIEW_OPERATOR")
+        if operator:
+            updates["REVIEW_FORGE_OPERATOR"] = validate_operator(operator).split(":")[0].lower()
+        updates["REVIEW_PRIVATE_REPOSITORIES"] = ",".join(p.slug for p in configured if p.visibility == "private")
+        previous = {key: os.environ.get(key) for key in (*updates, *SECRET_INPUTS)}
+        for key in SECRET_INPUTS:
+            os.environ.pop(key, None)
         os.environ.update(updates)
         try:
             yield
         finally:
-            for k, value in previous.items():
+            for key, value in previous.items():
                 if value is None:
-                    os.environ.pop(k, None)
+                    os.environ.pop(key, None)
                 else:
-                    os.environ[k] = value
+                    os.environ[key] = value

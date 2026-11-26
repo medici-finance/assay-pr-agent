@@ -72,10 +72,10 @@ class InteractiveSetupTests(unittest.TestCase):
         self.assertEqual(os.environ["REVIEW_QUALGEN_INTERVAL_SECONDS"],"7200")
         self.assertEqual(os.environ["REVIEW_MODEL"],"model-a")
         self.assertEqual(os.environ["CURSOR_API_KEY"],"fixture-cursor")
-        with forge_credentials(projects,self.state):
-            runtime = Path(os.environ["ASSAY_CONFIG_HOME"])
-            self.assertEqual((runtime/"gitlab-reviewer.token").read_text().strip(),"rotated-fixture")
-            self.assertEqual((runtime/"reviewer-app.pem").read_bytes(),(config/"github.pem").read_bytes())
+        with forge_credentials(projects):
+            runtime = Path(os.environ["REVIEW_FORGE_DIR"])
+            self.assertEqual((runtime/"gitlab.token").read_text().strip(),"rotated-fixture")
+            self.assertEqual((runtime/"github.pem").read_bytes(),(config/"github.pem").read_bytes())
 
     def test_usernames_are_stored_as_numeric_ids(self):
         from cursor_pr import accounts
