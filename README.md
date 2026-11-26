@@ -295,3 +295,7 @@ uv run --frozen python -m unittest discover -s tests -v
 ```
 
 The fixtures exercise GitHub and GitLab polling, restart handling, the Assay forge envelope/command contract, caching, the budget cutoff, incomplete inputs and Cursor failure handling. Install ShellCheck to run the integration fixtures. Tests substitute a local executable for inference and never post externally.
+
+## License
+
+This repository is licensed under the [Apache License 2.0](LICENSE). The license covers this project's own source. Third-party software that the image downloads or bundles keeps its own license and terms: the provider CLIs, PR-Agent, Assay's desk tools and Qualgen, and the scanners.
