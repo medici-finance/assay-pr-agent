@@ -212,15 +212,14 @@ spec:
   policyTypes:
     - Egress
   egress:
+    # DNS on port 53 to any destination. A selector for kube-system misses
+    # NodeLocal DNSCache (link-local node address) and, on CNIs that evaluate
+    # egress before Service DNAT, the kube-dns Service IP, which is cluster-specific.
     - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-        # NodeLocal DNSCache answers on this link-local address on every node, so
-        # it is never matched by the kube-system selector. Harmless if unused;
-        # change it if your installation picked another local resolver address.
         - ipBlock:
-            cidr: 169.254.20.10/32
+            cidr: 0.0.0.0/0
+        - ipBlock:
+            cidr: ::/0
       ports:
         - protocol: UDP
           port: 53
