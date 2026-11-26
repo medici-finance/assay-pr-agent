@@ -75,7 +75,7 @@ def project_from(row):
             raise ValueError("GitLab base URL must match the project URL")
         slug = url[len(prefix):]
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", slug):
-        raise ValueError("deskread and deskpost require an owner/project slug")
+        raise ValueError("Expected an owner/project slug")
     if any(part in (".", "..") for part in slug.split("/")):
         raise ValueError("Invalid project slug")
     if row["provider"] not in ("github", "gitlab"):
@@ -147,7 +147,7 @@ def parse_projects(rows):
     for row in rows:
         project = project_from(row)
         if any(p.slug.casefold() == project.slug.casefold() for p in projects.values()):
-            raise ValueError("Assay requires an unambiguous owner/project address")
+            raise ValueError("Use an unambiguous owner/project address")
         projects[project.key] = project
     if not projects:
         raise ValueError("Configure at least one project")

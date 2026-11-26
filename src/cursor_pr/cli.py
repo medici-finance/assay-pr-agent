@@ -17,16 +17,16 @@ from .scanners import fence
 from .login import auth_mode, login_directory
 from .setup import locked, apply_saved_setup, load_provider_key, max_input_tokens, state_dir
 from .config import DEFAULT_MAX_INPUT_TOKENS, load_config, project_from
-from .credentials import forge_credentials, standalone_requested
+from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import go_report, scan_files, scanner
 from .sync import scan_checkout
 from .engine import CursorFailure, pack, review, tokens
-from .source import ReviewError, ci_refs, forge_change, local_change, run_desk
+from .source import ReviewError, ci_refs, forge_change, local_change, post_comment
 
 
-def publish(address, head, report):
-    repo, number = address.rsplit("#", 1)
+def publish(address, head, report, *, project=None, state=None):
+    _, number = address.rsplit("#", 1)
     label = providers.LABELS[report.get("provider", "cursor")]
     body = [f"{label} review of {head}", report["state"]]
     # Paths come from the PR and titles/messages from the model: quote them as code
@@ -53,18 +53,15 @@ def publish(address, head, report):
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {fence(path)}")
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
-    with tempfile.NamedTemporaryFile("w", encoding="utf8") as tmp:
-        # A finding may quote a multiline source fragment, including forge quick actions.
-        tmp.write("\n".join(" ".join(line.splitlines()) for line in body) + "\n")
-        tmp.flush()
-        run_desk(["deskpost", "comment", repo, number, "--kind", "mr", "--head", head,
-             "--body-file", tmp.name])
+    # A finding may quote a multiline source fragment, including forge quick actions.
+    text = "\n".join(" ".join(line.splitlines()) for line in body) + "\n"
+    post_comment(project, int(number), head, text, state if state is not None else state_dir())
 
 
 def parser():
     p = argparse.ArgumentParser(description="Run one bounded code review and emit a JSON report.")
     mode = p.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--change", help="Assay-configured GitHub PR or GitLab MR, e.g. 'org/repo#42'")
+    mode.add_argument("--change", help="Configured GitHub PR or GitLab MR, e.g. 'org/repo#42'")
     mode.add_argument("--base", help="Local base revision to compare against")
     mode.add_argument("--ci", action="store_true", help="Use provider CI event SHAs in the checkout")
     p.add_argument("--expected-change-url", help="Require this exact open forge change before reviewing")
@@ -81,7 +78,7 @@ def parser():
                    help=f"Preflight estimate limit (default {DEFAULT_MAX_INPUT_TOKENS}, or the saved REVIEW_MAX_INPUT_TOKENS setting)")
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling the model")
     p.add_argument("--cache-dir", type=Path, default=Path(os.getenv("XDG_CACHE_HOME", Path.home()/".cache"))/"cursor-pr-review")
-    p.add_argument("--post", action="store_true", help="Publish a head-bound summary using deskpost with --change")
+    p.add_argument("--post", action="store_true", help="Publish a head-bound summary with --change")
     return p
 
 
@@ -94,7 +91,7 @@ def execute(args):
     if args.go_analysis_producer and not args.expected_change_url:
         raise ReviewError("--go-analysis-producer requires --expected-change-url")
     if args.change:
-        change = forge_change(args.change, args.expected_change_url)
+        change = forge_change(args.change, args.expected_change_url, project=getattr(args, "forge_project", None))
     else:
         base, head = ci_refs() if args.ci else (args.base, args.head or "HEAD")
         change = local_change(root, base, head)
@@ -185,9 +182,10 @@ def run_request(args):
         report.update(model_invocations=report["cursor_invocations"], model_usage=report["cursor_usage"])
     if args.post:
         try:
-            publish(args.change, report["head"], report)
-        except (ReviewError, OSError, subprocess.TimeoutExpired):
-            return dict(report, publication="failed"), 2
+            publish(args.change, report["head"], report, project=getattr(args, "forge_project", None),
+                    state=getattr(args, "forge_state", None))
+        except (ReviewError, OSError, ValueError, subprocess.TimeoutExpired) as err:
+            return dict(report, publication="failed", publication_error=str(err) or type(err).__name__), 2
         report["publication"] = "posted-or-already-present"
     return report, code
 
@@ -217,25 +215,29 @@ def main():
                 args.max_input_tokens = max_input_tokens(state)
             if args.model is None:
                 args.model = os.getenv("REVIEW_MODEL")
-            if args.change and os.getenv("CURSOR_REVIEW_POLLER_CHILD") == "1" and os.getenv("REVIEW_MANAGED_PROJECT"):
-                args.managed_project = project_from(json.loads(os.environ["REVIEW_MANAGED_PROJECT"]))
-            if args.change and standalone_requested():
-                state.mkdir(mode=0o700, parents=True, exist_ok=True)
-                projects = load_config(state)
+            if args.change:
+                if os.getenv("CURSOR_REVIEW_POLLER_CHILD") == "1":
+                    project = project_from(json.loads(os.environ["REVIEW_FORGE_PROJECT"]))
+                else:
+                    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    projects = load_config(state)
+                    slug = args.change.rpartition("#")[0]
+                    project = next((p for p in projects.values() if p.slug == slug), None)
+                    if project is None:
+                        raise ReviewError("Use a --change address from the configured review projects")
+                    stack.enter_context(forge_credentials(projects))
                 slug, _, number = args.change.rpartition("#")
-                project = next((p for p in projects.values() if p.slug == slug), None)
-                if project is None or not number.isdecimal():
+                if project.slug != slug or not number.isascii() or not number.isdecimal():
                     raise ReviewError("Use a --change address from the configured review projects")
                 if args.expected_change_url and args.expected_change_url != project.change_url(number):
                     raise ReviewError("Configured project and expected change URL differ")
                 args.expected_change_url = project.change_url(number)
                 if args.scanner_ci is None:
                     args.scanner_ci = project.scanner_ci
+                args.forge_project = project
+                args.forge_state = state
                 args.managed_project = project if project.managed else None
-                stack.enter_context(forge_credentials(projects, state))
             clean = stack.enter_context(tempfile.TemporaryDirectory(prefix="pr-agent-settings-"))
-            # deskread/deskpost discover their configured forge from the caller's checkout.
-            # Compute the upstream imports here, then restore cwd before touching the forge.
             os.chdir(clean)
             from pr_agent.algo.git_patch_processing import to_hunk_only_patch  # noqa: F401
             from pr_agent.algo.token_handler import TokenEncoder  # noqa: F401
