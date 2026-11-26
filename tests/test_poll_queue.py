@@ -19,6 +19,19 @@ with instance_lock(Path(sys.argv[1])):
 """
 
 
+class Stopped(Exception):
+    pass
+
+
+class StopsAfterTheColumn(sqlite3.Connection):
+    # The poller dies after adding the column and before counting the starts it finds.
+    def execute(self, statement, *parameters):
+        cursor = super().execute(statement, *parameters)
+        if statement.startswith("ALTER TABLE"):
+            raise Stopped
+        return cursor
+
+
 class QueueRestartTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -82,12 +95,14 @@ class QueueRestartTests(unittest.TestCase):
             self.assertEqual(restarted.next(), (self.gh.key, 3, 80))
             self.assertIsNone(restarted.next())
 
-    def test_queue_from_the_old_schema_migrates(self):
+    def old_queue(self, *rows):
         with closing(sqlite3.connect(self.state / "requests.sqlite3")) as db, db:
             db.execute("""CREATE TABLE requests (project TEXT NOT NULL, number INTEGER NOT NULL,
                 comment INTEGER NOT NULL, status TEXT NOT NULL, PRIMARY KEY(project, number, comment))""")
-            db.executemany("INSERT INTO requests VALUES (?,?,?,?)", [(self.gh.key, 3, 81, "queued"),
-                                                                    (self.gl.key, 4, 82, "started")])
+            db.executemany("INSERT INTO requests VALUES (?,?,?,?)", rows)
+
+    def test_queue_from_the_old_schema_migrates(self):
+        self.old_queue((self.gh.key, 3, 81, "queued"), (self.gl.key, 4, 82, "started"))
         jobs, logged = self.restart()
         self.assertEqual(logged, [f"Review of {self.gl.key} #4 comment 82 was interrupted by a restart; queued again"])
         self.assertEqual([row[1] for row in self.sql("PRAGMA table_info(requests)")],
@@ -104,6 +119,22 @@ class QueueRestartTests(unittest.TestCase):
                          ["marked failed, a new /review retries it", "queued again", "queued again"])
         self.assertEqual(self.sql("SELECT number, status FROM requests ORDER BY rowid"),
                          [(3, "queued"), (4, "failed"), (5, "queued")])
+
+    def test_migration_interrupted_by_a_restart_is_repeated_whole(self):
+        self.old_queue((self.gl.key, 4, 82, "started"))
+        connect = sqlite3.connect
+        with patch("sqlite3.connect", side_effect=lambda path: connect(path, factory=StopsAfterTheColumn)), \
+                self.assertRaises(Stopped):
+            Jobs(self.state)
+        self.assertEqual(self.sql("SELECT * FROM requests"), [(self.gl.key, 4, 82, "started")])  # Neither half is kept.
+        jobs, logged = self.restart()
+        self.assertEqual(logged, [f"Review of {self.gl.key} #4 comment 82 was interrupted by a restart; queued again"])
+        self.assertEqual(self.sql("SELECT status, attempts FROM requests"), [("queued", 1)])  # Its first start counts.
+        self.assertEqual(jobs.next(), (self.gl.key, 4, 82))  # The retry dies with the poller too.
+        jobs, logged = self.restart()
+        self.assertEqual(logged, [f"Review of {self.gl.key} #4 comment 82 was interrupted by a restart; "
+                                  "marked failed, a new /review retries it"])
+        self.assertIsNone(jobs.next())  # Not a third start.
 
 
 class InstanceLockTests(unittest.TestCase):

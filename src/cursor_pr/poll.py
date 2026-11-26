@@ -30,6 +30,9 @@ class Jobs:
                 project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,
                 status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(project, number, comment))""")
             if "attempts" not in {row[1] for row in db.execute("PRAGMA table_info(requests)")}:
+                # Both in one transaction. Stopped in between, the poller would otherwise come back
+                # to a column without the count and give an interrupted review a third start.
+                db.execute("BEGIN")
                 # Starts before this column existed are uncounted, except that a started row had one.
                 db.execute("ALTER TABLE requests ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
                 db.execute("UPDATE requests SET attempts=1 WHERE status='started'")
