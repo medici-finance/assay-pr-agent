@@ -38,7 +38,7 @@ from cursor_pr.config import project_from
 
 state, release = Path(sys.argv[1]), Path(sys.argv[2])
 with poll.instance_lock(state):
-    def review(argv, **kwargs):
+    def review(argv, timeout, **kwargs):
         subprocess.Popen([sys.executable, "-c", {ORPHAN!r}, str(release)], stderr=subprocess.DEVNULL, **kwargs)
         return subprocess.CompletedProcess(argv, 0, stdout=b'{{"state":"reviewed", "publication":"posted-or-already-present"}}')
     with patch("cursor_pr.poll.subprocess.run", side_effect=review):
@@ -357,6 +357,7 @@ class RequestRowTests(unittest.TestCase):
         with patch("sys.argv", argv), patch("cursor_pr.cli.run_request", side_effect=failing, return_value=(
                 {"state": "reviewed", "publication": "posted-or-already-present"}, 0)) as request, \
                 patch("cursor_pr.cli.tempfile.TemporaryDirectory", side_effect=leaving or tempfile.TemporaryDirectory), \
+                patch("cursor_pr.cli.os.setpgrp"), \
                 patch.dict(os.environ, {"CURSOR_REVIEW_POLLER_CHILD": "1", "REVIEW_STATE_DIR": str(self.state),
                                         "REVIEW_FORGE_PROJECT": json.dumps(project)}), \
                 patch("sys.stderr", new_callable=io.StringIO) as err:
@@ -467,6 +468,41 @@ with patch("cursor_pr.cli.QUEUED_REVIEW_SECONDS", 1), patch("cursor_pr.cli.CLEAN
         self.assertNotIn("giving up", ended.stderr)  # It never got to unwind.
         self.assertLess(took, 20)
         self.assertEqual(self.row()[0], "started")
+
+    def test_watchdog_ends_the_commands_the_review_was_waiting_on(self):
+        # The review is stuck where no handler runs while a command of its own is running.
+        ended, took = self.hang("pass", cleanup_seconds=1, waiting="""
+    import os, signal
+    helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    (state / "helper").write_text(f"{helper.pid} {os.getpgid(helper.pid)} {os.getpid()}")
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    time.sleep(60)""")
+        self.assertEqual(ended.returncode, -signal.SIGKILL, ended.stderr)
+        self.assertLess(took, 20)
+        helper, group, review = map(int, (self.state / "helper").read_text().split())
+        self.assertEqual(group, review)  # The command ran in the review's own group,
+        self.assertNotEqual(group, os.getpgrp())  # which is not the one of whoever started the review.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.kill(helper, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(helper, signal.SIGKILL)
+            self.fail("The command outlived the review")
+
+    def test_poller_does_not_wait_for_a_review_past_its_limits(self):
+        from cursor_pr import poll
+        self.assertGreater(poll.REVIEW_WAIT_SECONDS, cli.QUEUED_REVIEW_SECONDS + cli.CLEANUP_SECONDS)
+        project = project_from(dict(provider="github", url="https://github.com/acme/api", requester_ids=[7],
+                                    checkout=str(self.state)))
+        with patch("cursor_pr.poll.subprocess.run", side_effect=subprocess.TimeoutExpired("review", 1)) as run, \
+                self.assertLogs("cursor_pr.poll", level="WARNING") as logged:
+            self.assertEqual(run_review(project, 3, self.state, 81), "failed")
+        self.assertEqual(run.call_args.kwargs["timeout"], poll.REVIEW_WAIT_SECONDS)
+        self.assertIn("Review acme/api#3 did not end within", logged.output[0])
 
     def test_watchdog_ends_with_the_review_and_never_holds_the_lock(self):
         with patch("cursor_pr.cli.subprocess.Popen", wraps=subprocess.Popen) as started, \

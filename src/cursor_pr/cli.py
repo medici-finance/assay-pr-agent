@@ -72,9 +72,14 @@ CLEANUP_SECONDS = 30
 
 # Waits outside the review's interpreter, on a pipe only the review holds. The pipe closing means the
 # review has ended, however it did. Still open at the hard limit, the review is ended from here.
+# It ends the review's whole process group: a command the review was waiting on would otherwise outlive
+# it, with no limit of its own and perhaps with the pipe the poller reads the report from.
 WATCHDOG = """import os, select, signal, sys
 if not select.select([0], [], [], float(sys.argv[1]))[0]:
-    os.kill(int(sys.argv[2]), signal.SIGKILL)
+    try:
+        os.killpg(int(sys.argv[2]), signal.SIGKILL)
+    except OSError:
+        os.kill(int(sys.argv[2]), signal.SIGKILL)
 """
 
 
@@ -92,6 +97,12 @@ def time_limit():
     guard = subprocess.Popen([sys.executable, "-I", "-c", WATCHDOG, str(QUEUED_REVIEW_SECONDS + CLEANUP_SECONDS),
                               str(os.getpid())], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
+    try:
+        # A group of the review's own from here on, which the commands it starts join. The watchdog
+        # was started before and stays outside it.
+        os.setpgrp()
+    except OSError:
+        pass  # A session leader leads its group already.
     signal.signal(signal.SIGALRM, out_of_time)
     signal.alarm(QUEUED_REVIEW_SECONDS)
     try:

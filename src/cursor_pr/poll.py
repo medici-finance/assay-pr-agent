@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 
+from .cli import CLEANUP_SECONDS, QUEUED_REVIEW_SECONDS
 from .config import load_config
 from .credentials import SETUP_INPUTS, forge_credentials
 from .discovery import poll_project
@@ -24,6 +25,9 @@ log = logging.getLogger(__name__)
 # How a restart settles a review it found running.
 GIVEN_UP = "marked failed, a new /review retries it"
 UNRECORDED = "marked failed, the head it started at was not recorded, a new /review retries it"
+
+# How long the poller waits for a review child: the child's own limits and a margin.
+REVIEW_WAIT_SECONDS = QUEUED_REVIEW_SECONDS + CLEANUP_SECONDS + 30
 
 # The instance lock's descriptor while this process holds it. A review child inherits it, so the
 # lock outlives a poller that is killed while a review runs.
@@ -138,8 +142,14 @@ def run_review(project, number, state, comment=None):
             del env[key]
     # The review child inherits the instance lock, so the lock is held until it exits even when the
     # poller is killed first. No replacement recovers this request while the review can still run.
-    result = subprocess.run(argv, cwd=project.checkout, env=env, stdout=subprocess.PIPE,
-                            pass_fds=(lock_fd,) if lock_fd is not None else ())
+    # The child bounds itself, and its watchdog ends it and the commands it started. The wait here is
+    # bounded past that as well, so that nothing left holding the report pipe can keep the queue waiting.
+    try:
+        result = subprocess.run(argv, cwd=project.checkout, env=env, stdout=subprocess.PIPE,
+                                pass_fds=(lock_fd,) if lock_fd is not None else (), timeout=REVIEW_WAIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        log.warning("Review %s did not end within %d seconds and was stopped", address, REVIEW_WAIT_SECONDS)
+        return "failed"
     try:
         report = json.loads(result.stdout)
     except ValueError:
