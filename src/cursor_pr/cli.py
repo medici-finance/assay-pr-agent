@@ -32,8 +32,6 @@ MAX_DEGRADED_ROWS = 50
 TIERS = {"regular": 1, "mid": 2, "max": 10}
 CAPS = {"regular": MAX_FINDINGS, "mid": 6, "max": 10}
 TIMEOUTS = {"regular": 120, "mid": 240, "max": 480}
-# Cursor takes the prompt as one command-line argument, which Linux caps at 128 KiB.
-ARGV_TOKENS = 28_000
 DEEP_FOCUS = ("Look for what only this wider view shows: a caller the change breaks, behaviour the existing "
               "tests do not cover, and a description or earlier comment the change contradicts or leaves unanswered.")
 USED = ("included", "truncated")
@@ -220,10 +218,9 @@ def execute(args):
     tier, base = args.tier, args.max_input_tokens
     budget = base * TIERS[tier]
     backend = providers.provider()
-    ceiling = ARGV_TOKENS if backend == "cursor" else budget
     # Mid and max send the same first prompt, so a max review reuses a cached mid result.
     reserve = 0 if tier == "regular" else base // (2 if tier == "max" else 4)
-    limit = min(base if tier == "regular" else 2 * base - base // 4, ceiling)
+    limit = base if tier == "regular" else 2 * base - base // 4
     cap = CAPS["regular" if tier == "regular" else "mid"]
     (prompt, anchors, unseen, has_text), estimated, full, degraded = fit(files, checks, limit, cap)
     skip = frozenset(degraded)
@@ -238,7 +235,7 @@ def execute(args):
         else:
             fates = [dict(row, state="dropped") if row["state"] in USED else row for row in fates]
         if tier == "max":
-            deep_limit = min(budget - estimated - reserve, ceiling)
+            deep_limit = budget - estimated - reserve
             text, deep_fates = context.assemble(context.DEEP, raw, deep_limit - patch_tokens - 120)
             if text:
                 wider = pack(files, checks, skip, context=text, max_findings=cap, focus=DEEP_FOCUS)[0]
@@ -306,7 +303,7 @@ def execute(args):
         if tier != "regular" and findings:
             before = len(findings)
             check = next((text for radius in (15, 8, 3, 0)
-                          if tokens(text := verification(findings, files, radius)) <= min(reserve, ceiling)), None)
+                          if tokens(text := verification(findings, files, radius)) <= reserve), None)
             report["verification"] = {"state": "unavailable", "before": before}
             if check:
                 passes.append({"name": "verification", "estimated_input_tokens": tokens(check), "state": "failed"})

@@ -16,7 +16,8 @@ from cursor_pr.poll import Jobs, cycle, run_review
 SHIM = """#!/usr/bin/env python3
 import json, pathlib, sys
 here = pathlib.Path(__file__).parent
-prompt = sys.argv[-1]
+prompt = sys.stdin.read()
+assert prompt and prompt not in sys.argv, 'the prompt must arrive on standard input'
 kind = ("verification" if prompt.startswith("You are checking the findings")
         else "deep" if "Look for what only this wider view shows" in prompt else "review")
 with open(here / "prompts", "a") as log:

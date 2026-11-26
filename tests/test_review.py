@@ -32,7 +32,9 @@ class ReviewTest(unittest.TestCase):
         self.shim.write_text("#!/usr/bin/env python3\nimport json,os,pathlib,sys\n"
             "assert sys.argv[1:5]==['-p','--mode=ask','--output-format','json']\n"
             "assert json.loads(pathlib.Path('.cursor/cli.json').read_text())['permissions']['allow']==[]\n"
-            "assert 'SC2086' in sys.argv[-1] and 'example.sh' in sys.argv[-1]\n"
+            "prompt = sys.stdin.read()\n"
+            "assert sys.argv[5:] in ([], ['--trust'], ['--trust', '--model', sys.argv[-1]])\n"
+            "assert 'SC2086' in prompt and 'example.sh' in prompt\n"
             "assert 'GH_TOKEN' not in os.environ and not pathlib.Path('.git').exists()\n"
             f"with open({str(self.calls)!r}, 'a') as f: f.write('call\\n')\n"
             f"print({json.dumps(envelope)!r})\n")

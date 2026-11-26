@@ -37,7 +37,7 @@ class DegradeTests(unittest.TestCase):
                     "result": json.dumps({"review": {"key_issues_to_review": [issue]}})}
         shim = self.root / "cursor-agent"
         shim.write_text("#!/usr/bin/env python3\nimport sys\n"
-                        f"open({str(self.prompts)!r}, 'a').write(sys.argv[-1] + '\\0')\n"
+                        f"open({str(self.prompts)!r}, 'a').write(sys.stdin.read() + '\\0')\n"
                         f"print({json.dumps(envelope)!r})\n")
         shim.chmod(0o700)
         env = patch.dict(os.environ, {"PATH": str(self.root) + os.pathsep + os.environ["PATH"],

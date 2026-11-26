@@ -220,11 +220,11 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120):
         if model:
             argv += ["--model", model]
         try:
-            if backend == "cursor":
-                argv.append(prompt)
-            elif backend == "codex":
+            if backend == "codex":
                 argv.append("-")
-            response = subprocess.run(argv, input=None if backend == "cursor" else prompt.encode(),
+            # Every provider reads the prompt on standard input. As an argument it would be
+            # limited to 128 KiB on Linux, which a deep review exceeds.
+            response = subprocess.run(argv, input=prompt.encode(),
                                       cwd=workspace, env=env, capture_output=True, timeout=timeout)
             if not response.returncode and backend == "codex":
                 answer = Path(workspace, "answer")
