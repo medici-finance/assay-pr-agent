@@ -6,8 +6,13 @@ FROM node:22-bookworm-slim AS models
 RUN npm install --prefix /opt/model-clis @openai/codex@0.171.0 @anthropic-ai/claude-code@2.1.331
 # git-sync uses the Git 2.46+ config subcommands.
 FROM python:3.12-slim-trixie
+# pipefail: a failed download or checksum must fail the RUN, not hide behind a pipe.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG TARGETARCH
 RUN test "$TARGETARCH" = amd64 || (echo 'Assay release requires --platform linux/amd64' >&2 && exit 1)
+# System packages track the base image's Debian security updates; the tools whose
+# exact versions matter are digest-pinned below.
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl haproxy curl git gh shellcheck bash gzip tar && rm -rf /var/lib/apt/lists/*
 RUN curl --fail --silent --show-error --location --retry 3 \
       https://github.com/medici-finance/assay/releases/download/v1.0.94/qualgen-linux-amd64 -o /usr/local/bin/qualgen \
@@ -33,7 +38,7 @@ COPY pyproject.toml uv.lock ./
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable && useradd --create-home --uid 10001 reviewer && install -d -m 700 -o reviewer -g reviewer /state /repos /model-auth
 ENV DESK_LOOP=pr-review-desk DESK_TOOLS_BIN=/usr/local/bin HOME=/home/reviewer PATH=/opt/model-clis/node_modules/.bin:/opt/reviewer/.venv/bin:/home/reviewer/.local/bin:$PATH REVIEW_STATE_DIR=/state
-USER reviewer
+USER 10001
 # cursor.com/install always fetches the current release, so download that release's
 # tarball by version and digest instead, in the layout the installer produces.
 ARG CURSOR_AGENT_VERSION=2026.11.22-e9042b2
@@ -47,7 +52,7 @@ RUN curl -fsSL --retry 3 \
     && test "$(cursor-agent --version)" = "${CURSOR_AGENT_VERSION}" \
     && claude --version && codex --version && git-sync --version
 # Build record written by ci/publish-image.sh; local builds fall back to the build time.
-USER root
+USER 0
 ARG REVIEW_BUILD_SHA=
 ARG REVIEW_BUILD_TAGS=
 ARG REVIEW_BUILD_TIMESTAMP=
@@ -55,6 +60,6 @@ RUN printf '{"sha":"%s","tags":"%s","built_at":"%s"}\n' \
         "${REVIEW_BUILD_SHA:-unknown}" "${REVIEW_BUILD_TAGS:-}" \
         "${REVIEW_BUILD_TIMESTAMP:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" > build-info.json \
     && chmod 0644 build-info.json
-USER reviewer
+USER 10001
 VOLUME /state
 ENTRYPOINT ["cursor-review-container"]
