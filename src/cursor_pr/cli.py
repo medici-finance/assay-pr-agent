@@ -62,9 +62,14 @@ def publish(address, head, report):
 
 
 def record_head(path, head):
-    # Replaced whole, so a poller that stops meanwhile never finds part of a head.
+    # The first line names the request and is the poller's; the head goes under it. Replaced whole,
+    # so a poller that stops meanwhile never finds part of a head.
+    try:
+        request = path.read_text().partition("\n")[0]
+    except FileNotFoundError:
+        request = ""
     with tempfile.NamedTemporaryFile("w", encoding="ascii", dir=path.parent, delete=False) as tmp:
-        tmp.write(head + "\n")
+        tmp.write(f"{request}\n{head}\n")
     os.replace(tmp.name, path)
 
 

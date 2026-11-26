@@ -5,12 +5,13 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
 from cursor_pr import cli
 from cursor_pr.config import project_from
-from cursor_pr.poll import Jobs, cycle, head_record, instance_lock, main
+from cursor_pr.poll import Jobs, cycle, head_record, instance_lock, main, write_head_record
 from cursor_pr.source import Change, ReviewError
 
 HOLDER = """from pathlib import Path
@@ -19,24 +20,29 @@ from cursor_pr.poll import instance_lock
 with instance_lock(Path(sys.argv[1])):
     pass
 """
+ORPHAN = "import sys, time\nfrom pathlib import Path\nwhile not Path(sys.argv[1]).exists(): time.sleep(0.05)"
+# A poller that is killed while its review runs. The review is started the way run_review starts one.
+KILLED = f"""from pathlib import Path
+import os, subprocess, sys
+from unittest.mock import patch
+from cursor_pr import poll
+from cursor_pr.config import project_from
 
-
-class Stopped(Exception):
-    pass
-
-
-class StopsAfterTheColumn(sqlite3.Connection):
-    # The poller dies after adding the column and before counting the starts it finds.
-    def execute(self, statement, *parameters):
-        cursor = super().execute(statement, *parameters)
-        if statement.startswith("ALTER TABLE"):
-            raise Stopped
-        return cursor
+state, release = Path(sys.argv[1]), Path(sys.argv[2])
+with poll.instance_lock(state):
+    def review(argv, **kwargs):
+        subprocess.Popen([sys.executable, "-c", {ORPHAN!r}, str(release)], stderr=subprocess.DEVNULL, **kwargs)
+        return subprocess.CompletedProcess(argv, 0, stdout=b'{{"state":"reviewed", "publication":"posted-or-already-present"}}')
+    with patch("cursor_pr.poll.subprocess.run", side_effect=review):
+        poll.run_review(project_from(dict(provider="github", url="https://github.com/acme/api", requester_ids=[7],
+                                           checkout=str(state))), 3, state)
+os._exit(0)
+"""
 
 
 class QueueRestartTests(unittest.TestCase):
     REVIEWED = b'{"state":"reviewed","publication":"posted-or-already-present"}'
-    UNKNOWN_HEAD = "marked failed, the head it started at was not recorded, a new /review retries it"
+    UNRECORDED = "marked failed, the head it started at was not recorded, a new /review retries it"
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -121,33 +127,57 @@ class QueueRestartTests(unittest.TestCase):
     def test_queue_from_the_old_schema_migrates(self):
         self.old_queue((self.gh.key, 3, 81, "queued"), (self.gl.key, 4, 82, "started"))
         jobs, logged = self.restart()
-        self.assertEqual(logged, [f"Review of {self.gl.key} #4 comment 82 was interrupted by a restart; {self.UNKNOWN_HEAD}"])
+        self.assertEqual(logged, [f"Review of {self.gl.key} #4 comment 82 was interrupted by a restart; {self.UNRECORDED}"])
         self.assertEqual([row[1] for row in self.sql("PRAGMA table_info(requests)")],
                          ["project", "number", "comment", "status", "attempts"])
         self.assertEqual(self.sql("SELECT number, status, attempts FROM requests"),
                          [(3, "queued", 0), (4, "failed", 0)])
         jobs.enqueue(self.gh.key, 5, 83)
         self.assertEqual(jobs.next(), (self.gh.key, 3, 81))  # A failed row is never started again.
+        self.assertEqual(head_record(self.state).read_text(), f"{self.gh.key} 3 81\n\n")
+        jobs, logged = self.restart()  # The poller stopped before this review resolved a head.
+        self.assertEqual(logged, [f"Review of {self.gh.key} #3 comment 81 was interrupted by a restart; "
+                                  "queued again"])
+        self.assertEqual(jobs.next(), (self.gh.key, 3, 81))
+        jobs.finish((self.gh.key, 3, 81), "reviewed")
         self.assertEqual(jobs.next(), (self.gh.key, 5, 83))
         self.assertIsNone(jobs.next())
-        self.assertEqual(self.sql("SELECT attempts FROM requests ORDER BY rowid"), [(1,), (0,), (1,)])
-        # Both die with the poller now, before the review child resolved a head: each is a first start.
-        jobs, logged = self.restart()
-        self.assertEqual([line.rsplit("; ", 1)[1] for line in logged], ["queued again", "queued again"])
-        self.assertEqual(self.sql("SELECT number, status FROM requests ORDER BY rowid"),
-                         [(3, "queued"), (4, "failed"), (5, "queued")])
+        self.assertEqual(self.sql("SELECT number, status, attempts FROM requests ORDER BY rowid"),
+                         [(3, "reviewed", 2), (4, "failed", 0), (5, "started", 1)])
 
-    def test_migration_interrupted_by_a_restart_is_repeated_whole(self):
-        self.old_queue((self.gl.key, 4, 82, "started"))
-        connect = sqlite3.connect
-        with patch("sqlite3.connect", side_effect=lambda path: connect(path, factory=StopsAfterTheColumn)), \
-                self.assertRaises(Stopped):
-            Jobs(self.state)
-        self.assertEqual(self.sql("SELECT * FROM requests"), [(self.gl.key, 4, 82, "started")])  # Neither half is kept.
+    def test_retry_never_takes_an_earlier_requests_head(self):
+        jobs = Jobs(self.state)
+        jobs.enqueue(self.gh.key, 3, 81)
+        jobs.enqueue(self.gh.key, 3, 82)
+        jobs.next()
+        cli.record_head(head_record(self.state), "f" * 40)
+        self.sql("UPDATE requests SET status='reviewed' WHERE comment=81")  # It ended while the poller was
+        # stopping before it removed the head.
+        self.assertEqual(jobs.next(), (self.gh.key, 3, 82))  # The poller stops again at once.
+        self.assertEqual(head_record(self.state).read_text(), f"{self.gh.key} 3 82\n\n")
         jobs, logged = self.restart()
-        self.assertEqual(logged, [f"Review of {self.gl.key} #4 comment 82 was interrupted by a restart; {self.UNKNOWN_HEAD}"])
-        self.assertEqual(self.sql("SELECT status, attempts FROM requests"), [("failed", 0)])
+        self.assertEqual(logged, [f"Review of {self.gh.key} #3 comment 82 was interrupted by a restart; queued again"])
+        with self.assertNoLogs("cursor_pr.poll", level="WARNING"):
+            argv = self.run_cycle(jobs)
+        self.assertNotIn("--expected-head", argv)
+        self.assertIn("--record-head", argv)
+
+    def given_up_when(self, damage):
+        jobs = Jobs(self.state)
+        jobs.enqueue(self.gh.key, 3, 81)
+        jobs.next()
+        damage()
+        jobs, logged = self.restart()
+        self.assertEqual(logged, [f"Review of {self.gh.key} #3 comment 81 was interrupted by a restart; "
+                                  f"{self.UNRECORDED}"])
+        self.assertEqual(self.sql("SELECT status FROM requests"), [("failed",)])
         self.assertIsNone(jobs.next())
+
+    def test_started_request_whose_head_record_is_missing_is_given_up(self):
+        self.given_up_when(lambda: head_record(self.state).unlink())
+
+    def test_started_request_whose_head_record_is_another_requests_is_given_up(self):
+        self.given_up_when(lambda: write_head_record(self.state, (self.gl.key, 4, 82), "f" * 40))
 
     def test_first_start_records_its_head_and_the_requests_end_removes_it(self):
         jobs = Jobs(self.state)
@@ -157,13 +187,6 @@ class QueueRestartTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--record-head") + 1], str(head_record(self.state)))
         self.assertNotIn("--expected-head", argv)
         self.assertEqual(self.sql("SELECT status, attempts FROM requests"), [("reviewed", 1)])
-
-    def test_first_start_does_not_take_an_earlier_requests_head(self):
-        cli.record_head(head_record(self.state), "f" * 40)  # Its request ended while the poller was stopping.
-        jobs = Jobs(self.state)
-        jobs.enqueue(self.gh.key, 3, 81)
-        self.assertEqual(jobs.next(), (self.gh.key, 3, 81))
-        self.assertFalse(head_record(self.state).exists())
 
     def test_repeat_stays_at_the_head_of_its_interrupted_start(self):
         jobs = Jobs(self.state)
@@ -209,8 +232,12 @@ class RecordedHeadTests(unittest.TestCase):
             return cli.execute(args)
 
     def test_review_records_its_head_before_any_other_work(self):
-        self.review("--record-head", str(self.state / "requests.head"))
-        self.assertEqual((self.state / "requests.head").read_text(), "b" * 40 + "\n")
+        record = self.state / "requests.head"
+        self.review("--record-head", str(record))
+        self.assertEqual(record.read_text(), "\n" + "b" * 40 + "\n")
+        record.write_text("acme/api 3 81\n\n")  # As the poller writes it for the request it started.
+        self.review("--record-head", str(record))
+        self.assertEqual(record.read_text(), "acme/api 3 81\n" + "b" * 40 + "\n")
 
     def test_repeat_at_the_same_head_is_reviewed(self):
         self.assertEqual(self.review("--expected-head", "b" * 40)[0]["state"], "estimate")
@@ -247,6 +274,18 @@ class InstanceLockTests(unittest.TestCase):
         self.assertEqual(err.getvalue(), "Another poller is already running on this state volume.\n")
         watch.assert_not_called()  # Refused before setup, credentials or the queue are touched.
         self.assertEqual(self.holder().returncode, 0)
+
+    def test_review_child_holds_the_lock_until_it_exits(self):
+        release = self.state / "release"
+        killed = subprocess.run([sys.executable, "-c", KILLED, str(self.state), str(release)],
+                                capture_output=True, text=True)
+        self.assertEqual(killed.returncode, 0, killed.stderr)
+        self.assertIn("BlockingIOError", self.holder().stderr)  # Only the poller was killed. Its review still runs.
+        release.touch()
+        deadline = time.monotonic() + 20
+        while "BlockingIOError" in (other := self.holder()).stderr and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertEqual(other.returncode, 0, other.stderr)  # The review has exited.
 
     def test_lock_is_held_while_polling_and_released_on_exit(self):
         opened = []
