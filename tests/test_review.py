@@ -160,12 +160,14 @@ class ReviewTest(unittest.TestCase):
 
     def test_invalid_location(self):
         info = {"review":{"key_issues_to_review":[{"relevant_file":"x","start_line":17,"end_line":17}]}}
-        with self.assertRaises(source.ReviewError):
-            engine.parse_answer(json.dumps({"type":"result","subtype":"success","is_error":False,
-                                           "result":json.dumps(info)}),{"x":{1}})
+        # One bad citation is dropped, not a failed review; the rest of the answer stands.
+        self.assertEqual(engine.parse_answer(json.dumps({"type":"result","subtype":"success","is_error":False,
+                                           "result":json.dumps(info)}),{"x":{1}}),
+                         {"findings": [], "dropped": [{"path": "x", "line": 17, "reason": "cited line outside the reviewed patch"}],
+                          "cursor_usage": None})
 
     def test_auto_routing_preamble(self):
         result = '> Auto routed to Example Model\n\n{"review":{"key_issues_to_review":[]}}'
         usage = {"inputTokens": 4, "cacheReadTokens": 66}
         raw = json.dumps(dict(type="result", subtype="success", is_error=False, result=result, usage=usage))
-        self.assertEqual(engine.parse_answer(raw, {}), {"findings": [], "cursor_usage": usage})
+        self.assertEqual(engine.parse_answer(raw, {}), {"findings": [], "dropped": [], "cursor_usage": usage})
