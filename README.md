@@ -318,6 +318,20 @@ review:
 
 The test suite checks the log's contents and never uploads it to a forge. [Upload a SARIF file to GitHub](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/uploading-a-sarif-file-to-github) · [SARIF support for code scanning](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning) · [GitLab SARIF reports](https://docs.gitlab.com/user/application_security/detect/sarif/)
 
+### Report a check on the head
+
+Add `--forge-status`, or set `REVIEW_FORGE_STATUS=1` in the reviewer's environment, to report a review of a `--change` on the commit it reviewed. It is off by default, works with or without `--post`, and never runs for `--estimate`. The poller passes its environment through to each review, so it needs no change to pick the variable up.
+
+GitHub receives one check run named `assay-pr-agent/review` on the reviewed head. Its conclusion follows the exit code: `success` when the review completed (`reviewed` or `empty`), and `failure` when the model could not complete the review, when the prompt was over budget or when coverage was partial. Findings alone never fail the check, because the CLI also exits 0 for a review with findings. The title and summary hold fixed sentences and counts. Each model finding with a line also becomes a `warning` annotation, with its title and message quoted as code so nothing a change author or the model wrote can render as a link or a mention.
+
+GitLab receives one commit status with the same name on the reviewed head: `success` or `failed` by the same rule, with a fixed description of at most 255 characters and the change as its target. GitLab adds the status to the commit's newest pipeline, or creates a pipeline, as a job in an `external` stage.
+
+The outcome is in the JSON report as `forge_status`: `posted`, `failed` or `skipped`. A refusal, a missing permission included, logs one line without the credential and changes neither the exit code nor the summary comment. When `--post` itself fails, no status is attempted and the report has no `forge_status` key.
+
+The default reviewer credentials cannot post it, and setup still requests the least privilege. Creating a check run takes a GitHub App with **Checks** write permission (`checks: write`); the wizard requests only contents read, pull requests write and Actions read. A commit status takes a GitLab token with the `api` scope and the Developer role; the wizard creates a Reporter token. Add the permission to the reviewer credential before turning this on.
+
+To make it a required check on GitHub, add `assay-pr-agent/review` under **Require status checks before merging** on the protected branch, or under **Require status checks to pass before merging** in a ruleset. GitHub then blocks merging until the check succeeds on the pull request's latest commit, so every new push waits for a fresh `/review`. The check can be required from any source or from the reviewer App alone; in a ruleset, naming the App as the only accepted source takes **Commit statuses** write permission (`statuses: write`) on it as well. [Require status checks before merging](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging) · [REST API endpoints for check runs](https://docs.github.com/en/rest/checks/runs#create-a-check-run) · [GitLab commit statuses](https://docs.gitlab.com/api/commits/#set-commit-pipeline-status)
+
 ## Verification
 
 ```sh

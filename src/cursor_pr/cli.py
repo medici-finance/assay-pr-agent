@@ -23,7 +23,7 @@ from .checks import go_report, scan_files, scanner
 from .sync import scan_checkout
 from .engine import CursorFailure, pack, review, tokens
 from .source import ReviewError, ci_refs, forge_change, local_change, run_desk
-from . import sarif
+from . import forge_status, sarif
 
 
 def publish(address, head, report):
@@ -84,6 +84,8 @@ def parser():
     p.add_argument("--cache-dir", type=Path, default=Path(os.getenv("XDG_CACHE_HOME", Path.home()/".cache"))/"cursor-pr-review")
     p.add_argument("--post", action="store_true", help="Publish a head-bound summary using deskpost with --change")
     p.add_argument("--sarif", type=Path, help="Also write the findings as a SARIF 2.1.0 log at this path")
+    p.add_argument("--forge-status", action="store_true",
+                   help="Report the review on the reviewed head as a GitHub check run or GitLab commit status")
     return p
 
 
@@ -191,6 +193,7 @@ def run_request(args):
         except (ReviewError, OSError, subprocess.TimeoutExpired):
             return dict(report, publication="failed"), 2
         report["publication"] = "posted-or-already-present"
+    report["forge_status"] = forge_status.outcome(args, report)
     return report, code
 
 
