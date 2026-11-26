@@ -14,8 +14,8 @@ import yaml
 
 from . import history, providers, scanners
 from .login import auth_mode, login_directory
-from .setup import locked, apply_saved_setup, load_provider_key, state_dir
-from .config import load_config, project_from
+from .setup import locked, apply_saved_setup, load_provider_key, max_input_tokens, state_dir
+from .config import DEFAULT_MAX_INPUT_TOKENS, load_config, project_from
 from .credentials import forge_credentials, standalone_requested
 from .artifacts import forge_go_report
 from .checks import go_report, scan_files, scanner
@@ -73,7 +73,8 @@ def parser():
     p.add_argument("--scanner-ci", type=json.loads, help="Per-tool trusted CI report settings for a forge change")
     p.add_argument("--qualgen-store", type=Path, help="Read the poller’s mined Qualgen history for this project")
     p.add_argument("--model", help="Explicit provider model (otherwise the CLI default)")
-    p.add_argument("--max-input-tokens", type=int, help="Preflight estimate limit (default 6000)")
+    p.add_argument("--max-input-tokens", type=int,
+                   help=f"Preflight estimate limit (default {DEFAULT_MAX_INPUT_TOKENS}, or the saved REVIEW_MAX_INPUT_TOKENS setting)")
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling the model")
     p.add_argument("--cache-dir", type=Path, default=Path(os.getenv("XDG_CACHE_HOME", Path.home()/".cache"))/"cursor-pr-review")
     p.add_argument("--post", action="store_true", help="Publish a head-bound summary using deskpost with --change")
@@ -209,7 +210,7 @@ def main():
             if not args.estimate and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
                 stack.enter_context(providers.cursor_account())
             if args.max_input_tokens is None:
-                args.max_input_tokens = int(os.getenv("REVIEW_MAX_INPUT_TOKENS", "6000"))
+                args.max_input_tokens = max_input_tokens(state)
             if args.model is None:
                 args.model = os.getenv("REVIEW_MODEL")
             if args.change and os.getenv("CURSOR_REVIEW_POLLER_CHILD") == "1" and os.getenv("REVIEW_MANAGED_PROJECT"):
