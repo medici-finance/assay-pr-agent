@@ -87,6 +87,10 @@ def publish(address, head, report, *, project=None, state=None):
     # so the reviewer identity never posts a Markdown link or @mention for an attacker.
     for issue in report["findings"]:
         body.append(f"- {fence(issue['path'])}:{issue['line']} — {fence(issue['title'])}. {fence(issue['message'])}")
+    # A dropped finding is disclosed by count and reason only: its text was not evidence-bound.
+    for reason in sorted({item["reason"] for item in report.get("dropped", [])}):
+        count = sum(item["reason"] == reason for item in report["dropped"])
+        body.append(f"Dropped {count} model finding{'s' if count > 1 else ''}: {reason}.")
     if report["state"] == "over-budget":
         body.append(f"Skipped {label}. Estimated prompt {report['estimated_input_tokens']} tokens "
                     f"exceeds the limit of {report['max_input_tokens']}.")

@@ -119,23 +119,46 @@ def parse_answer(raw, anchors):
     if len(answer) > 32_768:
         raise ReviewError("Cursor answer exceeds the review size limit")
     issues = yaml.safe_load(answer)["review"]["key_issues_to_review"]
-    if not isinstance(issues, list) or len(issues) > MAX_FINDINGS:
+    if not isinstance(issues, list):
         raise ReviewError("Invalid Cursor finding list")
-    clean = []
+    # A bad finding costs the others nothing: the call is already paid for and there is no retry.
+    clean, dropped = [], []
     for issue in issues:
-        path = issue["relevant_file"].strip()
-        start, end = issue["start_line"], issue["end_line"]
-        lines = anchors.get(path, set())
-        if (type(start) is not int or type(end) is not int or start > end
-                or start not in lines or end not in lines or end - start >= len(lines)
-                or not all(line in lines for line in range(start, end + 1))):
-            raise ReviewError("Cursor cited a line outside the reviewed patch")
-        header, body = issue["issue_header"].strip(), issue["issue_content"].strip()
-        if not header or not body:
-            raise ReviewError("Empty review finding")
-        clean.append({"path": path, "line": start, "end_line": end, "title": header, "message": body})
+        valid, why = finding(issue, anchors)
+        if why:
+            dropped.append(why)
+        elif len(clean) == MAX_FINDINGS:
+            dropped.append({"path": valid["path"], "line": valid["line"], "reason": "over the finding limit"})
+        else:
+            clean.append(valid)
     usage = value.get("usage")
-    return {"findings": clean, "cursor_usage": usage if isinstance(usage, dict) else None}
+    return {"findings": clean, "dropped": dropped, "cursor_usage": usage if isinstance(usage, dict) else None}
+
+
+def finding(issue, anchors):
+    """One validated finding, or the record of why it was dropped. A reason is fixed text, never the model's."""
+    dropped = {"path": "", "line": None, "reason": "malformed finding"}
+    if not isinstance(issue, dict):
+        return None, dropped
+    path, start, end = issue.get("relevant_file"), issue.get("start_line"), issue.get("end_line")
+    header, body = issue.get("issue_header"), issue.get("issue_content")
+    if isinstance(path, str):
+        dropped["path"] = path.strip()[:500]
+    if type(start) is int:
+        dropped["line"] = start
+    if not isinstance(path, str) or type(start) is not int or type(end) is not int:
+        return None, dropped
+    path = path.strip()
+    lines = anchors.get(path, set())
+    if (start > end or start not in lines or end not in lines or end - start >= len(lines)
+            or not all(line in lines for line in range(start, end + 1))):
+        return None, dict(dropped, reason="cited line outside the reviewed patch")
+    if not isinstance(header, str) or not isinstance(body, str):
+        return None, dropped
+    header, body = header.strip(), body.strip()
+    if not header or not body:
+        return None, dict(dropped, reason="empty finding")
+    return {"path": path, "line": start, "end_line": end, "title": header, "message": body}, None
 
 
 def invoke(prompt, model, anchors):
