@@ -44,7 +44,7 @@ def rank(path):
     return 3
 
 
-def fit(files, checks, limit, *, title="", description="", advisories=()):
+def fit(files, checks, limit, *, title="", description="", advisories=(), model=None):
     """Pack the prompt, leaving out whole files until it fits the input budget.
 
     Returns the prompt parts, the estimate of what will be sent, the estimate of the full
@@ -52,10 +52,10 @@ def fit(files, checks, limit, *, title="", description="", advisories=()):
     """
     prompt, anchors, no_text, has_text = full_pack = pack(files, checks, title=title, description=description,
                                                          advisories=advisories)
-    estimated = full = tokens(prompt) if has_text else 0
+    estimated = full = tokens(prompt, model) if has_text else 0
     if full <= limit:
         return full_pack, full, full, []
-    sizes = {f.path: tokens(text) for f in files if (text := section(f)[0])}
+    sizes = {f.path: tokens(text, model) for f in files if (text := section(f)[0])}
     queue = sorted(sizes, key=lambda path: (rank(path), -sizes[path], path))
     dropped = []
     while estimated > limit and queue:
@@ -66,7 +66,7 @@ def fit(files, checks, limit, *, title="", description="", advisories=()):
             dropped.append(queue.pop(0))
             freed += sizes[dropped[-1]]
         prompt, anchors, no_text, has_text = pack(files, checks, frozenset(dropped), title, description, advisories)
-        estimated = tokens(prompt) if has_text else 0
+        estimated = tokens(prompt, model) if has_text else 0
     if not has_text or estimated > limit:
         return full_pack, full, full, []
     return (prompt, anchors, no_text, has_text), estimated, full, sorted(dropped)
@@ -210,7 +210,7 @@ def execute(args):
     qualgen = history.screen(root, args.qualgen_store, selected, change.head) if args.qualgen_store else None
     (prompt, anchors, no_text, has_text), estimated, full, degraded = fit(
         files, checks, args.max_input_tokens, title=change.title, description=change.description,
-        advisories=qualgen["advisories"] if qualgen else ())
+        advisories=qualgen["advisories"] if qualgen else (), model=args.model)
     # Only what a review could have covered and did not is a loss of coverage.
     omitted = sorted(paths - selected)
     backend = providers.provider()

@@ -107,9 +107,19 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
     return prompt, anchors, no_text, bool(sections)
 
 
-def tokens(prompt):
+def encodings(model):
+    """The encoders to count a prompt with for this model: one where its family is public, both otherwise."""
+    name = (model or "").lower()
+    if re.search(r"gpt-4o|gpt-4\.1|gpt-5|o[134]-", name):
+        return ("gpt-4o",)
+    return ("gpt-4",) if re.search(r"gpt-4|gpt-3\.5", name) else ("gpt-4", "gpt-4o")
+
+
+def tokens(prompt, model=None):
+    # Claude's tokenizer is not public and Cursor serves several vendors, so an unknown model gets the
+    # larger of the two public counts: the estimate then errs on the safe side of the budget.
     from pr_agent.algo.token_handler import TokenEncoder
-    return len(TokenEncoder.get_token_encoder("gpt-4o").encode(prompt, disallowed_special=()))
+    return max(len(TokenEncoder.get_token_encoder(name).encode(prompt, disallowed_special=())) for name in encodings(model))
 
 
 def parse_answer(raw, anchors):
