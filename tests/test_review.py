@@ -65,7 +65,9 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(result["findings"][0]["line"],2)
         self.assertTrue(self.check(*args)[1]["cache_hit"])
         self.assertEqual(self.calls.read_text().splitlines(),["call"])
-        self.git("commit", "--allow-empty", "-qm", "same patch with new head")
+        # The messages are part of the prompt: a new head with the same patch and message
+        # reuses the result, and a different message would be a different review.
+        self.git("commit", "--amend", "--no-edit", "-q", "--date", "2001-02-03T04:05:06Z")
         self.assertTrue(self.check(*args)[1]["cache_hit"])
         self.assertFalse(self.check(*args, "--model", "another-model")[1]["cache_hit"])
         self.assertEqual(self.calls.read_text().splitlines(), ["call", "call"])
