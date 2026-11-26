@@ -29,7 +29,7 @@ COPY --from=models /usr/local/bin/node /usr/local/bin/node
 COPY --from=models /opt/model-clis /opt/model-clis
 COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /opt/reviewer
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock LICENSE ./
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable && useradd --create-home --uid 10001 reviewer && install -d -m 700 -o reviewer -g reviewer /state /repos /model-auth
 ENV DESK_LOOP=pr-review-desk DESK_TOOLS_BIN=/usr/local/bin HOME=/home/reviewer PATH=/opt/model-clis/node_modules/.bin:/opt/reviewer/.venv/bin:/home/reviewer/.local/bin:$PATH REVIEW_STATE_DIR=/state
