@@ -17,7 +17,7 @@ from .credentials import SETUP_INPUTS, forge_credentials
 from .discovery import poll_project
 from .manager import ConfigurationWatch
 from .login import auth_mode, ensure_session, login_directory
-from . import buildinfo, history, setup, providers
+from . import acknowledge, buildinfo, history, setup, providers
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 class Jobs:
     def __init__(self, state):
         self.path = state / "requests.sqlite3"
+        self.abandoned = []  # Requests this start gave up on, so the requester can be told.
         with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("""CREATE TABLE IF NOT EXISTS requests (
                 project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,
@@ -41,6 +42,8 @@ class Jobs:
             for key, number, comment, attempts in db.execute(
                     "SELECT project, number, comment, attempts FROM requests WHERE status='started'").fetchall():
                 status = "queued" if attempts < 2 else "failed"
+                if status == "failed":
+                    self.abandoned.append((key, number, comment))
                 db.execute("UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?",
                            (status, key, number, comment))
                 log.warning("Review of %s #%d comment %d was interrupted by a restart; %s", key, number, comment,
@@ -68,6 +71,11 @@ class Jobs:
             return db.execute("""UPDATE requests SET status='started', attempts=attempts+1 WHERE rowid=(
                 SELECT rowid FROM requests WHERE status='queued' ORDER BY rowid LIMIT 1)
                 RETURNING project, number, comment""").fetchone()
+
+    def pending(self, project, number):
+        with closing(sqlite3.connect(self.path)) as db:
+            return db.execute("SELECT 1 FROM requests WHERE project=? AND number=? AND status IN ('queued','started')",
+                              (project, number)).fetchone() is not None
 
     def finish(self, job, status):
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -112,10 +120,10 @@ def run_review(project, number, state):
     return report["state"] if report.get("publication") == "posted-or-already-present" else "failed"
 
 
-def cycle(projects, state, jobs, since, runner=run_review):
+def cycle(projects, state, jobs, since, runner=run_review, ack=None):
     for project in projects.values():
         try:
-            poll_project(project, state, jobs, since[project.key])
+            poll_project(project, state, jobs, since[project.key], ack)
         except Exception:
             log.exception("Poll failed for %s; will retry next cycle", project.key)
     while job := jobs.next():
@@ -127,6 +135,8 @@ def cycle(projects, state, jobs, since, runner=run_review):
             except Exception:
                 log.exception("Review failed for %s #%d comment %d", key, number, comment)
         jobs.finish(job, status)
+        if ack is not None and key in projects:
+            ack.finished(projects[key], number, comment, status)
 
 
 @contextmanager
@@ -197,6 +207,10 @@ def main():
             parser.exit(2, f"Polling configuration: {err}\n")
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         jobs = Jobs(state)
+        ack = acknowledge.Acknowledgement(jobs)
+        for key, number, comment in jobs.abandoned:
+            if key in projects:
+                ack.finished(projects[key], number, comment, "failed")
         since = {key: jobs.activated(key) for key in projects}
         log.info("Polling %s with %d seconds between cycles", ", ".join(projects), args.interval)
         if mine_seconds:

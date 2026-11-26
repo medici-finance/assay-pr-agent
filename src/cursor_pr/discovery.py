@@ -91,7 +91,7 @@ def public_gitlab_request(project, number, note):
             and bool(latest.get("created_at")) and latest["created_at"] == latest.get("updated_at"))
 
 
-def poll_project(project, state, jobs, since):
+def poll_project(project, state, jobs, since, ack=None):
     for numbers in batched(open_changes(project, state), 16):
         try:
             threads = comment_threads(project, numbers)
@@ -115,3 +115,5 @@ def poll_project(project, state, jobs, since):
                         jobs.enqueue(project.key, number, comment, "ignored")
                         continue
                 jobs.enqueue(project.key, number, comment)
+                if ack is not None:
+                    ack.queued(project, number, comment)
