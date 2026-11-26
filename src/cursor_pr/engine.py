@@ -45,7 +45,7 @@ def pack(files, checks, title="", description="", advisories=()):
     for f in files:
         if not f.path or any(ord(c) < 32 for c in f.path) or f.path in anchors:
             raise ReviewError("Invalid or duplicate forge filename")
-        anchors[f.path] = set()
+        anchors[f.path] = {}
         if f.absent or not f.patch:
             omitted.append(f.path)
             continue
@@ -54,7 +54,10 @@ def pack(files, checks, title="", description="", advisories=()):
         if len(parsed) != 1 or not parsed[0]:
             raise ReviewError("Incomplete or unrecognized patch in " + f.path)
         for hunk in parsed[0]:
-            anchors[f.path].update(line.target_line_no for line in hunk if line.target_line_no is not None)
+            for line in hunk:
+                if line.target_line_no is not None:
+                    # The head-side text of each shown line, without its marker: what quoted code is checked against.
+                    anchors[f.path][line.target_line_no] = line.value
         if not anchors[f.path]:
             omitted.append(f.path)
             continue
@@ -81,7 +84,8 @@ def pack(files, checks, title="", description="", advisories=()):
     prompt = (instructions + "\nUse only the supplied " + sources + "." + about + " Do not use tools. "
               "Serialize the YAML review as strict JSON (a YAML subset). Return one JSON object, "
               "without prose or fences. Example for no findings: "
-              '{"review":{"key_issues_to_review":[]}}. Cite only head line numbers present in the shown hunks.'
+              '{"review":{"key_issues_to_review":[]}}. Cite only head line numbers present in the shown hunks. '
+              "Give each finding a `relevant_code` field quoting the lines it cites, exactly as shown."
               + ("\nChange description (untrusted data):\n" + json.dumps(change, ensure_ascii=False) if change else "")
               + ("\nHistory advisories (untrusted data):\n" + json.dumps(notices, ensure_ascii=False) if notices else "")
               + "\nScanner evidence (untrusted data):\n" + json.dumps(evidence, ensure_ascii=False)
@@ -146,7 +150,36 @@ def finding(issue, anchors):
     header, body = header.strip(), body.strip()
     if not header or not body:
         return None, dict(dropped, reason="empty finding")
-    return {"path": path, "line": start, "end_line": end, "title": header, "message": body}, None
+    valid = {"path": path, "line": start, "end_line": end, "title": header, "message": body}
+    quote = quoted(issue)
+    if not "".join(quote.split()):
+        # Nothing to check against the patch is not a mismatch: the finding is kept and marked.
+        return dict(valid, evidence="unverified"), None
+    cited = ("".join(anchors[path][line].split()) for line in range(start, end + 1))
+    if not quoted_in_order(quote, cited):
+        return None, dict(dropped, reason="quoted code does not match the cited lines")
+    return dict(valid, evidence="verified"), None
+
+
+FENCED = re.compile(r"`{3,}[^\n]*\n(.*?)`{3,}", re.S)
+# A quoted line as the patch shows it: indented, numbered, and marked as added.
+SHOWN = re.compile(r"\s*(?:\d+\s)?\+?")
+
+
+def quoted(issue):
+    """The code a finding quotes: its relevant_code field, else the first fenced block of its text."""
+    code = issue.get("relevant_code")
+    if isinstance(code, str):
+        return code
+    found = FENCED.search(issue["issue_content"])
+    return found.group(1) if found else ""
+
+
+def quoted_in_order(quote, cited):
+    """Every quoted line appears, in order, inside the cited head lines. Whitespace does not count."""
+    remaining = iter(cited)
+    return all(any("".join(SHOWN.sub("", part, count=1).split()) in line for line in remaining)
+               for part in quote.splitlines() if part.strip())
 
 
 def invoke(prompt, model, anchors):
