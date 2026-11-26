@@ -1,7 +1,7 @@
 """One bounded Cursor request using the published PR-Agent review rubric."""
 import fcntl
 import hashlib
-from importlib.metadata import distribution
+from importlib.resources import files
 import json
 import os
 from pathlib import Path
@@ -9,9 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-import tomllib
 
-from jinja2 import Environment
 import yaml
 from unidiff import PatchSet
 
@@ -19,9 +17,14 @@ from .source import ReviewError
 from .login import auth_mode, login_directory, login_env
 from .setup import state_dir
 from .providers import KEYS, LABELS, provider
+from .vendor.patch import FilePatchInfo, decouple_and_convert_to_hunks_with_lines_numbers
+from .vendor.tokens import encoding
 
 VERSION = "1"
 MAX_FINDINGS = 3
+
+# The PR-Agent review rubric as this reviewer renders it. Only the finding limit is substituted.
+RUBRIC = files("cursor_pr.vendor").joinpath("pr_review_prompt.system.txt").read_text(encoding="utf-8")
 
 
 class ModelFailure(ReviewError):
@@ -42,8 +45,6 @@ def hunks(f):
 
 def section(f):
     """Prompt text and head-side anchors for one file; no text when it has no reviewable patch."""
-    from pr_agent.algo.git_patch_processing import decouple_and_convert_to_hunks_with_lines_numbers
-    from pr_agent.algo.types import FilePatchInfo
     if f.absent or not f.patch:
         return None, {}
     # The head-side text of each shown line, without its marker: what quoted code is checked against.
@@ -59,13 +60,7 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
 
     The third result lists the files that have no text to review, which is not a loss of coverage.
     """
-    template = distribution("pr-agent").locate_file("pr_agent/settings/pr_reviewer_prompts.toml")
-    with template.open("rb") as stream:
-        rubric = tomllib.load(stream)["pr_review_prompt"]["system"]
-    instructions = Environment().from_string(rubric).render(
-        num_max_findings=MAX_FINDINGS,
-        diff_hunk_format="New hunks are numbered at the head; old hunks show the former code.",
-    )
+    instructions = RUBRIC.replace("__MAX_FINDINGS__", str(MAX_FINDINGS))
     sections, anchors, no_text = [], {}, []
     for f in files:
         if not f.path or any(ord(c) < 32 for c in f.path) or f.path in anchors:
@@ -118,8 +113,7 @@ def encodings(model):
 def tokens(prompt, model=None):
     # Claude's tokenizer is not public and Cursor serves several vendors, so an unknown model gets the
     # larger of the two public counts: the estimate then errs on the safe side of the budget.
-    from pr_agent.algo.token_handler import TokenEncoder
-    return max(len(TokenEncoder.get_token_encoder(name).encode(prompt, disallowed_special=())) for name in encodings(model))
+    return max(len(encoding(name).encode(prompt, disallowed_special=())) for name in encodings(model))
 
 
 def parse_answer(raw, anchors):

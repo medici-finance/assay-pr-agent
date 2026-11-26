@@ -8,7 +8,6 @@ import re
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
 
 from unidiff.errors import UnidiffParseError
@@ -289,7 +288,6 @@ def run_request(args):
 
 def main():
     args = parser().parse_args()
-    # Load PR-Agent settings only from an empty directory, independent of the target repo.
     args.repo = args.repo.resolve()
     args.cache_dir = args.cache_dir.resolve()
     if args.go_report:
@@ -334,10 +332,7 @@ def main():
                 args.forge_project = project
                 args.forge_state = state
                 args.managed_project = project if project.managed else None
-            clean = stack.enter_context(tempfile.TemporaryDirectory(prefix="pr-agent-settings-"))
-            os.chdir(clean)
-            from pr_agent.algo.git_patch_processing import to_hunk_only_patch  # noqa: F401
-            from pr_agent.algo.token_handler import TokenEncoder  # noqa: F401
+            # The forge and desk tools discover their configured forge from the caller's checkout.
             os.chdir(args.repo)
             report, status = run_request(args)
         print(json.dumps(report, ensure_ascii=True, indent=2))
