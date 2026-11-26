@@ -288,6 +288,36 @@ Add `--post` to the `--change` command to post the reviewed commit and findings 
 
 The standalone poller supports `/review`. For additional upstream PR-Agent chat commands such as `/ask` and `/improve`, see [GitHub integration](https://docs.pr-agent.ai/installation/github/) and [GitLab integration](https://docs.pr-agent.ai/installation/gitlab/). GitLab pipeline jobs alone do not receive comment events. The upstream comment server and this CLI are separate entry points.
 
+### Export SARIF
+
+Add `--sarif review.sarif` to any review or estimate to write the same findings as a [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html) log after the JSON report is printed. The log has one run whose driver is `assay-pr-agent` and one result per model finding and per ShellCheck, actionlint, Go analysis, hadolint, zizmor or OSV-Scanner finding. `ruleId` is the scanner rule or `model-finding`. The report keeps no scanner severity, so `level` is a fixed mapping: `warning` for model findings and OSV-Scanner vulnerabilities, `note` for every other scanner finding. Each result names a repository-relative `artifactLocation.uri` and, when the finding has a line, `region.startLine`, plus `region.endLine` for a model finding. OSV-Scanner findings carry no line, so they name the lockfile without a region. Messages are cut at 1,000 characters and a finding without a safe relative path is left out. `partialFingerprints.primaryLocationLineHash` is a hash of the path, rule, line and message, so the same reviewed head always gives the same values and a rule that repeats one message on several lines stays several results. `invocations[0].executionSuccessful` is `true` only for the `reviewed`, `empty` and `estimate` states. The path is resolved against the directory you run the command from, not `--repo`. If the file cannot be written, the JSON report is still printed, the reason goes to stderr and the exit code is 2. The poller does not request the export.
+
+GitHub code scanning accepts SARIF 2.1.0 files from third-party tools. It is available for public repositories on GitHub.com and for organization-owned repositories with GitHub Code Security enabled. Upload it from a GitHub Actions job with the `upload-sarif` action, which needs `security-events: write` and, for private repositories, `actions: read`:
+
+```yaml
+    steps:
+      - run: cursor-review --ci --max-input-tokens 4000 --sarif review.sarif > review.json
+      - uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: review.sarif
+```
+
+GitLab ingests SARIF 2.1.0 from an `artifacts:reports:sarif` artifact on GitLab Ultimate: generally available in GitLab 19.2, and from 18.11 with the `sarif_ingestion` feature flag, which is on by default from 19.1. The findings appear in the pipeline Security tab and in the merge request security widget. GitLab ingests the findings only when the job succeeds, and `cursor-review` exits 2 for partial coverage, an over-budget prompt or a failed model, so keep that exit status from failing the job and read the outcome from `review.json`:
+
+```yaml
+review:
+  script:
+    - cursor-review --ci --max-input-tokens 4000 --sarif review.sarif > review.json || review_exit=$?
+    - test -s review.sarif
+  artifacts:
+    when: always
+    paths: [review.json]
+    reports:
+      sarif: review.sarif
+```
+
+The test suite checks the log's contents and never uploads it to a forge. [Upload a SARIF file to GitHub](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/uploading-a-sarif-file-to-github) · [SARIF support for code scanning](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning) · [GitLab SARIF reports](https://docs.gitlab.com/user/application_security/detect/sarif/)
+
 ## Verification
 
 ```sh

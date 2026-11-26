@@ -23,6 +23,7 @@ from .checks import go_report, scan_files, scanner
 from .sync import scan_checkout
 from .engine import CursorFailure, pack, review, tokens
 from .source import ReviewError, ci_refs, forge_change, local_change, run_desk
+from . import sarif
 
 
 def publish(address, head, report):
@@ -82,6 +83,7 @@ def parser():
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling the model")
     p.add_argument("--cache-dir", type=Path, default=Path(os.getenv("XDG_CACHE_HOME", Path.home()/".cache"))/"cursor-pr-review")
     p.add_argument("--post", action="store_true", help="Publish a head-bound summary using deskpost with --change")
+    p.add_argument("--sarif", type=Path, help="Also write the findings as a SARIF 2.1.0 log at this path")
     return p
 
 
@@ -201,6 +203,8 @@ def main():
         args.go_report = args.go_report.resolve()
     if args.qualgen_store:
         args.qualgen_store = args.qualgen_store.resolve()
+    if args.sarif:
+        args.sarif = args.sarif.resolve()
     old = Path.cwd()
     try:
         with ExitStack() as stack:
@@ -242,6 +246,9 @@ def main():
             os.chdir(args.repo)
             report, status = run_request(args)
         print(json.dumps(report, ensure_ascii=True, indent=2))
+        # The report reaches stdout even when the export cannot be written.
+        if args.sarif:
+            sarif.write(args.sarif, report)
         return status
     except (ReviewError, OSError, ValueError, TypeError, KeyError, AttributeError,
             UnidiffParseError, yaml.YAMLError, subprocess.TimeoutExpired) as err:
