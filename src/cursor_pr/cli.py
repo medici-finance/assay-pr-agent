@@ -61,6 +61,13 @@ def publish(address, head, report):
              "--body-file", tmp.name])
 
 
+def record_head(path, head):
+    # Replaced whole, so a poller that stops meanwhile never finds part of a head.
+    with tempfile.NamedTemporaryFile("w", encoding="ascii", dir=path.parent, delete=False) as tmp:
+        tmp.write(head + "\n")
+    os.replace(tmp.name, path)
+
+
 def parser():
     p = argparse.ArgumentParser(description="Run one bounded code review and emit a JSON report.")
     mode = p.add_mutually_exclusive_group(required=True)
@@ -68,6 +75,8 @@ def parser():
     mode.add_argument("--base", help="Local base revision to compare against")
     mode.add_argument("--ci", action="store_true", help="Use provider CI event SHAs in the checkout")
     p.add_argument("--expected-change-url", help="Require this exact open forge change before reviewing")
+    p.add_argument("--expected-head", help="Require the change to be at this head before reviewing")
+    p.add_argument("--record-head", type=Path, help="Write the head under review to this file before any other work")
     p.add_argument("--head", help="Local head revision (default HEAD with --base)")
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="Checkout for local Git and scanners")
     p.add_argument("--path", action="append", default=[], help="Limit review to an exact changed path; repeatable")
@@ -88,6 +97,9 @@ def parser():
 def execute(args):
     if args.max_input_tokens < 1 or (args.head and not args.base) or (args.post and (not args.change or args.estimate)):
         raise ReviewError("Invalid budget or incompatible --head/--post options")
+    if (args.record_head and args.expected_head
+            or (args.record_head or args.expected_head) and not args.change):
+        raise ReviewError("--record-head and --expected-head need --change and exclude each other")
     root = args.repo.resolve()
     if args.expected_change_url and not args.change:
         raise ReviewError("--expected-change-url requires --change")
@@ -98,6 +110,11 @@ def execute(args):
     else:
         base, head = ci_refs() if args.ci else (args.base, args.head or "HEAD")
         change = local_change(root, base, head)
+
+    if args.record_head:
+        record_head(args.record_head, change.head)
+    if args.expected_head is not None and change.head != args.expected_head:
+        raise ReviewError(f"Change is at {change.head}, not at {args.expected_head}, the head of its interrupted start")
 
     paths = {f.path for f in change.files}
     selected = set(args.path) if args.path else paths

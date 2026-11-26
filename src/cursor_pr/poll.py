@@ -22,20 +22,34 @@ from . import buildinfo, history, setup, providers
 log = logging.getLogger(__name__)
 
 
+def head_record(state):
+    # The head the running review resolved, from before its model call until its request ends. A
+    # review child finding it repeats a request whose poller stopped, at that head or not at all.
+    return state / "requests.head"
+
+
 class Jobs:
     def __init__(self, state):
         self.path = state / "requests.sqlite3"
+        self.state = state
         with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("""CREATE TABLE IF NOT EXISTS requests (
                 project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,
                 status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(project, number, comment))""")
             if "attempts" not in {row[1] for row in db.execute("PRAGMA table_info(requests)")}:
-                # Both in one transaction. Stopped in between, the poller would otherwise come back
-                # to a column without the count and give an interrupted review a third start.
+                # Both in one transaction. A poller stopped in between would otherwise find the column
+                # on its next start, skip the rest and repeat these reviews as though their heads could
+                # be checked.
                 db.execute("BEGIN")
-                # Starts before this column existed are uncounted, except that a started row had one.
                 db.execute("ALTER TABLE requests ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
-                db.execute("UPDATE requests SET attempts=1 WHERE status='started'")
+                # No earlier poller recorded the head a running review had resolved, so repeating it
+                # could review a head nobody asked for. It is given up on instead.
+                for key, number, comment in db.execute(
+                        "SELECT project, number, comment FROM requests WHERE status='started'").fetchall():
+                    log.warning("Review of %s #%d comment %d was interrupted by a restart; marked failed, "
+                                "the head it started at was not recorded, a new /review retries it",
+                                key, number, comment)
+                db.execute("UPDATE requests SET status='failed' WHERE status='started'")
             db.execute("""CREATE TABLE IF NOT EXISTS activations (
                 project TEXT PRIMARY KEY, since TEXT NOT NULL)""")
             # Only the process holding the instance lock opens the queue, so a row still started
@@ -68,18 +82,27 @@ class Jobs:
 
     def next(self):
         with closing(sqlite3.connect(self.path)) as db, db:
-            return db.execute("""UPDATE requests SET status='started', attempts=attempts+1 WHERE rowid=(
+            job = db.execute("""UPDATE requests SET status='started', attempts=attempts+1 WHERE rowid=(
                 SELECT rowid FROM requests WHERE status='queued' ORDER BY rowid LIMIT 1)
-                RETURNING project, number, comment""").fetchone()
+                RETURNING project, number, comment, attempts""").fetchone()
+        if job and job[3] == 1:
+            # A first start: a head left by an earlier request is not this one's.
+            head_record(self.state).unlink(missing_ok=True)
+        return job[:3] if job else None
 
     def finish(self, job, status):
         with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?",
-                       (status, *job))
+            attempts = db.execute("""UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?
+                RETURNING attempts""", (status, *job)).fetchone()
+        head_record(self.state).unlink(missing_ok=True)
+        if attempts and attempts[0] > 1 and status == "failed":
+            # The head may have moved on since the first start, or the retry failed like the first did.
+            log.warning("Review of %s #%d comment %d was not completed by its retry; a new /review retries it", *job)
 
 
 def run_review(project, number, state):
     address = f"{project.slug}#{number}"
+    record = head_record(state)
     argv = [sys.executable, "-I", "-m", "cursor_pr.cli", "--repo", str(project.checkout),
             "--change", address, "--expected-change-url", project.change_url(number),
             "--post", "--cache-dir", str(state / "cache")]
@@ -93,6 +116,11 @@ def run_review(project, number, state):
         argv.extend(["--max-input-tokens", os.environ["REVIEW_MAX_INPUT_TOKENS"]])
     if os.getenv("REVIEW_MODEL"):
         argv.extend(["--model", os.environ["REVIEW_MODEL"]])
+    try:
+        # The head of a start a restart interrupted, which this one must stay at.
+        argv.extend(["--expected-head", record.read_text().strip()])
+    except FileNotFoundError:
+        argv.extend(["--record-head", str(record)])
     env = dict(os.environ)
     env["CURSOR_REVIEW_POLLER_CHILD"] = "1"
     env.pop("REVIEW_MANAGED_PROJECT", None)
