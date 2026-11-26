@@ -136,7 +136,7 @@ def execute(args):
         go["findings"] = [row for row in go["findings"] if row["path"] in selected]
         checks.append(go)
 
-    prompt, anchors, unseen, has_text = pack(files, checks)
+    prompt, anchors, unseen, has_text = pack(files, checks, change.title, change.description)
     estimated = tokens(prompt) if has_text else 0
     omitted = sorted(set(unseen) | (paths - selected))
     backend = providers.provider()

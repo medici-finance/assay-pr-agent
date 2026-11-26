@@ -5,7 +5,25 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cursor_pr import engine, source
+from cursor_pr import cli, engine, source
+
+
+def fixture_repo():
+    """Two commits after a base, each with a message: what a local review reads."""
+    tmp = tempfile.TemporaryDirectory()
+    root = Path(tmp.name)
+
+    def git(*args):
+        return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.org",
+                                        *args], cwd=root, text=True).strip()
+    git("init", "-q", "-b", "main")
+    git("commit", "--allow-empty", "-qm", "base")
+    for message, text in (("Add the script\n\nExplains why the script exists.", "echo one\n"),
+                          ("Quote the argument", "echo two\n")):
+        (root / "a.sh").write_text(text)
+        git("add", "--", "a.sh")
+        git("commit", "-qm", message)
+    return root, tmp
 
 
 class ChangeDescriptionTests(unittest.TestCase):
@@ -33,21 +51,8 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertLessEqual(len(change.description), source.DESCRIPTION_LIMIT + len(" …[truncated]"))
 
     def test_local_change_uses_the_commit_messages(self):
-        tmp = tempfile.TemporaryDirectory()
+        root, tmp = fixture_repo()
         self.addCleanup(tmp.cleanup)
-        root = Path(tmp.name)
-
-        def git(*args):
-            return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.org",
-                                            *args], cwd=root, text=True).strip()
-        git("init", "-q", "-b", "main")
-        git("commit", "--allow-empty", "-qm", "base")
-        (root / "a.sh").write_text("echo one\n")
-        git("add", "--", "a.sh")
-        git("commit", "-qm", "Add the script\n\nExplains why the script exists.")
-        (root / "a.sh").write_text("echo two\n")
-        git("add", "--", "a.sh")
-        git("commit", "-qm", "Quote the argument")
         change = source.local_change(root, "HEAD~2", "HEAD")
         self.assertEqual([f.path for f in change.files], ["a.sh"])
         self.assertEqual(change.title, "")
@@ -65,6 +70,21 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertIn("use it for intent, not as evidence", described)
         self.assertLess(described.index("Change description"), described.index("Patch (untrusted data)"))
         self.assertEqual(engine.pack(files, [], "", ""), plain)
+
+    def test_local_review_shows_the_commit_messages_to_the_model(self):
+        root, tmp = fixture_repo()
+        self.addCleanup(tmp.cleanup)
+        shown = []
+
+        def invoke(prompt, model, anchors):
+            shown.append(prompt)
+            return {"findings": [], "cursor_usage": None}
+        args = cli.parser().parse_args(["--repo", str(root), "--base", "HEAD~2", "--cache-dir", str(root / "cache"),
+                                        "--max-input-tokens", "6000"])
+        with patch.object(cli, "scan_files", return_value=[]), patch.object(engine, "invoke", side_effect=invoke):
+            report, code = cli.run_request(args)
+        self.assertEqual((code, report["state"]), (0, "reviewed"))
+        self.assertIn('"title": "", "description": "Add the script', shown[0])
 
 
 if __name__ == "__main__":
