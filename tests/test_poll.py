@@ -79,7 +79,7 @@ class PollTests(unittest.TestCase):
                       author={"id":7}, body="/review", created_at="t.001", updated_at="t.001")
         request = httpx.Request("GET", "https://gitlab.com")
         with patch.dict(os.environ, {"GITLAB_API_BASE":"https://gitlab.com/api/v4"}), \
-             patch("cursor_pr.source.run_desk", return_value=str(token).encode()) as lookup, \
+             patch("cursor_pr.source.reviewer_token_file", return_value=token) as lookup, \
              patch("cursor_pr.discovery.httpx.get") as get:
             for delta in ({}, {"internal":True}, {"internal":None}, {"confidential":True}, {"system":True},
                           {"updated_at":"t.002"}, {"author":{"id":7,"bot":True}}, {"author":{"id":8}},
@@ -88,7 +88,7 @@ class PollTests(unittest.TestCase):
                 self.assertEqual(public_gitlab_request(self.gl,3,self.note), not delta)
             get.assert_called_with("https://gitlab.com/api/v4/projects/acme%2Fgitlab/merge_requests/3/notes/81",
                                    headers={"PRIVATE-TOKEN":"fixture"}, follow_redirects=False, timeout=15)
-            self.assertIn("--no-rotate", lookup.call_args.args[0])
+            lookup.assert_called_with("gitlab", self.gl.slug, self.gl.checkout)
             for status in (302, 403, 429, 503):
                 get.return_value = httpx.Response(status, request=request)
                 with self.assertRaises(httpx.HTTPStatusError):
@@ -104,24 +104,16 @@ class PollTests(unittest.TestCase):
         since = {key: self.since for key in self.projects}
         notes, reviews = [], []
         broken = False
-        def desk(args, *, cwd, timeout, env=None):
-            self.assertEqual(cwd, self.state)
-            if args[0] == "deskmonitor":
-                self.assertEqual(args[:2], ["deskmonitor","pr"])
-                root = Path(env["PR_MONITOR_STATE_DIR"])
-                root.mkdir(parents=True, exist_ok=True)
-                (root/(args[2].replace("/","__")+".state")).write_text("3 abc ready OPEN CLEAN\n")
-                return b""  # No push, review or lifecycle event.
-            self.assertEqual(args[:3], ["deskread","comments","--change"])
-            slug = args[3].split("#")[0]
-            item = dict(repo=slug,number=3,comments=notes)
-            partial = broken and slug == self.gh.slug
-            return json.dumps(dict(schema=1,kind="comments",items=[] if partial else [item],
-                                   partial=[{"repo":slug,"number":3}] if partial else [])).encode()
+        def forge(verb, project, *, numbers=(), timeout):
+            if verb == "open":
+                return dict(numbers=[3], capped=False)
+            self.assertEqual((verb, numbers), ("comments", (3,)))
+            partial = broken and project.slug == self.gh.slug
+            return dict(items=[] if partial else [dict(number=3, comments=notes)], partial=[3] if partial else [])
         def review(project, number, state):
             reviews.append((project.key,number))
             return "reviewed"
-        with patch("cursor_pr.discovery.run_desk", side_effect=desk), \
+        with patch("cursor_pr.discovery.run_forge", side_effect=forge), \
              patch("cursor_pr.discovery.public_gitlab_request", return_value=True) as visibility:
             notes.append(self.note | dict(createdAt="2025-01-01T00:00:00Z", updatedAt="2025-01-01T00:00:00Z"))
             notes.append(self.note | dict(body="ordinary comment"))
@@ -148,6 +140,15 @@ class PollTests(unittest.TestCase):
                 self.assertEqual(argv[argv.index("--go-analysis-producer")+1], producer)
                 self.assertEqual(argv[argv.index("--expected-change-url")+1], project.change_url(3))
 
+    def test_publication_failure_reason_is_logged(self):
+        with patch("cursor_pr.poll.subprocess.run") as run:
+            run.return_value.stdout = json.dumps({
+                "state": "reviewed", "publication": "failed",
+                "publication_error": "pr-agent-forge comment exited 1: publication scope changed"}).encode()
+            with self.assertLogs("cursor_pr.poll", level="WARNING") as logs:
+                self.assertEqual(run_review(self.gh, 3, self.state), "failed")
+        self.assertIn("pr-agent-forge comment exited 1: publication scope changed", "\n".join(logs.output))
+
     def test_real_command_path_with_stubbed_executables(self):
         # Only the external forge and model binaries are replaced. Exercise the installed
         # isolated CLI subprocess, parser, prompt, cache, publication and head checks.
@@ -157,22 +158,34 @@ class PollTests(unittest.TestCase):
             p=bindir/name
             p.write_text("#!/usr/bin/env python3\n"+body)
             p.chmod(0o755)
-        install("deskread", """
+        install("pr-agent-forge", """
 import json,os,sys
-kind=sys.argv[1]
-assert sys.argv[2:]==['--change',os.environ['FIXTURE_SLUG']+'#3']
-item=dict(repo=os.environ['FIXTURE_SLUG'],number=3)
-if kind=='change':
-    item['change']=dict(url=os.environ['FIXTURE_CHANGE'],state='OPEN',headSha='a'*40,changedFiles=1)
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+verb=sys.argv[1]
+req=json.load(sys.stdin)
+if verb=="mint":
+    assert req["Repository"] == os.environ["FIXTURE_SLUG"].split("/")[1]
+    print(json.dumps(dict(token="fixture", expires_at=(datetime.now(timezone.utc)+timedelta(hours=1)).isoformat())))
+    raise SystemExit(0)
+assert req["Repository"]==os.environ["FIXTURE_SLUG"]
+assert req["Token"] == "fixture"
+assert "REVIEW_SECRET_FIXTURE" not in os.environ
+if verb=="change":
+    assert req["Numbers"]==[3]
+    print(json.dumps(dict(url=os.environ["FIXTURE_CHANGE"],state="open",headSha="a"*40,changedFiles=1)))
+elif verb=="change-files":
+    print(json.dumps(dict(headSha="a"*40,complete=True,changedFiles=1,files=[dict(filename="demo.py",
+        patchAbsent=False,status="added",patch="@@ -0,0 +1 @@\\n+x=1\\n")])))
 else:
-    item['changeFiles']=dict(complete=True,changedFiles=1,files=[dict(filename='demo.py',
-        patchAbsent=False,status='added',patch='@@ -0,0 +1 @@\\n+x=1\\n')])
-print(json.dumps(dict(schema=1,kind=kind,items=[item],partial=[])))
+    assert verb=="comment"
+    post=req["Publication"]
+    assert post["Number"]==3 and post["Head"]=="a"*40
+    if not post["AlreadyPosted"]:
+        with Path(os.environ["POST_LOG"]).open("a") as out:
+            out.write(post["Body"])
+    print("null")
 """)
-        # Standalone PR/MR comments must never pass through issue filing or PR creation.
-        unexpected=self.state/"unexpected-desk-command"
-        for tool in ("deskfile", "deskpr"):
-            install(tool, f"from pathlib import Path\nPath({str(unexpected)!r}).touch()\nraise SystemExit(1)")
         calls=self.state/"model-calls"
         install("cursor-agent",f"""
 from pathlib import Path
@@ -180,14 +193,6 @@ import json
 with Path({str(calls)!r}).open('a') as f: f.write('called\\n')
 print(json.dumps(dict(type='result',subtype='success',is_error=False,
                       result='{{"review":{{"key_issues_to_review":[]}}}}')))
-""")
-        install("deskpost","""
-import os,sys
-from pathlib import Path
-assert sys.argv[1:8]==['comment',os.environ['FIXTURE_SLUG'],'3','--kind','mr','--head','a'*40]
-assert 'REVIEW_SECRET_FIXTURE' not in os.environ
-with Path(os.environ['POST_LOG']).open('a') as out:
-    out.write(Path(sys.argv[-1]).read_text())
 """)
         # Real Qualgen, local Git, and the installed poller child exercise both providers.
         checkout = self.state / "checkout"
@@ -202,13 +207,17 @@ with Path(os.environ['POST_LOG']).open('a') as out:
             git("add", "--", "demo.py", "partner.py")
             git("commit", "-qm", str(revision))
         posts=self.state/"posts"
+        (self.state/"github.pem").write_text("fixture")
+        (self.state/"gitlab.token").write_text("fixture")
         with patch.dict(os.environ,dict(PATH=str(bindir)+os.pathsep+os.environ["PATH"],
-                    POST_LOG=str(posts), REVIEW_SECRET_FIXTURE="private")):
+                    POST_LOG=str(posts), REVIEW_SECRET_FIXTURE="private", REVIEW_FORGE_DIR=str(self.state),
+                    REVIEW_FORGE_APP_ID="1", REVIEW_FORGE_INSTALL_ID="2")):
             from dataclasses import replace
             for project in self.projects.values():
                 project = replace(project, checkout=checkout)
                 history.refresh(checkout, history.store_for(self.state, project))
-                with patch.dict(os.environ,{"FIXTURE_CHANGE":project.change_url(3),"FIXTURE_SLUG":project.slug}):
+                with patch.dict(os.environ, {"FIXTURE_CHANGE": project.change_url(3), "FIXTURE_SLUG": project.slug,
+                                             "GITLAB_API_BASE": "https://gitlab.com/api/v4"}):
                     with patch.dict(os.environ, {"REVIEW_QUALGEN_INTERVAL_SECONDS": "0"}):
                         self.assertEqual(run_review(project,3,self.state),"reviewed")
                     # The cache key contains the exact prompt. Enabling Qualgen must hit the same key.
@@ -225,7 +234,6 @@ with Path(os.environ['POST_LOG']).open('a') as out:
             with patch.dict(os.environ,{"FIXTURE_CHANGE":self.gl.change_url(3),"FIXTURE_SLUG":self.gh.slug}):
                 self.assertEqual(run_review(self.gh,3,self.state),"failed")
         self.assertEqual(posts.read_text().count("historically coupled to partner.py"), 4)
-        self.assertFalse(unexpected.exists())
         self.assertEqual(calls.read_text().splitlines(),["called","called"])
         self.assertEqual(posts.read_text().count("Skipped Cursor"),2)
         self.assertEqual(posts.read_text().count("[PR-Agent](https://github.com/the-pr-agent/pr-agent)"),6)
