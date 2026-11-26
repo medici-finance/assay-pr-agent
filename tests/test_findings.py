@@ -26,7 +26,7 @@ class ParseAnswerTests(unittest.TestCase):
         parsed = engine.parse_answer(envelope([issue(), issue("a.py", 9)]), ANCHORS)
         self.assertEqual([f["path"] for f in parsed["findings"]], ["a.py"])
         self.assertEqual(parsed["dropped"], [{"path": "a.py", "line": 9, "reason": "cited line outside the reviewed patch"}])
-        self.assertIsNone(parsed["cursor_usage"])
+        self.assertIsNone(parsed["model_usage"])
 
     def test_every_reason_and_the_finding_limit(self):
         issues = [issue(), "text", {"relevant_file": "a.py", "start_line": True, "end_line": 2}, issue("a.py", 4, 2),
@@ -79,7 +79,7 @@ class DroppedSummaryTests(unittest.TestCase):
 
     def test_a_review_whose_findings_were_all_dropped_is_not_reported_as_clean(self):
         parsed = {"findings": [], "dropped": [{"path": "a.py", "line": 9, "reason": "cited line outside the reviewed patch"}],
-                  "cursor_usage": None}
+                  "model_usage": None}
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         posts = []

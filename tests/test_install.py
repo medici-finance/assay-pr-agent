@@ -65,7 +65,7 @@ else:
                         args = ("review fixture", None, {}, root / "cache", "source")
                         first, cached = engine.review(*args)
                         self.assertFalse(cached)
-                        self.assertEqual(first["cursor_usage"], {"input_tokens": 23})
+                        self.assertEqual(first["model_usage"], {"input_tokens": 23})
                         self.assertTrue(engine.review(*args)[1])
             self.assertEqual(calls.read_text().splitlines(), ["claude", "codex"])
 

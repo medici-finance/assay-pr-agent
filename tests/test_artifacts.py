@@ -105,11 +105,11 @@ class ArtifactTests(unittest.TestCase):
         return report, status, posts[0]
 
     def test_both_forges_import_and_publish_with_one_model_call(self):
-        answer = {"findings": [], "cursor_usage": None}
+        answer = {"findings": [], "model_usage": None}
         for forge in ("github", "gitlab"):
             with self.subTest(forge=forge), patch.object(engine, "invoke", return_value=answer) as model:
                 report, status, post = self.exercise(forge)
-                self.assertEqual((status, report["cursor_invocations"]), (0, 1))
+                self.assertEqual((status, report["model_invocations"]), (0, 1))
                 self.assertIn("` logic.go `:1 — ` SA4006 `", post)
                 prompt = model.call_args.args[0]
                 self.assertIn("SA4006", prompt)
@@ -126,7 +126,7 @@ class ArtifactTests(unittest.TestCase):
                 ("github", "report", fixture_report() | {"repository": "other/repo"}),
                 ("github", "report", fixture_report() | {"expected_scans": 2})]:
             with self.subTest(provider=provider, attr=attr), patch.object(self, attr, value), \
-                 patch.object(engine, "invoke", return_value={"findings": [], "cursor_usage": None}):
+                 patch.object(engine, "invoke", return_value={"findings": [], "model_usage": None}):
                 result, status, post = self.exercise(provider)
                 self.assertEqual((status, result["state"], result["checks"][0]["state"]),
                                  (2, "partial", "could-not-check"))

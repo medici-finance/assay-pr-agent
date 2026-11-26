@@ -22,7 +22,7 @@ class CoverageStateTests(unittest.TestCase):
 
         def invoke(prompt, model, anchors):
             shown.append(prompt)
-            return {"findings": [], "dropped": [], "cursor_usage": None}
+            return {"findings": [], "dropped": [], "model_usage": None}
         with patch.object(cli, "forge_change", return_value=source.Change("a" * 40, files, "org/repo#1")), \
              patch.object(cli.drift, "forge", return_value=NO_DRIFT), patch.object(cli, "scan_files", return_value=[]), \
              patch.object(engine, "invoke", side_effect=invoke), \

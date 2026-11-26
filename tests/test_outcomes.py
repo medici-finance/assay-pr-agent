@@ -35,7 +35,7 @@ class OutcomeTests(unittest.TestCase):
                                         "--max-input-tokens", "6000"])
         with patch.object(cli, "forge_change", return_value=source.Change(head, [source.File("app.py", patch_text, "added")], "org/repo#7")), \
              patch.object(cli, "scan_files", return_value=[]), \
-             patch.object(engine, "invoke", return_value={"findings": answer, "dropped": [], "cursor_usage": None}), \
+             patch.object(engine, "invoke", return_value={"findings": answer, "dropped": [], "model_usage": None}), \
              patch.object(cli.drift, "forge", return_value={"state": "could-not-check", "behind": None, "both": [], "references": []}), \
              patch.object(cli, "post_comment", side_effect=lambda *args: posts.append(args[3])):
             report, code = cli.run_request(args)

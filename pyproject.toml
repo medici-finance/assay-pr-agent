@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cursor-pr-review"
 version = "0.1.0"
-description = "Single-pass Cursor reviewer for GitHub pull requests and GitLab merge requests"
+description = "Single-pass bounded reviewer for GitHub pull requests and GitLab merge requests, with Cursor, Claude or Codex as the model"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"

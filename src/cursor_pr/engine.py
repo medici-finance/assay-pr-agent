@@ -24,7 +24,7 @@ VERSION = "1"
 MAX_FINDINGS = 3
 
 
-class CursorFailure(ReviewError):
+class ModelFailure(ReviewError):
     def __init__(self, message, invocations, usage=None):
         super().__init__(message)
         self.invocations = invocations
@@ -125,7 +125,7 @@ def tokens(prompt, model=None):
 def parse_answer(raw, anchors):
     value = json.loads(raw)
     if value.get("type") != "result" or value.get("subtype") != "success" or value.get("is_error") is not False:
-        raise ReviewError("Cursor did not return a successful terminal result")
+        raise ReviewError("The model did not return a successful terminal result")
     answer = value["result"].strip()
     # In Auto mode the CLI can prepend its own routing notice to the model text.
     answer = re.sub(r"^> Auto routed to [^\r\n]+\r?\n\s*\n", "", answer, count=1)
@@ -133,10 +133,10 @@ def parse_answer(raw, anchors):
     if fenced:
         answer = fenced.group(1)
     if len(answer) > 32_768:
-        raise ReviewError("Cursor answer exceeds the review size limit")
+        raise ReviewError("The model's answer exceeds the review size limit")
     issues = yaml.safe_load(answer)["review"]["key_issues_to_review"]
     if not isinstance(issues, list):
-        raise ReviewError("Invalid Cursor finding list")
+        raise ReviewError("Invalid finding list from the model")
     # A bad finding costs the others nothing: the call is already paid for and there is no retry.
     clean, dropped = [], []
     for issue in issues:
@@ -148,7 +148,7 @@ def parse_answer(raw, anchors):
         else:
             clean.append(valid)
     usage = value.get("usage")
-    return {"findings": clean, "dropped": dropped, "cursor_usage": usage if isinstance(usage, dict) else None}
+    return {"findings": clean, "dropped": dropped, "model_usage": usage if isinstance(usage, dict) else None}
 
 
 def finding(issue, anchors):
@@ -211,7 +211,7 @@ def invoke(prompt, model, anchors):
     label = LABELS[backend]
     executable = (shutil.which("cursor-agent") or shutil.which("agent")) if backend == "cursor" else shutil.which(backend)
     if not executable:
-        raise CursorFailure(f"{label} CLI is not installed", 0)
+        raise ModelFailure(f"{label} CLI is not installed", 0)
     # Retain login discovery, but keep unrelated forge and CI secrets out of the child.
     env = {k: os.environ[k] for k in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR",
            "XDG_CONFIG_HOME", KEYS[backend], "SSL_CERT_FILE", "HTTPS_PROXY", "NO_PROXY")
@@ -235,7 +235,7 @@ def invoke(prompt, model, anchors):
             if use_login:
                 env = login_env(backend, login_directory(state_dir()))
             elif not env.get(KEYS[backend]):
-                raise CursorFailure(f"Set {KEYS[backend]} for {label}", 0)
+                raise ModelFailure(f"Set {KEYS[backend]} for {label}", 0)
             if backend == "claude":
                 argv = [executable, "-p", "--safe-mode" if use_login else "--bare", "--output-format", "json", "--tools", "",
                         "--strict-mcp-config", "--no-session-persistence", "--max-turns", "1"]
@@ -259,7 +259,7 @@ def invoke(prompt, model, anchors):
             if not response.returncode and backend == "codex":
                 answer = Path(workspace, "answer")
                 if not answer.is_file() or answer.stat().st_size > 32768:
-                    raise CursorFailure("Codex did not return a bounded final message", 1)
+                    raise ModelFailure("Codex did not return a bounded final message", 1)
                 try:
                     events = [json.loads(line) for line in response.stdout.splitlines() if line.strip()]
                     completed = [event for event in events if event.get("type") == "turn.completed"]
@@ -268,9 +268,9 @@ def invoke(prompt, model, anchors):
                     response.stdout = json.dumps(dict(type="result", subtype="success", is_error=False,
                                                       result=answer.read_text(), usage=completed[0].get("usage")))
                 except (AttributeError, ValueError, OSError):
-                    raise CursorFailure("Codex did not return one completed review turn", 1) from None
+                    raise ModelFailure("Codex did not return one completed review turn", 1) from None
         except subprocess.TimeoutExpired as err:
-            raise CursorFailure(f"{label} exceeded the 120-second limit", 1) from err
+            raise ModelFailure(f"{label} exceeded the 120-second limit", 1) from err
     if response.returncode:
         diagnostic = (response.stderr + response.stdout).lower()
         reason = "check the CLI credentials and account access"
@@ -285,7 +285,7 @@ def invoke(prompt, model, anchors):
             if any(marker in diagnostic for marker in markers):
                 reason = explanation
                 break
-        raise CursorFailure(f"{label} exited {response.returncode}: {reason}. No retry was made.", 1)
+        raise ModelFailure(f"{label} exited {response.returncode}: {reason}. No retry was made.", 1)
     try:
         return parse_answer(response.stdout, anchors)
     except (ReviewError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError) as err:
@@ -293,7 +293,7 @@ def invoke(prompt, model, anchors):
             usage = json.loads(response.stdout).get("usage")
         except (ValueError, AttributeError):
             usage = None
-        raise CursorFailure(f"{label} returned an invalid review: " + type(err).__name__,
+        raise ModelFailure(f"{label} returned an invalid review: " + type(err).__name__,
                             1, usage if isinstance(usage, dict) else None) from err
 
 

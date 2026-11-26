@@ -71,7 +71,7 @@ class ReceiptTests(unittest.TestCase):
                                         "--max-input-tokens", "6000", "--path", "app.py", "--path", "logo.png"])
 
         def invoke(prompt, model, anchors):
-            return {"findings": [], "dropped": [], "cursor_usage": {"input_tokens": 2900, "output_tokens": 120}}
+            return {"findings": [], "dropped": [], "model_usage": {"input_tokens": 2900, "output_tokens": 120}}
         with patch.object(cli, "forge_change", return_value=source.Change("a" * 40, [APP, LOGO, OTHER], "org/repo#1")), \
              patch.object(cli, "scan_files", return_value=[]), patch.object(engine, "invoke", side_effect=invoke), \
              patch.object(cli.drift, "forge", return_value={"state": "could-not-check", "behind": None, "both": [], "references": []}), \

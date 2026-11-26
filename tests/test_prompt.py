@@ -82,7 +82,7 @@ class ChangeDescriptionTests(unittest.TestCase):
 
         def invoke(prompt, model, anchors):
             shown.append(prompt)
-            return {"findings": [], "cursor_usage": None}
+            return {"findings": [], "model_usage": None}
         args = cli.parser().parse_args(["--repo", str(root), "--base", "HEAD~2", "--cache-dir", str(root / "cache"),
                                         "--max-input-tokens", "6000"])
         with patch.object(cli, "scan_files", return_value=[]), patch.object(engine, "invoke", side_effect=invoke):
@@ -118,7 +118,7 @@ class ChangeDescriptionTests(unittest.TestCase):
 
         def invoke(prompt, model, anchors):
             shown.append(prompt)
-            return {"findings": [], "cursor_usage": None}
+            return {"findings": [], "model_usage": None}
         change = source.Change("a" * 40, [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")], "org/repo#1", "T", "D")
         args = cli.parser().parse_args(["--change", "org/repo#1", "--repo", str(root), "--cache-dir", str(root / "cache"),
                                         "--qualgen-store", str(root / "store"), "--max-input-tokens", "6000"])
