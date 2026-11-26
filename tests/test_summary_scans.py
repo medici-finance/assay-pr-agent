@@ -139,13 +139,13 @@ class SummaryScannerTests(unittest.TestCase):
         def invoke(prompt, model, anchors):
             calls.append(prompt)
             return {"findings": [], "cursor_usage": None}
-        def publish(argv):
-            posts.append(Path(argv[-1]).read_text())
+        def publish(project, number, head, body, state):
+            posts.append(body)
         def local(root, head, tool, path, cache, **kwargs):
             self.assertNotEqual(tool, "hadolint")
             return scanners.completed(tool, path, "local", [{"line": None, "rule":"LOCAL", "message":"local-marker"}])
         self.start(patch.object(engine, "invoke", side_effect=invoke))
-        self.start(patch.object(cli, "run_desk", side_effect=publish))
+        self.start(patch.object(cli, "post_comment", side_effect=publish))
         self.start(patch.object(cli, "scan_files", return_value=[]))
         self.start(patch.object(scanners, "local", side_effect=local))
         expected = engine.pack(self.files_sorted(), [])[0]
