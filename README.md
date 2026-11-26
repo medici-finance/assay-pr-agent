@@ -201,6 +201,8 @@ cursor-review --repo /path/to/checkout --change 'org/repo#42' --model MODEL
 
 The local form compares the merge base to committed `HEAD`, or to an explicit `--head`. Both commits and their common ancestor must be available locally. The forge form uses the configured Assay backend for that repository. Both providers use the `owner/repo#number` address accepted by `deskread`. GitLab subgroup projects can also use CI mode independent of deskread’s slug syntax. Forge access requires the installed desk tools and their normal role/repository configuration. It reads metadata before and after the file list, checks head and file-count consistency, and records missing patches as incomplete coverage.
 
+The prompt also carries the change's title and description for a forge change, or the commit messages between the two revisions for a local or CI review. They are cut at 256 and 1,500 characters, labelled untrusted, and counted in the token estimate.
+
 ### Cost and coverage
 
 - `--estimate` makes zero Cursor calls. It performs the same diff preparation and static checks as a review.

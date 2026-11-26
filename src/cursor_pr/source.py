@@ -52,6 +52,18 @@ def valid_sha(value):
     return isinstance(value, str) and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value)
 
 
+TITLE_LIMIT = 256
+DESCRIPTION_LIMIT = 1500
+
+
+def bounded_text(value, limit):
+    # The author's own text is optional context: absent or malformed means empty, and long means cut.
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    value = "".join(c for c in value if c.isprintable() or c in "\n\t").strip()
+    return value if len(value) <= limit else value[:limit].rstrip() + " …[truncated]"
+
+
 @dataclass(frozen=True)
 class File:
     path: str
@@ -66,6 +78,8 @@ class Change:
     head: str
     files: list[File]
     identity: str
+    title: str = ""
+    description: str = ""
 
 
 def desk(kind, address):
@@ -105,7 +119,9 @@ def forge_change(address, expected_url=None):
             raise ReviewError("Missing patch coverage")
         files.append(File(row["filename"], row.get("patch", ""), row.get("status", ""),
                           row["patchAbsent"], row.get("previousFilename", "")))
-    return Change(head, files, first.get("url") or address)
+    # The description is context, not evidence, so it is read once and never bracketed like the head.
+    return Change(head, files, first.get("url") or address, bounded_text(last.get("title"), TITLE_LIMIT),
+                  bounded_text(last.get("body"), DESCRIPTION_LIMIT))
 
 
 def git(root, *args):
@@ -130,7 +146,10 @@ def local_change(root, base, head):
         except UnicodeDecodeError:
             patch = ""
         files.append(File(path, patch, status, not bool(patch)))
-    return Change(head, files, str(root.resolve()))
+    # Without a forge description, the commit messages are the author's account of the change.
+    messages = git(root, "log", "--reverse", "--format=%s%n%n%b%x00", base + ".." + head, "--").decode("utf8", "replace")
+    return Change(head, files, str(root.resolve()), "",
+                  bounded_text("\n\n".join(m.strip() for m in messages.split("\0") if m.strip()), DESCRIPTION_LIMIT))
 
 
 def ci_refs():
