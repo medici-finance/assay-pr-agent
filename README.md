@@ -61,7 +61,7 @@ In `REVIEW_PROJECTS`, use `"managed": true` in place of a checkout path for a ma
 
 ## Request a review in a PR or MR
 
-Post a new comment containing just `/review` on an open GitHub PR or GitLab MR. The service polls the configured projects every two minutes by default. It accepts new requests from the human accounts you configure and posts the result on the reviewed head. Setup takes GitHub or GitLab usernames and stores their numeric account IDs. A poll uses zero model tokens. Requests run one at a time with the existing prompt budget and cache.
+Post a new comment containing just `/review` on an open GitHub PR or GitLab MR. `/review-mid` and `/review-max` ask for a deeper review at 2 and 10 times the configured token limit; see [Review tiers](#review-tiers). The service polls the configured projects every two minutes by default. It accepts new requests from the human accounts you configure and posts the result on the reviewed head. Setup takes GitHub or GitLab usernames and stores their numeric account IDs. A poll uses zero model tokens. Requests run one at a time with the existing prompt budget and cache.
 
 The helper lists open changes and reads their conversations on every cycle, including changes with no new commits. The poller skips old commands, edits detectable from the forge timestamps, bot responses and ordinary messages. For GitLab, an otherwise eligible command gets a single [GitLab note lookup](https://docs.gitlab.com/api/notes/#retrieve-a-merge-request-note), using the configured GitLab reviewer credential and instance. Internal and system notes cannot start a review.
 
@@ -210,6 +210,20 @@ The local form compares the merge base to committed `HEAD`, or to an explicit `-
 - Successful results are cached under `~/.cache/cursor-pr-review` (or `XDG_CACHE_HOME`). The container image sets `XDG_CACHE_HOME=/tmp/.cache` because its root filesystem is read-only, and its poller passes `--cache-dir /state/cache` for the reviews it runs. Identical evidence, scope identity, model selection and prompt reuse the result. The lock serializes duplicate local requests. For CI reuse across jobs, provide a persistent, trusted `--cache-dir`. Each ephemeral runner otherwise starts cold. Use an explicit model for reproducible comparisons.
 - JSON keeps scanner findings separate from model findings. A source file with no usable patch or head-side location (including a whole-file deletion) is listed as omitted. Missing scanner evidence stays visible even when the model finds nothing.
 - Exit 0 means the requested full review/estimate completed, including a review with findings. Exit 2 means partial or degraded coverage, budget refusal, a model/tool error or a publication failure. Inspect `state`, `checks` and `findings` when using this in CI.
+
+### Review tiers
+
+`--tier` (or the comment command) sets the depth. Each tier's whole budget is a multiple of the configured limit, `REVIEW_MAX_INPUT_TOKENS` or `--max-input-tokens`, summed over every model call it makes. Each tier contains the one below it.
+
+| Tier | Command | Budget | Model calls | What the model sees |
+|---|---|---|---|---|
+| `regular` | `/review` | 1× | 1 | The patch and scanner evidence. Up to 3 findings. |
+| `mid` | `/review-mid` | 2× | up to 2 | The regular prompt, then context from outside the patch: the change description (or its commit messages), what the base changed in the same files, 25 lines around each hunk, and where the changed functions and types are used. Up to 6 findings, then a verification call that sees only the findings and the lines they cite and may drop findings but not add any. |
+| `max` | `/review-max` | 10× | up to 3 | The mid prompt, unchanged, so a cached mid result is reused. Then a deep pass over the patch with the whole changed source files, 15 lines around each use of a changed name, existing tests for the touched modules, and the change's earlier comments. Then verification of both passes' findings, up to 10. |
+
+Context is gathered from the checkout at the reviewed head with Git only. It is passed as untrusted data, and every finding must still cite lines of the patch. Context is cut before any file of the patch: a block that does not fit is truncated or dropped, and the summary lists the blocks used and those left out. When a tier cannot add any of its context, when the deep pass fails, or when verification cannot run, the review reports `degraded`, the comment says which tier was requested and which was delivered, and unverified findings are still posted. A `/review-max` therefore never returns less than `/review-mid`, nor `/review-mid` less than `/review`.
+
+The first prompt of a mid or max review may use twice the limit less a quarter, which is kept for verification; max keeps half the limit for it. The first call may run for 240 seconds and the deep pass for 480, against 120 for a regular review. Cursor receives the prompt as one command-line argument, so its prompts are held to 28,000 tokens whatever the budget; Claude and Codex read standard input and use the whole budget. The JSON adds `tier`, `delivered`, `base_input_tokens`, `passes`, `context` and `verification`, and `max_input_tokens` is the tier's whole budget. Any allowed requester can use any tier.
 
 ### Static analysis
 

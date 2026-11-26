@@ -11,6 +11,8 @@ from .gitlab_tls import client_options
 from .source import ReviewError, reviewer_token, run_forge
 
 log = logging.getLogger(__name__)
+# A request is a comment holding exactly one of these commands; the value is the review tier.
+COMMANDS = {"/review": "regular", "/review-mid": "mid", "/review-max": "max"}
 
 
 def open_changes(project):
@@ -44,7 +46,7 @@ def is_request(project, number, note, since):
     author, comment = note.get("authorId"), note.get("databaseId")
     if (type(author) is not int or author not in project.requesters
             or type(comment) is not int or comment < 1 or not isinstance(note.get("body"), str)
-            or note["body"].strip() != "/review" or not note.get("createdAt")
+            or note["body"].strip() not in COMMANDS or not note.get("createdAt")
             or note["createdAt"] != note.get("updatedAt")):
         return False
     try:
@@ -77,7 +79,7 @@ def public_gitlab_request(project, number, note):
             and latest.get("system") is False and latest.get("noteable_type") == "MergeRequest"
             and latest.get("noteable_iid") == number and latest.get("id") == note["databaseId"]
             and latest.get("author", {}).get("id") == note["authorId"]
-            and not latest["author"].get("bot") and latest.get("body", "").strip() == "/review"
+            and not latest["author"].get("bot") and latest.get("body", "").strip() == note["body"].strip()
             and bool(latest.get("created_at")) and latest["created_at"] == latest.get("updated_at"))
 
 
@@ -104,4 +106,7 @@ def poll_project(project, jobs, since):
                     if not public:
                         jobs.enqueue(project.key, number, comment, "ignored")
                         continue
+                tier = COMMANDS[note["body"].strip()]
+                if tier != "regular":
+                    jobs.set_tier(project.key, number, comment, tier)
                 jobs.enqueue(project.key, number, comment)

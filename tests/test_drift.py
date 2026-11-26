@@ -60,7 +60,7 @@ class DriftTests(unittest.TestCase):
     def test_reports_commits_behind_shared_files_and_names_removed_on_the_base(self):
         tip = self.move_main()
         result = drift.check(self.root, self.head, "main", self.files())
-        self.assertEqual(result, {"state": "complete", "base": tip, "behind": 2, "both": ["shared.py"],
+        self.assertEqual(result, {"state": "complete", "base": tip, "fork": self.fork, "behind": 2, "both": ["shared.py"],
                                   "references": [{"path": "README.md", "line": 3, "name": "oldtool"}]})
         self.assertEqual(drift.summary(result), [
             f"Base drift (base {tip[:12]}): the head is 2 commits behind.",

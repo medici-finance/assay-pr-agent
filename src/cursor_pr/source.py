@@ -142,6 +142,7 @@ class Change:
     identity: str
     base: str = ""      # tip of the base as a commit, when the caller named one
     base_ref: str = ""  # base branch name reported by the forge
+    description: str = ""  # title and body, when the forge read carries them
 
 
 def forge_change(address, expected_url=None, *, project=None):
@@ -177,7 +178,9 @@ def forge_change(address, expected_url=None, *, project=None):
         files.append(File(row["filename"], row.get("patch", ""), row.get("status", ""),
                           row["patchAbsent"], row.get("previousFilename", "")))
     base_ref = first.get("baseRef")
-    return Change(head, files, first.get("url") or address, base_ref=base_ref if isinstance(base_ref, str) else "")
+    described = "\n\n".join(first[key].strip() for key in ("title", "body") if isinstance(first.get(key), str))
+    return Change(head, files, first.get("url") or address, base_ref=base_ref if isinstance(base_ref, str) else "",
+                  description=described)
 
 
 def git(root, *args):
