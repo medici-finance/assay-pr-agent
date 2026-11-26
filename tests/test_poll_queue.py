@@ -436,11 +436,14 @@ with patch("cursor_pr.cli.QUEUED_REVIEW_SECONDS", 1), patch("cursor_pr.cli.CLEAN
         patch("cursor_pr.cli.run_request", side_effect=wait):
     sys.exit(cli.main())
 """
+        project = dict(provider="github", url="https://github.com/acme/api", checkout=str(self.state),
+                       requester_ids=[7])
         started = time.monotonic()
         ended = subprocess.run([sys.executable, "-c", hung, "--change", "acme/api#3", "--expected-change-url",
                                 "https://github.com/acme/api/pull/3", "--max-input-tokens", "6000", *self.options],
                                capture_output=True, text=True, timeout=30,
-                               env=dict(os.environ, CURSOR_REVIEW_POLLER_CHILD="1", REVIEW_STATE_DIR=str(self.state)))
+                               env=dict(os.environ, CURSOR_REVIEW_POLLER_CHILD="1", REVIEW_STATE_DIR=str(self.state),
+                                        REVIEW_FORGE_PROJECT=json.dumps(project)))
         return ended, time.monotonic() - started
 
     def test_queued_review_that_hangs_gives_up_cleans_up_and_leaves_its_row_running(self):
