@@ -81,7 +81,8 @@ def main():
                 try:
                     sync_project(project, state)
                 except (OSError, subprocess.SubprocessError, ReviewError) as err:
-                    log.warning("Repository sync failed for %s (%s); retrying", project.key, type(err).__name__)
+                    # str() names the cause: a ReviewError carries the desk tool's own reason.
+                    log.warning("Repository sync failed for %s (%s: %s); retrying", project.key, type(err).__name__, err)
             if all(p.checkout.is_dir() for p in projects.values()):
                 marker.touch(mode=0o600)
             watch.wait(seconds)

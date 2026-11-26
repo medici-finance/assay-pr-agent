@@ -18,10 +18,38 @@ def child_env(env=None):
     return {k: v for k, v in (os.environ if env is None else env).items() if k not in KEYS.values()}
 
 
+# Credential shapes that must never reach a log even if a tool were to print one.
+SECRET_SHAPES = tuple(map(re.compile, (
+    r"\bgh[pousr]_[A-Za-z0-9]{16,}\b", r"\bgithub_pat_[A-Za-z0-9_]{16,}\b", r"\bglpat-[A-Za-z0-9_-]{16,}\b",
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")))
+NOISE = ("assay-config:", "desk-trace:")
+OPAQUE = re.compile(r"PRIVATE KEY-----|^[A-Za-z0-9+/=]{40,}$")  # a PEM header or body line
+
+
+def failure_reason(result, limit=800):
+    """Why a failed child failed, in its own words: a desk monitor's MONITOR- lines and
+    the refusal on stderr, without its config banner or trace. Exit 2 from deskmonitor
+    meant "DNS blocked by policy" for a day and the poller could only say "exited 2"."""
+    kept = []
+    for stream, only in ((result.stdout, "MONITOR-"), (result.stderr, None)):
+        for line in stream.decode("utf8", "replace").splitlines():
+            line = line.strip()
+            if (not line or line.startswith(NOISE) or OPAQUE.search(line)
+                    or (only and not line.startswith(only))):
+                continue
+            for shape in SECRET_SHAPES:
+                line = shape.sub("<redacted>", line)
+            kept.append(line[:400])
+            if len(kept) == 4:
+                break
+    return " | ".join(kept)[:limit]
+
+
 def run(args, *, cwd=None, timeout=45, data=None, env=None):
     result = subprocess.run(args, input=data, capture_output=True, cwd=cwd, env=child_env(env), timeout=timeout)
     if result.returncode:
-        raise ReviewError(f"{Path(args[0]).name} {args[1]} exited {result.returncode}")
+        reason = failure_reason(result)
+        raise ReviewError(f"{Path(args[0]).name} {args[1]} exited {result.returncode}" + (f": {reason}" if reason else ""))
     return result.stdout
 
 
