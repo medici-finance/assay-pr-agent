@@ -79,7 +79,8 @@ kubectl exec -n pr-agent deploy/pr-agent -c setup -- touch /state/.reauth
   internet, where the forge, model providers and advisory databases live. Private
   ranges (RFC1918, CGNAT `100.64.0.0/10`, link-local including cloud metadata)
   are blocked. If your forge, GitLab instance or proxy is in one of them, drop
-  it from `except`; if DNS runs outside `kube-system`, extend the DNS rule.
+  it from `except`. The DNS rule covers `kube-system` and the NodeLocal DNSCache
+  address `169.254.20.10`; if DNS runs elsewhere, extend it.
   Ingress is not restricted, so `kubectl port-forward` works and you can expose
   the setup port with your own Traefik `IngressRoute` (limit it to the Traefik
   namespace).

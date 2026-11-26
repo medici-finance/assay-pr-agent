@@ -216,6 +216,11 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
+        # NodeLocal DNSCache answers on this link-local address on every node, so
+        # it is never matched by the kube-system selector. Harmless if unused;
+        # change it if your installation picked another local resolver address.
+        - ipBlock:
+            cidr: 169.254.20.10/32
       ports:
         - protocol: UDP
           port: 53
