@@ -39,7 +39,7 @@ class PublishFenceTests(unittest.TestCase):
                   ],
                   "omitted": ["@all", "[ok](https://evil.example)"]}
         bodies = []
-        with patch.object(cli, "run_desk", side_effect=lambda argv: bodies.append(Path(argv[-1]).read_text())):
+        with patch.object(cli, "post_comment", side_effect=lambda project, number, head, body, state: bodies.append(body)):
             cli.publish("org/repo#7", "a" * 40, report)
         body = bodies[0]
         self.assertIn("- ` @all `:1 — `` @all [click](https://evil.example) `x` ``. ` [link](https://evil.example) `", body)
@@ -74,26 +74,19 @@ class ChildEnvTests(unittest.TestCase):
 
 
 class RunFailureTests(unittest.TestCase):
-    """v0.5.0 in-cluster: the egress policy dropped DNS, deskmonitor exited 2 every cycle
-    and `run()` raised only "deskmonitor pr exited 2". The cause was in the discarded
-    output; it must now travel with the error, without the banner or any credential."""
-
-    def test_a_failed_child_names_its_reason_without_banner_or_credentials(self):
-        script = ("echo 'assay-config: class=write source=config file /home/reviewer/.config/assay/roster.env'; "
-                  "echo '{\"schema\":1,\"items\":[]}'; "
-                  "echo MONITOR-DEGRADED: org/repo seed read FAILED '(forge: dial tcp: lookup api.github.com: no such host)'; "
+    def test_a_failed_child_names_its_reason_without_echoing_credentials(self):
+        script = ("echo 'sensitive stdout'; "
+                  "echo 'forge unavailable: no such host' >&2; "
                   "echo '-----BEGIN RSA PRIVATE KEY-----' >&2; "
                   "echo MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7xJk >&2; "
                   "echo 'mint ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 glpat-ABCDEFGHIJKLMNOPQRST eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlLXNpZ25hdHVyZQ' >&2; "
-                  "echo 'desk-trace: credentials are redacted' >&2; exit 2")
+                  "exit 2")
         with self.assertRaises(source.ReviewError) as raised:
             source.run(["sh", "-c", script])
         message = str(raised.exception)
-        self.assertIn("sh -c exited 2: MONITOR-DEGRADED: org/repo seed read FAILED "
-                      "(forge: dial tcp: lookup api.github.com: no such host)", message)
+        self.assertIn("sh -c exited 2: forge unavailable: no such host", message)
         self.assertIn("mint <redacted> <redacted> <redacted>", message)
-        for hidden in ("assay-config", "desk-trace", "schema", "MIIEvQ", "PRIVATE KEY",
-                       "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "eyJhbGci", "c2lnbmF0"):
+        for hidden in ("sensitive stdout", "MIIEvQ", "PRIVATE KEY", "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "eyJhbGci", "c2lnbmF0"):
             self.assertNotIn(hidden, message)
 
     def test_a_silent_failure_keeps_the_short_form(self):
@@ -102,9 +95,9 @@ class RunFailureTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "sh -c exited 3")
 
     def test_the_reason_is_bounded(self):
-        loud = subprocess.CompletedProcess(["deskmonitor"], 2, stdout=b"MONITOR-DEGRADED: " + b"x" * 5000 + b"\n"
-                                            + b"\n".join(b"MONITOR-DEGRADED: line %d" % i for i in range(10)), stderr=b"y" * 5000)
+        loud = subprocess.CompletedProcess(["pr-agent-forge"], 2, stdout=b"private",
+            stderr=b"error: " + b"x" * 5000 + b"\n" + b"\n".join(b"error: line %d" % i for i in range(10)))
         reason = source.failure_reason(loud)
         self.assertLessEqual(len(reason), 800)
-        self.assertTrue(reason.startswith("MONITOR-DEGRADED: xxx"))
-        self.assertEqual(reason.count(" | "), 3)  # four lines at most
+        self.assertTrue(reason.startswith("error: xxx"))
+        self.assertEqual(reason.count(" | "), 3)

@@ -75,13 +75,13 @@ def main():
     seconds = int(os.getenv("REVIEW_SYNC_SECONDS", "120"))
     if seconds < 1:
         raise ValueError("REVIEW_SYNC_SECONDS must be positive")
-    with forge_credentials(projects, state):
+    with forge_credentials(projects):
         while not watch.changed():
             for project in projects.values():
                 try:
                     sync_project(project, state)
                 except (OSError, subprocess.SubprocessError, ReviewError) as err:
-                    # str() names the cause: a ReviewError carries the desk tool's own reason.
+                    # str() names the cause: a ReviewError carries the forge helper's reason.
                     log.warning("Repository sync failed for %s (%s: %s); retrying", project.key, type(err).__name__, err)
             if all(p.checkout.is_dir() for p in projects.values()):
                 marker.touch(mode=0o600)

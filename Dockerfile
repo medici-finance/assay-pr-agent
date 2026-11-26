@@ -1,4 +1,11 @@
-FROM ghcr.io/medici-finance/assay/desk-tools:v1.0.94 AS assay
+FROM golang:1.27.4-bookworm AS forge
+ARG ASSAY_FORGE_COMMIT=cc1dde28aa8327f64169835b014000adf5d9737d
+RUN git init -q /assay \
+    && git -C /assay fetch --depth=1 https://github.com/medici-finance/assay.git "$ASSAY_FORGE_COMMIT" \
+    && test "$(git -C /assay rev-parse FETCH_HEAD)" = "$ASSAY_FORGE_COMMIT" \
+    && git -C /assay checkout --quiet --detach FETCH_HEAD
+COPY forge-helper /src/forge-helper
+RUN /src/forge-helper/build.sh /assay /out/pr-agent-forge
 FROM ghcr.io/astral-sh/uv:0.9.26 AS uv
 FROM rhysd/actionlint:1.7.7 AS actionlint
 FROM registry.k8s.io/git-sync/git-sync:v4.8.0 AS sync
@@ -13,7 +20,7 @@ RUN test "$TARGETARCH" = amd64 || (echo 'Assay release requires --platform linux
 # System packages track the base image's Debian security updates; the tools whose
 # exact versions matter are digest-pinned below.
 # hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl haproxy curl git gh shellcheck bash gzip tar && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl haproxy curl git shellcheck bash gzip tar && rm -rf /var/lib/apt/lists/*
 RUN curl --fail --silent --show-error --location --retry 3 \
       https://github.com/medici-finance/assay/releases/download/v1.0.94/qualgen-linux-amd64 -o /usr/local/bin/qualgen \
     && echo 'cc3cf51fb2ee2f03e9e704385b59ae4ea57757e6bd9b66e613fec2abd62ce01e  /usr/local/bin/qualgen' | sha256sum -c - \
@@ -27,7 +34,7 @@ RUN curl -fsSL --retry 3 https://github.com/hadolint/hadolint/releases/download/
     && echo 'fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8  /usr/local/bin/osv-scanner' | sha256sum -c - \
     && chmod 0755 /usr/local/bin/hadolint /usr/local/bin/zizmor /usr/local/bin/osv-scanner \
     && hadolint --version && zizmor --version && osv-scanner --version
-COPY --from=assay /usr/local/bin/deskmonitor /usr/local/bin/deskread /usr/local/bin/deskpost /usr/local/bin/desktoken /usr/local/bin/
+COPY --from=forge /out/pr-agent-forge /usr/local/bin/pr-agent-forge
 COPY --from=actionlint /usr/local/bin/actionlint /usr/local/bin/actionlint
 COPY --from=sync /git-sync /usr/local/bin/git-sync
 COPY --from=models /usr/local/bin/node /usr/local/bin/node
@@ -40,7 +47,7 @@ RUN uv sync --frozen --no-dev --no-editable && useradd --create-home --uid 10001
 # The root filesystem is read-only at runtime, so XDG caches default to the
 # /tmp mount rather than $HOME/.cache. The poller passes --cache-dir /state/cache
 # for its own reviews; this covers a hand-run `cursor-review` in the container.
-ENV DESK_LOOP=pr-review-desk DESK_TOOLS_BIN=/usr/local/bin HOME=/home/reviewer XDG_CACHE_HOME=/tmp/.cache PATH=/opt/model-clis/node_modules/.bin:/opt/reviewer/.venv/bin:/home/reviewer/.local/bin:$PATH REVIEW_STATE_DIR=/state
+ENV HOME=/home/reviewer XDG_CACHE_HOME=/tmp/.cache PATH=/opt/model-clis/node_modules/.bin:/opt/reviewer/.venv/bin:/home/reviewer/.local/bin:$PATH REVIEW_STATE_DIR=/state
 USER 10001
 # cursor.com/install always fetches the current release, so download that release's
 # tarball by version and digest instead, in the layout the installer produces.

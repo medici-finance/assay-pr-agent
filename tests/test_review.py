@@ -116,43 +116,42 @@ class ReviewTest(unittest.TestCase):
                 self.assertEqual((code,report["head"]),(0,self.head),report)
         self.assertEqual(len(self.calls.read_text().splitlines()),1)
 
+    def forge_fixture(self, provider):
+        from cursor_pr.config import project_from
+        project = project_from(dict(provider=provider, url=f"https://{provider}.com/org/repo",
+                                    checkout=str(self.root), requester_ids=[1]))
+        files = {"complete": True, "changedFiles": 1, "files": [{
+            "filename": "example.sh", "patchAbsent": False, "status": "added",
+            "patch": "@@ -0,0 +1,2 @@\n+#!/bin/sh\n+echo $argument\n"}]}
+        detail = {"url": project.change_url(1), "headSha": self.head, "state": "open",
+                  "baseRef": "main", "changedFiles": 1}
+        return project, [detail, files, detail]
+
     def test_forge_read_and_post_arguments(self):
-        for host in ("https://github.com/org/repo/pull/1","https://gitlab.com/org/repo/-/merge_requests/1"):
-            calls = []
-            def fake(args):
-                self.assertEqual(args[0], "deskread")
-                kind = args[1]
-                calls.append(kind)
-                detail = {"change":{"url":host,"headSha":self.head,"baseRef":"main","changedFiles":1}}
-                files = {"changeFiles":{"complete":True,"changedFiles":1,"files":[{
-                    "filename":"example.sh","patchAbsent":False,"status":"added",
-                    "patch":"@@ -0,0 +1,2 @@\n+#!/bin/sh\n+echo $argument\n"}]}}
-                item = dict(detail if kind=="change" else files,repo="org/repo",number=1)
-                return json.dumps({"schema":1,"kind":kind,"items":[item],"partial":[]})
-            with patch.object(source,"run_desk",side_effect=fake),patch.object(cli,"run_desk") as post:
-                code,result = self.check("--change","org/repo#1","--post")
-                self.assertEqual(code,0,result)
-                self.assertEqual(result["source"],host)
-                self.assertEqual(calls,["change","change-files","change"])
-                self.assertEqual(post.call_args.args[0][:8],
-                                 ["deskpost","comment","org/repo","1","--kind","mr","--head",self.head])
+        for provider in ("github", "gitlab"):
+            project, reads = self.forge_fixture(provider)
+            with patch.object(cli, "load_config", return_value={project.key: project}), \
+                 patch.object(cli, "forge_credentials"), \
+                 patch.object(source, "run_forge", side_effect=reads) as read, \
+                 patch.object(cli, "post_comment") as post:
+                code, result = self.check("--change", "org/repo#1", "--post")
+                self.assertEqual(code, 0, result)
+                self.assertEqual(result["source"], project.change_url(1))
+                self.assertEqual([call.args[0] for call in read.call_args_list], ["change", "change-files", "change"])
+                self.assertTrue(all(call.args[1] == project and call.kwargs["numbers"] == [1]
+                                    for call in read.call_args_list))
+                self.assertEqual(post.call_args.args[:3], (project, 1, self.head))
 
     def test_failed_post_reports_reason(self):
-        def fake(args):
-            self.assertEqual(args[0], "deskread")
-            kind = args[1]
-            detail = {"change":{"url":"https://github.com/org/repo/pull/1","headSha":self.head,
-                                "baseRef":"main","changedFiles":1}}
-            files = {"changeFiles":{"complete":True,"changedFiles":1,"files":[{
-                "filename":"example.sh","patchAbsent":False,"status":"added",
-                "patch":"@@ -0,0 +1,2 @@\n+#!/bin/sh\n+echo $argument\n"}]}}
-            item = dict(detail if kind=="change" else files,repo="org/repo",number=1)
-            return json.dumps({"schema":1,"kind":kind,"items":[item],"partial":[]})
-        with patch.object(source,"run_desk",side_effect=fake), \
-             patch.object(cli,"run_desk",side_effect=source.ReviewError("deskpost comment exited 4: budget gate")):
-            code,report = self.check("--change","org/repo#1","--post")
-        self.assertEqual((code,report["publication"]), (2,"failed"))
-        self.assertEqual(report["publication_error"], "deskpost comment exited 4: budget gate")
+        project, reads = self.forge_fixture("github")
+        reason = "pr-agent-forge comment exited 1: reviewed head differs from current head"
+        with patch.object(cli, "load_config", return_value={project.key: project}), \
+             patch.object(cli, "forge_credentials"), \
+             patch.object(source, "run_forge", side_effect=reads), \
+             patch.object(cli, "post_comment", side_effect=source.ReviewError(reason)):
+            code, report = self.check("--change", "org/repo#1", "--post")
+        self.assertEqual((code, report["publication"]), (2, "failed"))
+        self.assertEqual(report["publication_error"], reason)
 
     def test_failed_cursor_keeps_scans(self):
         self.shim.write_text("#!/bin/sh\nexit 2\n")
@@ -164,7 +163,9 @@ class ReviewTest(unittest.TestCase):
 
     def test_missing_patch_and_stale_artifact(self):
         change = source.Change(self.head,[source.File("image","", "added",True)],"org/repo#1")
-        with patch.object(cli,"forge_change",return_value=change):
+        project, _ = self.forge_fixture("github")
+        with patch.object(cli, "load_config", return_value={project.key: project}), \
+             patch.object(cli, "forge_credentials"), patch.object(cli, "forge_change", return_value=change):
             code,report = self.check("--change","org/repo#1")
         self.assertEqual((code,report["omitted"]),(2,["image"]))
         self.assertFalse(self.calls.exists())
