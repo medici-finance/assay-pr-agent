@@ -2,6 +2,7 @@
 import json
 import os
 from .gitlab_tls import local_url
+from .providers import KEYS
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -12,8 +13,13 @@ class ReviewError(Exception):
     pass
 
 
+def child_env(env=None):
+    """Environment for git, the desk tools and scanners: never the model provider's key."""
+    return {k: v for k, v in (os.environ if env is None else env).items() if k not in KEYS.values()}
+
+
 def run(args, *, cwd=None, timeout=45, data=None, env=None):
-    result = subprocess.run(args, input=data, capture_output=True, cwd=cwd, env=env, timeout=timeout)
+    result = subprocess.run(args, input=data, capture_output=True, cwd=cwd, env=child_env(env), timeout=timeout)
     if result.returncode:
         raise ReviewError(f"{Path(args[0]).name} {args[1]} exited {result.returncode}")
     return result.stdout

@@ -54,6 +54,7 @@ def transport(base, directory):
                     "-days", "3650", "-out", str(cert), "-keyout", str(key)], check=True, capture_output=True)
     identity = directory / "listener.pem"
     identity.write_bytes(cert.read_bytes() + key.read_bytes())
+    identity.chmod(0o600)
     local_ca = directory / "client-roots.pem"
     local_ca.write_bytes(public_roots + b"\n" + cert.read_bytes())
     revocations = f" crl-file {crl}" if crl.exists() else ""

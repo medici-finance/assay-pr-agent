@@ -110,7 +110,7 @@ class ArtifactTests(unittest.TestCase):
             with self.subTest(forge=forge), patch.object(engine, "invoke", return_value=answer) as model:
                 report, status, post = self.exercise(forge)
                 self.assertEqual((status, report["cursor_invocations"]), (0, 1))
-                self.assertIn("logic.go:1 — SA4006", post)
+                self.assertIn("` logic.go `:1 — ` SA4006 `", post)
                 prompt = model.call_args.args[0]
                 self.assertIn("SA4006", prompt)
                 self.assertNotIn("unrelated-rule", prompt + post)

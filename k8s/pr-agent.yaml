@@ -106,9 +106,12 @@ spec:
               value: 0.0.0.0
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
             - name: state
               mountPath: /state
             - name: repos
@@ -128,9 +131,12 @@ spec:
               value: "1"
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
             - name: state
               mountPath: /state
             - name: repos
@@ -148,9 +154,12 @@ spec:
               value: /model-auth
           securityContext:
             allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
             - name: state
               mountPath: /state
             - name: repos
@@ -168,6 +177,9 @@ spec:
         - name: model-auth
           persistentVolumeClaim:
             claimName: pr-agent-model-auth
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
 ---
 apiVersion: v1
 kind: Service
@@ -184,3 +196,44 @@ spec:
     - name: setup
       port: 8765
       targetPort: setup
+---
+# Egress only: the forge, model providers and advisory databases on the public
+# internet, plus cluster DNS. Ingress is deliberately left open so
+# `kubectl port-forward` and any IngressRoute you add for the setup port work.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pr-agent-egress
+  namespace: pr-agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: pr-agent
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Public internet only: RFC1918, CGNAT and link-local (cloud metadata) stay
+    # unreachable. Drop ranges from `except` if your forge or proxy lives there.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+        - ipBlock:
+            cidr: ::/0
+            except:
+              - fc00::/7
+              - fe80::/10

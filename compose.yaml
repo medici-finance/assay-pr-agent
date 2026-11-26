@@ -2,6 +2,12 @@ x-reviewer: &reviewer
   platform: linux/amd64
   image: ${REVIEW_IMAGE:-assay-pr-agent:local}
   build: .
+  # The image writes only to its volumes and /tmp; keep the rest of the rootfs read-only.
+  read_only: true
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs:
+    - /tmp:mode=1777,size=1g
 services:
   setup:
     <<: *reviewer

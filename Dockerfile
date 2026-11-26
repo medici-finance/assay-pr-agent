@@ -34,7 +34,18 @@ COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable && useradd --create-home --uid 10001 reviewer && install -d -m 700 -o reviewer -g reviewer /state /repos /model-auth
 ENV DESK_LOOP=pr-review-desk DESK_TOOLS_BIN=/usr/local/bin HOME=/home/reviewer PATH=/opt/model-clis/node_modules/.bin:/opt/reviewer/.venv/bin:/home/reviewer/.local/bin:$PATH REVIEW_STATE_DIR=/state
 USER reviewer
-RUN curl -fsSL https://cursor.com/install -o /tmp/install-cursor.sh && bash /tmp/install-cursor.sh && rm /tmp/install-cursor.sh && cursor-agent --version && claude --version && codex --version && git-sync --version
+# cursor.com/install always fetches the current release, so download that release's
+# tarball by version and digest instead, in the layout the installer produces.
+ARG CURSOR_AGENT_VERSION=2026.11.22-e9042b2
+RUN curl -fsSL --retry 3 \
+        "https://downloads.cursor.com/lab/${CURSOR_AGENT_VERSION}/linux/x64/agent-cli-package.tar.gz" -o /tmp/agent-cli.tgz \
+    && echo '7663b1c5d1b56e095ef8e23bef38d66df6cfd665c4873470214e0e411f0f97b3  /tmp/agent-cli.tgz' | sha256sum -c - \
+    && mkdir -p "$HOME/.local/share/cursor-agent/versions/${CURSOR_AGENT_VERSION}" "$HOME/.local/bin" \
+    && tar --strip-components=1 -xzf /tmp/agent-cli.tgz -C "$HOME/.local/share/cursor-agent/versions/${CURSOR_AGENT_VERSION}" \
+    && rm /tmp/agent-cli.tgz \
+    && ln -s "$HOME/.local/share/cursor-agent/versions/${CURSOR_AGENT_VERSION}/cursor-agent" "$HOME/.local/bin/cursor-agent" \
+    && test "$(cursor-agent --version)" = "${CURSOR_AGENT_VERSION}" \
+    && claude --version && codex --version && git-sync --version
 # Build record written by ci/publish-image.sh; local builds fall back to the build time.
 USER root
 ARG REVIEW_BUILD_SHA=

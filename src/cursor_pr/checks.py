@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import tempfile
 
-from .source import ReviewError, git
+from .source import ReviewError, child_env, git
 
 
 def go_report(path, head):
@@ -75,7 +75,7 @@ def scan_files(root, head, files):
             blob = git(root, "cat-file", "blob", spec)
             # stdin in a clean directory avoids project-local config and external source files.
             with tempfile.TemporaryDirectory() as empty:
-                proc = subprocess.run([tool, *args], input=blob, cwd=empty, capture_output=True, timeout=20)
+                proc = subprocess.run([tool, *args], input=blob, cwd=empty, env=child_env(), capture_output=True, timeout=20)
             if proc.returncode not in (0, 1):
                 raise ReviewError("scanner failed")
             rows = json.loads(proc.stdout)
