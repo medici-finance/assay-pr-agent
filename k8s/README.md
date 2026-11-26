@@ -45,12 +45,15 @@ kubectl attach -it -n pr-agent deploy/pr-agent -c setup
 ```
 
 Finish the sign-in there and detach with **Ctrl-P**, **Ctrl-Q**. `sync` and
-`reviewer` wait for the first setup to complete and reload when the wizard saves
-a configuration.
+`reviewer` wait for the first setup to complete and reload when a configuration
+is saved.
 
-To change projects or credentials later, fetch the key from the log again. To
-switch the provider account, request a fresh sign-in and end the current session
-with **Quit setup** in the browser; the next session runs with `--reauth`:
+After the first save, each session opens on the **settings** page, where one
+setting changes at a time and each save reloads `sync` and `reviewer`. Click
+**Run the setup wizard** on that page to add or remove projects or to replace
+credentials; the page returns when the wizard saves. To switch the provider
+account, request a fresh sign-in and end the current session with **Close
+settings** in the browser; the next session runs with `--reauth`:
 
 ```sh
 kubectl exec -n pr-agent deploy/pr-agent -c setup -- touch /state/.reauth

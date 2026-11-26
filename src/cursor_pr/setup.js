@@ -20,7 +20,7 @@ quit.onclick = async () => {
     await api("POST", {id: step.id, action: "quit"});
     document.querySelector("#registration").hidden = true;
     document.querySelector("#external").hidden = true;
-    form.hidden = quit.hidden = true;
+    form.hidden = quit.hidden = list.hidden = true;
     answer.value = multi.value = "";
     message.textContent = "Setup closed. You can close this tab.";
   } catch (error) {
@@ -38,7 +38,7 @@ async function api(method, data, path = "/step") {
   return res;
 }
 function show_unlock(text) {
-  form.hidden = true; quit.hidden = true; unlock.hidden = false; message.textContent = text; secret.focus();
+  form.hidden = true; quit.hidden = true; list.hidden = true; unlock.hidden = false; message.textContent = text; secret.focus();
 }
 function fail(error) {
   form.hidden = true;
@@ -63,16 +63,93 @@ document.querySelector("#reprint").onclick = async () => {
     : res.status === 429 ? "The key was printed a moment ago; copy it from the installer console."
     : "The installer refused the request. Open http://127.0.0.1:8765/ in this browser.";
 };
+// A saved setup opens on a list where each setting is saved on its own.
+const list = document.querySelector("#settings"), groups = document.querySelector("#groups");
+const row = document.querySelector("#setting").content, wizard = document.querySelector("#wizard");
+function heading(tag, text) {
+  const node = document.createElement(tag); node.textContent = text; return node;
+}
+function field(item, project) {
+  const node = row.cloneNode(true), find = selector => node.querySelector(selector);
+  const key = (project ? project.url + " " : "") + item.name;
+  const box = find(".editor"), toggle = find(".change"), submit = find(".save"), drop = find(".remove"), problem = find(".error");
+  const text = find(".input"), area = find(".multi"), pick = find(".choice"), disk = find(".file");
+  const masked = item.kind === "secret", control = item.choices ? pick : item.multiline || item.kind === "json" ? area : text;
+  node.firstElementChild.dataset.key = key;
+  find(".label").textContent = item.label;
+  find(".value").textContent = masked ? {stored: "Stored", none: "Not set", env: "From the container environment"}[item.state] || item.value
+    : item.choices ? (item.choices.find(([value]) => value === item.value) || [, item.value])[1]
+    : item.value && (item.kind !== "json" || item.value.trim() !== "{}") ? item.value : "none";
+  find(".help").textContent = item.help;
+  if (item.choices) pick.replaceChildren(...item.choices.map(([value, name]) => new Option(name, value)));
+  [text, area, pick].forEach(element => element.setAttribute("aria-label", item.label));
+  text.hidden = control !== text; area.hidden = control !== area; pick.hidden = control !== pick;
+  area.classList.toggle("clear", item.kind === "json");
+  text.type = masked ? "password" : "text";
+  find(".import").hidden = !masked;
+  drop.hidden = !(item.optional && ["stored", "mounted"].includes(item.state));
+  toggle.hidden = item.locked || item.wizard;
+  toggle.onclick = () => {
+    toggle.hidden = true; box.hidden = false; problem.textContent = "";
+    if (!masked) control.value = item.value;
+    control.focus();
+  };
+  find(".cancel").onclick = () => { box.hidden = true; toggle.hidden = false; toggle.focus(); };
+  disk.onchange = async () => {
+    const chosen = disk.files[0];
+    if (chosen && chosen.size <= (item.multiline ? 900000 : 24000)) control.value = await chosen.text();
+    else problem.textContent = "This file is too large to import.";
+    disk.value = "";
+  };
+  const keep = async data => {
+    submit.disabled = drop.disabled = true;
+    try {
+      const res = await fetch("/setting", {method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({id: step.id, name: item.name, ...(project ? {project: project.url} : {}), ...data}), cache: "no-store"});
+      if (res.status === 401) throw Error("key");
+      if (res.status === 400) problem.textContent = (await res.json()).error;
+      else if (res.ok) {
+        step = await res.json(); render(step);
+        groups.querySelector(`[data-key="${CSS.escape(key)}"] .change`)?.focus();
+      } else {
+        await load(); message.textContent = "This page was out of date and has been refreshed. Try again.";
+      }
+    } catch (error) {
+      if (error.message === "key") show_unlock("Enter the setup key printed in the installer console.");
+      else problem.textContent = "The installer could not be reached. Open http://127.0.0.1:8765/ in this browser and try again.";
+    } finally { submit.disabled = drop.disabled = false; }
+  };
+  submit.onclick = () => keep({value: control.value});
+  drop.onclick = () => keep({remove: true});
+  return node;
+}
+function render(view) {
+  message.textContent = view.messages.join("\n");
+  groups.replaceChildren(...view.sections.flatMap(group => [heading("h2", group.title), ...group.settings.map(item => field(item))]),
+    heading("h2", "Repositories"), ...view.projects.flatMap(project =>
+      [heading("h3", project.url), ...project.settings.map(item => field(item, project))]));
+}
+wizard.onclick = async () => {
+  wizard.disabled = true;
+  try { await api("POST", {id: step.id, action: "wizard"}); await load(); } catch (error) { fail(error); }
+  finally { wizard.disabled = false; }
+};
 async function load() {
   if (quitting) return;
   const view = await (await api("GET")).json();
   if (quitting) return;
   step = view;
-  quit.hidden = !["question", "register"].includes(view.status);
+  const listed = view.status === "settings";
+  quit.hidden = !["question", "register", "settings"].includes(view.status);
+  quit.textContent = listed ? "Close settings" : "Quit setup";
+  list.hidden = !listed;
+  document.querySelector("h1").textContent = listed ? "Reviewer settings" : "Reviewer setup";
+  document.title = (listed ? "Reviewer settings" : "Reviewer setup") + " · Assay PR Agent";
   const registration = document.querySelector("#registration"), external = document.querySelector("#external");
   registration.hidden = view.status !== "register";
   external.hidden = !view.link;
   if (view.link) external.href = view.link;
+  if (listed) { form.hidden = true; render(view); return; }
   if (view.status === "register") {
     form.hidden = true;
     registration.action = view.action;

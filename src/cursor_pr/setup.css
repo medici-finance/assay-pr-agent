@@ -143,6 +143,66 @@ textarea {
   -webkit-text-security: disc;
 }
 
+#settings h2 {
+  font-size: 1.3rem;
+  margin: 2.4rem 0 .2rem;
+}
+
+#settings h3 {
+  font-size: 1.05rem;
+  margin: 1.7rem 0 .2rem;
+  overflow-wrap: anywhere;
+}
+
+.setting {
+  padding: 1rem 0;
+  border-top: 1px solid var(--line);
+}
+
+.setting .line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .4rem .9rem;
+}
+
+.setting .label {
+  font-weight: 640;
+}
+
+.setting .value {
+  flex: 1;
+  color: #46584e;
+  overflow-wrap: anywhere;
+}
+
+.setting .line button {
+  padding: .35rem .9rem;
+}
+
+.setting .editor {
+  margin-top: 1rem;
+}
+
+.setting .import {
+  margin: 1rem 0;
+  color: var(--green);
+  font-size: .88rem;
+}
+
+.setting .import input {
+  margin-top: .35rem;
+}
+
+.setting .error {
+  margin: .7rem 0 0;
+  color: #8c2f1d;
+}
+
+.setting textarea.clear {
+  -webkit-text-security: none;
+}
+
 [hidden] {
   display: none!important;
 }
