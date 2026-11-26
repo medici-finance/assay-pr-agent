@@ -93,5 +93,62 @@ class DroppedSummaryTests(unittest.TestCase):
         self.assertEqual((code, report["state"], report["findings"], report["dropped"]), (0, "reviewed", [], parsed["dropped"]))
         self.assertIn("Dropped 1 model finding: cited line outside the reviewed patch.", posts[0])
 
+PATCH = ["def total(items):", "    total = 0", "    for item in items:", "        total += item", "    return total"]
+
+
+def shown(*lines):
+    return {"a.py": {n + 1: text + "\n" for n, text in enumerate(lines)}}
+
+
+class QuotedEvidenceTests(unittest.TestCase):
+    def parse(self, finding):
+        return engine.parse_answer(envelope([finding]), shown(*PATCH))
+
+    def test_a_quote_must_match_the_cited_lines(self):
+        cases = (("        total += item\n    return total", 4, 5, "verified"),
+                 ("4 +        total += item\n5 +    return total", 4, 5, "verified"),
+                 ("total +=", 4, 4, "verified"),
+                 ("return total\ntotal += item", 4, 5, "quoted code does not match the cited lines"),
+                 ("return total", 2, 3, "quoted code does not match the cited lines"),
+                 ("raise ValueError", 4, 5, "quoted code does not match the cited lines"),
+                 ("", 4, 5, "unverified"))
+        for quote, start, end, expected in cases:
+            with self.subTest(quote=quote):
+                parsed = self.parse(dict(issue(start=start, end=end), relevant_code=quote))
+                if expected in ("verified", "unverified"):
+                    self.assertEqual([(f["evidence"], f["line"], f["end_line"]) for f in parsed["findings"]],
+                                     [(expected, start, end)])
+                    self.assertEqual(parsed["dropped"], [])
+                else:
+                    self.assertEqual(parsed["findings"], [])
+                    self.assertEqual(parsed["dropped"], [{"path": "a.py", "line": start, "reason": expected}])
+
+    def test_a_fenced_block_counts_as_the_quote_and_inline_spans_do_not(self):
+        fenced = issue(start=4, end=4, body="It adds up.\n```\ntotal += item\n```\n")
+        self.assertEqual(self.parse(fenced)["findings"][0]["evidence"], "verified")
+        inline = issue(start=4, end=4, body="It uses `total` and `undefined_elsewhere()`.")
+        self.assertEqual(self.parse(inline)["findings"][0]["evidence"], "unverified")
+        both = dict(issue(start=4, end=4, body="```\nraise ValueError\n```"), relevant_code="total += item")
+        self.assertEqual(self.parse(both)["findings"][0]["evidence"], "verified")
+
+    def test_pack_records_the_text_of_every_shown_head_line(self):
+        patch = "@@ -1,2 +1,2 @@\n first()\n-old\n+  third( x )\n"
+        self.assertEqual(engine.pack([source.File("a.py", patch, "modified")], [])[1],
+                         {"a.py": {1: "first()\n", 2: "  third( x )\n"}})
+
+    def test_the_prompt_asks_for_the_quote_and_the_summary_counts_the_unchecked(self):
+        prompt = engine.pack([source.File("a.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")], [])[0]
+        self.assertIn("Give each finding a `relevant_code` field quoting the lines it cites, exactly as shown.", prompt)
+        posts = []
+        report = {"provider": "cursor", "state": "reviewed", "checks": [], "omitted": [], "findings": [
+            {"path": "a.py", "line": 1, "title": "t", "message": "m", "evidence": "unverified"},
+            {"path": "a.py", "line": 1, "title": "t", "message": "m", "evidence": "verified"}]}
+        with patch.object(cli, "post_comment", side_effect=lambda *args: posts.append(args[3])):
+            cli.publish("org/repo#1", "a" * 40, report)
+            cli.publish("org/repo#1", "a" * 40, dict(report, findings=report["findings"][1:]))
+        self.assertIn("1 model finding quoted no code to check against the patch.", posts[0])
+        self.assertNotIn("quoted no code", posts[1])
+
+
 if __name__ == "__main__":
     unittest.main()

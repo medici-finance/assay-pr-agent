@@ -91,6 +91,9 @@ def publish(address, head, report, *, project=None, state=None):
     for reason in sorted({item["reason"] for item in report.get("dropped", [])}):
         count = sum(item["reason"] == reason for item in report["dropped"])
         body.append(f"Dropped {count} model finding{'s' if count > 1 else ''}: {reason}.")
+    unchecked = sum(entry.get("evidence") == "unverified" for entry in report["findings"])
+    if unchecked:
+        body.append(f"{unchecked} model finding{'s' if unchecked > 1 else ''} quoted no code to check against the patch.")
     if report["state"] == "over-budget":
         body.append(f"Skipped {label}. Estimated prompt {report['estimated_input_tokens']} tokens "
                     f"exceeds the limit of {report['max_input_tokens']}.")
