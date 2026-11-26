@@ -6,8 +6,9 @@ x-reviewer: &reviewer
   read_only: true
   cap_drop: ["ALL"]
   security_opt: ["no-new-privileges:true"]
+  # exec matches the k8s emptyDir (which cannot be noexec) and the CI test run.
   tmpfs:
-    - /tmp:mode=1777,size=1g
+    - /tmp:mode=1777,size=1g,exec
 services:
   setup:
     <<: *reviewer
