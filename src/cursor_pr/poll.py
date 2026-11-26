@@ -1,7 +1,7 @@
 """Poll configured forges and process explicit review requests serially."""
 import argparse
 import fcntl
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, contextmanager
 from datetime import datetime, timezone
 import json
 import logging
@@ -28,9 +28,23 @@ class Jobs:
         with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("""CREATE TABLE IF NOT EXISTS requests (
                 project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,
-                status TEXT NOT NULL, PRIMARY KEY(project, number, comment))""")
+                status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(project, number, comment))""")
+            if "attempts" not in {row[1] for row in db.execute("PRAGMA table_info(requests)")}:
+                # Starts before this column existed are uncounted, except that a started row had one.
+                db.execute("ALTER TABLE requests ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+                db.execute("UPDATE requests SET attempts=1 WHERE status='started'")
             db.execute("""CREATE TABLE IF NOT EXISTS activations (
                 project TEXT PRIMARY KEY, since TEXT NOT NULL)""")
+            # Only the process holding the instance lock opens the queue, so a row still started
+            # was left by a review that died with the previous process. Run it once more; a
+            # request that keeps killing the poller must not loop.
+            for key, number, comment, attempts in db.execute(
+                    "SELECT project, number, comment, attempts FROM requests WHERE status='started'").fetchall():
+                status = "queued" if attempts < 2 else "failed"
+                db.execute("UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?",
+                           (status, key, number, comment))
+                log.warning("Review of %s #%d comment %d was interrupted by a restart; %s", key, number, comment,
+                            "queued again" if status == "queued" else "marked failed, a new /review retries it")
 
     def activated(self, project):
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -46,12 +60,12 @@ class Jobs:
 
     def enqueue(self, project, number, comment, status="queued"):
         with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("INSERT OR IGNORE INTO requests VALUES (?,?,?,?)",
+            db.execute("INSERT OR IGNORE INTO requests (project, number, comment, status) VALUES (?,?,?,?)",
                        (project, number, comment, status))
 
     def next(self):
         with closing(sqlite3.connect(self.path)) as db, db:
-            return db.execute("""UPDATE requests SET status='started' WHERE rowid=(
+            return db.execute("""UPDATE requests SET status='started', attempts=attempts+1 WHERE rowid=(
                 SELECT rowid FROM requests WHERE status='queued' ORDER BY rowid LIMIT 1)
                 RETURNING project, number, comment""").fetchone()
 
@@ -115,6 +129,18 @@ def cycle(projects, state, jobs, since, runner=run_review):
         jobs.finish(job, status)
 
 
+@contextmanager
+def instance_lock(state):
+    # A file of its own, not the directory: setup takes shared and exclusive locks on the
+    # directory inode, and an exclusive lock there would block the setup wizard.
+    fd = os.open(state / ".poller.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+
+
 def container_main():
     print(buildinfo.banner(), flush=True)
     if sys.argv[1:2] == ["manage"]:
@@ -138,8 +164,12 @@ def main():
     args = parser.parse_args()
     state = args.state_dir.resolve()
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
-    watch = ConfigurationWatch(state)
     with ExitStack() as stack:
+        try:
+            stack.enter_context(instance_lock(state))
+        except BlockingIOError:
+            parser.exit(2, "Another poller is already running on this state volume.\n")
+        watch = ConfigurationWatch(state)
         try:
             fresh = not any((state / p).exists() for p in ("setup", "projects.json", "hooks.json"))
             first_install = (fresh and sys.stdin.isatty() and "REVIEW_PROJECTS" not in os.environ
@@ -165,9 +195,9 @@ def main():
             stack.enter_context(forge_credentials(projects, state))
         except (ValueError, KeyError, TypeError, EOFError, OSError, subprocess.TimeoutExpired) as err:
             parser.exit(2, f"Polling configuration: {err}\n")
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         jobs = Jobs(state)
         since = {key: jobs.activated(key) for key in projects}
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         log.info("Polling %s with %d seconds between cycles", ", ".join(projects), args.interval)
         if mine_seconds:
             threading.Thread(target=history.mine_periodically, args=(projects, state, mine_seconds),

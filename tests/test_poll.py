@@ -39,15 +39,17 @@ class PollTests(unittest.TestCase):
                 self.assertFalse(is_request(self.gh, 3, self.note | change, self.since))
         self.assertFalse(is_request(self.gh, 3, self.note, datetime(2027, 1, 1, tzinfo=timezone.utc)))
 
-    def test_queued_survives_restart_and_started_is_never_reissued(self):
+    def test_queued_and_interrupted_reviews_survive_a_restart(self):
         jobs = Jobs(self.state)
         since = jobs.activated(self.gh.key)
         jobs.enqueue(self.gh.key, 1, 10)
         jobs.enqueue(self.gh.key, 2, 11)
-        self.assertEqual(jobs.next(), (self.gh.key, 1, 10))
-        restarted = Jobs(self.state)
+        self.assertEqual(jobs.next(), (self.gh.key, 1, 10))  # The poller stops before this review finishes.
+        with self.assertLogs("cursor_pr.poll", level="WARNING"):
+            restarted = Jobs(self.state)
         self.assertEqual(restarted.activated(self.gh.key), since)
         restarted.enqueue(self.gh.key, 1, 10)
+        self.assertEqual(restarted.next(), (self.gh.key, 1, 10))
         self.assertEqual(restarted.next(), (self.gh.key, 2, 11))
         self.assertIsNone(restarted.next())
 
