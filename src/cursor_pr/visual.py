@@ -25,10 +25,11 @@ packages.lock.json yarn.lock bun.lock bun.lockb pnpm-lock.yaml package-lock.json
 deno.lock stack.yaml.lock renv.lock cabal.project.freeze""".split()
 
 # A project meta document such as README, LICENSE-MIT, LICENSE.Apache-2.0 or SECURITY.md. A source
-# file named security.py, authors.py or licensed.py must not match: after a dot, only a document
-# extension or a token that starts with a capital or a digit may follow.
+# file named security.py, authors.py, licensed.py or license_check.go must not match: after a dot,
+# only a document extension or a token that starts with a capital or a digit may follow, and a
+# token after - or _ holds no dot of its own.
 def named(*names):
-    return ("(?:(?:" + "|".join(names) + r")(?:[-_][A-Za-z0-9.]+|(?-i:\.[A-Z0-9][A-Za-z0-9.]*)"
+    return ("(?:(?:" + "|".join(names) + r")(?:[-_][A-Za-z0-9]+|(?-i:\.[A-Z0-9][A-Za-z0-9.]*)"
             r"|\.(?:md|txt|rst|html?))*)")
 
 
@@ -150,7 +151,8 @@ def pack(files):
     """One visual review prompt: an inventory of every file, then the hunks worth reading."""
     inventory, sections, anchors, unseen = [], [], {}, []
     for f in files:
-        if not f.path or any(ord(c) < 32 for c in f.path) or f.path in anchors:
+        # The previous name of a rename enters the inventory too, so it obeys the same rule.
+        if not f.path or any(ord(c) < 32 for c in f.path + (f.previous or "")) or f.path in anchors:
             raise ReviewError("Invalid or duplicate forge filename")
         anchors[f.path] = set()
         added, deleted, head = counts(f)

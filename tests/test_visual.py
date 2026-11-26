@@ -100,6 +100,11 @@ class VisualTests(unittest.TestCase):
                 ("attest.swift", "Logic", True), ("contest.kt", "Logic", True), ("app/security.py", "Logic", True),
                 ("src/support/go.py", "Logic", True), ("app/authors.py", "Logic", True), ("licensed.py", "Logic", True),
                 ("notice.js", "Logic", True), ("readme.py", "Logic", True), ("governance.go", "Logic", True),
+                # A document name followed by a separator and a source name is source, not a document.
+                ("app/security_utils.py", "Logic", True), ("readme_parser.go", "Logic", True),
+                ("support-tickets.ts", "Logic", True), ("license_check.go", "Logic", True),
+                ("authors_service.py", "Logic", True), ("codeowners_parser.go", "Logic", True),
+                ("src/notice-banner.tsx", "Logic", True), ("LICENSE-APACHE-2.0.txt", "Docs", False),
                 ("db/schema.sql", "Schema", True), ("api/migrations/0001.py", "Schema", True),
                 ("internal/manager_test.go", "Tests", True), ("app.spec.tsx", "Tests", True),
                 ("tests/e2e/x.ts", "Tests", True), ("UserTest.java", "Tests", True), ("UserTests.cs", "Tests", True),
@@ -177,6 +182,10 @@ class VisualTests(unittest.TestCase):
         moved = dict(change.files[0].__dict__, status="renamed", previous="old/" + change.files[0].path)
         self.assertIn(change.files[0].path + " | Config & CI | +2 -0 | renamed, was old/" + change.files[0].path,
                       visual.pack([source.File(**moved)])[0])
+        # The previous name of a rename enters the prompt too, so it is held to the same rule.
+        planted = dict(moved, previous="old\nfake.py | Logic | +1 -0 | added")
+        with self.assertRaises(source.ReviewError):
+            visual.pack([source.File(**planted)])
 
     def test_only_text_without_a_patch_costs_coverage(self):
         files = [source.File("gone.py", "@@ -1,3 +0,0 @@\n-a\n-b\n-c\n", "removed"),
