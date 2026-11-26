@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -13,7 +14,7 @@ import time
 from unidiff.errors import UnidiffParseError
 import yaml
 
-from . import drift, history, providers, receipt, scanners
+from . import drift, history, outcomes, providers, receipt, scanners
 from .scanners import fence
 from .login import auth_mode, login_directory
 from .setup import locked, apply_saved_setup, load_provider_key, max_input_tokens, state_dir
@@ -120,6 +121,13 @@ def publish(address, head, report, *, project=None, state=None):
                     + ", ".join(fence(path) for path in report["not_reviewable"][:20]) + more + ".")
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {fence(path)}")
+    tracked = report.get("outcomes")
+    if tracked and tracked["fixed"] + tracked["unaddressed"]:
+        # An accept rate needs a finding whose code the author either changed or left alone.
+        rate = f"{tracked['accept_rate']}%" if tracked["accept_rate"] is not None else "not available"
+        body.append(f"Tracked findings for this change: {tracked['fixed']} addressed and {tracked['unaddressed']} left unchanged "
+                    f"at a later review (accept rate {rate}); {tracked['repeated']} raised again; "
+                    f"{tracked['open']} awaiting a later review.")
     if "receipt" in report:
         body.extend(["", *receipt.render(report["receipt"])])
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
@@ -250,6 +258,12 @@ def execute(args):
         report.update(answer, cache_hit=cached, cursor_invocations=int(not cached))
         if cached:
             report["cursor_usage"] = None
+        if args.change and os.getenv("REVIEW_STATE_DIR") and state_dir().is_dir():
+            # What became of earlier findings, and what this review adds to track. Never at the cost of the review.
+            try:
+                report["outcomes"] = outcomes.record(state_dir(), args.change, change.head, report["findings"], anchors)
+            except (OSError, ValueError, KeyError, sqlite3.Error):
+                pass
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
     if degraded:
         report["state"] = "degraded"
