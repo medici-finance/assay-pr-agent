@@ -70,7 +70,11 @@ def pack(files, checks, title="", description="", advisories=()):
                for a in advisories[:12]]
     context = [name for name, present in (("change description", change), ("history advisories", notices)) if present]
     sources = ", ".join(context + ["patch"]) + " and scanner evidence" if context else "patch and scanner evidence"
-    about = " The change description is the author's own account: use it for intent, not as evidence." if change else ""
+    about = (" The change description is the author's own account: use it for intent, not as evidence. Check the claims "
+             "it makes about the patch and report each mismatch as a finding that cites patch lines: tests it says were "
+             "added or updated that the patch does not add or change; behaviour it claims with no supporting change in "
+             "the patch; changes unrelated to its stated purpose; stubbed or placeholder code (pass, TODO, "
+             "NotImplementedError, an empty handler) presented as done." if change else "")
     about += (" History advisories are notices from the repository's own history about files in this change, "
               "such as a file that usually changes together with a changed one. They are hints to check against "
               "the patch, not findings, and a finding still has to cite head lines present in the shown hunks." if notices else "")
