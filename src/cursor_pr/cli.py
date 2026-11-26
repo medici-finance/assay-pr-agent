@@ -13,7 +13,7 @@ import time
 from unidiff.errors import UnidiffParseError
 import yaml
 
-from . import drift, history, providers, scanners
+from . import drift, history, providers, receipt, scanners
 from .scanners import fence
 from .login import auth_mode, login_directory
 from .setup import locked, apply_saved_setup, load_provider_key, max_input_tokens, state_dir
@@ -120,6 +120,8 @@ def publish(address, head, report, *, project=None, state=None):
                     + ", ".join(fence(path) for path in report["not_reviewable"][:20]) + more + ".")
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {fence(path)}")
+    if "receipt" in report:
+        body.extend(["", *receipt.render(report["receipt"])])
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
     # A finding may quote a multiline source fragment, including forge quick actions.
     text = "\n".join(" ".join(line.splitlines()) for line in body) + "\n"
@@ -218,6 +220,11 @@ def execute(args):
               "checks": checks,
               "findings": [], "cursor_usage": None, "full_input_tokens": full, "degraded": degraded,
               "drift": drifted}
+    # What the review could cover and did: the denominators of the receipt.
+    deselected, text = paths - selected, len(files) - len(no_text)
+    reviewed = 0 if full > args.max_input_tokens else text - len(degraded)
+    report["coverage"] = {"changed": len(paths), "text": text + len(deselected), "reviewed": reviewed,
+                          "skipped": text - reviewed, "excluded": len(deselected), "no_text": len(no_text)}
     if static:
         report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
@@ -260,6 +267,7 @@ def run_request(args):
         report.update(cursor_invocations=0, cursor_usage=None)
     else:
         report.update(model_invocations=report["cursor_invocations"], model_usage=report["cursor_usage"])
+    report["receipt"] = receipt.build(report)
     if args.post:
         try:
             publish(args.change, report["head"], report, project=getattr(args, "forge_project", None),
