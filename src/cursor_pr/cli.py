@@ -1,4 +1,5 @@
 import argparse
+from collections import Counter
 import fcntl
 from contextlib import ExitStack
 import json
@@ -57,8 +58,17 @@ def publish(address, head, report):
         body.extend(["", *scanners.summary(report["static_checks"]), ""])
     if "qualgen" in report:
         body.extend(["", *history.summary(report["qualgen"]), ""])
+    skipped = report.get("skipped_for_budget") or []
+    if skipped:
+        # Paths come from the PR: quote them as code, and do not repeat them under coverage.
+        more = f" and {len(skipped) - 20} more" if len(skipped) > 20 else ""
+        body.append(f"Within the {report['max_input_tokens']}-token limit the model reviewed "
+                    f"{report['text_files'] - len(skipped)} of {report['text_files']} files with changes to review; "
+                    f"skipped for budget: " + ", ".join(fence(path) for path in skipped[:20]) + more +
+                    f". The complete review needs {report['full_estimated_input_tokens']} tokens.")
     for path in report["omitted"]:
-        body.append(f"- Outside review coverage: {fence(path)}")
+        if path not in skipped:
+            body.append(f"- Outside review coverage: {fence(path)}")
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
     with tempfile.NamedTemporaryFile("w", encoding="utf8") as tmp:
         # A finding may quote a multiline source fragment, including forge quick actions.
@@ -92,6 +102,52 @@ def parser():
     return p
 
 
+LOW_RISK = (".md", ".rst", ".txt", ".adoc", ".csv", ".tsv", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf")
+
+
+def priority(file, flagged):
+    """Highest risk first: scanner findings on the shown lines, then what a scanner checks, then other
+    source, then documentation and data; within a class more added lines first, then by path."""
+    added = sum(line.startswith("+") and not line.startswith("+++") for line in file.patch.splitlines())
+    rank = 3 if scanner(file.path) or scanners.tool_for(file.path) else 1 if file.path.lower().endswith(LOW_RISK) else 2
+    return -flagged, -rank, -added, file.path
+
+
+def fit(files, checks, change, advisories, budget):
+    """The prompt for the highest-risk files that fit the budget, and the files left out.
+
+    The fixed part of the prompt and each file are measured once; a file costs its own section plus the
+    scanner evidence on its shown lines. The chosen set is then built and measured as a whole.
+    """
+    def measure(shown):
+        prompt, anchors, unseen, has_text = pack(shown, checks, change.title, change.description, advisories)
+        return prompt, anchors, unseen, has_text, tokens(prompt)
+
+    whole = measure(files)
+    unseen, full = whole[2], whole[4]
+    text = [f for f in files if f.path not in unseen]
+    if full <= budget or not text:
+        return dict(built=whole, unseen=unseen, estimated=full, full=full, skipped=[], text=len(text))
+    flagged = Counter(finding["path"] for check in checks for finding in check["findings"]
+                      if finding["line"] in whole[1].get(finding["path"], {}))
+    base = measure([])[4]
+    cost = {f.path: measure([f])[4] - base for f in text}
+    chosen, skipped, total = [], [], base
+    for file in sorted(text, key=lambda f: priority(f, flagged[f.path])):
+        if total + cost[file.path] <= budget:
+            chosen.append(file)
+            total += cost[file.path]
+        else:
+            skipped.append(file.path)
+    # Per-file costs leave out what separates sections, so the chosen set is measured again.
+    while chosen:
+        built = measure(chosen)
+        if built[4] <= budget:
+            return dict(built=built, unseen=unseen, estimated=built[4], full=full, skipped=sorted(skipped), text=len(text))
+        skipped.append(chosen.pop().path)
+    return dict(built=None, unseen=unseen, estimated=full, full=full, skipped=sorted(f.path for f in text), text=len(text))
+
+
 def execute(args):
     if args.max_input_tokens < 1 or (args.head and not args.base) or (args.post and (not args.change or args.estimate)):
         raise ReviewError("Invalid budget or incompatible --head/--post options")
@@ -105,6 +161,7 @@ def execute(args):
     else:
         base, head = ci_refs() if args.ci else (args.base, args.head or "HEAD")
         change = local_change(root, base, head)
+
 
     paths = {f.path for f in change.files}
     selected = set(args.path) if args.path else paths
@@ -145,10 +202,11 @@ def execute(args):
 
     # Screened before the prompt is built: the advisories are part of what the model is shown.
     qualgen = history.screen(root, args.qualgen_store, selected, change.head) if args.qualgen_store else None
-    prompt, anchors, unseen, has_text = pack(files, checks, change.title, change.description,
-                                            qualgen["advisories"] if qualgen else ())
-    estimated = tokens(prompt) if has_text else 0
-    omitted = sorted(set(unseen) | (paths - selected))
+    plan = fit(files, checks, change, qualgen["advisories"] if qualgen else (), args.max_input_tokens)
+    built, unseen, skipped = plan["built"], plan["unseen"], plan["skipped"]
+    prompt, anchors, has_text = (built[0], built[1], built[3]) if built else ("", {}, False)
+    estimated = plan["estimated"] if has_text else 0
+    omitted = sorted(set(unseen) | set(skipped) | (paths - selected))
     backend = providers.provider()
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
               "estimated_input_tokens": estimated, "max_input_tokens": args.max_input_tokens,
@@ -160,7 +218,10 @@ def execute(args):
         report["cursor_team_id"] = os.environ["REVIEW_CURSOR_TEAM_ID"]
     if qualgen:
         report["qualgen"] = qualgen
-    if estimated > args.max_input_tokens:
+    if skipped:
+        report.update(skipped_for_budget=skipped, full_estimated_input_tokens=plan["full"], text_files=plan["text"])
+    # Only a change with nothing reviewable that fits is refused; otherwise the lowest-risk files were dropped.
+    if not built:
         return dict(report, state="over-budget"), 2
     if args.estimate:
         return dict(report, state="estimate"), 0
