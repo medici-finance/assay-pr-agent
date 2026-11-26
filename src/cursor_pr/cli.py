@@ -44,13 +44,14 @@ def rank(path):
     return 3
 
 
-def fit(files, checks, limit, *, title="", description=""):
+def fit(files, checks, limit, *, title="", description="", advisories=()):
     """Pack the prompt, leaving out whole files until it fits the input budget.
 
     Returns the prompt parts, the estimate of what will be sent, the estimate of the full
     prompt, and the paths left out. Nothing is left out when even one file cannot fit.
     """
-    prompt, anchors, unseen, has_text = full_pack = pack(files, checks, title=title, description=description)
+    prompt, anchors, unseen, has_text = full_pack = pack(files, checks, title=title, description=description,
+                                                         advisories=advisories)
     estimated = full = tokens(prompt) if has_text else 0
     if full <= limit:
         return full_pack, full, full, []
@@ -64,7 +65,7 @@ def fit(files, checks, limit, *, title="", description=""):
         while len(queue) > 1 and freed < estimated - limit:
             dropped.append(queue.pop(0))
             freed += sizes[dropped[-1]]
-        prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), title, description)
+        prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), title, description, advisories)
         estimated = tokens(prompt) if has_text else 0
     if not has_text or estimated > limit:
         return full_pack, full, full, []
@@ -191,8 +192,11 @@ def execute(args):
         go["findings"] = [row for row in go["findings"] if row["path"] in selected]
         checks.append(go)
 
+    # Screened before the prompt is built: the advisories are part of what the model is shown.
+    qualgen = history.screen(root, args.qualgen_store, selected, change.head) if args.qualgen_store else None
     (prompt, anchors, unseen, has_text), estimated, full, degraded = fit(
-        files, checks, args.max_input_tokens, title=change.title, description=change.description)
+        files, checks, args.max_input_tokens, title=change.title, description=change.description,
+        advisories=qualgen["advisories"] if qualgen else ())
     omitted = sorted(set(unseen) | (paths - selected))
     backend = providers.provider()
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
@@ -204,8 +208,8 @@ def execute(args):
         report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
         report["cursor_team_id"] = os.environ["REVIEW_CURSOR_TEAM_ID"]
-    if args.qualgen_store:
-        report["qualgen"] = history.screen(root, args.qualgen_store, selected, change.head)
+    if qualgen:
+        report["qualgen"] = qualgen
     if estimated > args.max_input_tokens:
         return dict(report, state="over-budget"), 2
     if args.estimate:

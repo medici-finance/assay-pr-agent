@@ -216,13 +216,13 @@ print(json.dumps(dict(type='result',subtype='success',is_error=False,
                                              "GITLAB_API_BASE": "https://gitlab.com/api/v4"}):
                     with patch.dict(os.environ, {"REVIEW_QUALGEN_INTERVAL_SECONDS": "0"}):
                         self.assertEqual(run_review(project,3,self.state),"reviewed")
-                    # The cache key contains the exact prompt. Enabling Qualgen must hit the same key.
+                    # Advisories are part of the prompt, so enabling Qualgen changes the cache key: one more call.
                     self.assertEqual(run_review(project,3,self.state),"reviewed")
                     with patch.dict(os.environ,{"REVIEW_MAX_INPUT_TOKENS":"1"}):
                         self.assertEqual(run_review(project,3,self.state),"over-budget")
             with patch.dict(os.environ,{"FIXTURE_CHANGE":self.gl.change_url(3),"FIXTURE_SLUG":self.gh.slug}):
                 self.assertEqual(run_review(self.gh,3,self.state),"failed")
         self.assertEqual(posts.read_text().count("historically coupled to partner.py"), 4)
-        self.assertEqual(calls.read_text().splitlines(),["called","called"])
+        self.assertEqual(calls.read_text().splitlines(),["called"] * 4)
         self.assertEqual(posts.read_text().count("Skipped Cursor"),2)
         self.assertEqual(posts.read_text().count("[PR-Agent](https://github.com/the-pr-agent/pr-agent)"),6)
