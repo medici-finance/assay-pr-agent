@@ -10,7 +10,6 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import threading
 
 from .config import load_config
@@ -31,70 +30,45 @@ UNRECORDED = "marked failed, the head it started at was not recorded, a new /rev
 lock_fd = None
 
 
-def head_record(state):
-    # One request runs at a time, so one file holds what is known about the running one: the
-    # request's identity, which the poller writes before it starts the request; under it the head its
-    # review resolved, which the review child writes before its model call; and under that how the
-    # review ended, which the child writes before it exits, for a poller that stops before it can
-    # read the report.
-    return state / "requests.head"
-
-
-def read_head_record(state):
-    # The request that owns the record, the head recorded for it and how its review ended once it
-    # did; no request, no head and no outcome when there is no readable record.
-    try:
-        request, head, outcome, _ = (head_record(state).read_text().split("\n") + ["", ""])[:4]
-        key, number, comment = request.split(" ")
-        return (key, int(number), int(comment)), head.strip(), outcome.strip()
-    except (OSError, ValueError):
-        return None, "", ""
-
-
-def write_head_record(state, job, head=""):
-    # Replaced whole, so a poller that stops meanwhile never finds part of a record.
-    with tempfile.NamedTemporaryFile("w", encoding="ascii", dir=state, delete=False) as tmp:
-        tmp.write(f"{job[0]} {job[1]} {job[2]}\n{head}\n")
-    os.replace(tmp.name, head_record(state))
-
-
 class Jobs:
+    """The request queue. A request's row is all that is kept about it: its status, how often it was
+    started, and the head its review resolved. The review child writes the head and the final status
+    to the row itself, each in one transaction, so no restart finds them disagreeing."""
+
     def __init__(self, state):
         self.path = state / "requests.sqlite3"
-        self.state = state
+        settled = []
         with closing(sqlite3.connect(self.path)) as db, db:
+            # One transaction for the schema and the recovery: sqlite3 opens none for DDL by itself,
+            # and a poller that stops halfway must leave nothing behind.
+            db.execute("BEGIN IMMEDIATE")
             db.execute("""CREATE TABLE IF NOT EXISTS requests (
                 project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,
-                status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(project, number, comment))""")
-            if "attempts" not in {row[1] for row in db.execute("PRAGMA table_info(requests)")}:
+                status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, head TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(project, number, comment))""")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(requests)")}
+            if "attempts" not in columns:
                 db.execute("ALTER TABLE requests ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+            if "head" not in columns:
+                db.execute("ALTER TABLE requests ADD COLUMN head TEXT NOT NULL DEFAULT ''")
+                # A version that kept no head left these running. They may have published at a head
+                # nobody recorded, so they cannot be repeated safely.
+                settled += [(row, "failed", UNRECORDED) for row in db.execute(
+                    "SELECT project, number, comment FROM requests WHERE status='started'").fetchall()]
+                db.execute("UPDATE requests SET status='failed' WHERE status='started'")
             db.execute("""CREATE TABLE IF NOT EXISTS activations (
                 project TEXT PRIMARY KEY, since TEXT NOT NULL)""")
-            # Only the process holding the instance lock opens the queue, so a row still started was
-            # left by a review whose poller stopped. The review child holds the lock until it exits,
-            # so the review either ended, and its record says how, or was cut off with the poller. An
-            # ended one is kept as it came out. A cut-off one runs once more, at the head it had
-            # resolved: a request that keeps killing the poller must not loop, and one whose head is
-            # not recorded, as from a version before the record, cannot be run safely.
-            recorded, _, outcome = read_head_record(state)
-            for key, number, comment, attempts in db.execute(
+            # Only the process holding the instance lock opens the queue, and a review child holds
+            # that lock until it exits and settles its own row before it does. So a row still started
+            # belongs to a review that was cut off. It runs once more, held to the head in its row if
+            # it had resolved one. A request that keeps killing the poller must not loop.
+            for *job, attempts in db.execute(
                     "SELECT project, number, comment, attempts FROM requests WHERE status='started'").fetchall():
-                if recorded != (key, number, comment):
-                    status, reason = "failed", "was interrupted by a restart; " + UNRECORDED
-                elif outcome:
-                    status, reason = outcome, "finished after its poller stopped; " + (
-                        "it did not publish, so marked failed, a new /review retries it" if outcome == "failed"
-                        else outcome)
-                elif attempts >= 2:
-                    status, reason = "failed", "was interrupted by a restart; " + GIVEN_UP
-                else:
-                    status, reason = "queued", "was interrupted by a restart; queued again"
+                settled.append((job, "failed", GIVEN_UP) if attempts >= 2 else (job, "queued", "queued again"))
                 db.execute("UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?",
-                           (status, key, number, comment))
-                log.warning("Review of %s #%d comment %d %s", key, number, comment, reason)
-        if outcome:
-            # The review that wrote it has ended, so its request is not to be run again at its head.
-            head_record(state).unlink(missing_ok=True)
+                           (settled[-1][1], *job))
+        for job, _, reason in settled:
+            log.warning("Review of %s #%d comment %d was interrupted by a restart; %s", *job, reason)
 
     def activated(self, project):
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -115,31 +89,23 @@ class Jobs:
 
     def next(self):
         with closing(sqlite3.connect(self.path)) as db, db:
-            row = db.execute("""SELECT rowid, project, number, comment FROM requests
-                WHERE status='queued' ORDER BY rowid LIMIT 1""").fetchone()
-            if row is None:
-                return None
-            job = (row[1], row[2], row[3])
-            # Claimed for the request before the row says it is started, so a poller that stops in
-            # between never leaves a start that comes back to another request's head. A request queued
-            # again keeps the head its first start recorded, unless that review has already ended.
-            request, _, outcome = read_head_record(self.state)
-            if request != job or outcome:
-                write_head_record(self.state, job)
-            db.execute("UPDATE requests SET status='started', attempts=attempts+1 WHERE rowid=?", (row[0],))
-            return job
+            return db.execute("""UPDATE requests SET status='started', attempts=attempts+1 WHERE rowid=(
+                SELECT rowid FROM requests WHERE status='queued' ORDER BY rowid LIMIT 1)
+                RETURNING project, number, comment""").fetchone()
 
     def finish(self, job, status):
         with closing(sqlite3.connect(self.path)) as db, db:
-            attempts = db.execute("""UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?
-                RETURNING attempts""", (status, *job)).fetchone()
-        head_record(self.state).unlink(missing_ok=True)
-        if attempts and attempts[0] > 1 and status == "failed":
+            # The review child settles its own row. This is for a review that did not get that far.
+            db.execute("""UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?
+                AND status='started'""", (status, *job))
+            row = db.execute("SELECT status, attempts FROM requests WHERE project=? AND number=? AND comment=?",
+                             job).fetchone()
+        if row and row[0] == "failed" and row[1] > 1:
             # The head may have moved on since the first start, or the retry failed like the first did.
             log.warning("Review of %s #%d comment %d was not completed by its retry; a new /review retries it", *job)
 
 
-def run_review(project, number, state):
+def run_review(project, number, state, comment=None):
     address = f"{project.slug}#{number}"
     argv = [sys.executable, "-I", "-m", "cursor_pr.cli", "--repo", str(project.checkout),
             "--change", address, "--expected-change-url", project.change_url(number),
@@ -154,12 +120,10 @@ def run_review(project, number, state):
         argv.extend(["--max-input-tokens", os.environ["REVIEW_MAX_INPUT_TOKENS"]])
     if os.getenv("REVIEW_MODEL"):
         argv.extend(["--model", os.environ["REVIEW_MODEL"]])
-    # The record names this request and, once a review of it has resolved a head, the head this run
-    # must stay at. Until then this run is the first to get that far and says which head it reviews.
-    # The child adds how it ended, for a poller that stops before it can read the report.
-    argv.extend(["--record-head", str(head_record(state))])
-    if head := read_head_record(state)[1]:
-        argv.extend(["--expected-head", head])
+    if comment is not None:
+        # The child keeps the request's row itself: the head it resolves, which a repeat of the
+        # request is held to, and how it ended, for a poller that stops before it can read the report.
+        argv.extend(["--queue", str(state / "requests.sqlite3"), "--request", project.key, str(number), str(comment)])
     env = dict(os.environ)
     env["CURSOR_REVIEW_POLLER_CHILD"] = "1"
     env.pop("REVIEW_MANAGED_PROJECT", None)
@@ -185,7 +149,7 @@ def run_review(project, number, state):
     return report["state"] if report.get("publication") == "posted-or-already-present" else "failed"
 
 
-def cycle(projects, state, jobs, since, runner=run_review):
+def cycle(projects, state, jobs, since, runner=None):
     for project in projects.values():
         try:
             poll_project(project, state, jobs, since[project.key])
@@ -196,7 +160,8 @@ def cycle(projects, state, jobs, since, runner=run_review):
         status = "failed"
         if key in projects:
             try:
-                status = runner(projects[key], number, state)
+                status = (runner(projects[key], number, state) if runner
+                          else run_review(projects[key], number, state, comment))
             except Exception:
                 log.exception("Review failed for %s #%d comment %d", key, number, comment)
         jobs.finish(job, status)

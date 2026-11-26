@@ -1,5 +1,7 @@
+from contextlib import closing
 import json
 import os
+import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -210,7 +212,14 @@ with Path(os.environ['POST_LOG']).open('a') as out:
                     with patch.dict(os.environ, {"REVIEW_QUALGEN_INTERVAL_SECONDS": "0"}):
                         self.assertEqual(run_review(project,3,self.state),"reviewed")
                     # The cache key contains the exact prompt. Enabling Qualgen must hit the same key.
-                    self.assertEqual(run_review(project,3,self.state),"reviewed")
+                    # Started from the queue this time: the real child keeps its request's row.
+                    jobs = Jobs(self.state)
+                    jobs.enqueue(project.key, 3, 81)
+                    self.assertEqual(jobs.next(), (project.key, 3, 81))
+                    self.assertEqual(run_review(project,3,self.state,81),"reviewed")
+                    with closing(sqlite3.connect(jobs.path)) as db:
+                        self.assertEqual(db.execute("SELECT status, attempts, head FROM requests WHERE project=?",
+                                                    (project.key,)).fetchall(), [("reviewed", 1, "a"*40)])
                     with patch.dict(os.environ,{"REVIEW_MAX_INPUT_TOKENS":"1"}):
                         self.assertEqual(run_review(project,3,self.state),"over-budget")
             with patch.dict(os.environ,{"FIXTURE_CHANGE":self.gl.change_url(3),"FIXTURE_SLUG":self.gh.slug}):
