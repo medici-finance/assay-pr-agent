@@ -211,6 +211,9 @@ def main():
             stack.enter_context(instance_lock(state))
         except BlockingIOError:
             parser.exit(2, "Another poller is already running on this state volume.\n")
+        except OSError as err:
+            # No lock, no poller: without it a second one would repeat the first one's running reviews.
+            parser.exit(2, f"Polling lock: {err}\n")
         watch = ConfigurationWatch(state)
         try:
             fresh = not any((state / p).exists() for p in ("setup", "projects.json", "hooks.json"))

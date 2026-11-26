@@ -4,6 +4,7 @@ from contextlib import ExitStack, closing
 import json
 import os
 from pathlib import Path
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -62,9 +63,19 @@ def publish(address, head, report):
              "--body-file", tmp.name])
 
 
+# The longest a review started from the queue may run. Its waits have timeouts of their own. This is
+# for one that hangs anyway: it holds the poller's lock, and no poller starts until it is gone.
+QUEUED_REVIEW_SECONDS = 1800
+
+
 def request_row(args):
     project, number, comment = args.request
     return project, int(number), int(comment)
+
+
+def open_queue(args):
+    # The poller's queue as it is. A wrong path is an error, not a new empty database.
+    return closing(sqlite3.connect(args.queue.resolve().as_uri() + "?mode=rw", uri=True))
 
 
 def claim_head(args, head):
@@ -72,7 +83,7 @@ def claim_head(args, head):
     # request finds the head of its interrupted start there and is refused at another. Read and
     # written in one transaction on the row the poller reads, so the two cannot disagree.
     try:
-        with closing(sqlite3.connect(args.queue)) as db, db:
+        with open_queue(args) as db, db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("""SELECT head FROM requests WHERE project=? AND number=? AND comment=?
                 AND status='started'""", request_row(args)).fetchone()
@@ -90,8 +101,10 @@ def settle(args, status):
     # How the review ended, on the request's row and before the lock is released, so that a poller
     # that has stopped reading finds it there. The first one stands: a report that only failed to
     # print did not fail. Never raises, because it also runs while a failure is being reported.
+    if not args.queue:
+        return  # --request without --queue: that failure is the one being reported.
     try:
-        with closing(sqlite3.connect(args.queue)) as db, db:
+        with open_queue(args) as db, db:
             db.execute("""UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?
                 AND status='started'""", (status, *request_row(args)))
     except (sqlite3.Error, ValueError, OSError) as err:
@@ -252,6 +265,8 @@ def main():
     if args.qualgen_store:
         args.qualgen_store = args.qualgen_store.resolve()
     old = Path.cwd()
+    if args.request:
+        signal.alarm(QUEUED_REVIEW_SECONDS)  # Ends the process. Its row stays started, for the next poller.
     try:
         with ExitStack() as stack:
             state = state_dir().resolve()
@@ -303,6 +318,7 @@ def main():
             settle(args, "failed")
         return 2
     finally:
+        signal.alarm(0)
         os.chdir(old)
 
 

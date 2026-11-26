@@ -1,9 +1,11 @@
 import argparse
 from contextlib import closing, nullcontext
+import errno
 import io
 import json
 import os
 from pathlib import Path
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -23,7 +25,10 @@ from cursor_pr.poll import instance_lock
 with instance_lock(Path(sys.argv[1])):
     pass
 """
-ORPHAN = "import sys, time\nfrom pathlib import Path\nwhile not Path(sys.argv[1]).exists(): time.sleep(0.05)"
+# Stands in for a review that outlives its poller. It ends when it is released, and also when the test's
+# directory is gone, so a test that fails before releasing it leaves no process behind.
+ORPHAN = ("import sys, time\nfrom pathlib import Path\nrelease = Path(sys.argv[1])\n"
+          "while not release.exists() and release.parent.exists(): time.sleep(0.05)")
 # A poller that is killed while its review runs. The review is started the way run_review starts one.
 KILLED = f"""from pathlib import Path
 import os, subprocess, sys
@@ -336,6 +341,7 @@ class RequestRowTests(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(ReviewError):
                 self.review(*options)
         self.assertEqual(self.row(), ("started", ""))
+        self.assertFalse((self.state / "absent.sqlite3").exists())  # A wrong path is not made into a queue.
 
     def test_queue_and_request_go_together(self):
         for options in (("--queue", str(self.queue)), ("--request", self.KEY, "3", "81")):
@@ -392,6 +398,33 @@ class RequestRowTests(unittest.TestCase):
         self.assertEqual((code, "Forge is down" in err), (2, True))
         self.assertEqual(self.row()[0], "failed")
 
+    def test_request_without_a_queue_is_refused_cleanly(self):
+        # The review is replaced here. The real one refuses these options before any work, like this.
+        code, _, err = self.enter("--request", self.KEY, "3", "81",
+                                  failing=ReviewError("--queue and --request go together and require --change"))
+        self.assertEqual((code, err), (2, "cursor-review: --queue and --request go together and require --change\n"))
+        self.assertEqual(self.row()[0], "started")
+
+    def test_queued_review_that_hangs_ends_itself_and_leaves_its_row_running(self):
+        hung = """import sys, time
+from unittest.mock import patch
+from cursor_pr import cli
+sys.argv[0] = "cursor-review"
+with patch("cursor_pr.cli.QUEUED_REVIEW_SECONDS", 1), patch("cursor_pr.cli.run_request", side_effect=lambda args: time.sleep(60)):
+    cli.main()
+"""
+        ended = subprocess.run([sys.executable, "-c", hung, "--change", "acme/api#3", "--expected-change-url",
+                                "https://github.com/acme/api/pull/3", "--max-input-tokens", "6000", *self.options],
+                               capture_output=True, timeout=30,
+                               env=dict(os.environ, CURSOR_REVIEW_POLLER_CHILD="1", REVIEW_STATE_DIR=str(self.state)))
+        self.assertEqual(ended.returncode, -signal.SIGALRM, ended.stderr)
+        self.assertEqual(self.row()[0], "started")  # For the next poller to queue again or give up on.
+
+    def test_review_outside_the_queue_has_no_limit_of_its_own(self):
+        with patch("cursor_pr.cli.signal.alarm") as alarm, patch("sys.stdout", new_callable=io.StringIO):
+            self.enter()
+        alarm.assert_called_once_with(0)
+
     def test_review_that_cannot_reach_its_row_still_reports_its_failure(self):
         code, _, err = self.enter("--queue", str(self.queue), "--request", self.KEY, "three", "81",
                                   failing=ReviewError("Forge is down"))
@@ -427,8 +460,19 @@ class InstanceLockTests(unittest.TestCase):
         watch.assert_not_called()  # Refused before setup, credentials or the queue are touched.
         self.assertEqual(self.holder().returncode, 0)
 
+    def test_lock_that_cannot_be_taken_stops_the_poller_with_its_reason(self):
+        for reason in (OSError(errno.ENOLCK, "No locks available"), PermissionError(errno.EACCES, "Permission denied")):
+            with self.subTest(reason=reason), patch("cursor_pr.poll.fcntl.flock", side_effect=reason), \
+                    patch("cursor_pr.poll.ConfigurationWatch") as watch, \
+                    patch("sys.stderr", new_callable=io.StringIO) as err, self.assertRaises(SystemExit) as stopped:
+                main()
+            self.assertEqual(stopped.exception.code, 2)
+            self.assertEqual(err.getvalue(), f"Polling lock: {reason}\n")
+            watch.assert_not_called()
+
     def test_review_child_holds_the_lock_until_it_exits(self):
         release = self.state / "release"
+        self.addCleanup(release.touch)  # Before the review is started, so a failed assertion releases it too.
         killed = subprocess.run([sys.executable, "-c", KILLED, str(self.state), str(release)],
                                 capture_output=True, text=True)
         self.assertEqual(killed.returncode, 0, killed.stderr)
