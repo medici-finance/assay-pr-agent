@@ -227,6 +227,8 @@ spec:
           port: 53
     # Public internet only: RFC1918, CGNAT and link-local (cloud metadata) stay
     # unreachable. Drop ranges from `except` if your forge or proxy lives there.
+    # NetworkPolicy does not filter traffic from a pod to the node it runs on, so a
+    # private service listening there is a host-level concern, not this policy's.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
