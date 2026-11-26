@@ -1,5 +1,5 @@
 FROM golang:1.27.4-bookworm AS forge
-ARG ASSAY_FORGE_COMMIT=cc1dde28aa8327f64169835b014000adf5d9737d
+ARG ASSAY_FORGE_COMMIT=273d62d941b34d8249a1e1889d838a3fc8e5010f
 RUN git init -q /assay \
     && git -C /assay fetch --depth=1 https://github.com/medici-finance/assay.git "$ASSAY_FORGE_COMMIT" \
     && test "$(git -C /assay rev-parse FETCH_HEAD)" = "$ASSAY_FORGE_COMMIT" \
