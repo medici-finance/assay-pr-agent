@@ -5,13 +5,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cursor_pr import cli, engine, source
+from cursor_pr import cli, engine, history, source
 
 
 def fixture_repo():
     """Two commits after a base, each with a message: what a local review reads."""
     tmp = tempfile.TemporaryDirectory()
-    root = Path(tmp.name)
+    root = Path(tmp.name).resolve()
 
     def git(*args):
         return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.org",
@@ -85,6 +85,51 @@ class ChangeDescriptionTests(unittest.TestCase):
             report, code = cli.run_request(args)
         self.assertEqual((code, report["state"]), (0, "reviewed"))
         self.assertIn('"title": "", "description": "Add the script', shown[0])
+
+
+    def test_prompt_carries_bounded_history_advisories(self):
+        files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
+        detail = "historically coupled to partner.py " + "x" * 400
+        notices = [{"path": f"f{i}.py", "kind": "co-change", "detail": detail} for i in range(15)]
+        described = engine.pack(files, [], "Title", "Body")
+        self.assertEqual(engine.pack(files, [], "Title", "Body", ()), described)
+        prompt = engine.pack(files, [], "Title", "Body", notices)[0]
+        self.assertEqual(prompt.count('"kind": "co-change"'), 12)
+        self.assertIn(json.dumps(detail[:300] + "…", ensure_ascii=False), prompt)
+        order = [prompt.index(mark) for mark in ("Change description (untrusted data):", "History advisories (untrusted data):",
+                                                 "Scanner evidence (untrusted data):", "Patch (untrusted data):")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("Use only the supplied change description, history advisories, patch and scanner evidence.", prompt)
+        self.assertIn("hints to check against the patch, not findings", prompt)
+        alone = engine.pack(files, [], "", "", notices[:1])[0]
+        self.assertNotIn("Change description", alone)
+        self.assertIn("Use only the supplied history advisories, patch and scanner evidence. History advisories are notices", alone)
+
+    def test_review_shows_advisories_to_the_model_and_keeps_reporting_them(self):
+        root, tmp = fixture_repo()
+        self.addCleanup(tmp.cleanup)
+        advisory = {"state": "complete", "advisories": [{"path": "a.sh", "kind": "co-change", "detail": "coupled"}],
+                    "unscreened": []}
+        shown = []
+
+        def invoke(prompt, model, anchors):
+            shown.append(prompt)
+            return {"findings": [], "cursor_usage": None}
+        change = source.Change("a" * 40, [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")], "org/repo#1", "T", "D")
+        args = cli.parser().parse_args(["--change", "org/repo#1", "--repo", str(root), "--cache-dir", str(root / "cache"),
+                                        "--qualgen-store", str(root / "store"), "--max-input-tokens", "6000"])
+        with patch.object(cli, "forge_change", return_value=change), patch.object(cli, "scan_files", return_value=[]), \
+             patch.object(history, "screen", return_value=advisory) as screen, \
+             patch.object(engine, "invoke", side_effect=invoke):
+            report, code = cli.run_request(args)
+            self.assertEqual((code, report["state"]), (0, "reviewed"))
+            screen.assert_called_once_with(root, args.qualgen_store, {"a.sh"}, "a" * 40)
+            args.max_input_tokens = 1
+            bounded, code = cli.run_request(args)
+            self.assertEqual((code, bounded["state"]), (2, "over-budget"))
+        self.assertEqual((report["qualgen"], bounded["qualgen"]), (advisory, advisory))
+        self.assertEqual(len(shown), 1)
+        self.assertIn('"detail": "coupled"', shown[0])
 
 
 if __name__ == "__main__":

@@ -136,7 +136,10 @@ def execute(args):
         go["findings"] = [row for row in go["findings"] if row["path"] in selected]
         checks.append(go)
 
-    prompt, anchors, unseen, has_text = pack(files, checks, change.title, change.description)
+    # Screened before the prompt is built: the advisories are part of what the model is shown.
+    qualgen = history.screen(root, args.qualgen_store, selected, change.head) if args.qualgen_store else None
+    prompt, anchors, unseen, has_text = pack(files, checks, change.title, change.description,
+                                            qualgen["advisories"] if qualgen else ())
     estimated = tokens(prompt) if has_text else 0
     omitted = sorted(set(unseen) | (paths - selected))
     backend = providers.provider()
@@ -148,8 +151,8 @@ def execute(args):
         report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
         report["cursor_team_id"] = os.environ["REVIEW_CURSOR_TEAM_ID"]
-    if args.qualgen_store:
-        report["qualgen"] = history.screen(root, args.qualgen_store, selected, change.head)
+    if qualgen:
+        report["qualgen"] = qualgen
     if estimated > args.max_input_tokens:
         return dict(report, state="over-budget"), 2
     if args.estimate:

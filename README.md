@@ -272,7 +272,7 @@ Set `REVIEW_QUALGEN_INTERVAL_SECONDS` in Docker or enter the refresh interval du
 
 An authorized GitHub or GitLab `/review` runs `qualgen check` for the changed paths and adds its notices to the posted summary. A notice can identify a frequently co-changed file that is missing from the change. The summary identifies the mined commit and marks paths with insufficient history. Live reference notices are included only when the checkout is at the reviewed head. While the first snapshot is being built, the review reports that history is unavailable. The comment shows up to 20 entries; the JSON includes the full advisory list.
 
-Qualgen uses local CPU, disk and Git history. Its output goes directly into the summary, outside the Cursor prompt, token estimate and model cache key. An over-budget review or a model failure can still publish historical advisories.
+Qualgen uses local CPU, disk and Git history. Its advisories go into the review prompt as untrusted data, at most 12 entries with each detail cut at 300 characters, so they count toward the token estimate and are part of the model cache key. The model is told they are hints to check against the patch, not findings. The advisories are also added to the posted summary, and an estimate, an over-budget review or a model failure still reports them.
 
 ### GitHub Actions and GitLab CI
 
