@@ -66,6 +66,16 @@ def publish(address, head, report):
 # The longest a review started from the queue may run. Its waits have timeouts of their own. This is
 # for one that hangs anyway: it holds the poller's lock, and no poller starts until it is gone.
 QUEUED_REVIEW_SECONDS = 1800
+CLEANUP_SECONDS = 30
+
+
+def out_of_time(signum, frame):
+    # Unwinds like any exit: the command being waited on is killed and the temporary files go. The row
+    # is not settled and stays started, for the next poller. If the unwinding hangs as well, the
+    # second alarm ends the process outright.
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+    signal.alarm(CLEANUP_SECONDS)
+    raise SystemExit(f"cursor-review: still running after {QUEUED_REVIEW_SECONDS} seconds, giving up")
 
 
 def request_row(args):
@@ -266,7 +276,8 @@ def main():
         args.qualgen_store = args.qualgen_store.resolve()
     old = Path.cwd()
     if args.request:
-        signal.alarm(QUEUED_REVIEW_SECONDS)  # Ends the process. Its row stays started, for the next poller.
+        signal.signal(signal.SIGALRM, out_of_time)
+        signal.alarm(QUEUED_REVIEW_SECONDS)
     try:
         with ExitStack() as stack:
             state = state_dir().resolve()
@@ -319,6 +330,7 @@ def main():
         return 2
     finally:
         signal.alarm(0)
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
         os.chdir(old)
 
 

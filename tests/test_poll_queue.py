@@ -379,10 +379,12 @@ class RequestRowTests(unittest.TestCase):
         self.assertEqual(self.row()[0], "reviewed")  # Not a failed review.
 
     def test_review_settles_its_row_before_its_cleanup_can_fail(self):
+        state = self.state  # A directory of the test's own, so nothing lands in the shared temporary one.
+
         class Stuck:
             # The settings directory of the review, which cannot be removed afterwards.
             def __enter__(self):
-                return tempfile.gettempdir()
+                return str(state)
 
             def __exit__(self, *raised):
                 raise OSError("Directory not empty")
@@ -405,20 +407,53 @@ class RequestRowTests(unittest.TestCase):
         self.assertEqual((code, err), (2, "cursor-review: --queue and --request go together and require --change\n"))
         self.assertEqual(self.row()[0], "started")
 
-    def test_queued_review_that_hangs_ends_itself_and_leaves_its_row_running(self):
-        hung = """import sys, time
+    def hang(self, review, cleanup_seconds=30):
+        # The review child as the poller starts it, with a time limit of one second and a review that
+        # waits on a command for a minute. The command says when it is running and the review says
+        # when its cleanup ran.
+        hung = f"""import subprocess, sys, time
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch
 from cursor_pr import cli
+state = Path({str(self.state)!r})
+@contextmanager
+def settings(**kwargs):
+    try:
+        yield str(state)
+    finally:
+        (state / "cleaned").touch()
+        {review}
+def wait(args):
+    subprocess.run([sys.executable, "-c", "import sys, time; open(sys.argv[1], 'w').close(); time.sleep(60)",
+                    str(state / "waiting")])
 sys.argv[0] = "cursor-review"
-with patch("cursor_pr.cli.QUEUED_REVIEW_SECONDS", 1), patch("cursor_pr.cli.run_request", side_effect=lambda args: time.sleep(60)):
-    cli.main()
+with patch("cursor_pr.cli.QUEUED_REVIEW_SECONDS", 1), patch("cursor_pr.cli.CLEANUP_SECONDS", {cleanup_seconds}), \\
+        patch("cursor_pr.cli.tempfile.TemporaryDirectory", side_effect=settings), \\
+        patch("cursor_pr.cli.run_request", side_effect=wait):
+    sys.exit(cli.main())
 """
+        started = time.monotonic()
         ended = subprocess.run([sys.executable, "-c", hung, "--change", "acme/api#3", "--expected-change-url",
                                 "https://github.com/acme/api/pull/3", "--max-input-tokens", "6000", *self.options],
-                               capture_output=True, timeout=30,
+                               capture_output=True, text=True, timeout=30,
                                env=dict(os.environ, CURSOR_REVIEW_POLLER_CHILD="1", REVIEW_STATE_DIR=str(self.state)))
-        self.assertEqual(ended.returncode, -signal.SIGALRM, ended.stderr)
+        return ended, time.monotonic() - started
+
+    def test_queued_review_that_hangs_gives_up_cleans_up_and_leaves_its_row_running(self):
+        ended, took = self.hang("pass")
+        self.assertEqual(ended.returncode, 1, ended.stderr)
+        self.assertIn("cursor-review: still running after 1 seconds, giving up", ended.stderr)
+        self.assertLess(took, 20)  # The command it waited on for a minute was killed, not waited for.
+        self.assertTrue((self.state / "waiting").exists())
+        self.assertTrue((self.state / "cleaned").exists())
         self.assertEqual(self.row()[0], "started")  # For the next poller to queue again or give up on.
+
+    def test_queued_review_whose_cleanup_hangs_too_is_ended_outright(self):
+        ended, took = self.hang("time.sleep(60)", cleanup_seconds=1)
+        self.assertEqual(ended.returncode, -signal.SIGALRM, ended.stderr)
+        self.assertLess(took, 20)
+        self.assertEqual(self.row()[0], "started")
 
     def test_review_outside_the_queue_has_no_limit_of_its_own(self):
         with patch("cursor_pr.cli.signal.alarm") as alarm, patch("sys.stdout", new_callable=io.StringIO):
