@@ -73,3 +73,17 @@ kubectl exec -n pr-agent deploy/pr-agent -c setup -- touch /state/.reauth
 - The compose `sync` healthcheck is intentionally not a Kubernetes readiness
   probe: it would mark the pod not-ready before setup completes and block the
   setup Service.
+- The containers run with a read-only root filesystem and a 1Gi `emptyDir` on
+  `/tmp`. Everything that persists lives on the three PVCs.
+- `pr-agent-egress` is an egress-only NetworkPolicy: DNS on port 53 to any
+  destination (the kube-dns Service IP is cluster-specific, some CNIs evaluate
+  egress before Service DNAT and NodeLocal DNSCache uses a link-local node
+  address), plus the public internet, where the forge, model providers and
+  advisory databases live. Private ranges (RFC1918, CGNAT `100.64.0.0/10`,
+  link-local including cloud metadata) are blocked. If your forge, GitLab
+  instance or proxy is in one of them, drop it from `except`. NetworkPolicy
+  cannot restrict traffic from a pod to the node it runs on, so a private
+  service listening there is a host-level concern, not this policy's.
+  Ingress is not restricted, so `kubectl port-forward` works and you can expose
+  the setup port with your own Traefik `IngressRoute` (limit it to the Traefik
+  namespace).

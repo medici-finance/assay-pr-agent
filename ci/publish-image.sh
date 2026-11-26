@@ -31,7 +31,10 @@ docker build --platform linux/amd64 \
 test_archive=$(mktemp)
 trap 'rm -f "$test_archive"' EXIT
 tar -cf "$test_archive" -C tests .
-docker run -i --rm --platform linux/amd64 --network none --entrypoint sh "$image" \
+# Same posture as compose.yaml, so the suite runs against the hardened runtime.
+docker run -i --rm --platform linux/amd64 --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges:true --tmpfs /tmp:mode=1777,size=1g,exec \
+    --entrypoint sh "$image" \
     -ec 'mkdir -p /tmp/reviewer-tests && tar -xf - -C /tmp/reviewer-tests && python -m unittest discover -s /tmp/reviewer-tests -v' < "$test_archive"
 # shellcheck disable=SC2086  # aliases are space-separated registry tags
 for alias in $aliases; do

@@ -13,9 +13,10 @@ from unidiff.errors import UnidiffParseError
 import yaml
 
 from . import history, providers, scanners
+from .scanners import fence
 from .login import auth_mode, login_directory
-from .setup import locked, apply_saved_setup, load_provider_key, state_dir
-from .config import load_config, project_from
+from .setup import locked, apply_saved_setup, load_provider_key, max_input_tokens, state_dir
+from .config import DEFAULT_MAX_INPUT_TOKENS, load_config, project_from
 from .credentials import forge_credentials, standalone_requested
 from .artifacts import forge_go_report
 from .checks import go_report, scan_files, scanner
@@ -28,8 +29,10 @@ def publish(address, head, report):
     repo, number = address.rsplit("#", 1)
     label = providers.LABELS[report.get("provider", "cursor")]
     body = [f"{label} review of {head}", report["state"]]
+    # Paths come from the PR and titles/messages from the model: quote them as code
+    # so the reviewer identity never posts a Markdown link or @mention for an attacker.
     for issue in report["findings"]:
-        body.append(f"- {issue['path']}:{issue['line']} — {issue['title']}. {issue['message']}")
+        body.append(f"- {fence(issue['path'])}:{issue['line']} — {fence(issue['title'])}. {fence(issue['message'])}")
     if report["state"] == "over-budget":
         body.append(f"Skipped {label}. Estimated prompt {report['estimated_input_tokens']} tokens "
                     f"exceeds the limit of {report['max_input_tokens']}.")
@@ -39,15 +42,16 @@ def publish(address, head, report):
         body.append("No model findings in the reviewed scope.")
     for check in report["checks"]:
         if check["state"] != "complete":
-            body.append(f"- {check['tool']}: could not check {check.get('path') or check.get('reason', '')}")
+            body.append(f"- {check['tool']}: could not check {fence(check.get('path') or check.get('reason', ''))}")
         for item in check["findings"]:
-            body.append(f"- {item['path']}:{item['line']} — {item['rule']} {item.get('message', '')}")
+            detail = " ".join(part for part in (fence(item["rule"]), fence(item.get("message", ""))) if part)
+            body.append(f"- {fence(item['path'])}:{item['line']} — {detail}")
     if report.get("static_checks"):
         body.extend(["", *scanners.summary(report["static_checks"]), ""])
     if "qualgen" in report:
         body.extend(["", *history.summary(report["qualgen"]), ""])
     for path in report["omitted"]:
-        body.append(f"- Outside review coverage: {path}")
+        body.append(f"- Outside review coverage: {fence(path)}")
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
     with tempfile.NamedTemporaryFile("w", encoding="utf8") as tmp:
         # A finding may quote a multiline source fragment, including forge quick actions.
@@ -73,7 +77,8 @@ def parser():
     p.add_argument("--scanner-ci", type=json.loads, help="Per-tool trusted CI report settings for a forge change")
     p.add_argument("--qualgen-store", type=Path, help="Read the poller’s mined Qualgen history for this project")
     p.add_argument("--model", help="Explicit provider model (otherwise the CLI default)")
-    p.add_argument("--max-input-tokens", type=int, help="Preflight estimate limit (default 6000)")
+    p.add_argument("--max-input-tokens", type=int,
+                   help=f"Preflight estimate limit (default {DEFAULT_MAX_INPUT_TOKENS}, or the saved REVIEW_MAX_INPUT_TOKENS setting)")
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling the model")
     p.add_argument("--cache-dir", type=Path, default=Path(os.getenv("XDG_CACHE_HOME", Path.home()/".cache"))/"cursor-pr-review")
     p.add_argument("--post", action="store_true", help="Publish a head-bound summary using deskpost with --change")
@@ -209,7 +214,7 @@ def main():
             if not args.estimate and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
                 stack.enter_context(providers.cursor_account())
             if args.max_input_tokens is None:
-                args.max_input_tokens = int(os.getenv("REVIEW_MAX_INPUT_TOKENS", "6000"))
+                args.max_input_tokens = max_input_tokens(state)
             if args.model is None:
                 args.model = os.getenv("REVIEW_MODEL")
             if args.change and os.getenv("CURSOR_REVIEW_POLLER_CHILD") == "1" and os.getenv("REVIEW_MANAGED_PROJECT"):

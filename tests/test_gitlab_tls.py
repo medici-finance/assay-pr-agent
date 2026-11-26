@@ -89,6 +89,7 @@ authorityKeyIdentifier=keyid
                         with gitlab_tls.transport(site + "/api/v4", root) as env:
                             url = env["REVIEW_GITLAB_LOCAL_ORIGIN"] + "/gitlab"
                             local = ssl.create_default_context(cafile=env["REVIEW_GITLAB_LOCAL_CA"])
+                            self.assertEqual((root/"listener.pem").stat().st_mode & 0o777, 0o600)
                             code = httpx.get(url, verify=local).status_code
                             self.assertEqual(code, 503 if revoked else 200)
                         # Exercise the actual binaries' TLS and URL routing. A fixture HTTP response

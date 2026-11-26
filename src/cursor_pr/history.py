@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import time
 
+from .scanners import fence
 from .setup import locked
 from .source import valid_sha
 
@@ -150,10 +151,7 @@ def summary(result):
         return lines + ["No historical advisories for the selected files."]
     # Leave room in the forge comment for scanner and model findings.
     for row in rows[:20]:
-        # Quote paths and notice text as code so Markdown and mentions stay literal.
-        text = " ".join(row[2:].splitlines())[:500]
-        fence = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
-        lines.append(f"- {fence} {text} {fence}")
+        lines.append(f"- {fence(row[2:], 500)}")
     if len(rows) > 20:
         lines.append(f"{len(rows) - 20} additional Qualgen entries omitted from this comment.")
     return lines

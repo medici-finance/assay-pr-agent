@@ -216,6 +216,17 @@ def local(root, head, tool, path, cache, *, timeout=90):
         return result
 
 
+def fence(value, limit=None):
+    """Quote attacker-influenced text as code so Markdown and @mentions stay literal."""
+    text = " ".join(str(value).splitlines())
+    if limit:
+        text = text[:limit]
+    if not text:
+        return ""
+    marks = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
+    return f"{marks} {text} {marks}"
+
+
 def summary(checks):
     lines = ["Static checks"]
     findings = []
@@ -234,9 +245,7 @@ def summary(checks):
             incomplete = sum(c["state"] != "complete" for c in group)
             lines.append(f"- {tool}: {ci} CI, {len(group)-ci} local, {count} findings, {incomplete} incomplete.")
     for finding in findings[:30]:
-        value = " ".join(finding.splitlines())[:450]
-        fence = "`" * (1 + max((len(r) for r in re.findall(r"`+", value)), default=0))
-        lines.append(f"- {fence} {value} {fence}")
+        lines.append(f"- {fence(finding, 450)}")
     if len(findings) > 30:
         lines.append(f"{len(findings)-30} additional entries omitted.")
     return lines

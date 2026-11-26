@@ -37,9 +37,12 @@ class ReviewTest(unittest.TestCase):
             f"with open({str(self.calls)!r}, 'a') as f: f.write('call\\n')\n"
             f"print({json.dumps(envelope)!r})\n")
         self.shim.chmod(0o700)
-        env = patch.dict(os.environ, {"PATH":str(self.root)+os.pathsep+os.environ["PATH"],"GH_TOKEN":"fixture"})
+        env = patch.dict(os.environ, {"PATH":str(self.root)+os.pathsep+os.environ["PATH"],"GH_TOKEN":"fixture",
+                                      "REVIEW_STATE_DIR":str(self.root/"state")})
         env.start()
         self.addCleanup(env.stop)
+        # Tests exercise the saved and default budgets; a shell REVIEW_MAX_INPUT_TOKENS would win over both.
+        os.environ.pop("REVIEW_MAX_INPUT_TOKENS", None)
 
     def git(self, *args):
         return subprocess.check_output(["git","-c","user.name=Test","-c","user.email=test@example.org",
@@ -66,6 +69,26 @@ class ReviewTest(unittest.TestCase):
         self.assertTrue(self.check(*args)[1]["cache_hit"])
         self.assertFalse(self.check(*args, "--model", "another-model")[1]["cache_hit"])
         self.assertEqual(self.calls.read_text().splitlines(), ["call", "call"])
+
+    def test_budget_comes_from_saved_setup_unless_overridden(self):
+        bundle = self.root/"state/.review-setup-fixture"
+        bundle.mkdir(parents=True)
+        settings = bundle/"settings.json"
+        settings.write_text(json.dumps({"settings": {"REVIEW_MAX_INPUT_TOKENS": "1"}, "projects": [], "secrets": {}}))
+        (self.root/"state/setup").symlink_to(bundle.name)
+        args = ["--base", self.base]
+        self.assertEqual(self.check(*args)[1]["state"], "over-budget")
+        self.assertEqual(self.check(*args, "--max-input-tokens", "1000000", "--estimate")[1]["state"], "estimate")
+        with patch.dict(os.environ, {"REVIEW_MAX_INPUT_TOKENS": "1000000"}):
+            self.assertEqual(self.check(*args, "--estimate")[1]["state"], "estimate")
+        settings.write_text(json.dumps({"settings": {}, "projects": [], "secrets": {}}))
+        self.assertEqual(self.check(*args, "--estimate")[1]["max_input_tokens"], 6000)
+        settings.write_text(json.dumps({"settings": {"REVIEW_MAX_INPUT_TOKENS": "bad"}, "projects": [], "secrets": {}}))
+        out = io.StringIO()
+        with patch("sys.argv", ["cursor-review", "--repo", str(self.root), "--base", self.base]), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            self.assertEqual(cli.main(), 2)
+        self.assertIn("REVIEW_MAX_INPUT_TOKENS must be a positive integer", out.getvalue())
 
     def test_go_coverage_and_gate(self):
         report = self.root/"go.json"

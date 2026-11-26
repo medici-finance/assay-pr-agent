@@ -118,6 +118,33 @@ class InteractiveSetupTests(unittest.TestCase):
         self.assertEqual(os.environ["REVIEW_POLL_SECONDS"],"45")
         self.assertEqual(os.environ["REVIEW_MAX_INPUT_TOKENS"],"5000")
 
+    def test_max_input_tokens_prefers_env_then_saved_setup_then_default(self):
+        from cursor_pr import config
+        self.assertEqual(config.DEFAULT_MAX_INPUT_TOKENS, 6000)
+        self.assertEqual(setup.max_input_tokens(self.state), 6000)
+        self.configure(self.project("gitlab")+["owner:13","","5000","","","","api-key","paste","paste"],["ck","pat"])
+        self.assertEqual(setup.max_input_tokens(self.state), 5000)
+        path = self.state/"setup/settings.json"
+        document = json.loads(path.read_text())
+        for saved, expected in (("7000", 7000), (8000, 8000), (None, 6000), ("bad", None), (0, None), ("6_000", None)):
+            document["settings"]["REVIEW_MAX_INPUT_TOKENS"] = saved
+            path.write_text(json.dumps(document))
+            if expected is None:
+                with self.assertRaisesRegex(ValueError, "REVIEW_MAX_INPUT_TOKENS must be a positive integer"):
+                    setup.max_input_tokens(self.state)
+            else:
+                self.assertEqual(setup.max_input_tokens(self.state), expected)
+        document["settings"].pop("REVIEW_MAX_INPUT_TOKENS")
+        path.write_text(json.dumps(document))
+        self.assertEqual(setup.max_input_tokens(self.state), 6000)
+        for legacy, expected in (("9000", 9000), ("6_000", 6000), ("+6000", 6000), ("bad", None), ("-6000", None), ("6.0", None)):
+            os.environ["REVIEW_MAX_INPUT_TOKENS"] = legacy
+            if expected is None:
+                with self.assertRaisesRegex(ValueError, "REVIEW_MAX_INPUT_TOKENS must be a positive integer"):
+                    setup.max_input_tokens(self.state)
+            else:
+                self.assertEqual(setup.max_input_tokens(self.state), expected)
+
     def test_saved_pat_stays_on_its_configured_host(self):
         self.configure(self.project("gitlab")+["owner:13","","","","","","api-key","paste","paste"],["ck","pat"])
         rows = json.loads((self.state/"setup/settings.json").read_text())["projects"]

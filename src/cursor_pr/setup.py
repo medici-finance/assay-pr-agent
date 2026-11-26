@@ -15,7 +15,7 @@ import uuid
 
 from . import accounts, dialog, providers, provision, gitlab_tls
 from .login import auth_mode, ensure_session, login_directory, login_env
-from .config import parse_projects, project_base, prompt_config
+from .config import DEFAULT_MAX_INPUT_TOKENS, parse_projects, project_base, prompt_config
 from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secret, validate_pem, validate_token
 
 CURSOR = "CURSOR_API_KEY"
@@ -121,6 +121,31 @@ def apply_saved_setup(state, *, sync_only=False):
             values[name] = path.read_text().strip()
         for k, v in values.items():
             os.environ.setdefault(k, v)
+
+
+def max_input_tokens(state):
+    """Effective prompt budget: container environment, then saved setup, then the default.
+
+    Environment values keep the int() syntax the CLI has always accepted, such as
+    "6_000" or "+6000"; the saved setting is written by the wizard as plain digits.
+    """
+    value = os.environ.get("REVIEW_MAX_INPUT_TOKENS")
+    saved = value is None and (state / "setup").is_symlink()
+    if saved:
+        with locked(state, fcntl.LOCK_SH):
+            settings = json.loads((active_bundle(state) / "settings.json").read_text())["settings"]
+        value = settings.get("REVIEW_MAX_INPUT_TOKENS")
+    if value is None:
+        return DEFAULT_MAX_INPUT_TOKENS
+    if isinstance(value, str):
+        value = value.strip()
+        try:
+            value = int(value) if not saved or (value.isascii() and value.isdecimal()) else None
+        except ValueError:
+            value = None
+    if type(value) is not int or value < 1:
+        raise ValueError("REVIEW_MAX_INPUT_TOKENS must be a positive integer")
+    return value
 
 
 def ask(label, default=""):
@@ -300,13 +325,14 @@ def configure_locked(state, force_login):
     if "github" in forges and "github" not in create:
         setting(APP_ID, "GitHub App ID", number)
         setting(INSTALL_ID, "GitHub App installation ID", number)
-    defaults = {"REVIEW_POLL_SECONDS": "120", "REVIEW_MAX_INPUT_TOKENS": "6000",
+    default_limit = str(DEFAULT_MAX_INPUT_TOKENS)
+    defaults = {"REVIEW_POLL_SECONDS": "120", "REVIEW_MAX_INPUT_TOKENS": default_limit,
                 "REVIEW_QUALGEN_INTERVAL_SECONDS": "86400"}
-    if session and not old and ask("Use recommended settings (2-minute polling, 6,000 input tokens, daily history refresh)? (y/n)", "y").lower() in ("y", "yes"):
+    if session and not old and ask(f"Use recommended settings (2-minute polling, {DEFAULT_MAX_INPUT_TOKENS:,} input tokens, daily history refresh)? (y/n)", "y").lower() in ("y", "yes"):
         settings.update(defaults)
     else:
         setting("REVIEW_POLL_SECONDS", "Seconds between polls", number, "120")
-        setting("REVIEW_MAX_INPUT_TOKENS", "Maximum estimated input tokens per review", number, "6000")
+        setting("REVIEW_MAX_INPUT_TOKENS", "Maximum estimated input tokens per review", number, default_limit)
         setting("REVIEW_QUALGEN_INTERVAL_SECONDS", "Seconds between Qualgen history refreshes (0 disables)",
                 lambda value: "0" if value == "0" else number(value), "86400")
     backend = retry(lambda: providers.provider(ask("Review provider (cursor/claude/codex)", previous.get("REVIEW_PROVIDER", "cursor"))))
