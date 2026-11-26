@@ -120,7 +120,7 @@ class ReviewTest(unittest.TestCase):
         from cursor_pr.config import project_from
         project = project_from(dict(provider=provider, url=f"https://{provider}.com/org/repo",
                                     checkout=str(self.root), requester_ids=[1]))
-        files = {"complete": True, "changedFiles": 1, "files": [{
+        files = {"headSha": self.head, "complete": True, "changedFiles": 1, "files": [{
             "filename": "example.sh", "patchAbsent": False, "status": "added",
             "patch": "@@ -0,0 +1,2 @@\n+#!/bin/sh\n+echo $argument\n"}]}
         detail = {"url": project.change_url(1), "headSha": self.head, "state": "open",
@@ -141,6 +141,19 @@ class ReviewTest(unittest.TestCase):
                 self.assertTrue(all(call.args[1] == project and call.kwargs["numbers"] == [1]
                                     for call in read.call_args_list))
                 self.assertEqual(post.call_args.args[:3], (project, 1, self.head))
+
+    def test_forge_read_rejects_missing_or_mismatched_file_head(self):
+        project, (first, files, last) = self.forge_fixture("github")
+        for file_head in ("b" * 40, None):
+            with self.subTest(file_head=file_head):
+                result = files.copy()
+                if file_head is None:
+                    del result["headSha"]
+                else:
+                    result["headSha"] = file_head
+                with patch.object(source, "run_forge", side_effect=[first, result, last]):
+                    with self.assertRaisesRegex(source.ReviewError, "Forge files do not match the reviewed head"):
+                        source.forge_change("org/repo#1", project=project)
 
     def test_failed_post_reports_reason(self):
         project, reads = self.forge_fixture("github")

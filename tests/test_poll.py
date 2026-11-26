@@ -171,7 +171,7 @@ if verb=="change":
     assert req["Numbers"]==[3]
     print(json.dumps(dict(url=os.environ["FIXTURE_CHANGE"],state="open",headSha="a"*40,changedFiles=1)))
 elif verb=="change-files":
-    print(json.dumps(dict(complete=True,changedFiles=1,files=[dict(filename="demo.py",
+    print(json.dumps(dict(headSha="a"*40,complete=True,changedFiles=1,files=[dict(filename="demo.py",
         patchAbsent=False,status="added",patch="@@ -0,0 +1 @@\\n+x=1\\n")])))
 else:
     assert verb=="comment"

@@ -156,8 +156,9 @@ def forge_change(address, expected_url=None, *, project=None):
     if not valid_sha(head):
         raise ReviewError("Forge did not identify the reviewed head")
     result = run_forge("change-files", project, numbers=numbers)
+    if result.get("headSha") != head:
+        raise ReviewError("Forge files do not match the reviewed head")
     last = run_forge("change", project, numbers=numbers)
-    # The file-list envelope has no revision. Bracket it with change observations.
     if any(first.get(k) != last.get(k) for k in ("headSha", "baseRef", "changedFiles", "url", "state")):
         raise ReviewError("Change moved during the forge read")
     rows = result.get("files")
