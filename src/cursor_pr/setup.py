@@ -124,17 +124,25 @@ def apply_saved_setup(state, *, sync_only=False):
 
 
 def max_input_tokens(state):
-    """Effective prompt budget: container environment, then saved setup, then the default."""
+    """Effective prompt budget: container environment, then saved setup, then the default.
+
+    Environment values keep the int() syntax the CLI has always accepted, such as
+    "6_000" or "+6000"; the saved setting is written by the wizard as plain digits.
+    """
     value = os.environ.get("REVIEW_MAX_INPUT_TOKENS")
-    if value is None and (state / "setup").is_symlink():
+    saved = value is None and (state / "setup").is_symlink()
+    if saved:
         with locked(state, fcntl.LOCK_SH):
-            saved = json.loads((active_bundle(state) / "settings.json").read_text())["settings"]
-        value = saved.get("REVIEW_MAX_INPUT_TOKENS")
+            settings = json.loads((active_bundle(state) / "settings.json").read_text())["settings"]
+        value = settings.get("REVIEW_MAX_INPUT_TOKENS")
     if value is None:
         return DEFAULT_MAX_INPUT_TOKENS
     if isinstance(value, str):
         value = value.strip()
-        value = int(value) if value.isascii() and value.isdecimal() else None
+        try:
+            value = int(value) if not saved or (value.isascii() and value.isdecimal()) else None
+        except ValueError:
+            value = None
     if type(value) is not int or value < 1:
         raise ValueError("REVIEW_MAX_INPUT_TOKENS must be a positive integer")
     return value

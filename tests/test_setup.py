@@ -137,11 +137,13 @@ class InteractiveSetupTests(unittest.TestCase):
         document["settings"].pop("REVIEW_MAX_INPUT_TOKENS")
         path.write_text(json.dumps(document))
         self.assertEqual(setup.max_input_tokens(self.state), 6000)
-        os.environ["REVIEW_MAX_INPUT_TOKENS"] = "9000"
-        self.assertEqual(setup.max_input_tokens(self.state), 9000)
-        os.environ["REVIEW_MAX_INPUT_TOKENS"] = "bad"
-        with self.assertRaisesRegex(ValueError, "REVIEW_MAX_INPUT_TOKENS must be a positive integer"):
-            setup.max_input_tokens(self.state)
+        for legacy, expected in (("9000", 9000), ("6_000", 6000), ("+6000", 6000), ("bad", None), ("-6000", None), ("6.0", None)):
+            os.environ["REVIEW_MAX_INPUT_TOKENS"] = legacy
+            if expected is None:
+                with self.assertRaisesRegex(ValueError, "REVIEW_MAX_INPUT_TOKENS must be a positive integer"):
+                    setup.max_input_tokens(self.state)
+            else:
+                self.assertEqual(setup.max_input_tokens(self.state), expected)
 
     def test_saved_pat_stays_on_its_configured_host(self):
         self.configure(self.project("gitlab")+["owner:13","","","","","","api-key","paste","paste"],["ck","pat"])
