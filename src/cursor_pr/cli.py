@@ -19,7 +19,7 @@ from .setup import locked, apply_saved_setup, load_provider_key, max_input_token
 from .config import DEFAULT_MAX_INPUT_TOKENS, load_config, project_from
 from .credentials import forge_credentials
 from .artifacts import forge_go_report
-from .checks import go_report, scan_files, scanner
+from .checks import blob, go_report, scan_files, scanner
 from .sync import scan_checkout
 from .engine import CursorFailure, pack, review, tokens
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment
@@ -250,7 +250,7 @@ def main():
         print(json.dumps(report, ensure_ascii=True, indent=2))
         # The report reaches stdout even when the export cannot be written.
         if args.sarif:
-            sarif.write(args.sarif, report)
+            sarif.write(args.sarif, report, lambda path: blob(args.repo, report["head"], path))
         return status
     except (ReviewError, OSError, ValueError, TypeError, KeyError, AttributeError,
             UnidiffParseError, yaml.YAMLError, subprocess.TimeoutExpired) as err:
