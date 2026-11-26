@@ -136,5 +136,16 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertIn('"detail": "coupled"', shown[0])
 
 
+    def test_claims_are_checked_only_when_there_is_a_description(self):
+        files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
+        claims = ("Check the claims it makes about the patch and report each mismatch as a finding that cites patch lines: "
+                  "tests it says were added or updated that the patch does not add or change; behaviour it claims with no "
+                  "supporting change in the patch; changes unrelated to its stated purpose; stubbed or placeholder code "
+                  "(pass, TODO, NotImplementedError, an empty handler) presented as done.")
+        self.assertNotIn("Check the claims", engine.pack(files, [])[0])
+        self.assertIn(claims, engine.pack(files, [], title="Title", description="Body")[0])
+        self.assertLessEqual(engine.tokens(claims), 110)
+
+
 if __name__ == "__main__":
     unittest.main()
