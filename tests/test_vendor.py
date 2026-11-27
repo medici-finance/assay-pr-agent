@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -47,7 +48,7 @@ AWKWARD = {
     "context-only hunk": "@@ -1 +1 @@\n-a\n+b\n@@ -5,1 +5,1 @@\n c\n",
     "long and non-ASCII lines": "@@ -1,2 +1,2 @@\n é\n-ü\n+日本語" + "x" * 5000 + "\n",
 }
-RUBRIC = "adc57144b7939b3ab541151f779b3071a7a3b42c96b315171b7cdd726846096a"
+RUBRIC = "8fb7630655305a588873e8b804e04f96c5b06514ece8f47ae067303eed980fcf"
 
 
 def digest(text):
@@ -55,11 +56,46 @@ def digest(text):
 
 
 class VendoredTests(unittest.TestCase):
-    def test_the_rubric_is_what_pr_agent_renders_for_this_reviewer(self):
+    def test_the_rubric_is_pinned(self):
         instructions = engine.RUBRIC.replace("__MAX_FINDINGS__", str(engine.MAX_FINDINGS))
         self.assertEqual(hashlib.sha256(instructions.encode()).hexdigest(), RUBRIC)
         prompt = engine.pack([source.File("a.sh", "@@ -0,0 +1 @@\n+x\n", "added")], [])[0]
         self.assertTrue(prompt.startswith(instructions))
+
+    def test_the_rubric_asks_for_what_parse_answer_reads(self):
+        for field in ("class PRReview", "review: Review", "key_issues_to_review: List[KeyIssuesComponentLink]",
+                      "relevant_file: str", "issue_header: str", "issue_content: str", "start_line: int",
+                      "end_line: int", "relevant_code: str", "(0-__MAX_FINDINGS__ issues)", "a JSON object"):
+            self.assertIn(field, engine.RUBRIC)
+        # The answer is strict JSON with one list read back: nothing asks for YAML or fields that are discarded.
+        for gone in ("YAML", "yaml", "relevant_tests", "security_concerns", "ticket", "```"):
+            self.assertNotIn(gone, engine.RUBRIC)
+        # The format it describes is the format the patch is shown in.
+        for marker in ("`Change`", "`## File: '<path>'`", "`__new hunk__`", "`__old hunk__`"):
+            self.assertIn(marker, engine.RUBRIC)
+        shown = engine.section(source.File("a.py", "@@ -1 +1 @@\n-a\n+b\n", "modified"))[0]
+        for marker in ("Change ", "## File: 'a.py'", "@@ -1,1 +1,1 @@", "__new hunk__\n1 +b", "__old hunk__\n-a"):
+            self.assertIn(marker, shown)
+        # An answer in the shape the rubric describes is read back in full.
+        answer = {"review": {"key_issues_to_review": [{"relevant_file": "a.py", "issue_header": "Bug", "issue_content": "b",
+                                                       "start_line": 1, "end_line": 1, "relevant_code": "1 +b"}]}}
+        raw = json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": json.dumps(answer)})
+        found = engine.parse_answer(raw, {"a.py": engine.section(source.File("a.py", "@@ -1 +1 @@\n-a\n+b\n", "m"))[1]})
+        self.assertEqual([(f["path"], f["line"], f["evidence"]) for f in found["findings"]], [("a.py", 1, "verified")])
+
+    def test_a_changed_rubric_is_not_served_an_answer_cached_with_the_old_one(self):
+        files = [source.File("a.sh", "@@ -0,0 +1 @@\n+x\n", "added")]
+        answer = {"findings": [], "dropped": [], "model_usage": None}
+        with tempfile.TemporaryDirectory() as tmp, mock.dict(os.environ, {"REVIEW_PROVIDER": "cursor"}), \
+                mock.object(engine, "invoke", return_value=answer) as model:
+            prompt, anchors = engine.pack(files, [])[:2]
+            self.assertFalse(engine.review(prompt, None, anchors, Path(tmp), "s")[1])
+            self.assertTrue(engine.review(prompt, None, anchors, Path(tmp), "s")[1])
+            with mock.object(engine, "RUBRIC", engine.RUBRIC.replace("concise", "brief")):
+                prompt, anchors = engine.pack(files, [])[:2]
+                self.assertFalse(engine.review(prompt, None, anchors, Path(tmp), "s")[1])
+            self.assertEqual(model.call_count, 2)
+        self.assertNotIn("pr-agent", engine.RUBRIC_ID)
 
     def test_the_hunk_trimmer_matches_pr_agent(self):
         for sample, trimmed in zip(SAMPLES, TRIMMED):
