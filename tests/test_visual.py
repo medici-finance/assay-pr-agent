@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from cursor_pr import cli, discovery, engine, source, visual
+from cursor_pr import acknowledge, cli, context, discovery, engine, source, visual
 from cursor_pr.config import DEFAULT_VISUAL_MAX_INPUT_TOKENS, project_from
 from cursor_pr.poll import Jobs, cycle, run_review
 from test_hardening import outside_code_spans
@@ -90,6 +90,15 @@ class VisualTests(unittest.TestCase):
         with patch("sys.argv", argv), contextlib.redirect_stdout(out):
             code = cli.main()
         return code, json.loads(out.getvalue())
+
+    def test_a_wrong_findings_cap_is_not_a_visual_reviews_problem(self):
+        with patch.dict(os.environ, {"REVIEW_MAX_FINDINGS": "0"}):
+            code, report = self.check("--estimate")
+            self.assertEqual((code, report["state"]), (0, "estimate"))
+            # It is a review's: the same run without --visual stops on it and prints no report.
+            with self.assertRaises(json.JSONDecodeError), contextlib.redirect_stderr(io.StringIO()) as err:
+                self.check("--estimate", visual_mode=False)
+        self.assertIn("REVIEW_MAX_FINDINGS", err.getvalue())
 
     def prompts(self):
         return self.calls.read_text().split("\n\x00\n")[:-1] if self.calls.exists() else []
@@ -723,6 +732,44 @@ class VisualRequestTests(unittest.TestCase):
                 os.environ.pop(name, None)
             run_review(self.gh, 3, self.state, "visual")
         self.assertNotIn("--max-input-tokens", run.call_args.args[0])
+
+    def test_a_failed_visual_request_is_told_to_post_its_own_command_again(self):
+        jobs = Jobs(self.state)
+        posted = []
+        for comment, body in ((81, "/review"), (82, "/visual-review"), (83, "/review-max")):
+            jobs.enqueue(self.gh.key, 3, comment, acknowledge=True)
+            if discovery.COMMANDS[body] != "regular":
+                jobs.set_tier(self.gh.key, 3, comment, discovery.COMMANDS[body])
+            jobs.finish(jobs.next(), "failed")
+        ack = acknowledge.Acknowledgement(jobs, self.state)
+        with patch.object(acknowledge, "run_forge", return_value=dict(headSha="a" * 40)), \
+                patch.object(acknowledge, "remove"), \
+                patch.object(acknowledge, "post_comment", side_effect=lambda *args: posted.append(args[3])):
+            for comment in (81, 82, 83):
+                ack.finished(self.gh, 3, comment, "failed")
+        self.assertEqual([re.findall(r"`(/[\w-]+)`", text) for text in posted],
+                         [["/review"] * 2, ["/visual-review"] * 2, ["/review-max"] * 2])
+
+    def test_a_visual_report_is_not_posted_as_the_review_check(self):
+        report = {"provider": "cursor", "state": "reviewed", "head": "a" * 40, "omitted": [], "checks": [], "findings": [],
+                  "cursor_invocations": 1, "cursor_usage": None, "map": {}}
+        args = cli.parser().parse_args(["--change", "acme/app#3", "--visual", "--forge-status"])
+        with patch.object(cli, "execute", return_value=(report, 0)), patch.object(cli.forge_status, "post") as post, \
+                patch.dict(os.environ, {"REVIEW_FORGE_STATUS": "1"}):
+            result, code = cli.run_request(args)
+        post.assert_not_called()  # It would replace a review's findings, or pass for a review that never ran.
+        self.assertEqual((result["forge_status"], code), ("skipped", 0))
+
+    def test_a_later_max_review_does_not_read_the_command_or_the_visual_comment_as_conversation(self):
+        notes = [dict(body="/visual-review"), dict(body="Cursor visual review of " + "a" * 40 + "\nreviewed\n\n```\nmap\n```"),
+                 dict(body="Please look at the retry path.")]
+        self.assertEqual(context.earlier_comments(notes), "## Comment 1\nPlease look at the retry path.")
+
+    def test_visual_writes_no_sarif(self):
+        for options in (["--sarif", "out.sarif"],):
+            args = cli.parser().parse_args(["--base", "HEAD", "--visual", "--max-input-tokens", "100", *options])
+            with self.assertRaisesRegex(source.ReviewError, "nothing to write with --sarif"):
+                cli.execute(args)
 
     def test_visual_takes_no_tier_and_no_findings_cap(self):
         for options in (["--tier", "mid"], ["--max-findings", "3"]):

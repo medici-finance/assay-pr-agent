@@ -617,6 +617,8 @@ def execute_review(args, verification_resources):
         raise ReviewError("--queue and --request go together and require --change")
     if args.visual and (args.tier != "regular" or args.max_findings is not None):
         raise ReviewError("--visual has no tiers and reports no findings: it takes neither --tier nor --max-findings")
+    if args.visual and args.sarif:
+        raise ReviewError("--visual reports no findings, so there is nothing to write with --sarif")
     root = args.repo.resolve()
     if args.expected_change_url and not args.change:
         raise ReviewError("--expected-change-url requires --change")
@@ -642,7 +644,8 @@ def execute_review(args, verification_resources):
             report, code = json.loads(prepared)
             return report, code
 
-    caps = max_findings(state_dir().resolve(), tier=args.tier, override=args.max_findings)
+    # A visual review reports no findings, so a cap that is set wrongly is not its problem.
+    caps = {} if args.visual else max_findings(state_dir().resolve(), tier=args.tier, override=args.max_findings)
     paths = {f.path for f in change.files}
     selected = set(args.path) if args.path else paths
     if not selected <= paths:
@@ -946,7 +949,9 @@ def run_request(args):
         except (ReviewError, OSError, ValueError, subprocess.TimeoutExpired) as err:
             return dict(report, publication="failed", publication_error=str(err) or type(err).__name__), 2
         report["publication"] = "posted-or-already-present"
-    report["forge_status"] = forge_status.outcome(args, report)
+    # The check says how a review for defects ended, and a visual review is none: posted under the
+    # same name it would replace that review's findings, or pass for one that never ran.
+    report["forge_status"] = "skipped" if "map" in report else forge_status.outcome(args, report)
     return report, code
 
 
