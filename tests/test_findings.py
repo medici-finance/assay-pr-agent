@@ -100,9 +100,37 @@ class DroppedSummaryTests(unittest.TestCase):
              patch.object(engine, "invoke", return_value=parsed), \
              patch.object(cli, "post_comment", side_effect=lambda *args: posts.append(args[3])):
             report, code = cli.run_request(args)
-        self.assertEqual((code, report["state"], report["findings"], report["dropped"]), (0, "reviewed", [], parsed["dropped"]))
+        self.assertEqual((code, report["state"], report["findings"], report["dropped"]), (2, "findings-dropped", [], parsed["dropped"]))
         self.assertIn("Dropped 1 model finding: cited line outside the reviewed patch.", posts[0])
         self.assertNotIn("No model findings in the reviewed scope.", posts[0])
+        self.assertIn("findings-dropped", posts[0])
+
+    def run_with(self, parsed, files=None, scan=()):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        args = cli.parser().parse_args(["--repo", tmp.name, "--cache-dir", str(Path(tmp.name) / "cache"),
+                                        "--change", "org/repo#1", "--max-input-tokens", "6000"])
+        files = files or [source.File("a.py", "@@ -0,0 +1,2 @@\n+x = 1\n+y = 2\n", "added")]
+        with patch.object(cli, "forge_change", return_value=source.Change("a" * 40, files, "org/repo#1")), \
+             patch.object(cli, "scan_files", return_value=list(scan)), patch.object(engine, "invoke", return_value=parsed):
+            return cli.run_request(args)
+
+    def test_all_dropped_outranks_incomplete_coverage(self):
+        parsed = {"findings": [], "dropped": [{"path": "a.py", "line": 9, "reason": "malformed finding"}], "cursor_usage": None}
+        check = {"tool": "osv", "path": "go.mod", "state": "could-not-check", "findings": []}
+        report, code = self.run_with(parsed, scan=[check])
+        self.assertEqual((code, report["state"]), (2, "findings-dropped"))
+
+    def test_some_dropped_or_none_returned_keeps_the_usual_state(self):
+        kept = {"path": "a.py", "line": 1, "end_line": 1, "title": "T", "message": "M"}
+        for parsed, state in (({"findings": [kept], "dropped": [{"path": "a.py", "line": 9, "reason": "malformed finding"}],
+                                "cursor_usage": None}, "reviewed"),
+                              ({"findings": [], "dropped": [], "cursor_usage": None}, "reviewed"),
+                              ({"findings": [], "cursor_usage": None}, "reviewed")):
+            with self.subTest(parsed=parsed):
+                report, code = self.run_with(parsed)
+                self.assertEqual((code, report["state"]), (0, state))
+
 
 PATCH = ["def total(items):", "    total = 0", "    for item in items:", "        total += item", "    return total"]
 
@@ -140,6 +168,37 @@ class QuotedEvidenceTests(unittest.TestCase):
                 else:
                     self.assertEqual(parsed["findings"], [])
                     self.assertEqual(parsed["dropped"], [{"path": "a.py", "line": start, "reason": expected}])
+
+    def test_a_quote_must_account_for_every_cited_line(self):
+        cases = (("    return total", 4, 5, "unverified"),
+                 ("        total += item", 3, 5, "unverified"),
+                 ("    for item in items:\n    return total", 3, 5, "unverified"),
+                 ("    for item in items:\n...", 3, 5, "verified"),
+                 ("...\n    return total", 3, 5, "verified"),
+                 ("    for item in items:\n        total += item\n    return total", 3, 5, "verified"))
+        for quote, start, end, expected in cases:
+            with self.subTest(quote=quote):
+                parsed = self.parse(dict(issue(start=start, end=end), relevant_code=quote))
+                self.assertEqual(([f["evidence"] for f in parsed["findings"]], parsed["dropped"]), ([expected], []))
+
+    def test_blank_cited_lines_need_no_quote(self):
+        anchors = shown("first = 1", "", "second = 2")
+        parsed = engine.parse_answer(envelope([dict(issue(start=1, end=3), relevant_code="first = 1\nsecond = 2")]), anchors)
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_a_quote_of_only_trivial_lines_is_unverified_not_dropped(self):
+        anchors = shown("call(", "    x", ")", "}", "return x", "x = 1", "});")
+        cases = (("x", 2, 2, "unverified"), (")", 3, 3, "unverified"), ("}", 4, 4, "unverified"),
+                 ("});", 7, 7, "unverified"), ("3 +)\n4 +}", 3, 4, "unverified"), ("...\n}", 1, 4, "unverified"),
+                 ("return x", 5, 5, "verified"), ("x = 1", 6, 6, "verified"), ("return x\nx = 1\n});", 5, 7, "verified"),
+                 ("call(\n...\n}", 1, 4, "verified"))
+        for quote, start, end, expected in cases:
+            with self.subTest(quote=quote):
+                parsed = engine.parse_answer(envelope([dict(issue(start=start, end=end), relevant_code=quote)]), anchors)
+                self.assertEqual(([f["evidence"] for f in parsed["findings"]], parsed["dropped"]), ([expected], []))
+        # A short quote that is not on the cited lines still contradicts them.
+        wrong = engine.parse_answer(envelope([dict(issue(start=4, end=4), relevant_code=")")]), anchors)
+        self.assertEqual(wrong["dropped"][0]["reason"], "quoted code does not match the cited lines")
 
     def test_raw_numbers_plus_signs_and_literal_whitespace_stay_significant(self):
         anchors = shown("+value", "1 + 2", 'return "a  b"', 'value = "one\u2028two"', "offset,")

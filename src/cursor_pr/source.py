@@ -6,7 +6,7 @@ import json
 import os
 from .credentials import SECRET_INPUTS, private_file, validate_token
 from .providers import KEYS
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import re
 import select
@@ -154,6 +154,43 @@ class File:
     @property
     def patch_unavailable(self):
         return self.absent and not self.known_no_text and self.status not in ("removed", "deleted", "D")
+
+
+# Names that are almost always binary: the only signal left when the head blob cannot be read.
+BINARY_NAME = re.compile(r".*\.(?:png|jpe?g|gif|bmp|ico|icns|webp|tiff?|psd|pdf|zip|gz|tgz|bz2|xz|zst|7z|rar|jar|war|"
+                         r"class|so|dylib|dll|exe|o|a|lib|wasm|pyc|woff2?|ttf|otf|eot|mp[34]|m4a|mov|avi|mkv|webm|ogg|"
+                         r"wav|flac|sqlite3?|db|bin|dat|pkl|npy|parquet|keystore|p12)", re.I | re.S)
+
+
+def without_text(root, head, file):
+    """Whether a file the forge served without a patch has no text to review, so its absence loses nothing.
+
+    The forge does not say why a patch is missing, so this asks Git. A pure rename has nothing to review.
+    An empty head blob, or one with a NUL byte in its first 8000 bytes (Git's own binary test), has no
+    text. A readable text blob does, so its missing patch is lost coverage. When the head blob cannot be
+    read, only a binary file name counts as no text.
+    """
+    if file.status in ("renamed", "R"):
+        return True
+    spec = f"{head}:{file.path}"
+    try:
+        git(root, "cat-file", "-e", spec)
+    except (ReviewError, OSError, subprocess.SubprocessError):
+        return bool(BINARY_NAME.fullmatch(file.path))
+    try:
+        with subprocess.Popen(["git", "--literal-pathspecs", "-C", str(root), "cat-file", "blob", spec],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=child_env()) as proc:
+            start = proc.stdout.read(8000)
+            proc.kill()
+    except OSError:
+        return bool(BINARY_NAME.fullmatch(file.path))
+    return not start or b"\0" in start
+
+
+def classify_absent(root, head, files):
+    """Mark each file whose missing forge patch hides no text, so that only lost text counts as unavailable."""
+    return [replace(f, known_no_text=True) if f.patch_unavailable and without_text(root, head, f) else f
+            for f in files]
 
 
 @dataclass(frozen=True)
