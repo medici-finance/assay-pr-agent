@@ -29,6 +29,7 @@ USER = "https://gitlab.example/api/v4/user"
 MR = "https://gitlab.example/api/v4/projects/org%2Fproject/merge_requests/7"
 THREADS = MR + "/discussions"
 REVIEW = "https://api.github.com/repos/org/project/pulls/7/reviews"
+REVIEWS = REVIEW + "?page=1&per_page=100"
 LOG = "cursor_pr.inline"
 
 
@@ -50,7 +51,7 @@ def discussion(body, author=ME, kind="DiffNote"):
 
 
 def review(author, mark, commit=HEAD):
-    return {"authorLogin": "x", "authorId": author, "state": "COMMENTED", "commitId": commit, "body": mark}
+    return {"user": {"login": "x", "id": author, "type": "Bot"}, "state": "COMMENTED", "commit_id": commit, "body": mark}
 
 
 class InlineTests(unittest.TestCase):
@@ -69,27 +70,26 @@ class InlineTests(unittest.TestCase):
         self.requests, self.events = [], []
         self.head, self.comments, self.reviews, self.discussions = HEAD, [summary()], [], []
         self.mr, self.user = dict(diff_refs=REFS), {"id": ME, "username": "project_1_bot_x"}
+        self.review_pages = {}
         self.pages, self.refused, self.refuse_combined, self.status, self.error = {}, set(), False, 201, None
         client = httpx.Client
         transport = httpx.MockTransport(self.respond)
         self.start(patch.object(forge_status.httpx, "Client", side_effect=lambda **opts: client(transport=transport, **opts)))
-        # Both names are bound at import: `inline.read` calls its own, `source.desk` the one in source.
-        self.start(patch.object(inline, "run_desk", side_effect=self.desk))
-        self.start(patch.object(source, "run_desk", side_effect=self.desk))
-        # No desk tool may run for real, whatever a later change to the mocks.
-        self.start(patch("cursor_pr.source.subprocess.run", side_effect=AssertionError("a real desk tool was executed")))
+        self.start(patch.object(inline, "run_forge", side_effect=self.forge))
+        # No forge helper may run for real, whatever a later change to the mocks.
+        self.start(patch("cursor_pr.source.subprocess.run", side_effect=AssertionError("a real forge helper was executed")))
 
     def start(self, patcher):
         self.addCleanup(patcher.stop)
         return patcher.start()
 
-    def desk(self, argv, **kwargs):
-        self.assertEqual(argv, ["deskread", argv[1], "--change", ADDRESS])
-        kind = argv[1]
-        self.events.append("desk:" + kind)
-        payload = {"comments": self.comments, "reviews": self.reviews,
-                   "change": {"url": SITES["github"], "state": "OPEN", "headSha": self.head}}[kind]
-        return json.dumps({"schema": 1, "kind": kind, "items": [dict(repo=SLUG, number=7, **{kind: payload})], "partial": []}).encode()
+    def forge(self, verb, project, *, numbers=(), **kwargs):
+        self.assertEqual((project, list(numbers)), (self.project, [7]))
+        self.events.append("forge:" + verb)
+        if verb == "comments":
+            return {"items": [{"number": 7, "comments": self.comments}], "partial": []}
+        self.assertEqual(verb, "change")
+        return {"url": SITES["github"], "state": "open", "headSha": self.head}
 
     def respond(self, request):
         self.requests.append(request)
@@ -98,6 +98,10 @@ class InlineTests(unittest.TestCase):
             raise self.error
         if request.url.host == "api.github.com":
             self.assertEqual(request.headers["Authorization"], "Bearer fixture")
+            if request.method == "GET":
+                page = int(request.url.params["page"])
+                self.assertEqual(str(request.url), REVIEW + f"?page={page}&per_page=100")
+                return httpx.Response(200, json=self.review_pages.get(page, self.reviews if page == 1 else []))
             self.assertEqual((request.method, str(request.url)), ("POST", REVIEW))
             comments = json.loads(request.content)["comments"]
             refused = (self.refuse_combined and len(comments) > 1) or any(c["path"] in self.refused for c in comments)
@@ -121,8 +125,10 @@ class InlineTests(unittest.TestCase):
         change = source.Change(HEAD, [source.File("demo.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")], SITES[provider])
         args = cli.parser().parse_args(["--change", ADDRESS, "--repo", str(self.root), *options,
                                          "--cache-dir", str(cache or self.root / "cache"), "--max-input-tokens", "6000"])
+        self.project = object()
+        args.forge_project = self.project
         with patch.object(cli, "forge_change", return_value=change), \
-             patch.object(cli, "run_desk", side_effect=desk_error or (lambda argv: self.events.append("deskpost"))) as desk, \
+             patch.object(cli, "post_comment", side_effect=desk_error or (lambda *call: self.events.append("summary"))) as desk, \
              patch.object(engine, "invoke", return_value={"findings": findings, "cursor_usage": None}), \
              (patch.object(cli, "review", side_effect=model) if model else contextlib.nullcontext()):
             report, code = cli.run_request(args)
@@ -139,8 +145,8 @@ class InlineTests(unittest.TestCase):
         self.assertEqual(self.posted(), [{"commit_id": HEAD, "event": "COMMENT", "body": inline.marker(HEAD, rows), "comments": [
             dict(path="src/app.py", line=3, side="RIGHT", body="` Unchecked input `\n\n` Validate it. `"),
             dict(path="src/util.py", line=9, side="RIGHT", body="` Off by one `\n\n` Start at zero. `")]}])
-        # The summary goes through deskpost first, and the head is the last thing read before the write.
-        self.assertEqual(self.events, ["deskpost", "desk:comments", "desk:reviews", "desk:change", "http:POST " + REVIEW])
+        # The summary is posted first, and the head is the last thing read before the write.
+        self.assertEqual(self.events, ["summary", "forge:comments", "http:GET " + REVIEWS, "forge:change", "http:POST " + REVIEW])
         self.assertEqual((posts, self.lookup.call_args.args), (1, ("github", SLUG, self.root)))
         self.assertNotIn("fixture", json.dumps(report))
 
@@ -150,8 +156,8 @@ class InlineTests(unittest.TestCase):
         self.assertEqual(self.posted(), [dict(body=f"{body}\n\n{inline.marker(HEAD, [path, line, body])}", commit_id=HEAD,
                                               position={"position_type": "text", **REFS, "new_path": path, "old_path": path, "new_line": line})
                                          for path, line, body in inline.comments(report)[0]])
-        self.assertEqual(self.events, ["deskpost", "http:GET " + USER, "http:GET " + MR, "http:GET " + THREADS + "?page=1&per_page=100",
-                                      "desk:change", *(["http:POST " + THREADS] * 2)])
+        self.assertEqual(self.events, ["summary", "http:GET " + USER, "http:GET " + MR, "http:GET " + THREADS + "?page=1&per_page=100",
+                                      "forge:change", *(["http:POST " + THREADS] * 2)])
         self.assertEqual((posts, self.lookup.call_args.args), (1, ("gitlab", SLUG, self.root)))
 
     def test_the_reviewer_identity_is_the_newest_bot_summary_on_github_and_the_token_on_gitlab(self):
@@ -163,8 +169,8 @@ class InlineTests(unittest.TestCase):
         self.assertEqual(self.exercise("github", "--post", "--inline-comments")[0]["inline_publication"], "posted")
         self.reviews, self.requests = [review(99, mark)], []
         self.assertEqual(self.exercise("github", "--post", "--inline-comments")[0]["inline_publication"], "already-present")
-        # deskpost's audit lines may sit above or below the summary's first line.
-        self.comments, self.reviews, self.requests = [summary(author=99, ident=903, prefix="<!-- deskpost audit -->\n")], [], []
+        # Lines the publication adds may sit above or below the summary's first line.
+        self.comments, self.reviews, self.requests = [summary(author=99, ident=903, prefix="<!-- audit -->\n")], [], []
         self.assertEqual(self.exercise("github", "--post", "--inline-comments")[0]["inline_publication"], "posted")
         # On GitLab the token's own user is the reviewer, whoever posted before it.
         self.user = {"id": 77, "username": "project_1_bot_x"}
@@ -184,7 +190,7 @@ class InlineTests(unittest.TestCase):
         with self.assertNoLogs(LOG, level="WARNING"):
             report, code, posts = self.exercise("github", "--post", "--inline-comments")
         self.assertEqual((code, report["inline_publication"], report["publication"], posts), (0, "already-present", "posted-or-already-present", 1))
-        self.assertEqual((self.requests, self.events[-1]), ([], "desk:reviews"))
+        self.assertEqual(([r.method for r in self.requests], self.events[-1]), (["GET"], "http:GET " + REVIEWS))
 
     def test_a_repeat_of_the_reviewer_identical_findings_is_skipped_on_gitlab(self):
         rows, _ = inline.comments({"findings": FINDINGS})
@@ -219,14 +225,29 @@ class InlineTests(unittest.TestCase):
         self.assertIn("Too many discussions", logs.output[0])
         self.assertFalse(any(r.method == "POST" for r in self.requests))
 
+    def test_review_pages_are_read_to_the_end_or_the_run_stops(self):
+        self.exercise("github", "--post", "--inline-comments")
+        mark = self.posted()[0]["body"]
+        # A full page means there may be another: the earlier review of ours is on the second.
+        self.review_pages, self.requests = {1: [review(7, "other")] * 100, 2: [review(ME, mark)]}, []
+        report, *_ = self.exercise("github", "--post", "--inline-comments")
+        self.assertEqual((report["inline_publication"], [str(r.url) for r in self.requests]),
+                         ("already-present", [REVIEW + "?page=1&per_page=100", REVIEW + "?page=2&per_page=100"]))
+        self.review_pages, self.requests = dict.fromkeys(range(1, 24), [review(7, "other")] * 100), []
+        with self.assertLogs(LOG, level="WARNING") as logs:
+            report, *_ = self.exercise("github", "--post", "--inline-comments")
+        self.assertEqual(report["inline_publication"], "failed")
+        self.assertIn("Too many reviews", logs.output[0])
+        self.assertFalse(any(r.method == "POST" for r in self.requests))
+
     def test_a_moved_head_refuses_to_post(self):
         self.head = "b" * 40
         with self.assertLogs(LOG, level="WARNING") as logs:
             report, code, posts = self.exercise("github", "--post", "--inline-comments")
         self.assertEqual((code, report["inline_publication"], report["publication"], posts), (0, "stale", "posted-or-already-present", 1))
-        self.assertEqual((self.requests, logs.output), ([], [
+        self.assertEqual(([str(r.url) for r in self.requests], logs.output), ([REVIEWS], [
             "WARNING:cursor_pr.inline:Inline comments for org/project#7 were not posted (the change moved on since the review)"]))
-        # GitLab learns the head from the merge request's diff refs and, last, from the same deskread.
+        # GitLab learns the head from the merge request's diff refs and, last, from the same forge read.
         for merge_request, head, reads in ((REFS | {"head_sha": "b" * 40}, HEAD, [USER, MR]),
                                            (REFS | {"start_sha": None}, HEAD, [USER, MR]),
                                            (REFS, "b" * 40, [USER, MR, THREADS + "?page=1&per_page=100"])):
@@ -285,14 +306,14 @@ class InlineTests(unittest.TestCase):
             parsed = cli.parser().parse_args(args)
             self.assertEqual(inline.outcome(parsed, {"publication": "posted-or-already-present"}), {"inline_publication": "skipped"})
         self.assertEqual(self.requests, [])
-        self.assertFalse([e for e in self.events if e != "deskpost"])
+        self.assertFalse([e for e in self.events if e != "summary"])
         with patch.dict(os.environ, {"REVIEW_INLINE_COMMENTS": "1"}):
             self.assertEqual(self.exercise("github", "--post")[0]["inline_publication"], "posted")
             self.assertEqual(self.exercise("github", "--estimate")[0]["inline_publication"], "skipped")
         # A separate cache, or the earlier answer with two findings would be reused.
         report, code, _ = self.exercise("github", "--post", "--inline-comments", findings=[], cache=self.root / "empty-cache")
         self.assertEqual((code, report["inline_publication"], report["findings"]), (0, "skipped", []))
-        report, code, posts = self.exercise("github", "--post", "--inline-comments", desk_error=source.ReviewError("deskpost comment exited 1"))
+        report, code, posts = self.exercise("github", "--post", "--inline-comments", desk_error=source.ReviewError("pr-agent-forge comment exited 1"))
         self.assertEqual((code, report["publication"], posts), (2, "failed", 1))
         self.assertNotIn("inline_publication", report)
 
@@ -337,7 +358,7 @@ class InlineTests(unittest.TestCase):
         self.status, self.requests = 302, []
         with self.assertLogs(LOG, level="WARNING"):
             report, *_ = self.exercise("github", "--post", "--inline-comments")
-        self.assertEqual((report["inline_publication"], len(self.requests)), ("failed", 1))
+        self.assertEqual((report["inline_publication"], [r.method for r in self.requests]), ("failed", ["GET", "POST"]))
 
     def test_the_poller_child_inherits_the_environment_variable(self):
         from cursor_pr.config import project_from
