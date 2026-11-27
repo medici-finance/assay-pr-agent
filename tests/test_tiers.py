@@ -119,7 +119,7 @@ class TierTests(unittest.TestCase):
         self.assertEqual(self.prompts(), [])
 
     def test_regular_review_is_one_call_with_main_prompt_and_commit_context(self):
-        self.answers(review=answer(finding(42, "Real")))
+        self.answers(review=answer(dict(finding(42, "Real"), verification_status="unverified")))
         code, report = self.check()
         change = cli.local_change(self.root, "main", self.head)
         files = sorted(change.files, key=lambda f: f.path)
@@ -127,9 +127,12 @@ class TierTests(unittest.TestCase):
                              commit_messages=True)[0]
         self.assertEqual(self.prompts(), [["review", prompt]])
         self.assertIn("observable behavior on base and head", prompt)
-        self.assertIn("Set verification_status to 'unverified'", prompt)
+        finding_schema = prompt.split("class KeyIssuesComponentLink(BaseModel):", 1)[1].split("class Review(BaseModel):", 1)[0]
+        self.assertIn('verification_status: Literal["unverified"] | None', finding_schema)
         self.assertEqual((code, report["state"], report["tier"], report["delivered"]), (0, "reviewed", "regular", "regular"))
         self.assertEqual(report["verification"], {"state": "not-needed"})
+        self.assertEqual(report["findings"][0]["verification_status"], "unverified")
+        self.assertIn("Unverified Real", cli.finding_line(report["findings"][0]))
 
     def test_mid_adds_context_to_the_plain_prompt_and_verifies_the_findings(self):
         self.answers(verification=verified_answer(dict(finding(42, "Real"), verification_status="confirmed")))

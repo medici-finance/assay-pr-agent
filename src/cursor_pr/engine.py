@@ -131,6 +131,14 @@ def pack(files, checks, skip=frozenset(), title="", description="", *,
         num_max_findings=max_findings,
         diff_hunk_format="New hunks are numbered at the head; old hunks show the former code.",
     )
+    # Extend the finding schema in the pinned PR-Agent prompt.
+    review_model = "\n\nclass Review(BaseModel):"
+    instructions = instructions.replace(
+        review_model,
+        '\n    verification_status: Literal["unverified"] | None = None  # Set when attribution evidence is incomplete.'
+        + review_model,
+        1,
+    )
     patches = render_sections(files).items() if rendered is None else ((f.path, rendered[f.path]) for f in files)
     sections, anchors, omitted = [], {}, []
     for path, (text, lines) in patches:
@@ -163,7 +171,6 @@ def pack(files, checks, skip=frozenset(), title="", description="", *,
               "the patch, not findings, and a finding still has to cite head lines present in the shown hunks." if notices else "")
     prompt = (instructions + "\nUse only the supplied " + sources + "." + about + " Do not use tools. "
               "For code findings, state the trigger, observable behavior on base and head, and the causal change. "
-              "Set verification_status to 'unverified' for incomplete evidence. "
               "A scanner baseline_match can have new reachability or impact. "
               "Serialize the YAML review as strict JSON (a YAML subset). Return one JSON object, "
               "without prose or fences. Example for no findings: "
