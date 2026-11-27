@@ -18,14 +18,14 @@ import httpx
 from unidiff.errors import UnidiffParseError
 import yaml
 
-from . import context, drift, engine, history, providers, scanners
+from . import context, drift, engine, history, providers, sarif, scanners
 from .scanners import fence
 from .login import auth_mode, login_directory
 from .setup import locked, apply_saved_setup, load_provider_key, max_findings, max_input_tokens, state_dir
 from .config import DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, FINDINGS_SETTINGS, MAX_FINDINGS_LIMIT, load_config, project_from
 from .credentials import forge_credentials
 from .artifacts import forge_go_report
-from .checks import go_report, scan_files
+from .checks import blob, go_report, scan_files
 from .sync import scan_checkout
 from .discovery import context_comments
 from .engine import (MAX_FINDINGS, CursorFailure, merge_findings, pack, prompt_advisories, rank, render_sections,
@@ -547,6 +547,7 @@ def parser():
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling the model")
     p.add_argument("--cache-dir", type=Path, default=Path(os.getenv("XDG_CACHE_HOME", Path.home()/".cache"))/"cursor-pr-review")
     p.add_argument("--post", action="store_true", help="Publish a head-bound summary with --change")
+    p.add_argument("--sarif", type=Path, help="Also write the findings as a SARIF 2.1.0 log at this path")
     return p
 
 
@@ -597,7 +598,10 @@ def execute(args):
             number = args.change.rsplit("#", 1)[1]
             if args.expected_change_url != project.change_url(number):
                 raise ReviewError("Managed checkout and reviewed project differ")
-            checkout = stack.enter_context(scan_checkout(root, project, number, change.head))
+            resources = getattr(args, "sarif_resources", stack)
+            checkout = resources.enter_context(scan_checkout(root, project, number, change.head))
+            if resources is not stack:
+                args.sarif_checkout = checkout
         checks = scan_files(checkout, change.head, files)
         deadline = time.monotonic() + 180
         for tool, path in missing:
@@ -898,10 +902,18 @@ def main():
             from pr_agent.algo.git_patch_processing import to_hunk_only_patch  # noqa: F401
             from pr_agent.algo.token_handler import TokenEncoder  # noqa: F401
             os.chdir(args.repo)
+            if args.sarif:
+                args.sarif_resources = stack
             report, status = run_request(args)
             if args.request:
                 # At once, before the cleanup or the report can fail.
                 settle(args, review_outcome(report))
+            if args.sarif:
+                # Print the report first, then export while the reviewed checkout is still available.
+                print(json.dumps(report, ensure_ascii=True, indent=2), flush=True)
+                checkout = getattr(args, "sarif_checkout", args.repo)
+                sarif.write(old / args.sarif, report, lambda path: blob(checkout, report["head"], path))
+                return status
         print(json.dumps(report, ensure_ascii=True, indent=2), flush=True)
         return status
     except (ReviewError, OSError, ValueError, TypeError, KeyError, AttributeError,
