@@ -22,7 +22,7 @@ def to_hunk_only_patch(patch_str: str) -> str:
     return patch_str[first.start():] if first else ""
 
 
-def _text(value):
+def one_line(value):
     """One line of the change as shown: its line ending removed, other line breaks shown as a space."""
     return value.removesuffix("\n").removesuffix("\r").translate(_BREAKS)
 
@@ -35,16 +35,16 @@ def numbered(name, hunks):
     ``__old hunk__`` with the base side unnumbered (``-`` removed, a space unchanged). Every line of
     the change is shown with a marker or a number in front, so none can look like these markers.
     """
-    out = [f"\n\n## File: '{_text(name.strip())}'\n"]
+    out = [f"\n\n## File: '{one_line(name.strip())}'\n"]
     for hunk in hunks:
         # Content lines only: unidiff also keeps "\ No newline at end of file" and trailing blank lines.
         lines = [line for line in hunk if line.line_type in ("+", "-", " ")]
-        section = _text(hunk.section_header).strip()
+        section = one_line(hunk.section_header).strip()
         out.append(f"\n@@ -{hunk.source_start},{hunk.source_length} +{hunk.target_start},{hunk.target_length} @@"
                    + (" " + section if section else "") + "\n__new hunk__\n")
-        out += [f"{line.target_line_no} {line.line_type}{_text(line.value)}\n"
+        out += [f"{line.target_line_no} {line.line_type}{one_line(line.value)}\n"
                 for line in lines if line.target_line_no is not None]
         if any(line.is_removed for line in lines):
             out.append("__old hunk__\n")
-            out += [f"{line.line_type}{_text(line.value)}\n" for line in lines if line.source_line_no is not None]
+            out += [f"{line.line_type}{one_line(line.value)}\n" for line in lines if line.source_line_no is not None]
     return "".join(out).rstrip("\n")

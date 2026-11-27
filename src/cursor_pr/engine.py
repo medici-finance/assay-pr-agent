@@ -17,7 +17,7 @@ from .source import ReviewError
 from .login import auth_mode, login_directory, login_env
 from .setup import state_dir
 from .providers import KEYS, LABELS, provider
-from .vendor.patch import numbered
+from .vendor.patch import numbered, one_line
 from .vendor.tokens import encoding
 
 VERSION = "1"
@@ -56,7 +56,7 @@ def section(f):
     if not anchors:
         return None, anchors
     # The text is built from the same parsed hunks, so every line it numbers is an anchor and the reverse.
-    return f"Change {f.status} {f.previous}\n{numbered(f.path, parsed)}", anchors
+    return f"Change {one_line(f.status)} {one_line(f.previous)}\n{numbered(f.path, parsed)}", anchors
 
 
 def pack(files, checks, skip=frozenset(), title="", description="", advisories=(), scoped=False):
@@ -68,7 +68,8 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
     instructions = RUBRIC.replace("__MAX_FINDINGS__", str(MAX_FINDINGS))
     sections, anchors, no_text = [], {}, []
     for f in files:
-        if not f.path or any(ord(c) < 32 for c in f.path) or f.path in anchors:
+        # The former path of a rename is shown too, so it is held to the same rule.
+        if not f.path or any(ord(c) < 32 for c in f.path + f.previous) or f.path in anchors:
             raise ReviewError("Invalid or duplicate forge filename")
         text, anchors[f.path] = section(f)
         # Deleted, binary, or a patch the forge did not serve: there was no text to review.
