@@ -67,49 +67,59 @@ QUEUED_REVIEW_SECONDS = 1800
 CLEANUP_SECONDS = 30
 
 
-# Waits outside the review's interpreter, on a pipe only the review holds. The pipe closing means the
-# review has ended, however it did. Still open at the hard limit, the review is ended from here.
-# It ends the review's whole process group: a command the review was waiting on would otherwise outlive
-# it, with no limit of its own and perhaps with the pipe the poller reads the report from.
+# The review closes the pipe with no message if it dies. The watchdog ends the review group on
+# that EOF or at the deadline, so an unfinished command cannot run beside a recovered review.
 WATCHDOG = """import os, select, signal, sys
-if not select.select([0], [], [], float(sys.argv[1]))[0]:
+if not select.select([0], [], [], float(sys.argv[1]))[0] or not os.read(0, 1):
     try:
         os.killpg(int(sys.argv[2]), signal.SIGKILL)
-    except OSError:
-        os.kill(int(sys.argv[2]), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 """
+
+class ReviewTimeout(SystemExit):
+    pass
 
 
 def out_of_time(signum, frame):
     # Unwinds like any exit: the command being waited on is killed and the temporary files go. The row
     # is not settled and stays started, for the next poller.
-    raise SystemExit(f"cursor-review: still running after {QUEUED_REVIEW_SECONDS} seconds, giving up")
+    raise ReviewTimeout(f"cursor-review: still running after {QUEUED_REVIEW_SECONDS} seconds, giving up")
 
 
 @contextmanager
 def time_limit():
-    # Two stops. The alarm asks the review to unwind. The watchdog does not ask: it also ends a review
-    # stuck where no handler runs, in a native call or in its own cleanup. It gets none of the
-    # review's descriptors, so it never holds the poller's lock.
-    guard = subprocess.Popen([sys.executable, "-I", "-c", WATCHDOG, str(QUEUED_REVIEW_SECONDS + CLEANUP_SECONDS),
-                              str(os.getpid())], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
-    try:
-        # A group of the review's own from here on, which the commands it starts join. The watchdog
-        # was started before and stays outside it.
+    # The alarm lets the review unwind. The separate watchdog also handles a hard hang or
+    # death during a command, and keeps the state-volume lock until it signals the review group.
+    pid = os.getpid()
+    if os.getpgrp() != pid:
         os.setpgrp()
-    except OSError:
-        pass  # A session leader leads its group already.
-    signal.signal(signal.SIGALRM, out_of_time)
-    signal.alarm(QUEUED_REVIEW_SECONDS)
+    lock = os.environ.pop("CURSOR_REVIEW_LOCK_FD", None)
+    guard = subprocess.Popen([sys.executable, "-I", "-c", WATCHDOG, str(QUEUED_REVIEW_SECONDS + CLEANUP_SECONDS),
+                              str(pid)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True,
+                             pass_fds=(int(lock),) if lock is not None else ())
+    timed_out = False
     try:
-        yield
+        previous = signal.signal(signal.SIGALRM, out_of_time)
+        signal.alarm(QUEUED_REVIEW_SECONDS)
+        try:
+            yield
+        except ReviewTimeout as error:
+            timed_out = True
+            print(error, file=sys.stderr, flush=True)
+            raise
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
     finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, signal.SIG_DFL)
-        guard.kill()
-        guard.stdin.close()
-        guard.wait()
+        # Distinguish orderly unwinding from unexpected EOF when the review process dies.
+        try:
+            with guard.stdin as pipe:
+                if not timed_out:
+                    pipe.write(b"1")
+        finally:
+            guard.wait()
 
 
 def request_row(args):
@@ -129,7 +139,7 @@ def claim_head(args, head):
     try:
         with open_queue(args) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("""SELECT head FROM requests WHERE project=? AND number=? AND comment=?
+            row = db.execute("""SELECT head, prepared FROM requests WHERE project=? AND number=? AND comment=?
                 AND status='started'""", request_row(args)).fetchone()
             if row is None:
                 raise ReviewError("The queue has no running request for this review")
@@ -137,6 +147,18 @@ def claim_head(args, head):
                 raise ReviewError(f"Change is at {head}, not at {row[0]}, the head of its interrupted start")
             db.execute("UPDATE requests SET head=? WHERE project=? AND number=? AND comment=?",
                        (head, *request_row(args)))
+            return row[1]
+    except sqlite3.Error as err:
+        raise ReviewError(f"Review queue: {err}") from err
+
+
+def prepare_publication(args, report, code):
+    # A restart can retry the same publication without repeating a model call or changing its text.
+    try:
+        with open_queue(args) as db, db:
+            db.execute("""UPDATE requests SET prepared=? WHERE project=? AND number=? AND comment=?
+                AND status='started' AND head=? AND prepared IS NULL""",
+                       (json.dumps([report, code]), *request_row(args), report["head"]))
     except sqlite3.Error as err:
         raise ReviewError(f"Review queue: {err}") from err
 
@@ -149,7 +171,7 @@ def settle(args, status):
         return  # --request without --queue: that failure is the one being reported.
     try:
         with open_queue(args) as db, db:
-            db.execute("""UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?
+            db.execute("""UPDATE requests SET status=?, prepared=NULL WHERE project=? AND number=? AND comment=?
                 AND status='started'""", (status, *request_row(args)))
     except (sqlite3.Error, ValueError, OSError) as err:
         print(f"cursor-review: could not record how the review ended: {err}", file=sys.stderr)
@@ -204,7 +226,10 @@ def execute(args):
         change = local_change(root, base, head)
 
     if args.request:
-        claim_head(args, change.head)
+        prepared = claim_head(args, change.head)
+        if prepared is not None:
+            report, code = json.loads(prepared)
+            return report, code
 
     paths = {f.path for f in change.files}
     selected = set(args.path) if args.path else paths
@@ -283,6 +308,8 @@ def execute(args):
 
 def run_request(args):
     report, code = execute(args)
+    if args.request and args.post:
+        prepare_publication(args, report, code)
     backend = report["provider"]
     if backend != "cursor":
         report["model_invocations"] = report["cursor_invocations"]

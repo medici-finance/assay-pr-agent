@@ -49,6 +49,7 @@ class Jobs:
             db.execute("""CREATE TABLE IF NOT EXISTS requests (
                 project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,
                 status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, head TEXT NOT NULL DEFAULT '',
+                prepared TEXT,
                 PRIMARY KEY(project, number, comment))""")
             columns = {row[1] for row in db.execute("PRAGMA table_info(requests)")}
             if "attempts" not in columns:
@@ -60,6 +61,8 @@ class Jobs:
                 settled += [(row, "failed", UNRECORDED) for row in db.execute(
                     "SELECT project, number, comment FROM requests WHERE status='started'").fetchall()]
                 db.execute("UPDATE requests SET status='failed' WHERE status='started'")
+            if "prepared" not in columns:
+                db.execute("ALTER TABLE requests ADD COLUMN prepared TEXT")
             db.execute("""CREATE TABLE IF NOT EXISTS activations (
                 project TEXT PRIMARY KEY, since TEXT NOT NULL)""")
             # Only the process holding the instance lock opens the queue, and a review child holds
@@ -69,8 +72,8 @@ class Jobs:
             for *job, attempts in db.execute(
                     "SELECT project, number, comment, attempts FROM requests WHERE status='started'").fetchall():
                 settled.append((job, "failed", GIVEN_UP) if attempts >= 2 else (job, "queued", "queued again"))
-                db.execute("UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?",
-                           (settled[-1][1], *job))
+                db.execute("""UPDATE requests SET status=?, prepared=CASE WHEN ?='failed' THEN NULL ELSE prepared END
+                    WHERE project=? AND number=? AND comment=?""", (settled[-1][1], settled[-1][1], *job))
         for job, _, reason in settled:
             log.warning("Review of %s #%d comment %d was interrupted by a restart; %s", *job, reason)
 
@@ -100,7 +103,7 @@ class Jobs:
     def finish(self, job, status):
         with closing(sqlite3.connect(self.path)) as db, db:
             # The review child settles its own row. This is for a review that did not get that far.
-            db.execute("""UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?
+            db.execute("""UPDATE requests SET status=?, prepared=NULL WHERE project=? AND number=? AND comment=?
                 AND status='started'""", (status, *job))
             row = db.execute("SELECT status, attempts FROM requests WHERE project=? AND number=? AND comment=?",
                              job).fetchone()
@@ -130,6 +133,9 @@ def run_review(project, number, state, comment=None):
         argv.extend(["--queue", str(state / "requests.sqlite3"), "--request", project.key, str(number), str(comment)])
     env = dict(os.environ)
     env["CURSOR_REVIEW_POLLER_CHILD"] = "1"
+    env.pop("CURSOR_REVIEW_LOCK_FD", None)
+    if comment is not None and lock_fd is not None:
+        env["CURSOR_REVIEW_LOCK_FD"] = str(lock_fd)
     env["REVIEW_STATE_DIR"] = str(state)
     env["REVIEW_FORGE_PROJECT"] = json.dumps(dict(provider=project.provider, url=project.url,
         managed=project.managed, checkout=str(project.checkout), requester_ids=sorted(project.requesters),

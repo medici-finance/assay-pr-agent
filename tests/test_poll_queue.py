@@ -148,7 +148,7 @@ class QueueRestartTests(unittest.TestCase):
         jobs, logged = self.restart()
         self.assertEqual(logged, [f"Review of {self.gl.key} #4 comment 82 was interrupted by a restart; {self.UNRECORDED}"])
         self.assertEqual([row[1] for row in self.sql("PRAGMA table_info(requests)")],
-                         ["project", "number", "comment", "status", "attempts", "head"])
+                         ["project", "number", "comment", "status", "attempts", "head", "prepared"])
         self.assertEqual(self.sql("SELECT number, status, attempts, head FROM requests"),
                          [(3, "queued", 0, ""), (4, "failed", 0, "")])
         jobs.enqueue(self.gh.key, 5, 83)
@@ -327,6 +327,27 @@ class RequestRowTests(unittest.TestCase):
         self.assertEqual(self.row(), ("started", "b" * 40))
         self.assertEqual(self.review(*self.options)[0]["state"], "estimate")  # A repeat at the same head.
 
+    def test_retry_uses_the_same_prepared_report_without_reviewing_again(self):
+        head = "b" * 40
+        address = "acme/api#3"
+        url = "https://github.com/acme/api/pull/3"
+        args = cli.parser().parse_args(["--change", address, "--expected-change-url", url, "--post", *self.options])
+        args.max_input_tokens = 6000
+        with patch("cursor_pr.cli.forge_change", return_value=Change(head, [], url)), \
+                patch("cursor_pr.cli.publish") as publish:
+            first, code = cli.run_request(args)
+            self.assertEqual(code, 0)
+            # The forge accepted the report, but the review never settled its request row.
+            with self.assertLogs("cursor_pr.poll", level="WARNING"):
+                jobs = Jobs(self.state)
+            jobs.next()
+            with patch("cursor_pr.cli.pack", side_effect=AssertionError("review repeated")):
+                self.assertEqual(cli.run_request(args), (first, code))
+            self.assertEqual(publish.call_args_list[0], publish.call_args_list[1])
+        cli.settle(args, "reviewed")
+        with closing(sqlite3.connect(self.queue)) as db:
+            self.assertEqual(db.execute("SELECT status, prepared FROM requests").fetchone(), ("reviewed", None))
+
     def test_repeat_at_another_head_is_refused_and_leaves_the_row_as_it_was(self):
         cli.claim_head(child_of(self.state, (self.KEY, 3, 81)), "a" * 40)
         with self.assertRaises(ReviewError) as refused:
@@ -448,7 +469,7 @@ with patch("cursor_pr.cli.QUEUED_REVIEW_SECONDS", 1), patch("cursor_pr.cli.CLEAN
 
     def test_queued_review_that_hangs_gives_up_cleans_up_and_leaves_its_row_running(self):
         ended, took = self.hang("pass")
-        self.assertEqual(ended.returncode, 1, ended.stderr)
+        self.assertEqual(ended.returncode, -signal.SIGKILL, ended.stderr)
         self.assertIn("cursor-review: still running after 1 seconds, giving up", ended.stderr)
         self.assertLess(took, 20)  # The command it waited on for a minute was killed, not waited for.
         self.assertTrue((self.state / "waiting").exists())
@@ -485,16 +506,17 @@ with patch("cursor_pr.cli.QUEUED_REVIEW_SECONDS", 1), patch("cursor_pr.cli.CLEAN
         helper, group, review = map(int, (self.state / "helper").read_text().split())
         self.assertEqual(group, review)  # The command ran in the review's own group,
         self.assertNotEqual(group, os.getpgrp())  # which is not the one of whoever started the review.
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                os.kill(helper, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.1)
-        else:
-            os.kill(helper, signal.SIGKILL)
-            self.fail("The command outlived the review")
+        # The helper inherited the captured report pipe. Its EOF let the wait above finish
+        # before the helper's sleep ended, even on hosts that have not yet reaped the helper.
+
+    def test_watchdog_ends_commands_after_the_review_dies(self):
+        ended, took = self.hang("pass", waiting="""
+    import os, signal
+    subprocess.Popen([sys.executable, "-c", "import time; time.sleep(25)"])
+    os.kill(os.getpid(), signal.SIGKILL)""")
+        self.assertEqual(ended.returncode, -signal.SIGKILL, ended.stderr)
+        self.assertLess(took, 20)  # The command's inherited report pipe has closed.
+        self.assertEqual(self.row()[0], "started")
 
     def test_poller_does_not_wait_for_a_review_past_its_limits(self):
         from cursor_pr import poll
@@ -507,23 +529,17 @@ with patch("cursor_pr.cli.QUEUED_REVIEW_SECONDS", 1), patch("cursor_pr.cli.CLEAN
         self.assertEqual(run.call_args.kwargs["timeout"], poll.REVIEW_WAIT_SECONDS)
         self.assertIn("Review acme/api#3 did not end within", logged.output[0])
 
-    def test_watchdog_ends_with_the_review_and_never_holds_the_lock(self):
-        with patch("cursor_pr.cli.subprocess.Popen", wraps=subprocess.Popen) as started, \
+    def test_watchdog_inherits_only_the_poller_lock(self):
+        with (self.state / "lock").open("wb") as lock, \
+                patch.dict(os.environ, {"CURSOR_REVIEW_LOCK_FD": str(lock.fileno())}), \
+                patch("cursor_pr.cli.subprocess.Popen", wraps=subprocess.Popen) as started, \
                 patch("sys.stdout", new_callable=io.StringIO):
+            lock_fd = lock.fileno()
             self.enter(*self.options)
         self.assertEqual(started.call_count, 1)
-        self.assertNotIn("pass_fds", started.call_args.kwargs)  # Its descriptors are closed: no lock comes along.
-        self.assertFalse(started.call_args.kwargs.get("close_fds") is False)
+        self.assertEqual(started.call_args.kwargs["pass_fds"], (lock_fd,))
+        self.assertTrue(started.call_args.kwargs["start_new_session"])
         self.assertEqual(self.row()[0], "reviewed")
-
-    def test_watchdog_ends_when_its_review_is_killed(self):
-        review = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-        guard = subprocess.Popen([sys.executable, "-I", "-c", cli.WATCHDOG, "60", str(review.pid)], stdin=subprocess.PIPE)
-        guard.stdin.close()  # What the review's death does to the pipe.
-        self.assertEqual(guard.wait(timeout=20), 0)
-        self.assertIsNone(review.poll())  # Not ended by a watchdog whose review is gone already.
-        review.kill()
-        review.wait()
 
     def test_review_outside_the_queue_has_no_limit_of_its_own(self):
         with patch("cursor_pr.cli.signal.alarm") as alarm, patch("cursor_pr.cli.subprocess.Popen") as watchdog, \
