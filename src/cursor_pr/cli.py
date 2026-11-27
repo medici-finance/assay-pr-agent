@@ -14,7 +14,7 @@ import httpx
 from unidiff.errors import UnidiffParseError
 import yaml
 
-from . import context, drift, history, providers, scanners
+from . import context, drift, engine, history, providers, scanners
 from .scanners import fence
 from .login import auth_mode, login_directory
 from .setup import locked, apply_saved_setup, load_provider_key, max_input_tokens, state_dir
@@ -86,18 +86,19 @@ def with_context(files, checks, packed, estimated, dropped, limit, cap, names, r
 
 def run_pass(row, prompt, anchors, args, source, *, cap, timeout):
     """Run one pass and record billing data only for fresh provider calls."""
+    before = engine.started
     try:
         answer, cached = review(prompt, args.model, anchors, args.cache_dir, source, limit=cap, timeout=timeout)
     except CursorFailure as err:
-        row.update(state="failed", model_invocations=err.invocations)
-        if err.invocations and err.usage is not None:
+        row.update(state="failed", model_invocations=engine.started - before)
+        if row["model_invocations"] and err.usage is not None:
             row["model_usage"] = err.usage
         return None, str(err)
     except (ReviewError, OSError, ValueError, KeyError, TypeError, AttributeError,
             subprocess.TimeoutExpired, yaml.YAMLError) as err:
-        row.update(state="failed", model_invocations=None)
+        row.update(state="failed", model_invocations=engine.started - before)
         return None, str(err) if isinstance(err, ReviewError) else type(err).__name__
-    row.update(state="cached" if cached else "called", model_invocations=int(not cached))
+    row.update(state="cached" if cached else "called", model_invocations=engine.started - before)
     if not cached and answer.get("cursor_usage") is not None:
         row["model_usage"] = answer["cursor_usage"]
     return answer, None
@@ -363,10 +364,9 @@ def execute(args):
                     findings = kept(findings, verdict)
                     report["verification"] = {"state": "filtered", "before": before, "after": len(findings)}
                 break
-    calls = [row["model_invocations"] for row in passes]
     report.update(findings=findings[:CAPS[tier]], cursor_usage=total_usage(passes),
                   cache_hit=bool(passes) and all(row["state"] == "cached" for row in passes),
-                  cursor_invocations=None if None in calls else sum(calls))
+                  cursor_invocations=sum(row["model_invocations"] for row in passes))
     if has_text and not completed:
         return dict(report, state="model-unavailable", error=last_error), 2
     degraded = sorted(reviewable - coverage.keys())

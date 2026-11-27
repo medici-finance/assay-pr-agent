@@ -39,10 +39,13 @@ def rank(path):
     return 3
 
 
+# Provider CLI processes this process has started. A caller counts a pass's calls as the difference.
+started = 0
+
+
 class CursorFailure(ReviewError):
-    def __init__(self, message, invocations, usage=None):
+    def __init__(self, message, usage=None):
         super().__init__(message)
-        self.invocations = invocations
         self.usage = usage
 
 
@@ -188,11 +191,12 @@ def parse_answer(raw, anchors, limit=MAX_FINDINGS):
 
 
 def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120):
+    global started
     backend = provider()
     label = LABELS[backend]
     executable = (shutil.which("cursor-agent") or shutil.which("agent")) if backend == "cursor" else shutil.which(backend)
     if not executable:
-        raise CursorFailure(f"{label} CLI is not installed", 0)
+        raise CursorFailure(f"{label} CLI is not installed")
     # Retain login discovery, but keep unrelated forge and CI secrets out of the child.
     env = {k: os.environ[k] for k in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR",
            "XDG_CONFIG_HOME", KEYS[backend], "SSL_CERT_FILE", "HTTPS_PROXY", "NO_PROXY")
@@ -216,7 +220,7 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120):
             if use_login:
                 env = login_env(backend, login_directory(state_dir()))
             elif not env.get(KEYS[backend]):
-                raise CursorFailure(f"Set {KEYS[backend]} for {label}", 0)
+                raise CursorFailure(f"Set {KEYS[backend]} for {label}")
             if backend == "claude":
                 argv = [executable, "-p", "--safe-mode" if use_login else "--bare", "--output-format", "json", "--tools", "",
                         "--strict-mcp-config", "--no-session-persistence", "--max-turns", "1"]
@@ -235,12 +239,18 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120):
                 argv.append("-")
             # Every provider reads the prompt on standard input. As an argument it would be
             # limited to 128 KiB on Linux, which a deep review exceeds.
-            response = subprocess.run(argv, input=prompt.encode(),
-                                      cwd=workspace, env=env, capture_output=True, timeout=timeout)
+            # Count a started CLI; one that fails to start raises OSError and made no call.
+            try:
+                response = subprocess.run(argv, input=prompt.encode(),
+                                          cwd=workspace, env=env, capture_output=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                started += 1
+                raise
+            started += 1
             if not response.returncode and backend == "codex":
                 answer = Path(workspace, "answer")
                 if not answer.is_file() or answer.stat().st_size > 32768:
-                    raise CursorFailure("Codex did not return a bounded final message", 1)
+                    raise CursorFailure("Codex did not return a bounded final message")
                 try:
                     events = [json.loads(line) for line in response.stdout.splitlines() if line.strip()]
                     completed = [event for event in events if event.get("type") == "turn.completed"]
@@ -249,9 +259,9 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120):
                     response.stdout = json.dumps(dict(type="result", subtype="success", is_error=False,
                                                       result=answer.read_text(), usage=completed[0].get("usage")))
                 except (AttributeError, ValueError, OSError):
-                    raise CursorFailure("Codex did not return one completed review turn", 1) from None
+                    raise CursorFailure("Codex did not return one completed review turn") from None
         except subprocess.TimeoutExpired as err:
-            raise CursorFailure(f"{label} exceeded the {timeout}-second limit", 1) from err
+            raise CursorFailure(f"{label} exceeded the {timeout}-second limit") from err
     if response.returncode:
         diagnostic = (response.stderr + response.stdout).lower()
         reason = "check the CLI credentials and account access"
@@ -266,7 +276,7 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120):
             if any(marker in diagnostic for marker in markers):
                 reason = explanation
                 break
-        raise CursorFailure(f"{label} exited {response.returncode}: {reason}. No retry was made.", 1)
+        raise CursorFailure(f"{label} exited {response.returncode}: {reason}. No retry was made.")
     try:
         return parse_answer(response.stdout, anchors, limit)
     except (ReviewError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError) as err:
@@ -275,7 +285,7 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120):
         except (ValueError, AttributeError):
             usage = None
         raise CursorFailure(f"{label} returned an invalid review: " + type(err).__name__,
-                            1, usage if isinstance(usage, dict) else None) from err
+                            usage if isinstance(usage, dict) else None) from err
 
 
 def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout=120):

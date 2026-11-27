@@ -210,6 +210,21 @@ class TierTests(unittest.TestCase):
         self.assertEqual((code, report["state"], report["verification"]), (2, "degraded", {"state": "unavailable", "before": 2}))
         self.assertEqual(len(report["findings"]), 2)  # Unverified findings are kept and labelled.
 
+    def test_model_invocations_are_counted_not_inferred_from_the_error(self):
+        real = os.replace
+
+        def replace(source, target):
+            if Path(target).parent.name == "cache":
+                raise OSError("cache volume is full")
+            return real(source, target)
+        with patch.object(engine.os, "replace", side_effect=replace):
+            code, report = self.check()
+        self.assertEqual(len(self.prompts()), 1)  # The CLI ran; only storing its answer failed.
+        self.assertEqual((code, report["state"], report["model_invocations"]), (2, "model-unavailable", 1))
+        (self.bin / "cursor-agent").write_text("#!/nonexistent/interpreter\n")
+        code, report = self.check("--model", "other")
+        self.assertEqual((code, report["state"], report["model_invocations"]), (2, "model-unavailable", 0))
+
     def test_posted_comment_reports_the_tier_its_context_and_any_fallback(self):
         report = self.check("--tier", "max", "--estimate")[1]
         report.update(state="degraded", provider="cursor", delivered="mid",
