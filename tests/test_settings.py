@@ -128,6 +128,72 @@ class SettingsTests(unittest.TestCase):
         setup.apply_saved_setup(self.state)
         self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-codex")
 
+    def test_an_absolute_credential_path_through_the_old_bundle_survives_a_save(self):
+        for reference in ("active symlink", "bundle directory", "external symlink", "symlink chain"):
+            with self.subTest(reference=reference):
+                self.seed()
+                old = setup.active_bundle(self.state)
+                path = old / "codex.key"
+                (old / "codex.key").chmod(0o644)
+                if reference == "active symlink":
+                    path = self.state / "setup" / "codex.key"
+                elif reference == "external symlink":
+                    path = self.root / "credential-alias"
+                    path.symlink_to(old / "codex.key")
+                elif reference == "symlink chain":
+                    external = self.root / "actual-key"
+                    path.rename(external)
+                    path.symlink_to(external)
+                    alias = self.root / "chained-alias"
+                    alias.symlink_to(self.state / "setup" / "codex.key")
+                    path = alias
+                document = self.document()
+                document["secrets"]["CODEX_API_KEY"] = str(path)
+                (old / "settings.json").write_text(json.dumps(document))
+                with patch.dict(os.environ):
+                    setup.apply_saved_setup(self.state)
+                    self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-codex")
+                settings.save(self.state, {"name": "REVIEW_MAX_INPUT_TOKENS", "value": "8000"})
+                with patch.dict(os.environ):
+                    setup.apply_saved_setup(self.state)
+                    self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-codex")
+                self.assertEqual(self.document()["secrets"]["CODEX_API_KEY"], "codex.key")
+                self.assertEqual((setup.active_bundle(self.state) / "codex.key").stat().st_mode & 0o777, 0o600)
+                self.assertFalse(old.exists())
+
+    def test_an_absolute_mount_path_through_the_stable_link_keeps_reading_the_mount(self):
+        self.seed()
+        external = self.state / "mounted.key"
+        external.write_text("fixture-mounted")
+        reference = self.state / "setup" / ".." / external.name
+        document = self.document()
+        document["secrets"]["CODEX_API_KEY"] = str(reference)
+        (setup.active_bundle(self.state) / "settings.json").write_text(json.dumps(document))
+        settings.save(self.state, {"name": "REVIEW_POLL_SECONDS", "value": "60"})
+        self.assertEqual(self.document()["secrets"]["CODEX_API_KEY"], str(reference))
+        external.write_text("fixture-rotated")
+        setup.apply_saved_setup(self.state)
+        self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-rotated")
+
+    def test_an_unreadable_bundle_credential_leaves_the_active_setup_intact(self):
+        self.seed()
+        old = setup.active_bundle(self.state)
+        credential = old / "codex.key"
+        credential.unlink()
+        mount = self.root / "reviewer-only-mount"
+        credential.symlink_to(mount)
+        document = self.document()
+        document["secrets"]["CODEX_API_KEY"] = str(credential)
+        (old / "settings.json").write_text(json.dumps(document))
+        with self.assertRaisesRegex(ValueError, "Could not preserve the configured CODEX_API_KEY"):
+            settings.save(self.state, {"name": "REVIEW_POLL_SECONDS", "value": "60"})
+        self.assertEqual(setup.active_bundle(self.state), old)
+        self.assertEqual(self.document(), document)
+        self.assertEqual(list(self.state.glob(".review-setup-*")), [old])
+        mount.write_text("fixture-mounted")
+        setup.apply_saved_setup(self.state)
+        self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-mounted")
+
     def test_invalid_values_keep_the_active_setup(self):
         self.seed()
         link = (self.state / "setup").readlink()
@@ -349,13 +415,49 @@ class SettingsTests(unittest.TestCase):
                 settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": ""})
         profile = "a" * 32
         self.seed(values={**SAVED, "REVIEW_PROVIDER": "cursor", "REVIEW_AUTH_MODE": "login", "REVIEW_LOGIN_PROFILE": profile})
-        with patch.object(providers, "team_command", return_value={"teams": teams}) as command:
+        with patch.object(providers, "team_command", return_value={"teams": teams}) as command, \
+                patch.object(settings.tempfile, "TemporaryDirectory", side_effect=PermissionError("no writable temp")):
             settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "1"})
             self.assertEqual([c.args[0] for c in command.call_args_list], [["list"]])
             # The live sign-in profile is listed, never switched.
             self.assertTrue(command.call_args.args[2].is_relative_to(self.state / "provider-login"))
         self.assertEqual(self.document()["settings"]["REVIEW_LOGIN_PROFILE"], profile)
         self.assertEqual(self.document()["settings"]["REVIEW_CURSOR_TEAM_ID"], "1")
+
+    def test_cursor_team_change_with_an_overriding_key_also_checks_the_saved_key(self):
+        team_seven = {"id": 7, "name": "Seven", "isSelectable": True}
+        team_eight = {"id": 8, "name": "Eight", "isSelectable": True}
+        env_key = self.root / "overriding-cursor-key"
+        env_key.write_text("another-key")
+        self.seed(values={**SAVED, "REVIEW_PROVIDER": "cursor", "REVIEW_CURSOR_TEAM_ID": "7"},
+                  secrets={setup.CURSOR: "working-key"})
+        old = setup.active_bundle(self.state)
+
+        def list_teams(args, key, _):
+            self.assertEqual(args, ["list"])
+            return {"teams": [team_seven] if key == "working-key" else [team_seven, team_eight]}
+
+        with patch.dict(os.environ, {setup.CURSOR + "_FILE": str(env_key)}), \
+                patch.object(providers, "team_command", side_effect=list_teams):
+            with self.assertRaisesRegex(ValueError, "saved Cursor account"):
+                settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "8"})
+            self.assertEqual(setup.active_bundle(self.state), old)
+            self.assertEqual(self.document()["settings"]["REVIEW_CURSOR_TEAM_ID"], "7")
+            settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "7"})
+        self.assertEqual(self.document()["settings"]["REVIEW_CURSOR_TEAM_ID"], "7")
+
+    def test_cursor_team_change_reports_a_saved_key_unavailable_in_setup(self):
+        teams = [{"id": number, "name": str(number), "isSelectable": True} for number in (7, 8)]
+        self.seed(values={**SAVED, "REVIEW_PROVIDER": "cursor", "REVIEW_CURSOR_TEAM_ID": "7"},
+                  secrets={setup.CURSOR: str(self.root / "reviewer-only-mount")})
+        old = setup.active_bundle(self.state)
+        with patch.dict(os.environ, {setup.CURSOR: "fixture-overriding-key"}), \
+                patch.object(providers, "team_command", return_value={"teams": teams}):
+            with self.assertRaisesRegex(ValueError, "saved Cursor key is unavailable"):
+                settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "8"})
+            self.assertEqual(setup.active_bundle(self.state), old)
+            settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "7"})
+        self.assertEqual(self.document()["settings"]["REVIEW_CURSOR_TEAM_ID"], "7")
 
     def test_usernames_resolve_for_the_operator_and_requesters(self):
         self.seed()
@@ -424,8 +526,26 @@ class SettingsTests(unittest.TestCase):
         with patch.object(providers, "select_team", return_value="8") as select, \
              patch.dict(os.environ, {"REVIEW_CURSOR_TEAM_ID": "8"}):
             settings.save(self.state, {"name": setup.CURSOR, "value": "replacement"})
-        self.assertEqual(select.call_args.args[:2], ("replacement", "8"))
+        self.assertEqual([call.args[:2] for call in select.call_args_list], [("replacement", "8"), ("replacement", "7")])
         self.assertEqual((setup.active_bundle(self.state) / "cursor.key").read_text().strip(), "replacement")
+
+    def test_cursor_key_change_with_an_overriding_team_also_checks_the_saved_team(self):
+        self.seed(values={**SAVED, "REVIEW_PROVIDER": "cursor", "REVIEW_CURSOR_TEAM_ID": "7"},
+                  secrets={setup.CURSOR: "working-key"})
+        old = setup.active_bundle(self.state)
+
+        def only_overriding_team_available(key, team, _):
+            self.assertEqual(key, "only-team-eight")
+            if team != "8":
+                raise ValueError("The selected team ID is not eligible for this Cursor account")
+            return team
+
+        with patch.dict(os.environ, {"REVIEW_CURSOR_TEAM_ID": "8"}), \
+                patch.object(providers, "select_team", side_effect=only_overriding_team_available):
+            with self.assertRaisesRegex(ValueError, "setup wizard"):
+                settings.save(self.state, {"name": setup.CURSOR, "value": "only-team-eight"})
+        self.assertEqual(setup.active_bundle(self.state), old)
+        self.assertEqual((old / "cursor.key").read_text().strip(), "working-key")
 
     def test_optional_gitlab_tls_files_can_be_replaced_and_removed(self):
         gitlab = dict(provider="gitlab", url="https://gitlab.com/org/repo", checkout=str(self.checkout), requester_ids=[13])
