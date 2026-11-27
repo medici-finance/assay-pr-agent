@@ -76,11 +76,12 @@ class VendoredTests(unittest.TestCase):
         shown = engine.section(source.File("a.py", "@@ -1 +1 @@\n-a\n+b\n", "modified"))[0]
         for marker in ("Change ", '## File: "a.py"', "@@ -1,1 +1,1 @@", "__new hunk__\n1 +b", "__old hunk__\n-a"):
             self.assertIn(marker, shown)
-        # An answer in the shape the rubric describes is read back in full.
+        # An answer in the shape the rubric describes is read back in full. A one-letter line is too
+        # trivial to verify a quote, so the line read back is real code.
         answer = {"review": {"key_issues_to_review": [{"relevant_file": "a.py", "issue_header": "Bug", "issue_content": "b",
-                                                       "start_line": 1, "end_line": 1, "relevant_code": "1 +b"}]}}
+                                                       "start_line": 1, "end_line": 1, "relevant_code": "1 +b = 1"}]}}
         raw = json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": json.dumps(answer)})
-        found = engine.parse_answer(raw, {"a.py": engine.section(source.File("a.py", "@@ -1 +1 @@\n-a\n+b\n", "m"))[1]})
+        found = engine.parse_answer(raw, {"a.py": engine.section(source.File("a.py", "@@ -1 +1 @@\n-a = 0\n+b = 1\n", "m"))[1]})
         self.assertEqual([(f["path"], f["line"], f["evidence"]) for f in found["findings"]], [("a.py", 1, "verified")])
 
     def test_a_changed_rubric_is_not_served_an_answer_cached_with_the_old_one(self):
