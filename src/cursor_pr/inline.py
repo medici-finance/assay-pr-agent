@@ -1,4 +1,6 @@
-"""Post model findings as inline comments on the reviewed head, outside the forge helper's publication checks."""
+"""Post optional inline comments on the reviewed head after a successful summary."""
+from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import logging
@@ -10,7 +12,8 @@ import httpx
 
 from . import forge_status, providers
 from .scanners import fence, safe_path
-from .source import ReviewError, run_forge
+from .setup import state_dir
+from .source import ReviewError, check_publication, run_forge
 
 log = logging.getLogger(__name__)
 PREFIX = "<!-- assay-pr-agent:inline:%s:"
@@ -23,6 +26,12 @@ SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 class Stale(ReviewError):
     """The change moved on since the review, so its lines may no longer be the same code."""
+
+
+@dataclass
+class Progress:
+    posted: int = 0
+    refused: int = 0
 
 
 def comments(value):
@@ -55,44 +64,35 @@ def carried(head, text):
     return {lines[2]}
 
 
-def thread(project, number):
-    """The change's comments through the forge helper, complete or not at all."""
-    data = run_forge("comments", project, numbers=[int(number)])
-    items = data.get("items") or []
-    if (data.get("partial") or len(items) != 1 or items[0].get("number") != int(number)
-            or not isinstance(items[0].get("comments"), list)):
-        raise ReviewError("Incomplete or mismatched change comment read")
-    return items[0]["comments"]
-
-
-def review_comments(client, headers, slug, number):
-    """Every review comment on the pull request, read to the end; an unread page could hide an earlier post."""
-    found, page = [], 1
-    while True:
-        response = client.get(f"https://api.github.com/repos/{slug}/pulls/{number}/comments",
-                              params={"page": page, "per_page": 100}, headers=headers)
+def github_comments(client, headers, endpoint):
+    """Read complete pages without trusting a server-supplied URL for the next request."""
+    for page in range(1, PAGES + 1):
+        response = client.get(endpoint, params={"page": page, "per_page": 100}, headers=headers)
         response.raise_for_status()
         rows = response.json()
         if not isinstance(rows, list):
-            raise ReviewError("Invalid pull request review comment list")
-        found += [r for r in rows if isinstance(r, dict)]
-        if len(rows) < 100:
-            return found
-        if page >= PAGES:
-            raise ReviewError("Too many review comments to check for earlier inline comments")
-        page += 1
+            raise ReviewError("Invalid GitHub comment list")
+        yield from (row for row in rows if isinstance(row, dict))
+        if len(rows) < 100 and "next" not in response.links:
+            return
+    raise ReviewError("Too many GitHub comments to check for earlier review publication")
 
 
-def reviewer(project, number, value):
-    """The account that posts this tool's summaries on GitHub: a bot, the author of the newest one."""
-    # An installation token cannot read its own identity, so the summary just posted stands in for it.
-    # Only a bot can match, and lines the publication adds may sit around the summary's first line.
-    first = f"{providers.LABELS[value.get('provider', 'cursor')]} review of {value['head']}"
-    ours = [c for c in thread(project, number) if isinstance(c, dict) and c.get("authorType") == "Bot"
-            and isinstance(c.get("body"), str) and first in c["body"].split("\n")]
-    if not ours or any(type(c.get(k)) is not int for c in ours for k in ("authorId", "databaseId")):
+def reviewer(client, headers, slug, number, value):
+    # GitHub identifies the App that actually posted a summary, independently of its comment text.
+    # The same configured App ID is used when the forge helper mints the installation token.
+    app_id = os.getenv("REVIEW_FORGE_APP_ID", "")
+    if not re.fullmatch(r"[1-9][0-9]*", app_id):
         raise ReviewError("Could not identify the reviewer identity on the change")
-    return max(ours, key=lambda c: c["databaseId"])["authorId"]
+    first = f"{providers.LABELS[value.get('provider', 'cursor')]} review of {value['head']}"
+    endpoint = f"https://api.github.com/repos/{slug}/issues/{number}/comments"
+    for row in github_comments(client, headers, endpoint):
+        integration, author = row.get("performed_via_github_app") or {}, row.get("user") or {}
+        if (integration.get("id") == int(app_id) and author.get("type") == "Bot"
+                and type(author.get("id")) is int and author["id"] > 0
+                and str(row.get("body") or "").split("\n", 1)[0] == first):
+            return author["id"]
+    raise ReviewError("Could not identify the reviewer identity on the change")
 
 
 def account(client, headers, base):
@@ -105,52 +105,61 @@ def account(client, headers, base):
     return me
 
 
-def unmoved(project, number, head):
-    # Read last, right before the first write: a comment on a moved head lands on the wrong line.
-    if run_forge("change", project, numbers=[int(number)]).get("headSha") != head:
+def authorize(project, number, head, rows, previous):
+    if run_forge("change", project, numbers=[number]).get("headSha") != head:
         raise Stale("the change moved on since the review")
+    checked = []
+    for path, line, body in rows:
+        old = previous.get(path) or path
+        if not safe_path(old):
+            raise ReviewError("Invalid previous path for an inline comment")
+        marked = f"{body}\n\n{marker(head, [path, line, body])}"
+        checked.extend((fence(path), fence(old), marked))
+    check_publication(project, number, head, "\n\n".join(checked))
 
 
-def github(client, headers, project, slug, number, rows, me, head):
-    """(posted, refused, already present) as one review on the reviewed head."""
+def github(client, headers, project, slug, number, rows, me, head, progress):
+    """Return whether all findings were already present, retaining each posting outcome."""
     # Each comment closes with its own marker, as on GitLab, so a later run with a different set of
     # findings, or one after a run that stopped partway, posts only what is not there yet.
-    found = set().union(*(carried(head, c.get("body")) for c in review_comments(client, headers, slug, number)
+    root = f"https://api.github.com/repos/{slug}/pulls/{number}"
+    found = set().union(*(carried(head, c.get("body")) for c in github_comments(client, headers, root + "/comments")
                           if (c.get("user") or {}).get("id") == me))
     rows = [row for row in rows if marker(head, row) not in found]
     if not rows:
-        return 0, 0, True
-    unmoved(project, number, head)
-    endpoint = f"https://api.github.com/repos/{slug}/pulls/{number}/reviews"
-    mark = marker(head, rows)
+        return True
+    authorize(project, number, head, rows, {})
+    endpoint = root + "/reviews"
 
     def submit(part):
         client.post(endpoint, headers=headers, json={
-            "commit_id": head, "event": "COMMENT", "body": mark,
+            "commit_id": head, "event": "COMMENT", "body": marker(head, part),
             "comments": [dict(path=path, line=line, side="RIGHT", body=f"{body}\n\n{marker(head, [path, line, body])}")
                          for path, line, body in part]}).raise_for_status()
 
     try:
         submit(rows)
-        return len(rows), 0, False
+        progress.posted += len(rows)
     except httpx.HTTPStatusError as error:
         if error.response.status_code != 422:
             raise
-    # GitHub takes or refuses a review whole, so one finding per review keeps a refused line to itself.
-    posted = refused = 0
-    for row in rows:
-        try:
-            submit([row])
-            posted += 1
-        except httpx.HTTPStatusError as error:
-            if error.response.status_code != 422:
-                raise
-            refused += 1
-    return posted, refused, False
+        if len(rows) == 1:
+            progress.refused += 1
+        else:
+            # The forge rejects a batch in full, so a singleton records only what it actually posted.
+            for row in rows:
+                try:
+                    submit([row])
+                    progress.posted += 1
+                except httpx.HTTPStatusError as refusal:
+                    if refusal.response.status_code != 422:
+                        raise
+                    progress.refused += 1
+    return False
 
 
-def gitlab(client, headers, project, base, slug, number, rows, me, head):
-    """(posted, refused, already present) as one discussion per finding on the reviewed head."""
+def gitlab(client, headers, project, base, slug, number, rows, me, head, previous, progress):
+    """Post pending findings as discussions, retaining each posting outcome."""
     root = f"{base}/projects/{quote(slug, safe='')}/merge_requests/{number}"
     response = client.get(root, headers=headers)
     response.raise_for_status()
@@ -176,41 +185,45 @@ def gitlab(client, headers, project, base, slug, number, rows, me, head):
         page += 1
     pending = [row for row in rows if marker(head, row) not in found]
     if not pending:
-        return 0, 0, True
-    unmoved(project, number, head)
-    posted = refused = 0
+        return True
+    authorize(project, number, head, pending, previous)
     for path, line, body in pending:
         try:
             client.post(root + "/discussions", headers=headers, json={
                 "body": f"{body}\n\n{marker(head, [path, line, body])}", "commit_id": head,
                 "position": {"position_type": "text", "base_sha": refs["base_sha"], "head_sha": head, "start_sha": refs["start_sha"],
-                             "new_path": path, "old_path": path, "new_line": line}}).raise_for_status()
+                             "new_path": path, "old_path": previous.get(path) or path, "new_line": line}}).raise_for_status()
         except httpx.HTTPStatusError as error:
             # Only the forge's own rejection of a position is that finding's problem alone.
             if error.response.status_code not in (400, 422):
                 raise
-            refused += 1
+            progress.refused += 1
         else:
-            posted += 1
-    return posted, refused, False
+            progress.posted += 1
+    return False
 
 
-def post(address, value, project, checkout):
-    """(outcome, posted, refused, left out). Raises on any read or transport failure."""
-    rows, left = comments(value)
-    head = value["head"]
-    if not rows:
-        return "skipped", 0, 0, left
+def post(address, value, project, state, rows, previous, progress):
+    head, url = value["head"], value["source"]
     if not isinstance(head, str) or not SHA.fullmatch(head):
         raise ReviewError("The reviewed head is not a commit SHA")
-    number = address.rsplit("#", 1)[1]
-    with forge_status.connection(address, value["source"], checkout) as (client, provider, slug, base, headers):
-        if provider == "github":
-            sent = github(client, headers, project, slug, number, rows, reviewer(project, number, value), head)
-        else:
-            sent = gitlab(client, headers, project, base, slug, number, rows, account(client, headers, base), head)
-    posted, refused, present = sent
-    return "already-present" if present else "posted" if posted else "failed", posted, refused, left
+    number = int(address.rsplit("#", 1)[1])
+    provider, slug, _ = forge_status.change(address, url)
+    if not project or project.provider != provider or project.slug != slug or project.change_url(number) != url:
+        raise ReviewError("The inline comment target is not a configured review project")
+    directory = state / "inline-publications"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    key = hashlib.sha256(json.dumps([project.key, number, head]).encode()).hexdigest()
+    with (directory / (key + ".lock")).open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with forge_status.connection(address, url, project.checkout) as (client, _, _, base, headers):
+            if provider == "github":
+                me = reviewer(client, headers, slug, number, value)
+                present = github(client, headers, project, slug, number, rows, me, head, progress)
+            else:
+                me = account(client, headers, base)
+                present = gitlab(client, headers, project, base, slug, number, rows, me, head, previous, progress)
+    return "already-present" if present else "posted" if progress.posted else "failed"
 
 
 def outcome(args, value):
@@ -218,17 +231,21 @@ def outcome(args, value):
     if not (args.change and args.post and not args.estimate and value.get("publication") == "posted-or-already-present"
             and (getattr(args, "inline_comments", False) or os.getenv("REVIEW_INLINE_COMMENTS") == "1")):
         return {"inline_publication": "skipped"}
+    rows, left = comments(value)
+    progress = Progress(refused=left)
+    previous = getattr(args, "inline_previous_paths", {})
     try:
-        result, posted, refused, left = post(args.change, value, getattr(args, "forge_project", None), args.repo)
+        state = getattr(args, "forge_state", None) or state_dir()
+        result = post(args.change, value, getattr(args, "forge_project", None), state, rows, previous, progress) if rows else "skipped"
     except Stale as error:
         log.warning("Inline comments for %s were not posted (%s)", args.change, error)
-        return {"inline_publication": "stale"}
-    # This path bypasses the helper's publication checks, so it must not be able to fail the review itself.
+        result = "stale"
     except Exception as error:
         reason = str(error) if isinstance(error, ReviewError) else (
             f"HTTP {error.response.status_code}" if isinstance(error, httpx.HTTPStatusError) else type(error).__name__)
-        log.warning("Inline comments for %s were not posted (%s)", args.change, reason)
-        return {"inline_publication": "failed"}
-    if refused or left:
-        log.warning("Inline comments for %s: %d posted, %d refused by the forge or left out", args.change, posted, refused + left)
-    return {"inline_publication": result, "inline_posted": posted, "inline_refused": refused + left}
+        log.warning("Inline comment publication for %s stopped (%s)", args.change, reason)
+        result = "failed"
+    if progress.refused:
+        log.warning("Inline comments for %s: %d posted, %d refused by the forge or left out",
+                    args.change, progress.posted, progress.refused)
+    return {"inline_publication": result, "inline_posted": progress.posted, "inline_refused": progress.refused}

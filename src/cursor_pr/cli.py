@@ -107,6 +107,8 @@ def execute(args):
     if not selected <= paths:
         raise ReviewError("--path must name a file changed in this review")
     files = sorted((f for f in change.files if f.path in selected), key=lambda f: f.path)
+    if args.change:
+        args.inline_previous_paths = {file.path: file.previous for file in files if file.previous}
     project = getattr(args, "managed_project", None)
     wanted = scanners.inputs(files) if args.change else set()
     static = scanners.ci_results(args.expected_change_url, change.head, root, wanted, args.scanner_ci or {})
