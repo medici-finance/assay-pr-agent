@@ -312,6 +312,18 @@ class TierTests(unittest.TestCase):
         self.assertIsNotNone(text)
         self.assertIn("## tests/test_app.py at the head", text)
 
+    def test_context_heading_alone_cannot_upgrade_the_delivered_tier(self):
+        name = "whole changed files"
+        long_line = "large source line " * 1000
+        text, fates = context.assemble((name,), {name: "\n" + long_line}, 100)
+        self.assertEqual((text, fates), ("", [{"name": name, "state": "dropped"}]))
+        self.assertEqual(cli.reached([("review", [{"name": "change description", "state": "included"}]),
+                                     ("deep", fates)]), "mid")
+
+        text, fates = context.assemble((name,), {name: "Useful context\n" + long_line}, 100)
+        self.assertIn("Useful context", text)
+        self.assertEqual(fates, [{"name": name, "state": "truncated"}])
+
     def test_context_blocks_share_an_allowance_in_order(self):
         raw = {"a": "one\n" * 400, "b": None, "c": "", "d": "two\n" * 5}
         text, fates = context.assemble(("a", "b", "c", "d"), raw, 300)

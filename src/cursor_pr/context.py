@@ -253,14 +253,16 @@ def gather(tier, root, checkout, change, files, drifted, notes):
 
 
 def clip(text, allowance):
-    """Cut text at a line boundary to fit an allowance in tokens."""
+    """Clip a headed block to complete lines, keeping at least one line of content."""
     if tokens(text) <= allowance:
         return text, False
     lines = text.splitlines()
     keep = len(lines)
     while keep and tokens("\n".join(lines[:keep])) > allowance - 8:
         keep = int(keep * 0.8)
-    return ("\n".join(lines[:keep]) + "\n[truncated to fit the token budget]" if keep else ""), True
+    if not any(line.strip() for line in lines[1:keep]):
+        return "", True
+    return "\n".join(lines[:keep]) + "\n[truncated to fit the token budget]", True
 
 
 def assemble(names, raw, allowance):
@@ -271,7 +273,7 @@ def assemble(names, raw, allowance):
         if text is None:
             fates.append({"name": name, "state": "unavailable"})
             continue
-        if not text:
+        if not text.strip():
             fates.append({"name": name, "state": "empty"})
             continue
         share = max(0, left) // sum(1 for later in names[position:] if raw.get(later))
