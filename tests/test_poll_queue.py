@@ -1154,6 +1154,22 @@ class ReadScheduleTests(Offline):
         self.assertEqual(self.tick(), [])
         self.assertEqual(self.tick(), [3])
 
+    def test_request_found_in_a_partial_read_returns_its_change_to_the_poll_interval(self):
+        self.open, self.threads = [3, 4], {3: [comment(81), comment(82)], 4: [comment(83)]}
+        self.tick(0)
+        self.tick()  # Read at 0 and 120; the wait is now 240 and the next read is due at 360.
+        self.tick()
+        # A request takes the place of the older comment: as many comments as before, and the same newest one.
+        self.threads[3][0] = comment(60, "/review") | dict(url=self.gh.change_url(3) + "#issuecomment-60")
+        self.partial = {4}
+        with self.assertLogs("cursor_pr.discovery", level="WARNING"):
+            self.assertEqual(self.tick(), [3, 4])  # 360: only 3 comes back, with the request.
+        self.assertEqual(self.reviews, [(360, 3)])
+        self.assertEqual(self.schedule()[0], (3, 2, 120, 360))
+        self.partial = set()
+        self.assertEqual(self.tick(), [3, 4])  # 480: the request is known by now and the conversation looks unchanged.
+        self.assertEqual(self.schedule()[0], (3, 2, 240, 480))  # Twice the poll interval, not twice the old wait.
+
     def test_partial_read_does_not_advance_the_schedule(self):
         self.open, self.threads = [3, 4], {3: [comment(81)], 4: [comment(82)]}
         self.assertEqual(self.tick(0), [3, 4])

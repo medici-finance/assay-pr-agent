@@ -169,8 +169,11 @@ def poll_project(project, jobs, since, ack=None, idle=None):
                 if ack is not None:
                     ack.queued(project, number, comment)
         # An incomplete read says nothing about the changes it asked for, so it never advances the schedule.
-        if idle is not None and complete:
+        # A request it did return is the exception: it is recorded now and will not count as new again,
+        # so its change goes back to the poll interval here or never.
+        if idle is not None:
             now = time.time()
             for number, notes in threads.items():
-                jobs.observed(project.key, number, *signature(notes), number in active, now, *idle)
+                if complete or number in active:
+                    jobs.observed(project.key, number, *signature(notes), number in active, now, *idle)
     return read, len(waiting)
