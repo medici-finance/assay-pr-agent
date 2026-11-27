@@ -13,9 +13,10 @@ from .providers import LABELS
 from .scanners import fence
 from .source import ReviewError
 
-VERSION = "visual-1"
+VERSION = "visual-2"
 MAX_CHANGES = 8
 MAX_HOTSPOTS = 6
+MAX_COMMENT_BYTES = 16 * 1024  # pr-agent-forge publication limit
 SEVERITIES = ("verify", "careful", "look")
 CREDIT = "THORChain's [visual-review](https://gitlab.com/thorchain/misc/visual-review)"
 
@@ -105,6 +106,11 @@ def narrated(path):
     return category(path) not in COUNTED_ONLY and not BOILERPLATE.search(path)
 
 
+def shows_hunks(f):
+    return (not f.absent and bool(f.patch) and f.status not in ("D", "removed", "deleted")
+            and narrated(f.path))
+
+
 def counts(f):
     """(added, deleted, head lines) of one file; nothing when its patch is missing."""
     if f.absent or not f.patch:
@@ -159,9 +165,9 @@ def pack(files):
         kind, read = category(f.path), narrated(f.path)
         # A deletion, a binary or legal text is named in the inventory and counted in the map. Only
         # a file the model should have read, but the forge sent no patch for, is coverage lost.
-        if not head and (f.absent or not f.patch) and read:
+        if (f.absent or not f.patch) and read and f.status not in ("D", "removed", "deleted"):
             unseen.append(f.path)
-        shown = bool(head) and read
+        shown = shows_hunks(f)
         row = f"{f.path} | {kind} | " + ("no text patch" if f.absent or not f.patch else f"+{added} -{deleted}")
         row += (f" | {f.status}" if f.status else "") + (f", was {f.previous}" if f.previous else "")
         inventory.append((shown, row))
@@ -194,16 +200,16 @@ def parse_answer(raw, anchors):
     for change in changes:
         title, paths = change["title"], change["files"]
         if (not isinstance(title, str) or not title.strip() or not isinstance(paths, list) or not paths
-                or any(not isinstance(path, str) or not path.strip() for path in paths)):
+                or any(not isinstance(path, str) or not path for path in paths)):
             raise ReviewError("Invalid visual change")
-        if any(path.strip() not in anchors for path in paths):
+        if any(path not in anchors for path in paths):
             raise ReviewError("Visual change names a file outside the change")
-        cards.append({"title": title.strip(), "paths": sorted({path.strip() for path in paths})})
+        cards.append({"title": title.strip(), "paths": sorted(set(paths))})
     flags = []
     for spot in hotspots:
-        path, start, end, severity = spot["file"].strip(), spot["line"], spot["end_line"], spot["severity"]
-        lines = anchors.get(path, set())
-        if (not path or type(start) is not int or type(end) is not int or start > end
+        path, start, end, severity = spot["file"], spot["line"], spot["end_line"], spot["severity"]
+        lines = anchors.get(path, set()) if isinstance(path, str) else set()
+        if (not lines or type(start) is not int or type(end) is not int or start > end
                 or start not in lines or end not in lines or end - start >= len(lines)
                 or not all(line in lines for line in range(start, end + 1)) or severity not in SEVERITIES):
             raise ReviewError("Cursor cited a line outside the reviewed patch")
@@ -268,6 +274,11 @@ def chart(report):
     count = len(diff_map["files"])
     head = (f"{number(diff_map['to_read'])} lines to read of {number(diff_map['lines'])} changed" if diff_map["lines"]
             else "No changed lines to read")
+    unknown = len(diff_map["no_text"])
+    if unknown:
+        head = (f"{number(diff_map['to_read'])} lines to read of {number(diff_map['lines'])} counted"
+                if diff_map["lines"] else "No text lines counted")
+        head += f" · line counts unavailable for {file_count(unknown)}"
     out = [head + (f" · {file_count(count)}" if count else ""), "",
            fit("Where the diff is", KIND + BAR) + right("lines", 10) + right("share", 7)]
     for kind in diff_map["categories"]:
@@ -289,7 +300,7 @@ def chart(report):
         if len(rows) > limit:
             out.append(f"+{number(len(rows) - limit)} more files")
     seen = [row for row in diff_map["files"] if row["path"] in shown]
-    if not count:
+    if not count or report.get("state") in ("estimate", "over-budget", "model-unavailable", "empty"):
         return out
     covered = number(sum(row["added"] + row["deleted"] for row in seen))
     if not seen:
@@ -309,6 +320,21 @@ def block(lines):
     return [marks, text, marks]
 
 
+def limited_rows(rows, allowance):
+    """Keep whole Markdown rows and leave room for an omitted-entry count."""
+    rows = list(rows)
+    kept = []
+    remaining = allowance - 80
+    for row in rows:
+        size = len(row.encode("utf-8")) + 1
+        if size <= remaining:
+            kept.append(row)
+            remaining -= size
+    if len(kept) != len(rows):
+        kept.append(f"{len(rows) - len(kept)} additional entries omitted to fit the comment limit.")
+    return kept
+
+
 def comment(report, evidence=()):
     """The posted comment: the map, then the model's reading of it, then the zero-token evidence."""
     label = LABELS[report.get("provider", "cursor")]
@@ -319,16 +345,20 @@ def comment(report, evidence=()):
         body += ["", "**What changed** — AI-generated from the diff. Check it against the code.", ""]
         body.append(fence(reading["summary"], SUMMARY))
         body.append("")
-        body += [f"- {fence(card['title'], TITLE)} — {', '.join(fence(path) for path in card['paths'][:5])}"
-                 + (f" +{len(card['paths']) - 5} more" if len(card["paths"]) > 5 else "") for card in reading["changes"]]
+        body += limited_rows(
+            (f"- {fence(card['title'], TITLE)} — {', '.join(fence(path, 200) for path in card['paths'][:5])}"
+             + (f" +{len(card['paths']) - 5} more" if len(card["paths"]) > 5 else "") for card in reading["changes"]),
+            3200)
         if not reading["changes"]:
             body.append("No changes listed.")
         rank = {name: index for index, name in enumerate(SEVERITIES)}
         spots = sorted(reading["hotspots"], key=lambda spot: rank[spot["severity"]])
         body += ["", "**What to check**", ""]
-        body += [f"- **{spot['severity']}** {fence(spot['path'])}:{spot['line']}"
-                 + (f"-{spot['end_line']}" if spot["end_line"] != spot["line"] else "")
-                 + f" — {fence(spot['title'], TITLE)}. {fence(spot['why'], WHY)}" for spot in spots]
+        body += limited_rows(
+            (f"- **{spot['severity']}** {fence(spot['path'], 200)}:{spot['line']}"
+             + (f"-{spot['end_line']}" if spot["end_line"] != spot["line"] else "")
+             + f" — {fence(spot['title'], TITLE)}. {fence(spot['why'], WHY)}" for spot in spots),
+            3200)
         if not spots:
             body.append("Nothing flagged. This is a reading of the diff, not a clean bill of health.")
     elif report["state"] == "over-budget":
@@ -338,13 +368,15 @@ def comment(report, evidence=()):
         body += ["", f"{label} could not complete the review."]
     else:
         body += ["", "No changed file has text the model can read."]
-    if evidence:
-        body += ["", "<details><summary>Static checks and history</summary>", "",
-                 *(" ".join(line.splitlines()) for line in evidence), "</details>"]
-    if report["omitted"]:
-        body.append("")
-    for path in report["omitted"]:
-        body.append(f"- Outside review coverage: {fence(path)}")
-    body += ["", f"Visual review after {CREDIT}. "
+    footer = ["", f"Visual review after {CREDIT}. "
                   "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."]
-    return body
+    coverage = limited_rows((f"- Outside review coverage: {fence(path, 200)}" for path in report["omitted"]), 1200)
+    if coverage:
+        coverage.insert(0, "")
+    if evidence:
+        opening = ["", "<details><summary>Static checks and history</summary>", ""]
+        closing = ["</details>"]
+        remaining = MAX_COMMENT_BYTES - sum(len(line.encode("utf-8")) + 1
+                                            for line in body + opening + closing + coverage + footer)
+        body += opening + limited_rows((" ".join(line.splitlines()) for line in evidence), remaining) + closing
+    return body + coverage + footer

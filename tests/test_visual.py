@@ -203,6 +203,16 @@ class VisualTests(unittest.TestCase):
                           "LICENSE | Docs | no text patch | modified", "huge.py | Logic | no text patch | modified"])
         self.assertEqual(visual.survey(files)["no_text"], ["LICENSE", "go.sum", "huge.py", "logo.png"])
 
+    def test_a_modified_file_with_only_removed_lines_enters_the_prompt(self):
+        empty = source.File("app.py", "@@ -1 +0,0 @@\n-OLD_SETTING = True\n", "modified")
+        gone = source.File("gone.py", "@@ -1 +0,0 @@\n-OLD_SETTING = True\n", "removed")
+        prompt, anchors, unseen, has_text = visual.pack([empty, gone])
+        self.assertTrue(has_text)
+        self.assertIn("## File: app.py", prompt)
+        self.assertNotIn("## File: gone.py", prompt)
+        self.assertEqual(anchors, {"app.py": set(), "gone.py": set()})
+        self.assertEqual(unseen, [])
+
     def test_hunks_show_each_line_once_with_its_head_number(self):
         # Real Git output: a replacement, a file that ends without a newline, and two-digit numbers.
         app = next(f for f in source.local_change(self.root, self.base, self.head).files if f.path == "app.py")
@@ -256,6 +266,15 @@ class VisualTests(unittest.TestCase):
         # A change may name a file the model was only told about, such as a binary.
         binary = visual.parse_answer(envelope(answer(changes=[{"title": "Logo", "files": ["logo.png", "app.py", "app.py"]}])), anchors)
         self.assertEqual(binary["visual"]["changes"], [{"title": "Logo", "paths": ["app.py", "logo.png"]}])
+        spaced = " app.py "
+        spaced_answer = answer(changes=[{"title": "Floor", "files": [spaced]}],
+                               hotspots=[dict(file=spaced, line=2, end_line=3, severity="look",
+                                              title="Floor", why="Rounding moved.")])
+        exact = visual.parse_answer(envelope(spaced_answer), dict(anchors, **{spaced: {2, 3}}))["visual"]
+        self.assertEqual(exact["changes"][0]["paths"], [spaced])
+        self.assertEqual(exact["hotspots"][0]["path"], spaced)
+        with self.assertRaises(source.ReviewError):
+            visual.parse_answer(envelope(spaced_answer), anchors)
         # The provider's routing notice and a code fence around the object are not part of the answer.
         usage = {"inputTokens": 4}
         wrapped = json.dumps(dict(type="result", subtype="success", is_error=False, usage=usage,
@@ -383,7 +402,7 @@ class VisualCommentTests(unittest.TestCase):
         text = self.text(evidence=["- shellcheck: 0 CI, 1 local, 1 findings, 0 incomplete."])
         self.assertEqual(text.splitlines()[:2], ["Cursor visual review of " + "a"*40, "reviewed"])
         lines = text.split("```\n")[1].splitlines()
-        self.assertEqual(lines[0], "8 lines to read of 39 changed · 5 files")
+        self.assertEqual(lines[0], "8 lines to read of 39 counted · line counts unavailable for 1 file · 5 files")
         header, *rows = lines[2:11]
         self.assertEqual(header, "Where the diff is" + " "*25 + "lines  share")
         self.assertEqual([row[:13].strip() for row in rows], list(visual.DISPLAY))
@@ -428,7 +447,7 @@ class VisualCommentTests(unittest.TestCase):
         everything = "\n".join(visual.chart({"map": dict(visual.survey(files), shown=["app.py", "test_app.py"])}))
         self.assertIn("Prompt covers all 2 files (1,001 lines).", everything)
         blank = "\n".join(visual.chart({"map": dict(visual.survey([source.File("logo.png", "", "added", True)]), shown=[])}))
-        self.assertIn("No changed lines to read · 1 file", blank)
+        self.assertIn("No text lines counted · line counts unavailable for 1 file · 1 file", blank)
 
     def test_only_a_successful_model_run_is_presented_as_generated(self):
         for state, line in (("over-budget", "Skipped Cursor. Estimated prompt 9 tokens exceeds the limit of 1."),
@@ -441,6 +460,7 @@ class VisualCommentTests(unittest.TestCase):
                 for absent in ("AI-generated", "What to check", "What changed", "<details>", "Nothing flagged"):
                     self.assertNotIn(absent, text)
                 self.assertIn("Where the diff is", text)
+                self.assertNotIn("Prompt covers", text)
         text = self.text(dict(self.report, provider="codex", state="model-unavailable") | {"visual": None})
         self.assertIn("Codex could not complete the review.", text)
         quiet = self.text(dict(self.report, visual={"summary": "Rewording only.", "changes": [], "hotspots": []}))
@@ -492,6 +512,17 @@ class VisualCommentTests(unittest.TestCase):
         self.assertTrue(any(line.startswith("```mermaid") for line in chart))
         self.assertLessEqual(max(visual.width(line) for line in chart), 84)
         self.assertTrue(all(not line.endswith(" ") for line in chart[11:]))
+
+    def test_comment_preserves_the_map_and_check_summary_within_the_forge_byte_limit(self):
+        evidence = ["Static checks", "- osv-scanner: 1 CI, 0 local, 30 findings, 0 incomplete.",
+                    *[f"- {visual.fence('測' * 450)}" for _ in range(30)]]
+        text = "\n".join(visual.comment(self.report, evidence)) + "\n"
+        self.assertLessEqual(len(text.encode("utf-8")), visual.MAX_COMMENT_BYTES)
+        self.assertIn("Where the diff is", text)
+        self.assertIn("30 findings", text)
+        self.assertIn("omitted to fit the comment limit", text)
+        self.assertIn("</details>", text)
+        self.assertIn(visual.CREDIT, text)
 
     def test_evidence_is_collapsed_and_quotes_hostile_tool_output(self):
         report = dict(self.report, checks=[

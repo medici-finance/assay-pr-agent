@@ -160,7 +160,7 @@ def execute(args):
               "findings": [], "cursor_usage": None}
     if args.visual:
         # The map costs no tokens and stays in the report when the model is skipped or fails.
-        report["map"] = dict(visual.survey(files), shown=sorted(path for path, lines in anchors.items() if lines))
+        report["map"] = dict(visual.survey(files), shown=sorted(file.path for file in files if visual.shows_hunks(file)))
     if static:
         report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
