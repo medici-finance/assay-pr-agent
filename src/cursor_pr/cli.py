@@ -67,11 +67,16 @@ def fit(files, checks, limit, *, title="", description="", advisories=(), render
     if not has_metadata:
         title = description = ""
     skipped = frozenset(dropped)
-    for count in range(len(notices), 0, -1):
+    smallest, largest = 1, len(notices)
+    while smallest <= largest:
+        count = (smallest + largest) // 2
         candidate = pack(files, checks, skipped, title, description, advisories=notices[:count], rendered=rendered)
         candidate_size = tokens(candidate[0])
         if candidate_size <= limit:
-            return candidate, candidate_size, original_size, dropped
+            packed, estimate = candidate, candidate_size
+            smallest = count + 1
+        else:
+            largest = count - 1
     return packed, estimate, original_size, dropped
 
 
@@ -104,8 +109,10 @@ def fit_patch(files, checks, limit, title, description, rendered):
             sizes[file.path] = tokens(standalone) - overhead
     queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
+    batch_start = 0
     while estimated > limit and queue:
         # Per-file sizes are approximate, so the last file only leaves after a real recount.
+        batch_start = len(dropped)
         dropped.append(queue.pop(0))
         freed = sizes[dropped[-1]]
         while len(queue) > 1 and freed < estimated - limit:
@@ -113,6 +120,20 @@ def fit_patch(files, checks, limit, title, description, rendered):
             freed += sizes[dropped[-1]]
         prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), title, description, rendered=rendered)
         estimated = tokens(prompt) if has_text else 0
+    # The final batch may have removed too much because tokenizer boundaries
+    # differ between standalone patches and the combined prompt.
+    smallest, largest = batch_start + 1, len(dropped)
+    while estimated <= limit and smallest < largest:
+        count = (smallest + largest) // 2
+        candidate = pack(files, checks, frozenset(dropped[:count]), title, description, rendered=rendered)
+        candidate_size = tokens(candidate[0])
+        if candidate_size <= limit:
+            prompt, anchors, unseen, has_text = candidate
+            estimated = candidate_size
+            largest = count
+        else:
+            smallest = count + 1
+    del dropped[largest:]
     fits = has_text and estimated <= limit
     if (title or description) and (not fits or len(dropped) > 1):
         fitted, estimate, _, skipped, _ = fit_patch(files, checks, limit, "", "", rendered)

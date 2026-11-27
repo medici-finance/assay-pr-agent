@@ -257,7 +257,7 @@ class ChangeDescriptionTests(unittest.TestCase):
         ]
         wanted = engine.pack([first, hidden], [], advisories=notices)
         wanted_size = engine.tokens(wanted[0])
-        limit = wanted_size + 5  # Allow for per-file estimates around section boundaries.
+        limit = wanted_size
         self.assertGreater(engine.tokens(engine.pack([hidden], [], advisories=notices)[0]), limit)
         self.assertGreater(engine.tokens(engine.pack([oversized], [])[0]), limit)
 
@@ -265,6 +265,17 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertEqual((estimate, degraded), (wanted_size, [oversized.path]))
         self.assertEqual(packed[0], wanted[0])
         self.assertTrue(packed[1][hidden.path])
+
+    def test_fit_rechecks_exact_batch_savings_before_skipping_another_file(self):
+        files = [source.File(name, "@@ -0,0 +1 @@\n+" + line + "\n", "added")
+                 for name, line in (("deps.lock", "x"), ("src/a.py", "a"), ("src/b.py", "b"))]
+        notices = [{"path": files[0].path, "kind": "co-change", "detail": "Frequently changes with pyproject.toml."}]
+        wanted = engine.pack(files[1:], [])
+        limit = engine.tokens(wanted[0])
+
+        packed, estimate, _, degraded = cli.fit(files, [], limit, advisories=notices)
+        self.assertEqual((estimate, degraded), (limit, [files[0].path]))
+        self.assertEqual(packed[0], wanted[0])
 
     def test_fit_refills_advisory_space_from_files_the_prompt_keeps(self):
         def added(path, count):
