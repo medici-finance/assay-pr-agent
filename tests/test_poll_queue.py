@@ -464,7 +464,7 @@ class RequestRowTests(unittest.TestCase):
             cli.main()
         self.assertEqual(self.row()[0], "failed")  # Not left running for a restart to repeat.
 
-    def test_review_asked_to_stop_cleans_up_and_leaves_its_row_running(self):
+    def stop(self, cleanup="pass"):
         # The review child as the poller starts it, waiting on a command, when its supervisor asks it
         # to stop. The command holds a lock while it runs and the review says when its cleanup ran.
         waiting = f"""import subprocess, sys
@@ -479,6 +479,7 @@ def settings(**kwargs):
         yield str(state)
     finally:
         (state / "cleaned").touch()
+        {cleanup}
 def wait(args):
     subprocess.run([sys.executable, "-c", {BUSY!r}, str(state / "command")])
 sys.argv[0] = "cursor-review"
@@ -499,10 +500,18 @@ with patch("cursor_pr.cli.tempfile.TemporaryDirectory", side_effect=settings), \
         review.send_signal(signal.SIGTERM)
         out, err = review.communicate(timeout=20)
         self.assertEqual((review.returncode, out), (1, ""), err)
-        self.assertIn("cursor-review: stopped by its supervisor", err)
         self.assertTrue((self.state / "cleaned").exists())
         self.assertTrue(gone(self.state / "command"))  # The command it waited on was ended with it.
         self.assertEqual(self.row()[0], "started")  # For the poller to finish, or the next one to queue again.
+        return err
+
+    def test_review_asked_to_stop_cleans_up_and_leaves_its_row_running(self):
+        self.assertIn("cursor-review: stopped by its supervisor\n", self.stop())
+
+    def test_review_whose_cleanup_fails_while_it_stops_is_still_an_interrupted_one(self):
+        # Not a review that ran and failed: its row must stay for the retry.
+        err = self.stop('raise OSError("Directory not empty")')
+        self.assertIn("cursor-review: stopped by its supervisor (Directory not empty)\n", err)
 
     def test_review_keeps_the_stop_request_to_itself(self):
         before = signal.getsignal(signal.SIGTERM)
@@ -528,9 +537,13 @@ class SupervisorTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.state = Path(tmp.name)
 
-    def supervise(self, command, seconds=60, keep=(), grace=None):
+    def supervise(self, command, seconds=60, keep=(), grace=None, number=None):
         # Returns the supervisor and the end of the lifeline that the poller holds.
         lifeline, hold = os.pipe()
+        if number is not None:  # The lifeline under the number it would have in a poller with many files open.
+            os.dup2(lifeline, number)
+            os.close(lifeline)
+            lifeline = number
         self.addCleanup(lambda: [os.close(fd) for fd in (hold,) if fd in self.open])
         self.open = {hold}
         argv = [str(lifeline), str(seconds), ",".join(map(str, keep)), *command]
@@ -566,6 +579,32 @@ class SupervisorTests(unittest.TestCase):
         _, err = process.communicate(timeout=20)
         self.assertEqual((process.returncode, err),
                          (124, "cursor-review: the review was stopped: the poller that started it is gone\n"))
+        self.assertTrue(gone(self.state / "review"))
+
+    def test_lifeline_may_have_any_descriptor_number(self):
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard < 2048:
+            self.skipTest("cannot open a descriptor numbered above 1024 here")
+        resource.setrlimit(resource.RLIMIT_NOFILE, (2048, hard))
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        process, hold = self.supervise(self.busy("review"), number=1500)
+        started(self.state / "review")
+        self.assertIsNone(process.poll())  # Still watching, not ended by a wait that refuses the number.
+        self.let_go(hold)
+        _, err = process.communicate(timeout=20)
+        self.assertEqual((process.returncode, err),
+                         (124, "cursor-review: the review was stopped: the poller that started it is gone\n"))
+        self.assertTrue(gone(self.state / "review"))
+
+    def test_review_is_ended_when_the_supervisor_cannot_watch(self):
+        # As when it is given a lifeline it cannot wait on: here one that is not open.
+        process = subprocess.Popen([sys.executable, "-I", str(poll.SUPERVISOR), "987", "60", "", *self.busy("review")],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(process.kill)
+        _, err = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 124)
+        self.assertIn("cursor-review: the review was stopped: its supervisor failed:", err)
         self.assertTrue(gone(self.state / "review"))
 
     def test_review_is_ended_when_its_time_is_up(self):

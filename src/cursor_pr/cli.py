@@ -133,9 +133,15 @@ class Stopped(SystemExit):
     pass
 
 
+# Set once the supervisor has asked this review to stop.
+stopping = False
+
+
 def stopped(number, frame):
     # The supervisor asks before it ends the review. Leaving like any exit removes the temporary
     # files and ends the command being waited on. The row is not settled and stays started.
+    global stopping
+    stopping = True
     raise Stopped("cursor-review: stopped by its supervisor")
 
 
@@ -365,6 +371,8 @@ def main():
     if args.qualgen_store:
         args.qualgen_store = args.qualgen_store.resolve()
     old = Path.cwd()
+    global stopping
+    stopping = False
     asked = signal.signal(signal.SIGTERM, stopped) if args.request else None
     try:
         with ExitStack() as stack:
@@ -416,6 +424,10 @@ def main():
         return status
     except (ReviewError, OSError, ValueError, TypeError, KeyError, AttributeError,
             UnidiffParseError, yaml.YAMLError, subprocess.TimeoutExpired) as err:
+        if stopping:
+            # Something failed while leaving because the supervisor asked. That is still an interrupted
+            # review, whose row stays started, not one that ran and failed.
+            raise Stopped(f"cursor-review: stopped by its supervisor ({err})") from err
         if args.request:
             # Before the diagnostic, which fails when nobody reads it any more.
             settle(args, "failed")

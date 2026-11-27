@@ -16,7 +16,7 @@ LIFELINE is a descriptor the poller holds the other end of. FDS is a comma-separ
 descriptors to hand on to the review (the lock), or an empty string.
 """
 import os
-import select
+import selectors
 import signal
 import subprocess
 import sys
@@ -38,34 +38,53 @@ def supervise(lifeline, seconds, keep, command):
     # The review holds one end of this pipe and nothing it starts does. It closes when the review ends.
     ended, alive = os.pipe()
     review = subprocess.Popen(command, pass_fds=(*keep, alive), start_new_session=True)
-    os.close(alive)
-    reason = None
-    deadline = time.monotonic() + seconds
-    while True:
-        left = deadline - time.monotonic()
-        if left <= 0:
-            reason = f"it was still running after {seconds:g} seconds"
-            break
-        readable = select.select([lifeline, ended, woken], [], [], left)[0]
-        if ended in readable:
-            break
-        if lifeline in readable:
-            reason = "the poller that started it is gone"
-            break
-        if woken in readable:
-            reason = "its supervisor was told to stop"
-            break
-    if reason:
-        # Asked first, so that it removes its temporary files and ends the command it waits on.
-        signal_group(review.pid, signal.SIGTERM)
-        select.select([ended], [], [], GRACE_SECONDS)
-    # The review has not been waited for yet, so its group cannot have become another's.
-    signal_group(review.pid, signal.SIGKILL)
+    try:
+        os.close(alive)
+        reason = watch(lifeline, ended, woken, seconds)
+        if reason:
+            # Asked first, so that it removes its temporary files and ends the command it waits on.
+            signal_group(review.pid, signal.SIGTERM)
+            wait_for(ended, GRACE_SECONDS)
+    except BaseException as failure:
+        # Whatever goes wrong with the waiting, the review is not left running without it.
+        reason = f"its supervisor failed: {failure!r}"
+    finally:
+        # The review has not been waited for yet, so its group cannot have become another's.
+        signal_group(review.pid, signal.SIGKILL)
     status = review.wait()
     if reason:
         print(f"cursor-review: the review was stopped: {reason}", file=sys.stderr, flush=True)
         return STOPPED
     return status if status >= 0 else STOPPED
+
+
+def watch(lifeline, ended, woken, seconds):
+    """Wait for the review to end. Return why it has to be stopped, or None when it ended by itself."""
+    # Not select(): it refuses a descriptor numbered 1024 or more, and the lifeline has whatever
+    # number it was given in the poller.
+    with selectors.DefaultSelector() as waiting:
+        for descriptor in (lifeline, ended, woken):
+            waiting.register(descriptor, selectors.EVENT_READ)
+        deadline = time.monotonic() + seconds
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return f"it was still running after {seconds:g} seconds"
+            readable = {key.fd for key, _ in waiting.select(left)}
+            if ended in readable:
+                return None
+            if lifeline in readable:
+                return "the poller that started it is gone"
+            if woken in readable:
+                return "its supervisor was told to stop"
+
+
+def wait_for(descriptor, seconds):
+    with selectors.DefaultSelector() as waiting:
+        waiting.register(descriptor, selectors.EVENT_READ)
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0 and not waiting.select(left):
+            pass
 
 
 def signal_group(group, number):
