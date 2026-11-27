@@ -106,6 +106,21 @@ def connection(address, url, checkout):
         yield client, provider, slug, base, headers
 
 
+def gitlab_source_ref(client, headers, base, slug, number, head):
+    # The authorized status target is this configured project. Do not write to a fork's project.
+    response = client.get(f"{base}/projects/{quote(slug, safe='')}/merge_requests/{number}", headers=headers)
+    response.raise_for_status()
+    change = response.json()
+    if not isinstance(change, dict) or change.get("sha") != head:
+        raise ReviewError("The GitLab merge request moved on since the review")
+    source, target, ref = (change.get(name) for name in ("source_project_id", "target_project_id", "source_branch"))
+    if type(source) is not int or type(target) is not int or source < 1 or source != target:
+        raise ReviewError("The GitLab status source project is outside the configured publication target")
+    if not isinstance(ref, str) or not ref or not ref.isprintable():
+        raise ReviewError("GitLab did not identify the reviewed source branch")
+    return ref
+
+
 def post(address, value, project):
     """Apply the comment publication policy before creating a status on the reviewed head."""
     number = int(address.rsplit("#", 1)[1])
@@ -127,6 +142,8 @@ def post(address, value, project):
         checked = [body["description"]]
     check_publication(project, number, head, "\n\n".join(checked))
     with connection(address, url, project.checkout) as (client, _, _, _, headers):
+        if provider == "gitlab":
+            body["ref"] = gitlab_source_ref(client, headers, base, slug, number, head)
         client.post(endpoint, headers=headers, json=body).raise_for_status()
 
 
