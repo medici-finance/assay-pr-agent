@@ -102,12 +102,12 @@ def run_forge(verb, project, *, numbers=(), publication=None, timeout=45):
     return json.loads(run(["pr-agent-forge", verb], data=json.dumps(request).encode(), env=env, timeout=timeout))
 
 
-def post_comment(project, number, head, body, state):
+def post_comment(project, number, head, body, state, *, dedupe_body=None):
     if project is None:
         raise ReviewError("Use a --change address from the configured review projects")
     directory = state / "publications"
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    key = hashlib.sha256(json.dumps([project.key, number, head, body]).encode()).hexdigest()
+    key = hashlib.sha256(json.dumps([project.key, number, head, body if dedupe_body is None else dedupe_body]).encode()).hexdigest()
     receipt = directory / (key + ".posted")
     with (directory / (key + ".lock")).open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
