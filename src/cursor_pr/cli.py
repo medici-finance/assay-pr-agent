@@ -215,12 +215,14 @@ def execute(args):
     (prompt, anchors, no_text, has_text), estimated, full, degraded = fit(
         files, checks, args.max_input_tokens, title=change.title, description=change.description,
         advisories=qualgen["advisories"] if qualgen else (), scoped=selected != paths)
-    # Only what a review could have covered and did not is a loss of coverage.
-    omitted = sorted(paths - selected)
+    # An absent forge patch does not establish that the file has no text.
+    unavailable = {f.path for f in files if f.patch_unavailable}
+    omitted = sorted((paths - selected) | unavailable)
     backend = providers.provider()
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
               "estimated_input_tokens": estimated, "max_input_tokens": args.max_input_tokens,
-              "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "not_reviewable": no_text,
+              "cursor_invocations": 0, "cache_hit": False, "omitted": omitted,
+              "not_reviewable": [path for path in no_text if path not in unavailable],
               "checks": checks,
               "findings": [], "cursor_usage": None, "full_input_tokens": full, "degraded": degraded,
               "drift": drifted}
@@ -239,7 +241,7 @@ def execute(args):
     if estimated > args.max_input_tokens:
         return dict(report, state="over-budget"), 2
     if args.estimate:
-        return dict(report, state="estimate"), 2 if degraded else 0
+        return dict(report, state="estimate"), 2 if degraded or unavailable else 0
     if has_text:
         try:
             answer, cached = review(prompt, args.model, anchors, args.cache_dir,
