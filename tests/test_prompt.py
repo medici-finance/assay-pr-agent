@@ -183,7 +183,8 @@ class ChangeDescriptionTests(unittest.TestCase):
 
     def test_claims_about_files_left_out_of_the_prompt_are_not_mismatches(self):
         shown = source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")
-        tests = source.File("tests/test_a.py", "@@ -0,0 +1 @@\n+assert True\n", "added")
+        tests = source.File("tests/test_a.py", "@@ -0,0 +1,20 @@\n" + "".join(f"+assert {n} == {n}\n" for n in range(20)),
+                            "added")
         caveat = "The patch does not show every changed file, so a claim about a file that is not shown is not a mismatch."
         body = dict(title="Add a greeting", description="Adds tests for the greeting.")
         self.assertNotIn(caveat, engine.pack([shown, tests], [], **body)[0])
@@ -196,6 +197,7 @@ class ChangeDescriptionTests(unittest.TestCase):
                 self.assertIn(caveat, prompt)
         # A degraded review drops test files first: the prompt it sends carries the caveat.
         limit = engine.tokens(engine.pack([shown, tests], [], frozenset({tests.path}), **body)[0])
+        self.assertGreater(engine.tokens(engine.pack([shown, tests], [], **body)[0]), limit)
         (prompt, *_), _, _, degraded = cli.fit([shown, tests], [], limit, **body)
         self.assertEqual(degraded, [tests.path])
         self.assertIn(caveat, prompt)
