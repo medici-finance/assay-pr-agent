@@ -101,6 +101,7 @@ class ForgeHelperTests(unittest.TestCase):
                         self.assertEqual((described.title, described.description),
                                          ("Align acceptance criteria", "Verify the expected state."))
                         self.assertEqual(described.head, original)
+                        source.check_publication(project, 9, original, "Status text checked.")
                         source.post_comment(project, 9, original, "Review finished.", root)
                         source.post_comment(project, 9, original, "Review finished.", root)
                         change["sha"] = "b" * 40
