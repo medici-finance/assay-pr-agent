@@ -119,18 +119,26 @@ def pack(files, checks, skip=frozenset(), *, context="", max_findings=MAX_FINDIN
     return prompt, anchors, omitted, bool(sections)
 
 
-def removed_excerpt(lines, omitted, width, *, nearest_end):
-    """Render a bounded excerpt with omissions marked at the side they came from."""
+def removed_excerpt(prefix, suffix, total, width, note, *, before, after):
+    """Render the edges next to cited rows and mark exactly where lines were omitted."""
+    omitted = total - len(suffix)
+    lines = suffix
+    if omitted:
+        prefix_size = suffix.maxlen if before else 0
+        if before and after:
+            prefix_size = (prefix_size + 1) // 2
+        lines = [*prefix[:prefix_size], None, *list(suffix)[prefix_size:]]
     rows = []
-    if omitted and nearest_end:
-        rows.append(f"[{omitted} removed lines omitted from this window]")
     for line in lines:
+        if line is None:
+            rows.append(f"[{omitted} removed lines omitted from this window]")
+            continue
         text = line.value.rstrip()
         if len(text) > width:
             text = text[:width] + " [remaining text omitted]"
         rows.append(f"- -{text}")
-    if omitted and not nearest_end:
-        rows.append(f"[{omitted} removed lines omitted from this window]")
+    if note and (after or not omitted):
+        rows.append(note)
     return rows
 
 
@@ -140,28 +148,37 @@ def verification_rows(file, start, end, radius):
     removed_limit, removed_width = 4 + radius, 160 + 32 * radius
     for hunk in hunks(file):
         near = False
-        removed = deque(maxlen=removed_limit)
+        prefix = []
+        suffix = deque(maxlen=removed_limit)
         removed_count = 0
+        removed_note = None
         for line in hunk:
             if line.is_removed:
                 removed_count += 1
-                # Keep the prefix after an in-range row, or the suffix before one.
-                if not near or len(removed) < removed_limit:
-                    removed.append(line)
+                if near and len(prefix) < removed_limit:
+                    prefix.append(line)
+                suffix.append(line)
                 continue
             number = line.target_line_no
+            if number is None and removed_count:
+                # The old file's no-newline annotation is part of its removal block.
+                removed_note = f"- {line.line_type}{line.value.rstrip()}"
+                continue
             next_near = near if number is None else start <= number <= end
             if removed_count and (near or next_near or line.is_context):
                 if near or next_near:
-                    rows.extend(removed_excerpt(removed, removed_count - len(removed), removed_width,
-                                                nearest_end=not near))
-                removed.clear()
+                    rows.extend(removed_excerpt(prefix, suffix, removed_count, removed_width, removed_note,
+                                                before=near, after=next_near))
+                prefix.clear()
+                suffix.clear()
                 removed_count = 0
+                removed_note = None
             near = next_near
             if near:
                 rows.append(f"{number if number is not None else '-'} {line.line_type}{line.value.rstrip()}")
         if near and removed_count:
-            rows.extend(removed_excerpt(removed, removed_count - len(removed), removed_width, nearest_end=False))
+            rows.extend(removed_excerpt(prefix, suffix, removed_count, removed_width, removed_note,
+                                        before=True, after=False))
     return rows
 
 

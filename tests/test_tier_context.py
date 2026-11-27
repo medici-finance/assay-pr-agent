@@ -118,8 +118,25 @@ class TierContextTests(unittest.TestCase):
                                                "- -removed_000()\n- -removed_001()\n"
                                                "- -removed_002()\n- -removed_003()\n"
                                                "[28 removed lines omitted from this window]"))
+        both = engine.verification([dict(after, line=1)], [file], radius=0)
+        self.assertTrue(both.endswith("1  initialize()\n- -removed_000()\n- -removed_001()\n"
+                                      "[28 removed lines omitted from this window]\n"
+                                      "- -removed_030()\n- -removed_031()\n2  finish()"))
         wide = engine.verification([after], [file], radius=15)
         self.assertGreater(wide.count("- -removed_"), narrow_after.count("- -removed_"))
+        self.assertIn("- -removed_031()\n2  finish()", wide)
+
+    def test_verification_keeps_both_removal_edges_across_a_no_newline_marker(self):
+        deleted = "".join(f"-removed_{i}()\n" for i in range(8))
+        note = "\\ No newline at end of file"
+        file = File("app.py", f"@@ -1,9 +1,2 @@\n initialize()\n{deleted}{note}\n+finish()\n", "modified")
+        finding = dict(path="app.py", line=1, end_line=2, title="Removed step", message="Check the missing step.")
+
+        prompt = engine.verification([finding], [file], radius=0)
+        self.assertTrue(prompt.endswith("1  initialize()\n- -removed_0()\n- -removed_1()\n"
+                                        "[4 removed lines omitted from this window]\n"
+                                        "- -removed_6()\n- -removed_7()\n"
+                                        f"- {note}\n2 +finish()"))
 
     def test_narrow_verification_marks_a_shortened_removed_line(self):
         deleted = "x" * 5000
