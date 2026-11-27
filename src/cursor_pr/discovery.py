@@ -62,22 +62,47 @@ def is_request(project, number, note, since):
     return note.get("authorType") in (None, "", "User")
 
 
-def public_gitlab_request(project, number, note):
-    # The list adapter omits note visibility and rounds GitLab timestamps to
-    # seconds. Check both on this single candidate before a public response.
+def gitlab_notes(project, number):
     base = os.environ.get("GITLAB_API_BASE", "").rstrip("/")
     if base != project.url.removesuffix("/" + project.slug) + "/api/v4":
         raise ReviewError("GITLAB_API_BASE must match the project's HTTPS instance /api/v4")
     token = reviewer_token("gitlab", project.slug, project.checkout)
-    url = f"{base}/projects/{quote(project.slug, safe='')}/merge_requests/{number}/notes/{note['databaseId']}"
+    return f"{base}/projects/{quote(project.slug, safe='')}/merge_requests/{number}/notes", token
+
+
+def visible_gitlab_note(note, number):
+    return (note.get("internal") is False and not note.get("confidential")
+            and note.get("system") is False and note.get("noteable_type") == "MergeRequest"
+            and note.get("noteable_iid") == number)
+
+
+def context_comments(project, number):
+    """Read comments whose visibility permits using them in review context."""
+    if project.provider != "gitlab":
+        return comment_threads(project, [number]).get(number)
+    url, token = gitlab_notes(project, number)
+    response = httpx.get(url, headers={"PRIVATE-TOKEN": token}, follow_redirects=False, timeout=15,
+                         params={"per_page": 20, "activity_filter": "only_comments",
+                                 "sort": "desc", "order_by": "created_at"},
+                         **client_options())
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list):
+        raise ReviewError("Invalid GitLab note list")
+    return [row for row in reversed(rows) if isinstance(row, dict) and visible_gitlab_note(row, number)]
+
+
+def public_gitlab_request(project, number, note):
+    # The list adapter omits note visibility and rounds GitLab timestamps to
+    # seconds. Check both on this single candidate before a public response.
+    notes_url, token = gitlab_notes(project, number)
+    url = f"{notes_url}/{note['databaseId']}"
     response = httpx.get(url, headers={"PRIVATE-TOKEN": token}, follow_redirects=False, timeout=15, **client_options())
     if response.status_code == 404:
         return False
     response.raise_for_status()
     latest = response.json()
-    return (latest.get("internal") is False and not latest.get("confidential")
-            and latest.get("system") is False and latest.get("noteable_type") == "MergeRequest"
-            and latest.get("noteable_iid") == number and latest.get("id") == note["databaseId"]
+    return (visible_gitlab_note(latest, number) and latest.get("id") == note["databaseId"]
             and latest.get("author", {}).get("id") == note["authorId"]
             and not latest["author"].get("bot") and latest.get("body", "").strip() == note["body"].strip()
             and bool(latest.get("created_at")) and latest["created_at"] == latest.get("updated_at"))

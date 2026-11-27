@@ -3,12 +3,15 @@
 Every block is plain text for the prompt's untrusted-data section. A gatherer returns "" when
 there is nothing to add and None when it could not look.
 """
+from contextlib import closing
+import os
 import re
 import subprocess
+import threading
 
 from .drift import git
 from .engine import hunks, rank, tokens
-from .source import ReviewError
+from .source import ReviewError, child_env, git as git_bytes
 
 MID = ("change description", "overlap with the base", "surrounding code", "call sites")
 DEEP = ("change description", "overlap with the base", "earlier comments", "whole changed files",
@@ -37,7 +40,7 @@ def blob(repo, head, path):
     if int(git(repo, "cat-file", "-s", spec)) > MAX_BLOB:
         return None
     try:
-        return git(repo, "cat-file", "blob", spec)
+        return git_bytes(repo, "cat-file", "blob", spec).decode()
     except UnicodeDecodeError:
         return None
 
@@ -90,27 +93,66 @@ def symbols(files):
     return found[:MAX_SYMBOLS]
 
 
+def git_lines(repo, *args, alternates=None):
+    """Stream complete Git output lines up to the context byte cap and deadline."""
+    env = child_env()
+    if alternates:
+        env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = alternates
+    command = ["git", "--literal-pathspecs", "-C", os.fspath(repo), *args]
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env) as proc:
+        expired = threading.Event()
+
+        def stop():
+            expired.set()
+            proc.kill()
+
+        deadline = threading.Timer(20, stop)
+        deadline.start()
+        remaining = MAX_RAW
+        try:
+            while remaining:
+                row = proc.stdout.readline(remaining + 1)
+                if not row:
+                    code = proc.wait()
+                    if expired.is_set() or (code != 0 and (args[0], code) != ("grep", 1)):
+                        raise ReviewError("Git context read did not finish")
+                    return
+                if len(row) > remaining:
+                    return
+                remaining -= len(row)
+                yield row.decode("utf-8", "replace")
+        finally:
+            deadline.cancel()
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+
 @guarded
 def call_sites(repo, head, files, radius=0):
     """Where the changed functions and types are used elsewhere at the head."""
     names = symbols(files)
     if not names:
         return ""
-    args = ["grep", "-n", "-I", "-w", "-F", "--no-color", "--max-count=4"]
+    args = ["grep", "-n", "-z", "-I", "-w", "-F", "--no-color", "--no-column", "--max-count=4"]
     for name in names:
         args.extend(["-e", name])
-    try:
-        output = git(repo, *args, head)
-    except ReviewError:
-        return ""  # git grep exits 1 when nothing matches.
     sites = {name: [] for name in names}
-    for row in output.splitlines():
-        _, path, number, text = row.split(":", 3)
-        definition = DEFINITION.match(text)
-        for name in names:
-            if (re.search(rf"\b{re.escape(name)}\b", text) and len(sites[name]) < MAX_SITES
-                    and not (definition and definition[1] == name)):
-                sites[name].append((path, int(number), text.strip()))
+    patterns = {name: re.compile(rf"\b{re.escape(name)}\b") for name in names}
+    with closing(git_lines(repo, *args, head)) as lines:
+        for row in lines:
+            fields = row.split("\0", 2)
+            if len(fields) != 3 or not fields[0].startswith(head + ":"):
+                continue
+            location, number, text = fields
+            path = location[len(head) + 1:]
+            definition = DEFINITION.match(text)
+            for name in names:
+                if (len(sites[name]) < MAX_SITES and patterns[name].search(text)
+                        and not (definition and definition[1] == name)):
+                    sites[name].append((path, int(number), text.strip()))
+            if all(len(group) >= MAX_SITES for group in sites.values()):
+                break
     parts, cache = [], {}
     for name, rows in sites.items():
         if not rows:
@@ -138,18 +180,19 @@ def description(change, root, head_repo, fork):
     if not fork:
         return ""
     objects = git(root, "rev-parse", "--path-format=absolute", "--git-path", "objects") if head_repo != root else None
-    return git(head_repo, "log", "--no-color", "--format=%s%n%b", f"{fork}..{change.head}", alternates=objects)
+    return "".join(git_lines(head_repo, "log", "--no-show-signature", "--no-color", "--format=%s%n%b",
+                             f"{fork}..{change.head}", alternates=objects)).strip()
 
 
 @guarded
 def overlap(root, drifted):
     """What the base changed, since the branch point, in files this change also touches."""
-    if drifted.get("state") != "complete":
+    if drifted.get("state") != "complete" or drifted.get("comparison") == "default branch":
         raise ReviewError("base drift unavailable")
     if not drifted["both"]:
         return ""
-    return git(root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-color", "--unified=3",
-               drifted["fork"], drifted["base"], "--", *drifted["both"])
+    return "".join(git_lines(root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-color",
+                             "--unified=3", drifted["fork"], drifted["base"], "--", *drifted["both"])).strip()
 
 
 @guarded
