@@ -24,6 +24,8 @@ from unittest.mock import patch
 from cursor_pr import cli, engine
 
 DEFAULT_BUDGET = "200000"
+# How a capture's output directory is named.
+OUTPUT = "capture-prompt-"
 # The only cursor-review options a capture takes. Every other one is refused: it would select a
 # source other than a local change, publish, or run a mode this script does not stand in for.
 ALLOWED = ("--base", "--head", "--repo", "--path", "--max-input-tokens", "--cache-dir", "--go-report", "--qualgen-store")
@@ -57,7 +59,9 @@ def committed(repo, reported, asked):
     if head != git(repo, "rev-parse", "--verify", "HEAD^{commit}"):
         return head[:12], None
     # Every untracked file, whatever status.showUntrackedFiles says in the developer's configuration.
-    status = git(repo, "status", "--porcelain", "--untracked-files=all", "--", ":(top)")
+    # Not the directories of earlier captures, where a harness keeps its temporary files in the checkout.
+    status = git(repo, "status", "--porcelain", "--untracked-files=all", "--", ":(top)",
+                 f":(top,exclude,glob)**/{OUTPUT}*/**")
     return head[:12], None if status is None else len(status.splitlines())
 
 
@@ -67,6 +71,10 @@ def main(argv):
         return fail("usage: capture-prompt.py --base REV [options]; it takes no output path, "
                     "writes to a new directory of its own and prints where")
     for name in ELSEWHERE:
+        os.environ.pop(name, None)
+    # A capture uses no credential, so it must not fail on the settings of one either: a key file
+    # that cannot be read, or a login profile that is not there.
+    for name in [name for name in os.environ if name.endswith("_API_KEY_FILE")] + ["REVIEW_AUTH_MODE", "REVIEW_LOGIN_PROFILE"]:
         os.environ.pop(name, None)
     for option in options:
         if option.startswith("-") and option.split("=", 1)[0] not in ALLOWED:
@@ -116,7 +124,9 @@ def main(argv):
         return fail(f"the review never reached the model step (state: {report.get('state')}, "
                     f"estimated input tokens: {report.get('estimated_input_tokens')}, "
                     f"limit: {report.get('prompt_limit')}"
-                    + (f", error: {report['error']}" if report.get("error") else "") + "); nothing was written")
+                    + (f", error: {report['error']}" if report.get("error") else "") + "); nothing was written"
+                    + ("; if cursor_pr.cli changed how it calls review, update the stand-in in this script"
+                       if report.get("error") == "TypeError" else ""))
     if len(captured) > 1:
         return fail(f"the review sent {len(captured)} prompts; this script expects one")
     prompt, anchors = captured[0]
@@ -127,7 +137,7 @@ def main(argv):
     # cannot be encoded or an interrupt, the directory is removed again.
     directory = None
     try:
-        directory = Path(tempfile.mkdtemp(prefix="capture-prompt-"))
+        directory = Path(tempfile.mkdtemp(prefix=OUTPUT))
         anchors_file, prompt_file = directory / "anchors.json", directory / "prompt.txt"
         anchors_file.write_text(json.dumps({path: sorted(lines) for path, lines in anchors.items()}, indent=1),
                                 encoding="utf-8")

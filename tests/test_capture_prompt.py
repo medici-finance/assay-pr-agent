@@ -145,11 +145,52 @@ class CapturePromptTest(unittest.TestCase):
     def test_shows_what_cursor_review_printed_when_there_is_no_report(self):
         module = self.script("capture_prompt")
         err = io.StringIO()
-        with patch.object(cli, "main", lambda: print("unexpected diagnostic") or 2), contextlib.redirect_stderr(err):
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(cli, "main", lambda: print("unexpected diagnostic") or 2), contextlib.redirect_stderr(err):
             code = module.main(["capture-prompt.py", "--base", self.base])
         self.assertEqual(code, 1)
         self.assertIn("unexpected diagnostic", err.getvalue())
         self.assertIn("stopped before producing a report (exit 2)", err.getvalue())
+
+    def test_shows_what_cursor_review_printed_when_it_exits(self):
+        module = self.script("capture_prompt_exit")
+        err = io.StringIO()
+
+        def leave():
+            print("said before leaving")
+            raise SystemExit(3)
+        with patch.dict(os.environ, self.env, clear=True), patch.object(cli, "main", leave), contextlib.redirect_stderr(err):
+            code = module.main(["capture-prompt.py", "--base", self.base])
+        self.assertEqual(code, 1)
+        self.assertIn("said before leaving", err.getvalue())
+        self.assertIn("cursor-review exited (3)", err.getvalue())
+        self.assertEqual(self.left(), [])
+
+    def test_points_at_the_stand_in_when_review_is_called_differently(self):
+        # The real path: cli passes review an argument the stand-in does not take.
+        module = self.script("capture_prompt_drift")
+        err = io.StringIO()
+        run_pass = cli.run_pass
+
+        def changed(*args, **kwargs):
+            stand_in = cli.review
+            with patch.object(cli, "review", lambda *a, **k: stand_in(*a[:3], **k)):  # Two arguments fewer.
+                return run_pass(*args, **kwargs)
+        with patch.dict(os.environ, self.env, clear=True), patch.object(cli, "run_pass", changed), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = module.main(["capture-prompt.py", "--repo", str(self.repo), "--base", self.base,
+                                "--cache-dir", str(self.root / "cache")])
+        self.assertEqual(code, 1)
+        self.assertIn("error: TypeError", err.getvalue())
+        self.assertIn("update the stand-in in this script", err.getvalue())
+
+    def test_settings_of_a_credential_do_not_stop_a_capture(self):
+        self.env = dict(self.env, CURSOR_API_KEY_FILE=str(self.root / "no-such-key"), REVIEW_AUTH_MODE="login",
+                        REVIEW_LOGIN_PROFILE="nobody")
+        del self.env["CURSOR_API_KEY"]
+        result = self.capture()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.started.exists())
 
     def test_a_capture_that_cannot_be_written_leaves_neither_file(self):
         # In this process, so that the write of the prompt can be made to fail after the anchors are written.
@@ -257,6 +298,11 @@ class CapturePromptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.written(result).parent.parent, self.repo)
         self.assertNotIn("warning", result.stderr)
+        again = self.capture()  # The first capture's directory is still there, as between two rounds of review.
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertNotIn("warning", again.stderr)
+        (self.repo / "new.py").write_text("y = 2\n")
+        self.assertIn("warning: 1 uncommitted or untracked path(s)", self.capture().stderr)
 
     def test_stand_in_clis_record_a_start_whatever_the_path_looks_like(self):
         self.assertEqual(subprocess.run(["codex"], env=self.env).returncode, 1)
@@ -323,7 +369,7 @@ class CapturePromptTest(unittest.TestCase):
     def test_fails_when_the_patched_name_is_gone(self):
         module = self.script("capture_prompt")
         err = io.StringIO()
-        with patch.object(cli, "review", None), contextlib.redirect_stderr(err):
+        with patch.dict(os.environ, self.env, clear=True), patch.object(cli, "review", None), contextlib.redirect_stderr(err):
             code = module.main(["capture-prompt.py", "--repo", str(self.repo),
                                 "--base", self.base])
         self.assertEqual(code, 1)
