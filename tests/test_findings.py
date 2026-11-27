@@ -47,6 +47,14 @@ class ParseAnswerTests(unittest.TestCase):
         for dropped in engine.parse_answer(envelope(["junk", issue("a.py", 50)]), ANCHORS)["dropped"]:
             self.assertEqual(set(dropped), {"path", "line", "reason"})
 
+    def test_dropped_line_number_cannot_break_result_serialization(self):
+        parsed_answer = {"review": {"key_issues_to_review": [issue(), issue(start=2**20_000)]}}
+        with patch.object(engine.yaml, "safe_load", return_value=parsed_answer):
+            result = engine.parse_answer(envelope([]), ANCHORS)
+        self.assertEqual(json.loads(json.dumps(result))["dropped"],
+                         [{"path": "a.py", "line": None, "reason": "cited line outside the reviewed patch"}])
+        self.assertEqual(len(result["findings"]), 1)
+
     def test_the_answer_itself_must_still_be_valid(self):
         base = {"type": "result", "subtype": "success", "is_error": False}
         bad = [json.dumps(dict(base, subtype="error", result="{}")),
@@ -110,7 +118,9 @@ class QuotedEvidenceTests(unittest.TestCase):
     def test_a_quote_must_match_the_cited_lines(self):
         cases = (("        total += item\n    return total", 4, 5, "verified"),
                  ("4 +        total += item\n5 +    return total", 4, 5, "verified"),
-                 ("total +=", 4, 4, "verified"),
+                 ("total +=", 4, 4, "quoted code does not match the cited lines"),
+                 ("return tot", 5, 5, "quoted code does not match the cited lines"),
+                 ("4 +    return total", 5, 5, "quoted code does not match the cited lines"),
                  ("return total\ntotal += item", 4, 5, "quoted code does not match the cited lines"),
                  ("return total", 2, 3, "quoted code does not match the cited lines"),
                  ("raise ValueError", 4, 5, "quoted code does not match the cited lines"),
@@ -130,6 +140,17 @@ class QuotedEvidenceTests(unittest.TestCase):
                 else:
                     self.assertEqual(parsed["findings"], [])
                     self.assertEqual(parsed["dropped"], [{"path": "a.py", "line": start, "reason": expected}])
+
+    def test_raw_numbers_plus_signs_and_literal_whitespace_stay_significant(self):
+        anchors = shown("+value", "1 + 2", 'return "a  b"', 'value = "one\u2028two"', "offset,")
+        for line, quote in ((1, "+value"), (1, "1 ++value"), (2, "1 + 2"), (3, 'return "a  b"'),
+                            (4, '4 +value = "one\u2028two"')):
+            with self.subTest(quote=quote):
+                parsed = engine.parse_answer(envelope([dict(issue(start=line, end=line), relevant_code=quote)]), anchors)
+                self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+        for line, quote in ((3, 'return "a b"'), (5, "5 + offset,")):
+            wrong = engine.parse_answer(envelope([dict(issue(start=line, end=line), relevant_code=quote)]), anchors)
+            self.assertEqual(wrong["dropped"][0]["reason"], "quoted code does not match the cited lines")
 
     def test_a_fenced_block_counts_as_the_quote_and_inline_spans_do_not(self):
         fenced = issue(start=4, end=4, body="It adds up.\n```\ntotal += item\n```\n")
@@ -158,8 +179,8 @@ class QuotedEvidenceTests(unittest.TestCase):
         with patch.object(cli, "post_comment", side_effect=lambda *args: posts.append(args[3])):
             cli.publish("org/repo#1", "a" * 40, report)
             cli.publish("org/repo#1", "a" * 40, dict(report, findings=report["findings"][1:]))
-        self.assertIn("1 model finding quoted no code to check against the patch.", posts[0])
-        self.assertNotIn("quoted no code", posts[1])
+        self.assertIn("Could not verify quoted code for 1 model finding.", posts[0])
+        self.assertNotIn("Could not verify quoted code", posts[1])
 
 
 if __name__ == "__main__":
