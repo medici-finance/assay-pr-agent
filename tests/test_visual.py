@@ -196,6 +196,13 @@ class VisualTests(unittest.TestCase):
         self.assertIn("Treated as generated from its content, hunks not sent: ` pkg/query_string.go `", text)
         self.assertNotIn("vendor/x/y.go", text)
 
+    def test_a_long_header_line_is_read_in_bounded_time(self):
+        # Use an isolated process so a slow match cannot block the test runner.
+        program = ("import sys; from cursor_pr.visual import category; "
+                   "print(category('x.go', '@@ -0,0 +1 @@\\n+// ' + 'generated ' * 200000 + '\\n', 'added'))")
+        result = subprocess.check_output([sys.executable, "-c", program], text=True, timeout=5)
+        self.assertEqual(result.strip(), "Logic")
+
     def test_dotted_document_names_classify_without_backtracking(self):
         # Use an isolated process so a slow match cannot block the test runner.
         program = ("import sys; from cursor_pr.visual import category; "
