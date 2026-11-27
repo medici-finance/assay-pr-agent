@@ -152,15 +152,18 @@ class Jobs:
         return {number for number, (wait, seen) in saved.items()
                 if number in numbers and now >= seen and seen + min(wait, cap) > now}
 
-    def observed(self, project, number, comments, newest, active, now, interval, cap):
-        """Keep one complete read of a change. A first look, new comments or a request read again after one
-        interval; an unchanged conversation waits twice as long as before, never longer than the cap."""
+    def observed(self, project, changes, now, interval, cap):
+        """Keep one complete read of each change, given as (number, comments, newest, active). A first look,
+        new comments or a request read again after one interval; an unchanged conversation waits twice as
+        long as before, never longer than the cap. One transaction for the batch: a first poll of a large
+        project reads hundreds of changes, and a commit for each would hold the queued reviews back."""
         with closing(sqlite3.connect(self.path)) as db, db:
-            previous = db.execute("SELECT comments, newest, wait FROM schedule WHERE project=? AND number=?",
-                                  (project, number)).fetchone()
-            quiet = previous is not None and not active and list(previous[:2]) == [comments, newest]
-            db.execute("INSERT OR REPLACE INTO schedule VALUES (?,?,?,?,?,?)",
-                       (project, number, comments, newest, min(previous[2] * 2, cap) if quiet else interval, now))
+            for number, comments, newest, active in changes:
+                previous = db.execute("SELECT comments, newest, wait FROM schedule WHERE project=? AND number=?",
+                                      (project, number)).fetchone()
+                quiet = previous is not None and not active and list(previous[:2]) == [comments, newest]
+                db.execute("INSERT OR REPLACE INTO schedule VALUES (?,?,?,?,?,?)",
+                           (project, number, comments, newest, min(previous[2] * 2, cap) if quiet else interval, now))
 
     def unfinished_acknowledgements(self, now=None):
         """Finished requests that still owe the forge something; with a time, only those due a try by then."""

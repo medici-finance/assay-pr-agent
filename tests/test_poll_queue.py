@@ -1203,6 +1203,17 @@ class ReadScheduleTests(Offline):
         self.assertEqual(self.tick(), [4, 5])  # 720
         self.assertEqual([row[0] for row in self.schedule()], [4, 5])  # A closed change is forgotten.
 
+    def test_one_batch_of_reads_is_kept_in_one_transaction(self):
+        self.open = list(range(3, 23))
+        self.threads = {number: [comment(100 + number)] for number in self.open}
+        batches = []
+        with patch.object(Jobs, "observed", autospec=True,
+                          side_effect=lambda jobs, project, changes, *rest: batches.append(len(changes))):
+            self.tick(0)
+        self.assertEqual((sum(batches), len(batches)), (20, len(self.reads)))  # One write per read, not per change.
+        self.tick(0)
+        self.assertEqual([row[:3] for row in self.schedule()], [(number, 1, 120) for number in self.open])
+
     def test_cycle_logs_how_many_changes_it_read_and_how_many_it_skipped(self):
         self.open = [3, 4, 5]
         self.threads = {number: [comment(number)] for number in self.open}

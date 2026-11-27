@@ -171,8 +171,7 @@ def poll_project(project, jobs, since, ack=None, idle=None):
         # A request it did return is the exception: it is recorded now and will not count as new again,
         # so its change goes back to the poll interval here or never.
         if idle is not None:
-            now = time.time()
-            for number, notes in threads.items():
-                if complete or number in active:
-                    jobs.observed(project.key, number, *signature(notes), number in active, now, *idle)
+            jobs.observed(project.key, [(number, *signature(notes), number in active)
+                                        for number, notes in threads.items() if complete or number in active],
+                          time.time(), *idle)
     return read, len(waiting)
