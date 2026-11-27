@@ -168,12 +168,15 @@ def finding(issue, anchors):
     if not header or not body:
         return None, dict(dropped, reason="empty finding")
     valid = {"path": path, "line": start, "end_line": end, "title": header, "message": body}
-    quote = quoted(issue)
+    quote, asked = quoted(issue)
     if not "".join(quote.split()):
         # Nothing to check against the patch is not a mismatch: the finding is kept and marked.
         return dict(valid, evidence="unverified"), None
     cited = ("".join(anchors[path][line].split()) for line in range(start, end + 1))
     if not quoted_in_order(quote, cited):
+        if not asked:
+            # A fenced block in the text may be a suggested fix rather than a quote.
+            return dict(valid, evidence="unverified"), None
         return None, dict(dropped, reason="quoted code does not match the cited lines")
     return dict(valid, evidence="verified"), None
 
@@ -184,12 +187,15 @@ SHOWN = re.compile(r"\s*(?:\d+\s)?\+?")
 
 
 def quoted(issue):
-    """The code a finding quotes: its relevant_code field, else the first fenced block of its text."""
+    """The code a finding quotes, and whether it is the relevant_code field the prompt asks for.
+
+    Without that field, the first fenced block of its text stands in.
+    """
     code = issue.get("relevant_code")
     if isinstance(code, str):
-        return code
+        return code, True
     found = FENCED.search(issue["issue_content"])
-    return found.group(1) if found else ""
+    return (found.group(1) if found else ""), False
 
 
 def quoted_in_order(quote, cited):

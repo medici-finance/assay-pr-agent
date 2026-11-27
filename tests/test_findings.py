@@ -133,6 +133,10 @@ class QuotedEvidenceTests(unittest.TestCase):
         self.assertEqual(self.parse(inline)["findings"][0]["evidence"], "unverified")
         both = dict(issue(start=4, end=4, body="```\nraise ValueError\n```"), relevant_code="total += item")
         self.assertEqual(self.parse(both)["findings"][0]["evidence"], "verified")
+        # Without relevant_code, a fenced block that does not match may be a suggested fix: kept, unverified.
+        fix = issue(start=4, end=4, body="It adds up.\n```\ntotal = sum(items)\n```\n")
+        parsed = self.parse(fix)
+        self.assertEqual(([f["evidence"] for f in parsed["findings"]], parsed["dropped"]), (["unverified"], []))
 
     def test_pack_records_the_text_of_every_shown_head_line(self):
         patch = "@@ -1,2 +1,2 @@\n first()\n-old\n+  third( x )\n"
