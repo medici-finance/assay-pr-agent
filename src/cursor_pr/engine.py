@@ -54,8 +54,11 @@ def section(f):
     return f"Change {f.status} {f.previous}\n{rendered}", anchors
 
 
-def pack(files, checks, skip=frozenset(), title="", description="", advisories=()):
-    """Build the prompt. Paths in skip are left out to fit the budget and get no anchors."""
+def pack(files, checks, skip=frozenset(), title="", description="", advisories=(), scoped=False):
+    """Build the prompt. Paths in skip are left out to fit the budget and get no anchors.
+
+    scoped says the caller passed only some of the changed files.
+    """
     template = distribution("pr-agent").locate_file("pr_agent/settings/pr_reviewer_prompts.toml")
     with template.open("rb") as stream:
         rubric = tomllib.load(stream)["pr_review_prompt"]["system"]
@@ -88,6 +91,10 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
              "added or updated that the patch does not add or change; behaviour it claims with no supporting change in "
              "the patch; changes unrelated to its stated purpose; stubbed or placeholder code (pass, TODO, "
              "NotImplementedError, an empty handler) presented as done." if change else "")
+    # A test or behaviour the description claims may sit in a changed file that is not shown.
+    if change and (scoped or omitted or any(f.path in skip for f in files)):
+        about += (" The patch does not show every changed file, so a claim about a file that is not shown "
+                  "is not a mismatch.")
     about += (" History advisories are notices from the repository's own history about files in this change, "
               "such as a file that usually changes together with a changed one. They are hints to check against "
               "the patch, not findings, and a finding still has to cite head lines present in the shown hunks." if notices else "")

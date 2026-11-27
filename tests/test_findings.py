@@ -73,9 +73,11 @@ class DroppedSummaryTests(unittest.TestCase):
             cli.publish("org/repo#1", "a" * 40, self.report())
         self.assertIn("Dropped 2 model findings: cited line outside the reviewed patch.", posts[0])
         self.assertIn("Dropped 1 model finding: malformed finding.", posts[0])
-        self.assertIn("No model findings in the reviewed scope.", posts[0])
+        self.assertIn("No model finding passed the checks.", posts[0])
+        self.assertNotIn("No model findings in the reviewed scope.", posts[0])
         self.assertNotIn("@all", posts[0])
         self.assertNotIn("Dropped", posts[1])
+        self.assertIn("No model findings in the reviewed scope.", posts[1])
 
     def test_a_review_whose_findings_were_all_dropped_is_not_reported_as_clean(self):
         parsed = {"findings": [], "dropped": [{"path": "a.py", "line": 9, "reason": "cited line outside the reviewed patch"}],
@@ -92,6 +94,7 @@ class DroppedSummaryTests(unittest.TestCase):
             report, code = cli.run_request(args)
         self.assertEqual((code, report["state"], report["findings"], report["dropped"]), (0, "reviewed", [], parsed["dropped"]))
         self.assertIn("Dropped 1 model finding: cited line outside the reviewed patch.", posts[0])
+        self.assertNotIn("No model findings in the reviewed scope.", posts[0])
 
 PATCH = ["def total(items):", "    total = 0", "    for item in items:", "        total += item", "    return total"]
 
