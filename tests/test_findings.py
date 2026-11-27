@@ -169,6 +169,37 @@ class QuotedEvidenceTests(unittest.TestCase):
                     self.assertEqual(parsed["findings"], [])
                     self.assertEqual(parsed["dropped"], [{"path": "a.py", "line": start, "reason": expected}])
 
+    def test_a_quote_must_account_for_every_cited_line(self):
+        cases = (("    return total", 4, 5, "unverified"),
+                 ("        total += item", 3, 5, "unverified"),
+                 ("    for item in items:\n    return total", 3, 5, "unverified"),
+                 ("    for item in items:\n...", 3, 5, "verified"),
+                 ("...\n    return total", 3, 5, "verified"),
+                 ("    for item in items:\n        total += item\n    return total", 3, 5, "verified"))
+        for quote, start, end, expected in cases:
+            with self.subTest(quote=quote):
+                parsed = self.parse(dict(issue(start=start, end=end), relevant_code=quote))
+                self.assertEqual(([f["evidence"] for f in parsed["findings"]], parsed["dropped"]), ([expected], []))
+
+    def test_blank_cited_lines_need_no_quote(self):
+        anchors = shown("first = 1", "", "second = 2")
+        parsed = engine.parse_answer(envelope([dict(issue(start=1, end=3), relevant_code="first = 1\nsecond = 2")]), anchors)
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_a_quote_of_only_trivial_lines_is_unverified_not_dropped(self):
+        anchors = shown("call(", "    x", ")", "}", "return x", "x = 1", "});")
+        cases = (("x", 2, 2, "unverified"), (")", 3, 3, "unverified"), ("}", 4, 4, "unverified"),
+                 ("});", 7, 7, "unverified"), ("3 +)\n4 +}", 3, 4, "unverified"), ("...\n}", 1, 4, "unverified"),
+                 ("return x", 5, 5, "verified"), ("x = 1", 6, 6, "verified"), ("return x\nx = 1\n});", 5, 7, "verified"),
+                 ("call(\n...\n}", 1, 4, "verified"))
+        for quote, start, end, expected in cases:
+            with self.subTest(quote=quote):
+                parsed = engine.parse_answer(envelope([dict(issue(start=start, end=end), relevant_code=quote)]), anchors)
+                self.assertEqual(([f["evidence"] for f in parsed["findings"]], parsed["dropped"]), ([expected], []))
+        # A short quote that is not on the cited lines still contradicts them.
+        wrong = engine.parse_answer(envelope([dict(issue(start=4, end=4), relevant_code=")")]), anchors)
+        self.assertEqual(wrong["dropped"][0]["reason"], "quoted code does not match the cited lines")
+
     def test_raw_numbers_plus_signs_and_literal_whitespace_stay_significant(self):
         anchors = shown("+value", "1 + 2", 'return "a  b"', 'value = "one\u2028two"', "offset,")
         for line, quote in ((1, "+value"), (1, "1 ++value"), (2, "1 + 2"), (3, 'return "a  b"'),
