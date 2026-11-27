@@ -2,12 +2,13 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 from cursor_pr import context, discovery, engine
 from cursor_pr.config import project_from
-from cursor_pr.source import File
+from cursor_pr.source import File, local_change
 
 
 class TierContextTests(unittest.TestCase):
@@ -54,3 +55,52 @@ class TierContextTests(unittest.TestCase):
         self.assertEqual(engine.kept([issue, other], {"findings": [other]}), [other])
         file = File("app.py", "@@ -1 +1 @@\n-foo()\n+bar()\n", "modified")
         self.assertIn("keep the finding unchanged and unverified", engine.verification([issue], [file]))
+
+
+class CallSiteTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name)
+        self.git("init", "-q", "-b", "main")
+        self.module = "def alpha_fn():\n    return 1\n\n\ndef beta_fn():\n    return 2\n\n\ndef gamma_fn():\n    return 3\n"
+        (self.repo / "app.py").write_text(self.module)
+        (self.repo / "a:b.py").write_text("x = gamma_fn()\n")
+        (self.repo / "users.py").write_text("alpha_fn()\n" * 5 + "beta_fn()\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "base")
+        self.git("switch", "-qc", "feature")
+
+    def git(self, *args):
+        return subprocess.check_output(["git", "-C", str(self.repo), "-c", "user.name=Test",
+                                        "-c", "user.email=test@example.org", *args], text=True).strip()
+
+    def change(self, text):
+        (self.repo / "app.py").write_text(text)
+        self.git("commit", "-qam", "change")
+        head = self.git("rev-parse", "HEAD")
+        return head, local_change(self.repo, "main", head).files
+
+    def test_only_names_the_change_touches_are_symbols(self):
+        # The hunk header names beta_fn and the hunk shows the def line of gamma_fn; only gamma_fn changes.
+        _, files = self.change(self.module.replace("return 3", "return 30"))
+        self.assertEqual(context.symbols(files), ["gamma_fn"])
+
+    def test_one_name_does_not_crowd_another_out_of_a_file(self):
+        head, files = self.change(self.module.replace("return 1", "return 10"))
+        with patch.object(context, "symbols", return_value=["alpha_fn", "beta_fn", "gamma_fn"]):
+            text = context.call_sites(self.repo, head, files)
+        self.assertIn("## Uses of beta_fn\nusers.py:6: beta_fn()", text)
+        self.assertEqual(text.count("users.py:"), 6)
+        self.assertIn("## Uses of gamma_fn\na:b.py:1: x = gamma_fn()", text)  # A colon in a path.
+
+    def test_git_failure_is_unavailable_not_empty(self):
+        head, files = self.change(self.module.replace("return 3", "return 30"))
+        self.assertIsNone(context.call_sites(self.repo, "0" * 40, files))
+        self.assertIsNone(context.call_sites(self.repo / "missing", head, files))
+
+    def test_description_without_a_branch_point_is_unavailable(self):
+        head, _ = self.change(self.module.replace("return 3", "return 30"))
+        change = SimpleNamespace(description="", head=head)
+        self.assertIsNone(context.description(change, self.repo, self.repo, ""))
+        self.assertEqual(context.description(change, self.repo, self.repo, self.git("rev-parse", "main")), "change")

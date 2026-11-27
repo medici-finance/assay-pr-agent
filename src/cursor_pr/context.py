@@ -84,12 +84,14 @@ def symbols(files):
     found = []
     for f in live(files):
         for hunk in hunks(f):
-            # The header names the function a hunk sits in; a definition may also be an unchanged line.
-            texts = [hunk.section_header or ""] + [line.value for line in hunk if not line.is_removed]
-            for text in texts:
-                match = DEFINITION.match(text)
-                if match and match[1] not in found:
-                    found.append(match[1])
+            # The header names the definition the hunk starts in; a later definition line takes over.
+            current = DEFINITION.match(hunk.section_header or "")
+            current = current and current[1]
+            for line in hunk:
+                if not line.is_removed and (match := DEFINITION.match(line.value)):
+                    current = match[1]
+                if (line.is_added or line.is_removed) and current and current not in found:
+                    found.append(current)
     return found[:MAX_SYMBOLS]
 
 
@@ -134,7 +136,7 @@ def call_sites(repo, head, files, radius=0):
     names = symbols(files)
     if not names:
         return ""
-    args = ["grep", "-n", "-z", "-I", "-w", "-F", "--no-color", "--no-column", "--max-count=4"]
+    args = ["grep", "-n", "-z", "-I", "-w", "-F", "--no-color", "--no-column"]
     for name in names:
         args.extend(["-e", name])
     sites = {name: [] for name in names}
@@ -178,7 +180,7 @@ def description(change, root, head_repo, fork):
     if change.description.strip():
         return change.description.strip()
     if not fork:
-        return ""
+        raise ReviewError("no branch point for the commit messages")
     objects = git(root, "rev-parse", "--path-format=absolute", "--git-path", "objects") if head_repo != root else None
     return "".join(git_lines(head_repo, "log", "--no-show-signature", "--no-color", "--format=%s%n%b",
                              f"{fork}..{change.head}", alternates=objects)).strip()
