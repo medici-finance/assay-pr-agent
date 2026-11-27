@@ -320,6 +320,26 @@ class MarkerTests(Offline):
         self.assertEqual(asked, ["POST", "POST", "DELETE"])
         self.assertIsNone(ack.jobs.owed(job))
 
+    def test_request_whose_client_was_not_ready_in_time_sends_nothing_and_is_no_try(self):
+        with httpx.Client() as made:
+            client = type(made)
+        asked, ready = [], threading.Event()
+
+        def slow_to_prepare(**options):
+            time.sleep(1.6)  # As a TLS set-up that takes what is left of the time.
+            ready.set()
+            return client(transport=httpx.MockTransport(lambda request: asked.append(request) or httpx.Response(200)),
+                          **options)
+        before = acknowledge.started[0]
+        with patch.object(acknowledge.httpx, "Client", side_effect=slow_to_prepare), \
+                self.assertRaises(acknowledge.OutOfTime):
+            acknowledge.request(self.gh, "POST", GITHUB, {}, time.monotonic() + 1.2)
+        self.assertTrue(ready.wait(10))
+        for thread in threading.enumerate():
+            if thread.name == "forge-marker-request":
+                thread.join(10)
+        self.assertEqual((asked, acknowledge.started[0] - before, acknowledge.unanswered), ([], 0, {}))
+
     def test_a_call_that_started_is_a_try_however_little_time_it_had(self):
         ack = self.ack()
         job = self.gh.key, 3, 81

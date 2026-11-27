@@ -97,21 +97,32 @@ def request(project, method, url, headers, deadline=None, **options):
     # the error then names what was slow, and its thread has ended when the next call is made.
     patience = left - SHORTEST_SECONDS / 2
 
+    # Whether the request is sent is settled once, between the thread and its caller: the thread
+    # commits to sending only within the time and while it is still waited for, and the caller
+    # that stops waiting learns whether it had. A call that sent nothing is no try.
+    settle, state = threading.Lock(), {"sending": False, "waited_for": True}
+
     def send():
         try:
-            if time.monotonic() >= cutoff:
-                raise OutOfTime()  # First run when the caller had stopped waiting: nothing is sent.
             with httpx.Client(timeout=patience, follow_redirects=False,
                               **(client_options() if project.provider == "gitlab" else {})) as client:
+                with settle:  # After the client is ready, which can take its time: just before sending.
+                    if time.monotonic() >= cutoff or not state["waited_for"]:
+                        raise OutOfTime()
+                    state["sending"] = True
+                    started[0] += 1
                 answer.put((client.request(method, url, headers=headers, **options), None))
         except BaseException as err:
             answer.put((None, err))
-    started[0] += 1
     thread = threading.Thread(target=send, name="forge-marker-request", daemon=True)
     thread.start()
     try:
         response, error = answer.get(timeout=max(cutoff - time.monotonic(), 0))
     except queue.Empty:
+        with settle:
+            state["waited_for"] = False
+            if not state["sending"]:
+                raise OutOfTime() from None  # It never got to send, and now will not.
         unanswered[host] = thread
         raise httpx.ReadTimeout("The forge did not answer in time") from None
     if error is not None:
