@@ -108,7 +108,7 @@ def line_hashes(blob):
 
 def log(report, source=None):
     """source(path) is the content of a path at the reviewed head, or None when Git cannot supply it."""
-    results, rules, lines = [], {}, {}
+    results, rules, lines, located = [], {}, {}, []
     for tool, name, path, line, end, text in findings(report):
         if not (isinstance(text, str) and text.strip() and safe_path(path)
                 and isinstance(name, str) and name.strip()):
@@ -117,22 +117,34 @@ def log(report, source=None):
         text = (text if tool == "model" else f"{tool}: {text}")[:MESSAGE_LIMIT]
         # A URI reference: a '#' or '%' in a path must not read as a fragment or an escape.
         location = {"artifactLocation": {"uri": quote(path, safe="/")}}
+        result = {"ruleId": name, "level": "warning" if tool in WARNINGS else "note", "message": {"text": text},
+                  "locations": [{"physicalLocation": location}]}
         # A finding without a line, such as an OSV-Scanner vulnerability, has only these to identify it.
         fingerprint = hashlib.sha256(json.dumps([path, name, text]).encode()).hexdigest()
         if type(line) is int and line > 0:
-            location["region"] = {"startLine": line, **({"endLine": end} if type(end) is int and end >= line else {})}
+            extent = end if type(end) is int and end >= line else None
+            location["region"] = {"startLine": line, **({"endLine": extent} if extent is not None else {})}
             # The line's own text identifies the result, so a line added above it is not a new alert.
             if path not in lines:
                 blob = source(path) if source else None
                 lines[path] = line_hashes(blob) if blob is not None else {}
             # Without the line's text there is no value: the upload-sarif action computes it instead.
             fingerprint = lines[path].get(line)
-        rules.setdefault(name, describe(tool, name))
-        result = {"ruleId": name, "level": "warning" if tool in WARNINGS else "note", "message": {"text": text},
-                  "locations": [{"physicalLocation": location}]}
+            if fingerprint:
+                located.append(((path, name, fingerprint), (extent, text), result))
         if fingerprint:
             result["partialFingerprints"] = {"primaryLocationLineHash": fingerprint}
+        rules.setdefault(name, describe(tool, name))
         results.append(result)
+    # One rule can report several findings on one line: every model finding has one rule, and ShellCheck
+    # reports SC2086 for each unquoted variable. The first keeps the reference value and each one after
+    # it that differs from the ones before adds its number. Findings the log cannot tell apart, such as
+    # two SC2086 with one message, keep one identity.
+    told_apart = {}
+    for place, finding, result in located:
+        number = told_apart.setdefault(place, {}).setdefault(finding, len(told_apart[place]) + 1)
+        if number > 1:
+            result["partialFingerprints"]["primaryLocationLineHash"] += f":{number}"
     return {"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0", "runs": [{
         "tool": {"driver": {"name": TOOL, "version": release(), "informationUri": PROJECT,
                             "rules": list(rules.values())}},

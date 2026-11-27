@@ -41,7 +41,7 @@ def prints(rows):
 
 
 SCRIPT = b"#!/bin/sh\nfor f in $list; do\n  echo $f\n  cp $f $dir\ndone\n"
-SOURCES = {"run.sh": SCRIPT, "src/app.py": b"import os\n" * 12, "Dockerfile": b"FROM node:latest\n"}
+SOURCES = {"run.sh": SCRIPT, "src/app.py": b"import os\n" * 12, "copy.py": b"import os\n" * 12, "Dockerfile": b"FROM node:latest\n"}
 EXAMPLE = "#!/bin/sh\necho $argument\n"
 SHELL = {"path": "example.sh", "rule": "SC2086", "line": 2, "message": "Double quote to prevent globbing."}
 
@@ -107,6 +107,40 @@ class SarifLogTests(unittest.TestCase):
         # The 100 characters after a line are part of its value, so this edit reaches both findings.
         edited = export(2, 4, text=SCRIPT.replace(b"cp $f", b"mv $f"))
         self.assertEqual([value != old for value, old in zip(edited, first)], [True, True])
+
+    def test_findings_of_one_rule_on_one_line_are_told_apart(self):
+        def model(*findings):
+            return report(findings=[{"path": "src/app.py", "line": 3, "end_line": end, "title": "T", "message": message}
+                                    for message, end in findings], checks=[], static_checks=[])
+
+        def scanned(*findings):
+            return report(findings=[], static_checks=[], checks=[
+                {"tool": "shellcheck", "path": "run.sh", "state": "complete", "findings": list(findings)}])
+        value = sarif.line_hashes(SOURCES["src/app.py"])[3]
+        # Every model finding has one rule. Three defects on one line would be one alert.
+        self.assertEqual(prints(results(model(("first", 3), ("second", 4), ("third", 3)), head_text)), [
+            {"primaryLocationLineHash": value}, {"primaryLocationLineHash": value + ":2"},
+            {"primaryLocationLineHash": value + ":3"}])
+        # The first keeps the reference value, so a finding alone on its line keeps its identity.
+        self.assertEqual(prints(results(model(("first", 3)), head_text)), [{"primaryLocationLineHash": value}])
+        # Two that differ only in extent are two findings, and a later one that repeats an earlier one
+        # takes that finding's number.
+        self.assertEqual(prints(results(model(("same", 3), ("same", 5), ("first", 3), ("first", 3)), head_text)), [
+            {"primaryLocationLineHash": value}, {"primaryLocationLineHash": value + ":2"},
+            {"primaryLocationLineHash": value + ":3"}, {"primaryLocationLineHash": value + ":3"}])
+        # The log cannot tell apart two SC2086 rows with one message, so they keep one identity.
+        shell = {"path": "run.sh", "rule": "SC2086", "line": 4, "message": "Double quote."}
+        one = [{"primaryLocationLineHash": sarif.line_hashes(SCRIPT)[4]}]
+        self.assertEqual(prints(results(scanned(shell, shell), head_text)), one * 2)
+        # Two rules on one line need no number: the rule is part of a result's identity.
+        other = dict(shell, rule="SC2154", message="Referenced but not assigned.")
+        self.assertEqual(prints(results(scanned(shell, other), head_text)), one * 2)
+        # Neither does the same rule on the same text in another file.
+        alone = model(("first", 3))
+        self.assertEqual(prints(results(dict(alone, findings=alone["findings"] + [
+            dict(alone["findings"][0], path="copy.py", message="elsewhere")]), head_text)),
+            [{"primaryLocationLineHash": value}] * 2)
+        self.assertEqual(prints(results(model(("first", 3), ("second", 3)), None)), [None, None])
 
     def test_unreadable_lines_carry_no_fingerprint_and_lineless_ones_keep_one(self):
         # Without the line's text there is no value: the upload-sarif action computes it from its checkout.
