@@ -26,7 +26,8 @@ from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
 from .discovery import context_comments
-from .engine import MAX_FINDINGS, CursorFailure, merge_findings, pack, rank, render_sections, review, tokens, verification
+from .engine import (MAX_FINDINGS, CursorFailure, merge_findings, pack, prompt_advisories, rank, render_sections,
+                     review, tokens, verification, visible_advisories)
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
 
 
@@ -41,71 +42,127 @@ DEEP_FOCUS = ("Look for what only this wider view shows: a caller the change bre
 USED = ("included", "truncated")
 
 
-def fit(files, checks, limit, cap=MAX_FINDINGS, *, title="", description="", focus="", rendered=None):
-    """Pack the prompt, leaving out whole files until it fits the input budget.
+def add_history(files, checks, packed, estimate, limit, dropped, advisories, **options):
+    """Fit a prefix of the notices without changing the chosen patch scope or tier context."""
+    if estimate >= limit:
+        return packed, estimate
+    notices = visible_advisories(advisories, packed[1])
+    skipped = frozenset(dropped)
+    smallest, largest = 1, len(notices)
+    while smallest <= largest:
+        count = (smallest + largest) // 2
+        candidate = pack(files, checks, skipped, advisories=notices[:count], **options)
+        candidate_size = tokens(candidate[0])
+        if candidate_size <= limit:
+            packed, estimate = candidate, candidate_size
+            smallest = count + 1
+        else:
+            largest = count - 1
+    return packed, estimate
 
-    Returns the prompt parts, the estimate of what will be sent, the estimate of the full
-    prompt, and the paths left out. Nothing is left out when even one file cannot fit.
-    """
+
+def fit(files, checks, limit, cap=MAX_FINDINGS, *, title="", description="", focus="", advisories=(), rendered=None):
+    """Fill the prompt with reviewable patches first and use spare space for history."""
     if rendered is None:
         rendered = render_sections(files)
+    options = dict(max_findings=cap, focus=focus, rendered=rendered)
+    if advisories:
+        original = pack(files, checks, title=title, description=description, advisories=advisories, **options)
+        original_size = tokens(original[0]) if original[3] else 0
+        if original_size <= limit:
+            return original, original_size, original_size, []
+
+    packed, estimate, full, dropped, has_metadata = fit_patch(files, checks, limit, title, description, **options)
+    if not advisories:
+        return packed, estimate, full, dropped
+    if estimate > limit:
+        return original, original_size, original_size, []
+    if not has_metadata:
+        title = description = ""
+    packed, estimate = add_history(files, checks, packed, estimate, limit, dropped, advisories,
+                                   title=title, description=description, **options)
+    return packed, estimate, original_size, dropped
+
+
+def fit_patch(files, checks, limit, title, description, *, max_findings, focus, rendered):
+    """Pack the prompt, leaving out whole files until it fits the input budget.
+
+    Returns the prompt, token estimates, skipped paths and whether author context was kept.
+    """
+    options = dict(max_findings=max_findings, focus=focus, rendered=rendered)
     prompt, anchors, unseen, has_text = full_pack = pack(
-        files, checks, title=title, description=description, max_findings=cap, focus=focus, rendered=rendered)
+        files, checks, title=title, description=description, **options)
     estimated = full = tokens(prompt) if has_text else 0
     if full <= limit:
-        return full_pack, full, full, []
+        return full_pack, full, full, [], bool(title or description)
     if title or description:
-        plain = pack(files, checks, max_findings=cap, focus=focus, rendered=rendered)
+        plain = pack(files, checks, **options)
         plain_estimate = tokens(plain[0])
         if plain_estimate <= limit:
-            return plain, plain_estimate, full, []
+            return plain, plain_estimate, full, [], False
     # Measure each file with its scanner evidence before choosing what to leave out.
     # A file that cannot fit alone leaves first, so a smaller file can still be reviewed.
     findings_by_path = defaultdict(list)
     for check in checks:
         for finding in check["findings"]:
             findings_by_path[finding["path"]].append(finding)
-    overhead = tokens(pack([], [], title=title, description=description, max_findings=cap, focus=focus)[0])
+    overhead = tokens(pack([], [], title=title, description=description, **options)[0])
     sizes = {}
     for file in files:
         if rendered[file.path][0] is not None:
             file_checks = [{"findings": findings_by_path.get(file.path, ())}]
-            standalone, _, _, _ = pack(
-                [file], file_checks, title=title, description=description, max_findings=cap, focus=focus, rendered=rendered)
+            standalone, _, _, _ = pack([file], file_checks, title=title, description=description, **options)
             sizes[file.path] = tokens(standalone) - overhead
     queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
+    batch_start = 0
     while estimated > limit and queue:
         # Per-file sizes are approximate, so the last file only leaves after a real recount.
+        batch_start = len(dropped)
         dropped.append(queue.pop(0))
         freed = sizes[dropped[-1]]
         while len(queue) > 1 and freed < estimated - limit:
             dropped.append(queue.pop(0))
             freed += sizes[dropped[-1]]
-        prompt, anchors, unseen, has_text = pack(
-            files, checks, frozenset(dropped), title, description, max_findings=cap, focus=focus, rendered=rendered)
+        prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), title, description, **options)
         estimated = tokens(prompt) if has_text else 0
+    # The final batch may have removed too much because tokenizer boundaries
+    # differ between standalone patches and the combined prompt.
+    smallest, largest = batch_start + 1, len(dropped)
+    while estimated <= limit and smallest < largest:
+        count = (smallest + largest) // 2
+        candidate = pack(files, checks, frozenset(dropped[:count]), title, description, **options)
+        candidate_size = tokens(candidate[0])
+        if candidate_size <= limit:
+            prompt, anchors, unseen, has_text = candidate
+            estimated = candidate_size
+            largest = count
+        else:
+            smallest = count + 1
+    del dropped[largest:]
     fits = has_text and estimated <= limit
     if (title or description) and (not fits or len(dropped) > 1):
-        fitted, estimate, _, skipped = fit(files, checks, limit, cap, focus=focus, rendered=rendered)
+        fitted, estimate, _, skipped, _ = fit_patch(files, checks, limit, "", "", **options)
         if fitted[3] and estimate <= limit and (not fits or len(skipped) < len(dropped)):
-            return fitted, estimate, full, skipped
+            return fitted, estimate, full, skipped, False
     if not fits:
-        return full_pack, full, full, []
-    return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped)
+        return full_pack, full, full, [], bool(title or description)
+    return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped), bool(title or description)
 
 
 def with_context(files, checks, packed, estimated, dropped, limit, cap, names, raw, *, rendered, focus=""):
-    """Add optional context without exceeding the patch pass's allowance."""
+    """Fit tier-specific context to an already selected scope."""
     text, fates = context.assemble(names, raw, limit - estimated - (120 if focus else 80))
+    options = dict(max_findings=cap, focus=focus, rendered=rendered)
     if text:
-        wider = pack(files, checks, frozenset(dropped), context=text, max_findings=cap, focus=focus,
-                     rendered=rendered)[0]
-        size = tokens(wider)
+        wider = pack(files, checks, frozenset(dropped), context=text, **options)
+        size = tokens(wider[0])
         if size <= limit:
-            return wider, size, fates
-        fates = [dict(row, state="dropped") if row["state"] in USED else row for row in fates]
-    return packed, estimated, fates
+            packed, estimated = wider, size
+        else:
+            fates = [dict(row, state="dropped") if row["state"] in USED else row for row in fates]
+            text = ""
+    return packed, estimated, fates, text
 
 
 def run_pass(row, prompt, anchors, args, source, *, cap, timeout, originals=None):
@@ -399,6 +456,9 @@ def execute(args):
         go["findings"] = [row for row in go["findings"] if row["path"] in selected]
         checks.append(go)
 
+    qualgen = history.screen(root, args.qualgen_store, selected, change.head) if args.qualgen_store else None
+    advisories = qualgen["advisories"] if qualgen else ()
+
     tier, base = args.tier, args.max_input_tokens
     budget = base * TIERS[tier]
     backend = providers.provider()
@@ -407,17 +467,18 @@ def execute(args):
     first_tier = "regular" if tier == "regular" else "mid"
     cap = CAPS[first_tier]
     rendered = render_sections(files)
-    metadata = {"title": change.title, "description": change.description} if tier == "regular" else {}
-    (prompt, anchors, unseen, has_text), estimated, full, dropped = fit(
-        files, checks, limit, cap, rendered=rendered, **metadata)
+    regular_options = {"title": change.title, "description": change.description, "advisories": advisories} if tier == "regular" else {}
+    first_pack, estimated, full, dropped = fit(files, checks, limit, cap, rendered=rendered, **regular_options)
+    prompt, anchors, unseen, has_text = first_pack
     plans = []
     fates = context.assemble(context.MID, raw, 0)[1] if tier != "regular" else []
     deep_fates = context.assemble(context.DEEP, raw, 0)[1] if tier == "max" else []
     first_paths = set()
     if has_text and estimated <= limit:
         if tier != "regular":
-            prompt, estimated, fates = with_context(
-                files, checks, prompt, estimated, dropped, limit, cap, context.MID, raw, rendered=rendered)
+            first_pack, estimated, fates, first_context = with_context(
+                files, checks, first_pack, estimated, dropped, limit, cap, context.MID, raw, rendered=rendered)
+            prompt = first_pack[0]
         plans.append(({"name": "review", "estimated_input_tokens": estimated, "state": "planned"}, prompt, anchors, fates))
         first_paths = {path for path, lines in anchors.items() if lines}
 
@@ -425,19 +486,47 @@ def execute(args):
     if tier == "max" and has_text:
         # The reserve is for planning. Verification may use any tokens left after actual prompts.
         deep_limit = budget - (estimated if plans else 0) - base // 2
-        (deep, deep_anchors, _, _), deep_size, _, deep_dropped = fit(
+        deep_pack, deep_size, _, deep_dropped = fit(
             files, checks, deep_limit, cap, focus=DEEP_FOCUS, rendered=rendered)
+        deep_anchors = deep_pack[1]
         if deep_size <= deep_limit:
-            deep, deep_size, deep_fates = with_context(
-                files, checks, deep, deep_size, deep_dropped, deep_limit, cap, context.DEEP, raw,
+            deep_pack, deep_size, deep_fates, deep_context = with_context(
+                files, checks, deep_pack, deep_size, deep_dropped, deep_limit, cap, context.DEEP, raw,
                 rendered=rendered, focus=DEEP_FOCUS)
             new_paths = any(lines and path not in first_paths for path, lines in deep_anchors.items())
             extra_context = any(row["name"] not in context.MID and row["state"] in USED for row in deep_fates)
             if new_paths or extra_context:
                 plans.append(({"name": "deep", "estimated_input_tokens": deep_size, "state": "planned"},
-                              deep, deep_anchors, deep_fates))
+                              deep_pack[0], deep_anchors, deep_fates))
             else:
                 deep_fates = [dict(row, state="dropped") if row["state"] in USED else row for row in deep_fates]
+
+    if tier != "regular" and advisories:
+        # Share the existing context allowance. The original pass sizes bound
+        # history-bearing prompts, preserving the patch scope and verification budget.
+        history_name = "history advisories (untrusted data)"
+        for index, (row, _, locations, blocks) in enumerate(plans):
+            is_deep = row["name"] == "deep"
+            names, skipped, original_context = ((context.DEEP, deep_dropped, deep_context) if is_deep
+                                                 else (context.MID, dropped, first_context))
+            notices = prompt_advisories(advisories, locations)
+            if not original_context or not notices:
+                continue
+            history_text = "\n".join(json.dumps(notice, ensure_ascii=False) for notice in notices)
+            wider, fates_with_history = context.assemble(
+                (*names, history_name), {**raw, history_name: history_text}, tokens(original_context))
+            replacements = fates_with_history[:-1]
+            if fates_with_history[-1]["state"] not in USED or any(
+                    old["state"] in USED and new["state"] not in USED
+                    for old, new in zip(blocks, replacements, strict=True)):
+                continue
+            candidate = pack(files, checks, frozenset(skipped), context=wider, max_findings=cap,
+                             focus=DEEP_FOCUS if is_deep else "", rendered=rendered)[0]
+            size = tokens(candidate)
+            if size <= row["estimated_input_tokens"]:
+                row["estimated_input_tokens"] = size
+                blocks[:] = replacements
+                plans[index] = row, candidate, locations, blocks
 
     passes = [row for row, _, _, _ in plans]
     context_fates = merged_fates([fates, deep_fates])
@@ -457,8 +546,8 @@ def execute(args):
         report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
         report["cursor_team_id"] = os.environ["REVIEW_CURSOR_TEAM_ID"]
-    if args.qualgen_store:
-        report["qualgen"] = history.screen(root, args.qualgen_store, selected, change.head)
+    if qualgen:
+        report["qualgen"] = qualgen
     if has_text and not passes:
         return dict(report, state="over-budget", estimated_input_tokens=full, prompt_limit=deep_limit, delivered=None), 2
     if args.estimate:
