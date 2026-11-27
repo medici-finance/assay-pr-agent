@@ -14,13 +14,13 @@ def count(name, text):
 
 class EstimateTests(unittest.TestCase):
     def test_the_encoding_follows_the_model(self):
-        for model in ("gpt-5-codex", "GPT-4.1-mini", "o3-mini", "o1-preview", "gpt-4o"):
+        for model in ("gpt-5-codex", "GPT-4.1-mini", "o3-mini", "o1-preview", "gpt-4o", "o3", "o1"):
             with self.subTest(model=model):
                 self.assertEqual(engine.encodings(model), ("gpt-4o",))
         for model in ("gpt-4-turbo", "gpt-3.5-turbo"):
             with self.subTest(model=model):
                 self.assertEqual(engine.encodings(model), ("gpt-4",))
-        for model in ("claude-sonnet-4-5", "opus", "cursor-default", "gemini-2.5-pro", "", None):
+        for model in ("claude-sonnet-4-5", "opus", "cursor-default", "gemini-2.5-pro", "pro4-x", "", None):
             with self.subTest(model=model):
                 self.assertEqual(engine.encodings(model), ("gpt-4", "gpt-4o"))
 
@@ -32,11 +32,15 @@ class EstimateTests(unittest.TestCase):
             self.assertEqual((engine.tokens(text, "gpt-4-turbo"), engine.tokens(text, "gpt-5")), (gpt4, gpt4o))
 
     def test_the_budget_uses_the_selected_model(self):
-        files = [source.File("a.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")]
+        files = [source.File("a.py", "@@ -0,0 +1 @@\n+x = 1\n", "added"),
+                 source.File("big.py", "@@ -0,0 +1,400 @@\n" + "".join(f"+value_{n} = compute({n})\n" for n in range(400)), "added")]
         with patch.object(cli, "tokens", wraps=engine.tokens) as counter:
-            cli.fit(files, [], 6000, model="gpt-4-turbo")
-        self.assertTrue(counter.call_args_list)
-        self.assertEqual({call.args[1] for call in counter.call_args_list}, {"gpt-4-turbo"})
+            cli.fit(files[:1], [], 6000, model="gpt-4-turbo")
+            # Over the limit, so the per-file sizes, the overhead and the recount are all counted too.
+            degraded = cli.fit(files, [], 2500, model="gpt-4-turbo")[3]
+        self.assertEqual(degraded, ["big.py"])
+        self.assertGreater(len(counter.call_args_list), 4)
+        self.assertEqual({call.args[1] if len(call.args) > 1 else None for call in counter.call_args_list}, {"gpt-4-turbo"})
 
 
 if __name__ == "__main__":
