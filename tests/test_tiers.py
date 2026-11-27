@@ -103,6 +103,16 @@ class TierTests(unittest.TestCase):
                 self.assertLessEqual(report["estimated_input_tokens"], limit * times)
         self.assertEqual(self.prompts(), [])
 
+    def test_empty_review_has_no_tier_degradation_or_provider_call(self):
+        head = self.git("rev-parse", "main")
+        for tier in cli.TIERS:
+            with self.subTest(tier=tier):
+                code, report = self.check("--tier", tier, "--head", head)
+                self.assertEqual((code, report["state"], report["delivered"]), (0, "empty", None))
+                code, estimated = self.check("--tier", tier, "--head", head, "--estimate")
+                self.assertEqual((code, estimated["state"]), (0, "estimate"))
+        self.assertEqual(self.prompts(), [])
+
     def test_regular_review_is_one_call_with_the_plain_prompt(self):
         self.answers(review=answer(finding(42, "Real")))
         code, report = self.check()

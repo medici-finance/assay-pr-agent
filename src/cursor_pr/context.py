@@ -200,10 +200,16 @@ def overlap(root, drifted):
 @guarded
 def whole_files(repo, head, files):
     parts = []
-    for f in live(files):
-        if rank(f.path) == SOURCE_RANK and (text := blob(repo, head, f.path)) is not None:
-            parts.append(f"## {f.path} at the head\n{text}")
-    return "\n\n".join(parts)
+    remaining = MAX_RAW
+    for file in live(files):
+        if rank(file.path) == SOURCE_RANK and (text := blob(repo, head, file.path)) is not None:
+            separator = "\n\n" if parts else ""
+            part = f"{separator}## {file.path} at the head\n{text}"[:remaining]
+            parts.append(part)
+            remaining -= len(part)
+            if remaining == 0:
+                break
+    return "".join(parts)
 
 
 @guarded

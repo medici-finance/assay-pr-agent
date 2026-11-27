@@ -48,6 +48,14 @@ class TierContextTests(unittest.TestCase):
             with patch.object(context, "MAX_RAW", 50):
                 self.assertEqual(list(context.git_lines(repo, "grep", "-I", "-F", "-e", "x", head)), [])
 
+    def test_whole_files_stops_reading_when_the_context_limit_is_reached(self):
+        files = [File(f"{name}.py", "present", "modified") for name in ("one", "two", "three")]
+        with patch.object(context, "MAX_RAW", 45), patch.object(context, "blob", return_value="x" * 40) as blob:
+            text = context.whole_files(None, "head", files)
+        self.assertEqual(len(text), 45)
+        self.assertTrue(text.startswith("## one.py at the head"))
+        blob.assert_called_once_with(None, "head", "one.py")
+
     def test_verification_preserves_distinct_findings_at_the_same_location(self):
         issue = dict(path="app.py", line=1, end_line=1, title="First issue", message="First defect")
         other = dict(issue, title="Other issue", message="Different defect")

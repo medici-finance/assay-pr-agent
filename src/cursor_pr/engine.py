@@ -71,7 +71,17 @@ def section(f):
     return f"Change {f.status} {f.previous}\n{rendered}", anchors
 
 
-def pack(files, checks, skip=frozenset(), *, context="", max_findings=MAX_FINDINGS, focus=""):
+def render_sections(files):
+    """Validate paths and render each patch once for full and reduced prompts."""
+    rendered = {}
+    for file in files:
+        if not file.path or any(ord(char) < 32 for char in file.path) or file.path in rendered:
+            raise ReviewError("Invalid or duplicate forge filename")
+        rendered[file.path] = section(file)
+    return rendered
+
+
+def pack(files, checks, skip=frozenset(), *, context="", max_findings=MAX_FINDINGS, focus="", rendered=None):
     """Build the prompt. Paths in skip are left out to fit the budget and get no anchors.
 
     context is text from beyond the patch; findings must still cite patch lines. With the
@@ -84,16 +94,13 @@ def pack(files, checks, skip=frozenset(), *, context="", max_findings=MAX_FINDIN
         num_max_findings=max_findings,
         diff_hunk_format="New hunks are numbered at the head; old hunks show the former code.",
     )
+    patches = render_sections(files).items() if rendered is None else ((f.path, rendered[f.path]) for f in files)
     sections, anchors, omitted = [], {}, []
-    for f in files:
-        if not f.path or any(ord(c) < 32 for c in f.path) or f.path in anchors:
-            raise ReviewError("Invalid or duplicate forge filename")
-        text, anchors[f.path] = section(f)
+    for path, (text, lines) in patches:
+        anchors[path] = set() if path in skip else lines
         if text is None:
-            omitted.append(f.path)
-        elif f.path in skip:
-            anchors[f.path] = set()
-        else:
+            omitted.append(path)
+        elif path not in skip:
             sections.append(text)
     evidence = [finding for check in checks for finding in check["findings"]
                 if finding["line"] in anchors.get(finding["path"], set())]

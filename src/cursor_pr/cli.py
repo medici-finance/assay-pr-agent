@@ -1,4 +1,5 @@
 import argparse
+from collections import defaultdict
 import fcntl
 from contextlib import ExitStack
 import json
@@ -24,7 +25,7 @@ from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
 from .discovery import context_comments
-from .engine import MAX_FINDINGS, CursorFailure, kept, merge_findings, pack, rank, review, tokens, verification
+from .engine import MAX_FINDINGS, CursorFailure, kept, merge_findings, pack, rank, render_sections, review, tokens, verification
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
 
 
@@ -38,23 +39,30 @@ DEEP_FOCUS = ("Look for what only this wider view shows: a caller the change bre
 USED = ("included", "truncated")
 
 
-def fit(files, checks, limit, cap=MAX_FINDINGS, *, focus=""):
+def fit(files, checks, limit, cap=MAX_FINDINGS, *, focus="", rendered=None):
     """Pack the prompt, leaving out whole files until it fits the input budget.
 
     Returns the prompt parts, the estimate of what will be sent, the estimate of the full
     prompt, and the paths left out. Nothing is left out when even one file cannot fit.
     """
-    prompt, anchors, unseen, has_text = full_pack = pack(files, checks, max_findings=cap, focus=focus)
+    if rendered is None:
+        rendered = render_sections(files)
+    prompt, anchors, unseen, has_text = full_pack = pack(files, checks, max_findings=cap, focus=focus, rendered=rendered)
     estimated = full = tokens(prompt) if has_text else 0
     if full <= limit:
         return full_pack, full, full, []
     # Measure each file with its scanner evidence before choosing what to leave out.
     # A file that cannot fit alone leaves first, so a smaller file can still be reviewed.
+    findings_by_path = defaultdict(list)
+    for check in checks:
+        for finding in check["findings"]:
+            findings_by_path[finding["path"]].append(finding)
     overhead = tokens(pack([], [], max_findings=cap, focus=focus)[0])
     sizes = {}
     for file in files:
-        if file.path not in unseen:
-            standalone, _, _, _ = pack([file], checks, max_findings=cap, focus=focus)
+        if rendered[file.path][0] is not None:
+            file_checks = [{"findings": findings_by_path.get(file.path, ())}]
+            standalone, _, _, _ = pack([file], file_checks, max_findings=cap, focus=focus, rendered=rendered)
             sizes[file.path] = tokens(standalone) - overhead
     queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
@@ -65,18 +73,19 @@ def fit(files, checks, limit, cap=MAX_FINDINGS, *, focus=""):
         while len(queue) > 1 and freed < estimated - limit:
             dropped.append(queue.pop(0))
             freed += sizes[dropped[-1]]
-        prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), max_findings=cap, focus=focus)
+        prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), max_findings=cap, focus=focus, rendered=rendered)
         estimated = tokens(prompt) if has_text else 0
     if not has_text or estimated > limit:
         return full_pack, full, full, []
     return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped)
 
 
-def with_context(files, checks, packed, estimated, dropped, limit, cap, names, raw, *, focus=""):
+def with_context(files, checks, packed, estimated, dropped, limit, cap, names, raw, *, rendered, focus=""):
     """Add optional context without exceeding the patch pass's allowance."""
     text, fates = context.assemble(names, raw, limit - estimated - (120 if focus else 80))
     if text:
-        wider = pack(files, checks, frozenset(dropped), context=text, max_findings=cap, focus=focus)[0]
+        wider = pack(files, checks, frozenset(dropped), context=text, max_findings=cap, focus=focus,
+                     rendered=rendered)[0]
         size = tokens(wider)
         if size <= limit:
             return wider, size, fates
@@ -155,7 +164,7 @@ def publish(address, head, report, *, project=None, state=None):
     elif tier != "regular":
         body.append(f"Tier {tier}: budget {report['max_input_tokens']} tokens ({TIERS[tier]}× the configured "
                     f"{report['base_input_tokens']}), estimated use {report['estimated_input_tokens']}.")
-        if report["delivered"] != tier:
+        if report["delivered"] is not None and report["delivered"] != tier:
             body.append(f"Degraded review: {tier} was requested and {report['delivered']} was delivered.")
         blocks = {row["name"]: row["state"] for row in report["context"]}
         used = [name + (" (truncated)" if state == "truncated" else "") for name, state in blocks.items() if state in USED]
@@ -303,13 +312,14 @@ def execute(args):
     limit = base if tier == "regular" else 2 * base - base // 4
     first_tier = "regular" if tier == "regular" else "mid"
     cap = CAPS[first_tier]
-    (prompt, anchors, unseen, has_text), estimated, full, dropped = fit(files, checks, limit, cap)
+    rendered = render_sections(files)
+    (prompt, anchors, unseen, has_text), estimated, full, dropped = fit(files, checks, limit, cap, rendered=rendered)
     plans, fates, deep_fates = [], [], []
     first_paths = set()
     if has_text and estimated <= limit:
         if tier != "regular":
             prompt, estimated, fates = with_context(
-                files, checks, prompt, estimated, dropped, limit, cap, context.MID, raw)
+                files, checks, prompt, estimated, dropped, limit, cap, context.MID, raw, rendered=rendered)
         plans.append(({"name": "review", "estimated_input_tokens": estimated, "state": "planned"}, prompt, anchors, fates))
         first_paths = {path for path, lines in anchors.items() if lines}
 
@@ -317,10 +327,12 @@ def execute(args):
     if tier == "max" and has_text:
         # The reserve is for planning. Verification may use any tokens left after actual prompts.
         deep_limit = budget - (estimated if plans else 0) - base // 2
-        (deep, deep_anchors, _, _), deep_size, _, deep_dropped = fit(files, checks, deep_limit, cap, focus=DEEP_FOCUS)
+        (deep, deep_anchors, _, _), deep_size, _, deep_dropped = fit(
+            files, checks, deep_limit, cap, focus=DEEP_FOCUS, rendered=rendered)
         if deep_size <= deep_limit:
             deep, deep_size, deep_fates = with_context(
-                files, checks, deep, deep_size, deep_dropped, deep_limit, cap, context.DEEP, raw, focus=DEEP_FOCUS)
+                files, checks, deep, deep_size, deep_dropped, deep_limit, cap, context.DEEP, raw,
+                rendered=rendered, focus=DEEP_FOCUS)
             new_paths = any(lines and path not in first_paths for path, lines in deep_anchors.items())
             extra_context = any(row["name"] not in context.MID and row["state"] in USED for row in deep_fates)
             if new_paths or extra_context:
@@ -331,7 +343,7 @@ def execute(args):
 
     passes = [row for row, _, _, _ in plans]
     context_fates = merged_fates([fates, deep_fates])
-    planned_tier = reached([(row["name"], blocks) for row, _, _, blocks in plans])
+    planned_tier = reached([(row["name"], blocks) for row, _, _, blocks in plans]) if plans else None
     reviewable = selected - set(unseen)
     planned_paths = {path for _, _, locations, _ in plans for path, lines in locations.items() if lines}
     degraded = sorted(reviewable - planned_paths) if plans else []
@@ -352,7 +364,7 @@ def execute(args):
     if has_text and not passes:
         return dict(report, state="over-budget", estimated_input_tokens=full, prompt_limit=deep_limit, delivered=None), 2
     if args.estimate:
-        return dict(report, state="estimate"), 2 if degraded or planned_tier != tier else 0
+        return dict(report, state="estimate"), 2 if degraded or (has_text and planned_tier != tier) else 0
 
     completed, coverage, findings, last_error = [], {}, [], None
     for row, pass_prompt, locations, blocks in plans:
@@ -394,7 +406,7 @@ def execute(args):
     report["degraded"] = degraded
     if report["delivered"] == "max":
         report["prompt_limit"] = deep_limit
-    lowered = (report["delivered"] != tier or report["verification"]["state"] == "unavailable"
+    lowered = ((has_text and report["delivered"] != tier) or report["verification"]["state"] == "unavailable"
                or any(row["state"] == "failed" for row in passes))
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
     if degraded or lowered:
