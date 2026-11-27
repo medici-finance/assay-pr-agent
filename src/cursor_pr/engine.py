@@ -173,7 +173,7 @@ def finding(issue, anchors):
     if not parts:
         # Nothing to check against the patch is not a mismatch: the finding is kept and marked.
         return dict(valid, evidence="unverified"), None
-    cited = ("".join(anchors[path][line].split()) for line in range(start, end + 1))
+    cited = ((line, lines[line].rstrip("\r\n")) for line in range(start, end + 1))
     if not quoted_in_order(parts, cited):
         if not asked:
             # A fenced block in the text may be a suggested fix rather than a quote.
@@ -184,7 +184,7 @@ def finding(issue, anchors):
 
 FENCED = re.compile(r"`{3,}[^\n]*\n(.*?)`{3,}", re.S)
 # A quoted line as the patch shows it: indented, numbered, and marked as added.
-SHOWN = re.compile(r"\s*(?:\d+\s)?\+?")
+SHOWN = re.compile(r"([1-9]\d*) (?:\+| )(.*)")
 # Lines that stand for no code: an elision such as "..." or "# …", and the patch's hunk markers.
 PLACEHOLDER = re.compile(r"(?:#|//)?(?:\.{3,}|…)|__(?:new|old)hunk__")
 
@@ -202,15 +202,24 @@ def quoted(issue):
 
 
 def checkable(quote):
-    """The quoted lines as code to look for: display, whitespace and placeholder lines removed."""
-    parts = ("".join(SHOWN.sub("", part, count=1).split()) for part in quote.splitlines())
-    return [part for part in parts if part and not PLACEHOLDER.fullmatch(part)]
+    """Ignore blank lines and elisions, retaining the raw and numbered forms of each quote line."""
+    parts = []
+    for raw in quote.split("\n"):
+        raw = raw.removesuffix("\r")
+        text = raw.strip(" \t")
+        shown = SHOWN.fullmatch(raw.lstrip(" \t"))
+        content = shown[2] if shown else text
+        if content.strip(" \t") and not PLACEHOLDER.fullmatch("".join(content.split())):
+            parts.append((text, shown[1] if shown else None, content))
+    return parts
 
 
 def quoted_in_order(parts, cited):
-    """Every quoted line appears, in order, inside the cited head lines. Whitespace does not count."""
+    """Match whole head lines in order, accepting either raw code or the prompt's line display."""
     remaining = iter(cited)
-    return all(any(part in line for line in remaining) for part in parts)
+    return all(any(text == line.strip(" \t") or (number == str(index) and content == line)
+                   for index, line in remaining)
+               for text, number, content in parts)
 
 
 def invoke(prompt, model, anchors):

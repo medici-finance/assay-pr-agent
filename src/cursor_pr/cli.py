@@ -95,7 +95,7 @@ def publish(address, head, report, *, project=None, state=None):
         body.append(f"Dropped {count} model finding{'s' if count > 1 else ''}: {reason}.")
     unchecked = sum(entry.get("evidence") == "unverified" for entry in report["findings"])
     if unchecked:
-        body.append(f"{unchecked} model finding{'s' if unchecked > 1 else ''} quoted no code to check against the patch.")
+        body.append(f"Could not verify quoted code for {unchecked} model finding{'s' if unchecked > 1 else ''}.")
     if report["state"] == "over-budget":
         body.append(f"Skipped {label}. Estimated prompt {report['estimated_input_tokens']} tokens "
                     f"exceeds the limit of {report['max_input_tokens']}.")
