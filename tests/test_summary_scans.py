@@ -136,8 +136,7 @@ class SummaryScannerTests(unittest.TestCase):
 
     def test_review_mixed_sources_without_changing_prompt_or_cache(self):
         calls, posts = [], []
-        def invoke(prompt, model, anchors, parse):
-            self.assertIs(parse, engine.parse_answer)
+        def invoke(prompt, model, anchors):
             calls.append(prompt)
             return {"findings": [], "cursor_usage": None}
         def publish(project, number, head, body, state):

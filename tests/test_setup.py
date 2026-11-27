@@ -147,29 +147,57 @@ class InteractiveSetupTests(unittest.TestCase):
             else:
                 self.assertEqual(setup.max_input_tokens(self.state), expected)
         # The visual budget is its own setting, with the same precedence and a larger default.
-        visual = ("REVIEW_VISUAL_MAX_INPUT_TOKENS", config.DEFAULT_VISUAL_MAX_INPUT_TOKENS)
         self.assertEqual(config.DEFAULT_VISUAL_MAX_INPUT_TOKENS, 12000)
-        self.assertEqual(setup.max_input_tokens(self.state, *visual), 12000)
+        self.assertEqual(setup.visual_max_input_tokens(self.state), 12000)
         document["settings"]["REVIEW_VISUAL_MAX_INPUT_TOKENS"] = "9000"
         path.write_text(json.dumps(document))
-        self.assertEqual(setup.max_input_tokens(self.state, *visual), 9000)
+        self.assertEqual(setup.visual_max_input_tokens(self.state), 9000)
         document["settings"]["REVIEW_VISUAL_MAX_INPUT_TOKENS"] = "6_000"
         path.write_text(json.dumps(document))
         with self.assertRaisesRegex(ValueError, "REVIEW_VISUAL_MAX_INPUT_TOKENS must be a positive integer"):
-            setup.max_input_tokens(self.state, *visual)
+            setup.visual_max_input_tokens(self.state)
         document["settings"].pop("REVIEW_VISUAL_MAX_INPUT_TOKENS")
         path.write_text(json.dumps(document))
         for legacy, expected in (("6_000", 6000), ("bad", None)):
             os.environ["REVIEW_VISUAL_MAX_INPUT_TOKENS"] = legacy
             if expected is None:
                 with self.assertRaisesRegex(ValueError, "REVIEW_VISUAL_MAX_INPUT_TOKENS must be a positive integer"):
-                    setup.max_input_tokens(self.state, *visual)
+                    setup.visual_max_input_tokens(self.state)
             else:
-                self.assertEqual(setup.max_input_tokens(self.state, *visual), expected)
+                self.assertEqual(setup.visual_max_input_tokens(self.state), expected)
         # An invalid review budget left in the shell is not a visual review's problem.
         os.environ.pop("REVIEW_VISUAL_MAX_INPUT_TOKENS")
         self.assertEqual(os.environ["REVIEW_MAX_INPUT_TOKENS"], "6.0")
-        self.assertEqual(setup.max_input_tokens(self.state, *visual), 12000)
+        self.assertEqual(setup.visual_max_input_tokens(self.state), 12000)
+
+    def test_max_findings_prefers_env_then_saved_setup_then_default_for_each_tier(self):
+        for name in ("REVIEW_MAX_FINDINGS", "REVIEW_MAX_FINDINGS_MID", "REVIEW_MAX_FINDINGS_MAX"):
+            os.environ.pop(name, None)
+        self.assertEqual(setup.max_findings(self.state), {"regular": 6, "mid": 6, "max": 6})
+        self.configure(self.project("gitlab")+["owner:13","","5000","","","","","api-key","paste","paste"],["ck","pat"])
+        self.assertEqual(setup.max_findings(self.state), {"regular": 6, "mid": 6, "max": 6})
+        path = self.state/"setup/settings.json"
+        document = json.loads(path.read_text())
+        document["settings"].update(REVIEW_MAX_FINDINGS="4", REVIEW_MAX_FINDINGS_MID="8", REVIEW_MAX_FINDINGS_MAX="12")
+        path.write_text(json.dumps(document))
+        self.assertEqual(setup.max_findings(self.state), {"regular": 4, "mid": 8, "max": 12})
+        os.environ["REVIEW_MAX_FINDINGS_MID"] = "+3"
+        self.assertEqual(setup.max_findings(self.state), {"regular": 4, "mid": 3, "max": 12})
+        for bad in ("0", "13", "bad", "-1"):
+            os.environ["REVIEW_MAX_FINDINGS_MID"] = bad
+            with self.assertRaisesRegex(ValueError, "REVIEW_MAX_FINDINGS_MID must be an integer from 1 to 12"):
+                setup.max_findings(self.state)
+        del os.environ["REVIEW_MAX_FINDINGS_MID"]
+        for bad in ("13", "06x", 0):
+            document["settings"]["REVIEW_MAX_FINDINGS"] = bad
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(ValueError, "REVIEW_MAX_FINDINGS must be an integer from 1 to 12"):
+                setup.max_findings(self.state)
+        # Saved settings are exported to the environment for the poller's review children.
+        document["settings"]["REVIEW_MAX_FINDINGS"] = "5"
+        path.write_text(json.dumps(document))
+        setup.apply_saved_setup(self.state)
+        self.assertEqual(os.environ["REVIEW_MAX_FINDINGS"], "5")
 
     def test_saved_pat_stays_on_its_configured_host(self):
         self.configure(self.project("gitlab")+["owner:13","","","","","","","api-key","paste","paste"],["ck","pat"])

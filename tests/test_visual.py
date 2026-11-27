@@ -1,4 +1,5 @@
 import contextlib
+from datetime import datetime, timezone
 import io
 import json
 import os
@@ -10,8 +11,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from cursor_pr import cli, engine, source, visual
-from cursor_pr.config import DEFAULT_VISUAL_MAX_INPUT_TOKENS
+from cursor_pr import cli, discovery, engine, source, visual
+from cursor_pr.config import DEFAULT_VISUAL_MAX_INPUT_TOKENS, project_from
+from cursor_pr.poll import Jobs, cycle, run_review
 from test_hardening import outside_code_spans
 
 CREDIT = "[visual-review](https://gitlab.com/thorchain/misc/visual-review)"
@@ -57,7 +59,7 @@ class VisualTests(unittest.TestCase):
         # The provider CLI records each prompt and answers with whatever the test staged.
         shim = self.root/"cursor-agent"
         shim.write_text("#!/usr/bin/env python3\nimport json,pathlib,sys\n"
-                        f"with open({str(self.calls)!r}, 'a') as f: f.write(sys.argv[-1] + '\\n\\x00\\n')\n"
+                        f"with open({str(self.calls)!r}, 'a') as f: f.write(sys.stdin.read() + '\\n\\x00\\n')\n"
                         "print(json.dumps(dict(type='result', subtype='success', is_error=False,\n"
                         f"                      result=pathlib.Path({str(self.answer)!r}).read_text())))\n")
         shim.chmod(0o700)
@@ -339,8 +341,8 @@ class VisualTests(unittest.TestCase):
         # Every line of each patch appears exactly once: no second copy of the context lines
         # as in the review prompt, and no "no newline" marker.
         for f in source.local_change(self.root, start, "HEAD").files:
-            body = sum(sum(line.is_added or line.is_removed or line.is_context for line in hunk) for hunk in engine.parsed(f))
-            self.assertEqual(len(visual.hunks(f).splitlines()), body + 1 + len(engine.parsed(f)), f.path)
+            body = sum(sum(line.is_added or line.is_removed or line.is_context for line in hunk) for hunk in source.hunks(f))
+            self.assertEqual(len(visual.hunks(f).splitlines()), body + 1 + len(source.hunks(f)), f.path)
 
     def test_answer_is_checked_against_the_change_before_it_is_trusted(self):
         anchors = {"app.py": {1, 2, 3, 4}, "logo.png": set()}
@@ -668,3 +670,63 @@ class VisualPostTests(unittest.TestCase):
         self.assertTrue(body.startswith("Cursor visual review of " + "a"*40 + "\nreviewed\n\n```\n"))
         self.assertTrue(body.endswith("Visual review after THORChain's " + CREDIT + ". "
                                        "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent).\n"))
+
+
+class VisualRequestTests(unittest.TestCase):
+    """The poller's side: /visual-review is one more command, queued and dispatched like a tier."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = Path(tmp.name)
+        self.gh = project_from(dict(provider="github", url="https://github.com/acme/app", requester_ids=[7],
+                                    checkout=tmp.name))
+        self.since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def note(self, comment, body):
+        return dict(authorId=7, databaseId=comment, authorType="User", body=body,
+                    createdAt="2026-07-01T00:00:00+00:00", updatedAt="2026-07-01T00:00:00+00:00",
+                    url=f"{self.gh.change_url(3)}#issuecomment-{comment}")
+
+    def test_the_command_is_a_request_only_as_the_whole_comment(self):
+        bodies = ["/visual-review", " /visual-review\n", "/visual_review", "/visual review", "/visual-review please",
+                  "/review /visual-review", "/Visual-Review"]
+        self.assertEqual([discovery.is_request(self.gh, 3, self.note(81 + n, body), self.since) for n, body in enumerate(bodies)],
+                         [True, True, False, False, False, False, False])
+
+    def test_a_visual_request_is_queued_and_run_as_itself_beside_a_review(self):
+        notes = [self.note(81, "/review"), self.note(82, "/visual-review"), self.note(83, "/review-mid")]
+        jobs, ran = Jobs(self.state), []
+        with patch.object(discovery, "open_changes", return_value=([3], True)), \
+             patch.object(discovery, "comment_threads", return_value=({3: notes}, True)):
+            cycle({self.gh.key: self.gh}, self.state, jobs, {self.gh.key: self.since},
+                  lambda project, number, state, *kind: ran.append(kind) or "reviewed")
+        self.assertEqual(ran, [(), ("visual",), ("mid",)])
+        self.assertEqual(Jobs(self.state).tier((self.gh.key, 3, 82)), "visual")  # Survives a restart.
+
+    def test_the_child_gets_the_visual_flag_and_budget_and_nothing_of_a_tier(self):
+        done = json.dumps({"state": "reviewed", "publication": "posted-or-already-present"}).encode()
+        settings = {"REVIEW_MAX_INPUT_TOKENS": "4000", "REVIEW_VISUAL_MAX_INPUT_TOKENS": "9000", "REVIEW_MAX_FINDINGS": "2"}
+        for kind, flag, budget, cap in (("regular", False, "4000", "2"), ("visual", True, "9000", None)):
+            with self.subTest(kind=kind), patch.dict(os.environ, settings), \
+                    patch("cursor_pr.poll.supervised", return_value=done) as run, \
+                    patch("cursor_pr.poll.history.interval", return_value=0):
+                self.assertEqual(run_review(self.gh, 3, self.state, kind), "reviewed")
+            argv = run.call_args.args[0]
+            self.assertEqual(("--visual" in argv, "--tier" in argv), (flag, False))
+            self.assertEqual(argv[argv.index("--max-input-tokens") + 1], budget)
+            self.assertEqual(argv[argv.index("--max-findings") + 1] if "--max-findings" in argv else None, cap)
+        # With neither budget in the environment the child resolves the saved one for its command.
+        with patch.dict(os.environ, {}), patch("cursor_pr.poll.supervised", return_value=done) as run, \
+                patch("cursor_pr.poll.history.interval", return_value=0):
+            for name in settings:
+                os.environ.pop(name, None)
+            run_review(self.gh, 3, self.state, "visual")
+        self.assertNotIn("--max-input-tokens", run.call_args.args[0])
+
+    def test_visual_takes_no_tier_and_no_findings_cap(self):
+        for options in (["--tier", "mid"], ["--max-findings", "3"]):
+            with self.subTest(options=options):
+                args = cli.parser().parse_args(["--base", "HEAD", "--visual", "--max-input-tokens", "100", *options])
+                with self.assertRaisesRegex(source.ReviewError, "takes neither --tier nor --max-findings"):
+                    cli.execute(args)

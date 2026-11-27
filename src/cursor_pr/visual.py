@@ -8,10 +8,11 @@ import json
 import re
 import unicodedata
 
-from .engine import answer, parse_patch, parsed
+from .engine import model_text
 from .providers import LABELS
 from .scanners import fence
 from .source import File, ReviewError
+from .source import hunks as parsed
 
 VERSION = "visual-2"
 MAX_CHANGES = 8
@@ -181,6 +182,13 @@ def shows_hunks(f):
     return not f.absent and bool(f.patch) and not gone(f.status) and narrated(f.path, f.patch, f.status)
 
 
+def parse_patch(f):
+    """Head-side line numbers and added/removed counts for one file's text patch."""
+    lines = [line for hunk in parsed(f) for line in hunk]
+    head = {line.target_line_no for line in lines if line.target_line_no is not None}
+    return head, sum(line.is_added for line in lines), sum(line.is_removed for line in lines)
+
+
 def counts(f):
     """(added, deleted, head lines) of one file; nothing when its patch is missing."""
     if f.absent or not f.patch:
@@ -257,7 +265,7 @@ def pack(files):
 
 
 def parse_answer(raw, anchors):
-    text, usage = answer(raw)
+    text, usage = model_text(raw)
     value = json.loads(text)
     try:
         summary, changes, hotspots = value["visual"]["summary"], value["visual"]["changes"], value["visual"]["hotspots"]

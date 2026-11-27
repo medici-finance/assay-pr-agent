@@ -17,6 +17,11 @@ DEFAULT_MAX_INPUT_TOKENS = 6000
 # far shorter than the review rubric and each hunk is shown once, so twice the budget reads
 # several times more of the change.
 DEFAULT_VISUAL_MAX_INPUT_TOKENS = 12000
+# Findings each tier asks the model for, by setting. Twelve compact finding rows of
+# four-byte text still fit the 16 KiB forge comment limit with the rest of a summary.
+FINDINGS_SETTINGS = {"regular": "REVIEW_MAX_FINDINGS", "mid": "REVIEW_MAX_FINDINGS_MID", "max": "REVIEW_MAX_FINDINGS_MAX"}
+DEFAULT_MAX_FINDINGS = 6
+MAX_FINDINGS_LIMIT = 12
 
 
 @dataclass(frozen=True)

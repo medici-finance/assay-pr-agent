@@ -1,3 +1,4 @@
+from contextlib import closing
 import json
 import os
 import sqlite3
@@ -12,7 +13,7 @@ import httpx
 
 from cursor_pr import history
 from cursor_pr.config import load_config, project_from
-from cursor_pr.discovery import request_command, public_gitlab_request
+from cursor_pr.discovery import is_request, public_gitlab_request
 from cursor_pr.poll import Jobs, cycle, run_review
 
 
@@ -31,68 +32,28 @@ class PollTests(unittest.TestCase):
         self.since = datetime(2026, 11, 15, tzinfo=timezone.utc)
 
     def test_request_filter(self):
-        self.assertEqual(request_command(self.gh, 3, self.note, self.since), "review")
-        self.assertEqual(request_command(self.gh, 3, self.note | dict(body="/visual-review"), self.since), "visual-review")
+        self.assertTrue(is_request(self.gh, 3, self.note, self.since))
         for change in (dict(authorId=True), dict(authorId=8), dict(databaseId=-1), dict(authorType="Bot"),
                        dict(url=self.gl.change_url(3)), dict(body="> /review"), dict(body="/review please"),
-                       dict(body="/visual_review"), dict(body="/visual review"), dict(body="/visual-review please"),
                        dict(body=""), dict(updatedAt="later"), dict(createdAt=None), dict(updatedAt=None),
-                       dict(createdAt="yesterday"), dict(updatedAt="yesterday")):
+                       dict(createdAt="yesterday", updatedAt="yesterday")):
             with self.subTest(change=change):
-                self.assertIsNone(request_command(self.gh, 3, self.note | change, self.since))
-        self.assertIsNone(request_command(self.gh, 3, self.note, datetime(2027, 1, 1, tzinfo=timezone.utc)))
+                self.assertFalse(is_request(self.gh, 3, self.note | change, self.since))
+        self.assertFalse(is_request(self.gh, 3, self.note, datetime(2027, 1, 1, tzinfo=timezone.utc)))
 
-    def test_queued_survives_restart_and_started_is_never_reissued(self):
-        # A state volume from before /visual-review has no command column; its rows are reviews.
-        with sqlite3.connect(self.state / "requests.sqlite3") as db:
-            db.execute("CREATE TABLE requests (project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,"
-                       " status TEXT NOT NULL, PRIMARY KEY(project, number, comment))")
-            db.execute("INSERT INTO requests VALUES ('github/github.com/acme/github', 5, 50, 'queued')")
+    def test_queued_and_interrupted_reviews_survive_a_restart(self):
         jobs = Jobs(self.state)
         since = jobs.activated(self.gh.key)
-        self.assertEqual(jobs.next(), (self.gh.key, 5, 50, "review"))
         jobs.enqueue(self.gh.key, 1, 10)
-        jobs.enqueue(self.gh.key, 2, 11, command="visual-review")
-        self.assertEqual(jobs.next(), (self.gh.key, 1, 10, "review"))
-        restarted = Jobs(self.state)
+        jobs.enqueue(self.gh.key, 2, 11)
+        self.assertEqual(jobs.next(), (self.gh.key, 1, 10))  # The poller stops before this review finishes.
+        with self.assertLogs("cursor_pr.poll", level="WARNING"):
+            restarted = Jobs(self.state)
         self.assertEqual(restarted.activated(self.gh.key), since)
         restarted.enqueue(self.gh.key, 1, 10)
-        self.assertEqual(restarted.next(), (self.gh.key, 2, 11, "visual-review"))
+        self.assertEqual(restarted.next(), (self.gh.key, 1, 10))
+        self.assertEqual(restarted.next(), (self.gh.key, 2, 11))
         self.assertIsNone(restarted.next())
-
-    def test_rollback_can_queue_and_claim_regular_reviews(self):
-        jobs = Jobs(self.state)
-        jobs.enqueue(self.gh.key, 1, 10, command="visual-review")
-        with sqlite3.connect(jobs.path) as old:
-            # The previous image inserts without a column list and claims only queued rows.
-            old.execute("INSERT OR IGNORE INTO requests VALUES (?,?,?,?)", (self.gh.key, 2, 20, "queued"))
-            claimed = old.execute("""UPDATE requests SET status='started' WHERE rowid=(
-                SELECT rowid FROM requests WHERE status='queued' ORDER BY rowid LIMIT 1)
-                RETURNING project, number, comment""").fetchone()
-            self.assertEqual(claimed, (self.gh.key, 2, 20))
-        restarted = Jobs(self.state)
-        visual = restarted.next()
-        self.assertEqual(visual, (self.gh.key, 1, 10, "visual-review"))
-        restarted.finish(visual, "reviewed")
-        self.assertIsNone(restarted.next())
-
-    def test_queue_migrates_the_initial_visual_schema_without_losing_commands(self):
-        jobs = Jobs(self.state)
-        with sqlite3.connect(jobs.path) as db:
-            db.execute("ALTER TABLE requests ADD COLUMN command TEXT NOT NULL DEFAULT 'review'")
-            db.executemany("INSERT INTO requests VALUES (?,?,?,?,?)", [
-                (self.gh.key, 1, 10, "queued", "review"),
-                (self.gh.key, 2, 20, "queued", "visual-review"),
-                (self.gh.key, 3, 30, "started", "visual-review"),
-            ])
-        migrated = Jobs(self.state)
-        with sqlite3.connect(jobs.path) as db:
-            self.assertEqual([row[1] for row in db.execute("PRAGMA table_info(requests)")],
-                             ["project", "number", "comment", "status"])
-        self.assertEqual(migrated.next(), (self.gh.key, 1, 10, "review"))
-        self.assertEqual(migrated.next(), (self.gh.key, 2, 20, "visual-review"))
-        self.assertTrue(migrated.recorded(self.gh.key, 3, 30))
-        self.assertIsNone(migrated.next())
 
     def test_wizard_env_and_legacy_config(self):
         row = dict(provider="github", url=self.gh.url, checkout=str(self.state), requester_ids=[7])
@@ -122,12 +83,9 @@ class PollTests(unittest.TestCase):
              patch("cursor_pr.discovery.httpx.get") as get:
             for delta in ({}, {"internal":True}, {"internal":None}, {"confidential":True}, {"system":True},
                           {"updated_at":"t.002"}, {"author":{"id":7,"bot":True}}, {"author":{"id":8}},
-                          {"body":"changed"}, {"body":"/visual-review"}, {"noteable_iid":4}):
+                          {"body":"changed"}, {"noteable_iid":4}):
                 get.return_value = httpx.Response(200, json=record|delta, request=request)
                 self.assertEqual(public_gitlab_request(self.gl,3,self.note), not delta)
-            get.return_value = httpx.Response(200, json=record|{"body":"/visual-review"}, request=request)
-            self.assertTrue(public_gitlab_request(self.gl,3,self.note|dict(body="/visual-review")))
-            self.assertFalse(public_gitlab_request(self.gl,3,self.note))
             get.assert_called_with("https://gitlab.com/api/v4/projects/acme%2Fgitlab/merge_requests/3/notes/81",
                                    headers={"PRIVATE-TOKEN":"fixture"}, follow_redirects=False, timeout=15)
             lookup.assert_called_with("gitlab", self.gl.slug, self.gl.checkout)
@@ -152,8 +110,8 @@ class PollTests(unittest.TestCase):
             self.assertEqual((verb, numbers), ("comments", (3,)))
             partial = broken and project.slug == self.gh.slug
             return dict(items=[] if partial else [dict(number=3, comments=notes)], partial=[3] if partial else [])
-        def review(project, number, state, command):
-            reviews.append((project.key,number,command))
+        def review(project, number, state):
+            reviews.append((project.key,number))
             return "reviewed"
         with patch("cursor_pr.discovery.run_forge", side_effect=forge), \
              patch("cursor_pr.discovery.public_gitlab_request", return_value=True) as visibility:
@@ -165,52 +123,31 @@ class PollTests(unittest.TestCase):
             notes.append(self.note)
             broken = True
             cycle(self.projects,self.state,jobs,since,review)
-            self.assertEqual(reviews, [(self.gl.key,3,"review")])
+            self.assertEqual(reviews, [(self.gl.key,3)])
             broken = False
             cycle(self.projects,self.state,Jobs(self.state),since,review)
             cycle(self.projects,self.state,Jobs(self.state),since,review)
-            self.assertEqual(reviews, [(self.gl.key,3,"review"),(self.gh.key,3,"review")])
-            # A second command on the same change is a separate request, dispatched as itself.
-            notes.append(self.note | dict(databaseId=82, body="/visual-review",
-                                          url=self.gh.change_url(3)+"#issuecomment-82"))
-            cycle(self.projects,self.state,Jobs(self.state),since,review)
-            self.assertEqual(reviews, [(self.gl.key,3,"review"),(self.gh.key,3,"review"),
-                                       (self.gh.key,3,"visual-review"),(self.gl.key,3,"visual-review")])
-            self.assertEqual(visibility.call_count, 2)
+            self.assertEqual(reviews, [(self.gl.key,3),(self.gh.key,3)])
+            visibility.assert_called_once()
 
     def test_worker_passes_configured_ci_producer_to_review(self):
         from dataclasses import replace
         for project, producer in ((self.gh, "go.yml"), (self.gl, "go-lint")):
-            with patch("cursor_pr.poll.subprocess.run") as run:
-                run.return_value.stdout = b'{"state":"reviewed","publication":"posted-or-already-present"}'
+            with patch("cursor_pr.poll.supervised") as run:
+                run.return_value = b'{"state":"reviewed","publication":"posted-or-already-present"}'
                 self.assertEqual(run_review(replace(project, go_analysis=producer), 3, self.state), "reviewed")
                 argv = run.call_args.args[0]
                 self.assertEqual(argv[argv.index("--go-analysis-producer")+1], producer)
                 self.assertEqual(argv[argv.index("--expected-change-url")+1], project.change_url(3))
 
     def test_publication_failure_reason_is_logged(self):
-        with patch("cursor_pr.poll.subprocess.run") as run:
-            run.return_value.stdout = json.dumps({
+        with patch("cursor_pr.poll.supervised") as run:
+            run.return_value = json.dumps({
                 "state": "reviewed", "publication": "failed",
                 "publication_error": "pr-agent-forge comment exited 1: publication scope changed"}).encode()
             with self.assertLogs("cursor_pr.poll", level="WARNING") as logs:
                 self.assertEqual(run_review(self.gh, 3, self.state), "failed")
         self.assertIn("pr-agent-forge comment exited 1: publication scope changed", "\n".join(logs.output))
-
-    def test_worker_runs_each_command_under_its_own_budget(self):
-        with patch("cursor_pr.poll.subprocess.run") as run, \
-             patch.dict(os.environ, {"REVIEW_MAX_INPUT_TOKENS": "4000", "REVIEW_VISUAL_MAX_INPUT_TOKENS": "9000"}):
-            run.return_value.stdout = b'{"state":"reviewed","publication":"posted-or-already-present"}'
-            self.assertEqual(run_review(self.gh, 3, self.state), "reviewed")
-            argv = run.call_args.args[0]
-            self.assertNotIn("--visual", argv)
-            self.assertEqual(argv[argv.index("--max-input-tokens")+1], "4000")
-            self.assertEqual(run_review(self.gh, 3, self.state, "visual-review"), "reviewed")
-            argv = run.call_args.args[0]
-            self.assertIn("--visual", argv)
-            self.assertEqual(argv[argv.index("--max-input-tokens")+1], "9000")
-            with self.assertRaises(ValueError):
-                run_review(self.gh, 3, self.state, "unknown")
 
     def test_real_command_path_with_stubbed_executables(self):
         # Only the external forge and model binaries are replaced. Exercise the installed
@@ -250,19 +187,13 @@ else:
     print("null")
 """)
         calls=self.state/"model-calls"
-        # The provider CLI answers whichever prompt it was given: the review rubric or the visual map.
-        install("cursor-agent", """
+        install("cursor-agent",f"""
 from pathlib import Path
-import json,sys
-with Path(%r).open('a') as f: f.write('called\\n')
-if 'You map a pull request' in sys.argv[-1]:
-    result = {"visual": {"summary": "Sets the demo value.", "changes": [{"title": "Set the demo value",
-              "files": ["demo.py"]}], "hotspots": [{"file": "demo.py", "line": 1, "end_line": 1, "severity": "look",
-              "title": "Value changed", "why": "Read the new assignment."}]}}
-else:
-    result = {"review": {"key_issues_to_review": []}}
-print(json.dumps(dict(type='result',subtype='success',is_error=False,result=json.dumps(result))))
-""" % str(calls))
+import json
+with Path({str(calls)!r}).open('a') as f: f.write('called\\n')
+print(json.dumps(dict(type='result',subtype='success',is_error=False,
+                      result='{{"review":{{"key_issues_to_review":[]}}}}')))
+""")
         # Real Qualgen, local Git, and the installed poller child exercise both providers.
         checkout = self.state / "checkout"
         checkout.mkdir()
@@ -289,17 +220,20 @@ print(json.dumps(dict(type='result',subtype='success',is_error=False,result=json
                                              "GITLAB_API_BASE": "https://gitlab.com/api/v4"}):
                     with patch.dict(os.environ, {"REVIEW_QUALGEN_INTERVAL_SECONDS": "0"}):
                         self.assertEqual(run_review(project,3,self.state),"reviewed")
-                    # The cache key contains the exact prompt. Enabling Qualgen must hit the same key.
-                    self.assertEqual(run_review(project,3,self.state),"reviewed")
+                    # Advisories are part of the prompt, so enabling Qualgen changes the cache key: one more call.
+                    # Started from the queue this time: the real child keeps its request's row.
+                    jobs = Jobs(self.state)
+                    jobs.enqueue(project.key, 3, 81)
+                    self.assertEqual(jobs.next(), (project.key, 3, 81))
+                    self.assertEqual(run_review(project,3,self.state,comment=81),"reviewed")
+                    with closing(sqlite3.connect(jobs.path)) as db:
+                        self.assertEqual(db.execute("SELECT status, attempts, head FROM requests WHERE project=?",
+                                                    (project.key,)).fetchall(), [("reviewed", 1, "a"*40)])
                     with patch.dict(os.environ,{"REVIEW_MAX_INPUT_TOKENS":"1"}):
                         self.assertEqual(run_review(project,3,self.state),"over-budget")
-                    # The visual command has its own prompt and budget, so the review budget does not bind it.
-                    self.assertEqual(run_review(project,3,self.state,"visual-review"),"reviewed")
             with patch.dict(os.environ,{"FIXTURE_CHANGE":self.gl.change_url(3),"FIXTURE_SLUG":self.gh.slug}):
                 self.assertEqual(run_review(self.gh,3,self.state),"failed")
-        self.assertEqual(posts.read_text().count("historically coupled to partner.py"), 6)
-        self.assertEqual(calls.read_text().splitlines(),["called"]*4)
+        self.assertEqual(posts.read_text().count("historically coupled to partner.py"), 4)
+        self.assertEqual(calls.read_text().splitlines(),["called"] * 4)
         self.assertEqual(posts.read_text().count("Skipped Cursor"),2)
-        self.assertEqual(posts.read_text().count("[PR-Agent](https://github.com/the-pr-agent/pr-agent)"),8)
-        self.assertEqual(posts.read_text().count("**What to check**"),2)
-        self.assertEqual(posts.read_text().count("lines to read"),2)
+        self.assertEqual(posts.read_text().count("[PR-Agent](https://github.com/the-pr-agent/pr-agent)"),6)
