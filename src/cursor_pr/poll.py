@@ -7,12 +7,14 @@ import json
 import logging
 import os
 from pathlib import Path
+import selectors
+import signal
 import sqlite3
 import subprocess
 import sys
 import threading
+import time
 
-from .cli import CLEANUP_SECONDS, QUEUED_REVIEW_SECONDS
 from .config import load_config
 from .credentials import SETUP_INPUTS, forge_credentials
 from .discovery import poll_project
@@ -26,11 +28,20 @@ log = logging.getLogger(__name__)
 GIVEN_UP = "marked failed, a new /review retries it"
 UNRECORDED = "marked failed, the head it started at was not recorded, a new /review retries it"
 
-# How long the poller waits for a review child: the child's own limits and a margin.
-REVIEW_WAIT_SECONDS = QUEUED_REVIEW_SECONDS + CLEANUP_SECONDS + 30
+# The longest a review may run. Its waits on the forge, the model and the scanners have timeouts of
+# their own. This is for one that hangs anyway.
+REVIEW_SECONDS = 1800
+# How long the supervisor is given to end a review before the poller stops waiting for it.
+STOP_SECONDS = 30
+# How long what a review printed is still read for once its supervisor has ended.
+DRAIN_SECONDS = 2
+# How long a poller waits for the lock at its start. A poller that was just stopped leaves the lock
+# with its review's supervisor for the few seconds that takes to end the review.
+LOCK_WAIT_SECONDS = 15
+SUPERVISOR = Path(__file__).with_name("supervise.py")
 
-# The instance lock's descriptor while this process holds it. A review child inherits it, so the
-# lock outlives a poller that is killed while a review runs.
+# The instance lock's descriptor while this process holds it. A review's supervisor and the review
+# inherit it, so the lock is not free again until a review that outlived its poller has been ended.
 lock_fd = None
 
 
@@ -151,8 +162,23 @@ class Jobs:
             log.warning("Review of %s #%d comment %d was not completed by its retry; a new /review retries it", *job)
         return row[0] if row else status
 
+    # Tiers live in their own table: a request without a row is a plain /review.
+    TIERS = "CREATE TABLE IF NOT EXISTS tiers (project TEXT, number INTEGER, comment INTEGER, tier TEXT NOT NULL, " \
+            "PRIMARY KEY(project, number, comment))"
 
-def run_review(project, number, state, comment=None):
+    def set_tier(self, project, number, comment, tier):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(self.TIERS)
+            db.execute("INSERT OR IGNORE INTO tiers VALUES (?,?,?,?)", (project, number, comment, tier))
+
+    def tier(self, job):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(self.TIERS)
+            row = db.execute("SELECT tier FROM tiers WHERE project=? AND number=? AND comment=?", job).fetchone()
+            return row[0] if row else "regular"
+
+
+def run_review(project, number, state, tier="regular", comment=None):
     address = f"{project.slug}#{number}"
     argv = [sys.executable, "-I", "-m", "cursor_pr.cli", "--repo", str(project.checkout),
             "--change", address, "--expected-change-url", project.change_url(number),
@@ -167,15 +193,14 @@ def run_review(project, number, state, comment=None):
         argv.extend(["--max-input-tokens", os.environ["REVIEW_MAX_INPUT_TOKENS"]])
     if os.getenv("REVIEW_MODEL"):
         argv.extend(["--model", os.environ["REVIEW_MODEL"]])
+    if tier != "regular":
+        argv.extend(["--tier", tier])
     if comment is not None:
         # The child keeps the request's row itself: the head it resolves, which a repeat of the
         # request is held to, and how it ended, for a poller that stops before it can read the report.
         argv.extend(["--queue", str(state / "requests.sqlite3"), "--request", project.key, str(number), str(comment)])
     env = dict(os.environ)
     env["CURSOR_REVIEW_POLLER_CHILD"] = "1"
-    env.pop("CURSOR_REVIEW_LOCK_FD", None)
-    if comment is not None and lock_fd is not None:
-        env["CURSOR_REVIEW_LOCK_FD"] = str(lock_fd)
     env["REVIEW_STATE_DIR"] = str(state)
     env["REVIEW_FORGE_PROJECT"] = json.dumps(dict(provider=project.provider, url=project.url,
         managed=project.managed, checkout=str(project.checkout), requester_ids=sorted(project.requesters),
@@ -185,18 +210,12 @@ def run_review(project, number, state, comment=None):
     for key in list(env):
         if key.startswith("REVIEW_SECRET_"):
             del env[key]
-    # The review child inherits the instance lock, so the lock is held until it exits even when the
-    # poller is killed first. No replacement recovers this request while the review can still run.
-    # The child bounds itself, and its watchdog ends it and the commands it started. The wait here is
-    # bounded past that as well, so that nothing left holding the report pipe can keep the queue waiting.
-    try:
-        result = subprocess.run(argv, cwd=project.checkout, env=env, stdout=subprocess.PIPE,
-                                pass_fds=(lock_fd,) if lock_fd is not None else (), timeout=REVIEW_WAIT_SECONDS)
-    except subprocess.TimeoutExpired:
-        log.warning("Review %s did not end within %d seconds and was stopped", address, REVIEW_WAIT_SECONDS)
+    stdout = supervised(argv, cwd=project.checkout, env=env)
+    if stdout is None:
+        log.warning("Review %s did not end within %d seconds and was stopped", address, REVIEW_SECONDS + STOP_SECONDS)
         return "failed"
     try:
-        report = json.loads(result.stdout)
+        report = json.loads(stdout)
     except ValueError:
         return "failed"
     log.info("Review %s state=%s publication=%s provider=%s model_invocations=%s", address, report["state"],
@@ -205,6 +224,98 @@ def run_review(project, number, state, comment=None):
         log.warning("Review %s publication failed: %r", address,
                     report.get("publication_error", "reason not reported"))
     return report["state"] if report.get("publication") == "posted-or-already-present" else "failed"
+
+
+def supervised(argv, **options):
+    """Run a review under its supervisor and return what it printed, or None if it had to be given up on.
+
+    The supervisor ends the review, and whatever the review started, when this process is gone, when
+    the review's time is up, or when the review ends. This process tells it that it is gone by
+    nothing more than exiting: the supervisor holds the read end of a pipe that only this process
+    can write to. So a review never runs beside a later poller, however this one stops.
+
+    The supervisor, the review and all the review starts are one process group, which has the
+    supervisor's number. If the supervisor is stuck or was killed, this process ends that group.
+    """
+    lifeline, hold = os.pipe()
+    # The supervisor holds the other end of this one for as long as it runs, and gives it to nobody.
+    # It says that the supervisor has ended without the poller having to wait for it, which would
+    # give up the supervisor's number while the group, which has the same number, is still needed.
+    over, running = os.pipe()
+    keep = (lock_fd,) if lock_fd is not None else ()
+    process = None
+    try:
+        # Without the poller's input: the group is not the terminal's foreground one, and a command
+        # that read from the terminal there would be stopped by it and hang.
+        process = subprocess.Popen(
+            [sys.executable, "-I", str(SUPERVISOR), str(lifeline), str(REVIEW_SECONDS),
+             ",".join(map(str, keep)), *argv], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            pass_fds=(lifeline, running, *keep), process_group=0, **options)
+        os.close(running)
+        running = None
+        return read_report(process.stdout.fileno(), over, REVIEW_SECONDS + STOP_SECONDS)
+    finally:
+        # Closing the poller's end is what tells the supervisor to end the review: on a timeout,
+        # on an interrupt, and on any other way out of here.
+        os.close(lifeline)
+        os.close(hold)
+        if running is not None:
+            os.close(running)
+        if process is not None:
+            ended = read_all(over, STOP_SECONDS) is not None
+            # Neither of these waits for the supervisor, so its number, which is the group's, is
+            # still its own when the group is ended. The supervisor is stopped first, so that it
+            # cannot start anything more meanwhile.
+            for end in ((os.kill,) if not ended else ()) + (os.killpg,):
+                try:
+                    end(process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            process.wait()
+            process.stdout.close()
+        os.close(over)
+
+
+def read_report(report, over, seconds):
+    """What the review printed, or None when neither it nor its supervisor ended in time.
+
+    The report is complete when its pipe closes. If the supervisor ends first, nothing more is
+    coming from a review it ended, so what has been written by then is all there is: a command
+    that left the group and kept the pipe open does not keep the queue waiting.
+    """
+    parts = []
+    with selectors.DefaultSelector() as waiting:
+        waiting.register(report, selectors.EVENT_READ)
+        waiting.register(over, selectors.EVENT_READ)
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            readable = {key.fd for key, _ in waiting.select(left)}
+            if over in readable:
+                # The supervisor has ended. What is still in the pipe is taken, for a short time
+                # only, whether or not something goes on writing to it.
+                waiting.unregister(over)
+                deadline = min(deadline, time.monotonic() + DRAIN_SECONDS)
+            if report in readable:
+                part = os.read(report, 65536)
+                if not part:
+                    return b"".join(parts)
+                parts.append(part)
+        return b"".join(parts) if over not in waiting.get_map() else None
+
+
+def read_all(descriptor, seconds):
+    """Everything written to the descriptor until it is closed, or None when that takes too long."""
+    parts = []
+    with selectors.DefaultSelector() as waiting:
+        waiting.register(descriptor, selectors.EVENT_READ)
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            if waiting.select(left):
+                part = os.read(descriptor, 65536)
+                if not part:
+                    return b"".join(parts)
+                parts.append(part)
+    return None
 
 
 def cycle(projects, state, jobs, since, runner=None, ack=None):
@@ -218,8 +329,10 @@ def cycle(projects, state, jobs, since, runner=None, ack=None):
         status = "failed"
         if key in projects:
             try:
-                status = (runner(projects[key], number, state) if runner
-                          else run_review(projects[key], number, state, comment))
+                tier = jobs.tier(job)
+                extra = () if tier == "regular" else (tier,)
+                status = (runner(projects[key], number, state, *extra) if runner
+                          else run_review(projects[key], number, state, tier, comment))
             except Exception:
                 log.exception("Review failed for %s #%d comment %d", key, number, comment)
         # The row, not the report, says how it ended: the child settles it before its report can fail.
@@ -229,14 +342,22 @@ def cycle(projects, state, jobs, since, runner=None, ack=None):
 
 
 @contextmanager
-def instance_lock(state):
+def instance_lock(state, wait=None):
     # A file of its own, not the directory: setup takes shared and exclusive locks on the
     # directory inode, and an exclusive lock there would block the setup wizard.
     global lock_fd
     fd = os.open(state / ".poller.lock", os.O_RDWR | os.O_CREAT, 0o600)
     held = lock_fd
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        deadline = time.monotonic() + (LOCK_WAIT_SECONDS if wait is None else wait)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.2)
         lock_fd = fd
         yield
     finally:

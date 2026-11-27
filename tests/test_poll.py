@@ -133,16 +133,16 @@ class PollTests(unittest.TestCase):
     def test_worker_passes_configured_ci_producer_to_review(self):
         from dataclasses import replace
         for project, producer in ((self.gh, "go.yml"), (self.gl, "go-lint")):
-            with patch("cursor_pr.poll.subprocess.run") as run:
-                run.return_value.stdout = b'{"state":"reviewed","publication":"posted-or-already-present"}'
+            with patch("cursor_pr.poll.supervised") as run:
+                run.return_value = b'{"state":"reviewed","publication":"posted-or-already-present"}'
                 self.assertEqual(run_review(replace(project, go_analysis=producer), 3, self.state), "reviewed")
                 argv = run.call_args.args[0]
                 self.assertEqual(argv[argv.index("--go-analysis-producer")+1], producer)
                 self.assertEqual(argv[argv.index("--expected-change-url")+1], project.change_url(3))
 
     def test_publication_failure_reason_is_logged(self):
-        with patch("cursor_pr.poll.subprocess.run") as run:
-            run.return_value.stdout = json.dumps({
+        with patch("cursor_pr.poll.supervised") as run:
+            run.return_value = json.dumps({
                 "state": "reviewed", "publication": "failed",
                 "publication_error": "pr-agent-forge comment exited 1: publication scope changed"}).encode()
             with self.assertLogs("cursor_pr.poll", level="WARNING") as logs:
@@ -220,12 +220,12 @@ print(json.dumps(dict(type='result',subtype='success',is_error=False,
                                              "GITLAB_API_BASE": "https://gitlab.com/api/v4"}):
                     with patch.dict(os.environ, {"REVIEW_QUALGEN_INTERVAL_SECONDS": "0"}):
                         self.assertEqual(run_review(project,3,self.state),"reviewed")
-                    # The cache key contains the exact prompt. Enabling Qualgen must hit the same key.
+                    # Advisories are part of the prompt, so enabling Qualgen changes the cache key: one more call.
                     # Started from the queue this time: the real child keeps its request's row.
                     jobs = Jobs(self.state)
                     jobs.enqueue(project.key, 3, 81)
                     self.assertEqual(jobs.next(), (project.key, 3, 81))
-                    self.assertEqual(run_review(project,3,self.state,81),"reviewed")
+                    self.assertEqual(run_review(project,3,self.state,comment=81),"reviewed")
                     with closing(sqlite3.connect(jobs.path)) as db:
                         self.assertEqual(db.execute("SELECT status, attempts, head FROM requests WHERE project=?",
                                                     (project.key,)).fetchall(), [("reviewed", 1, "a"*40)])
@@ -234,6 +234,6 @@ print(json.dumps(dict(type='result',subtype='success',is_error=False,
             with patch.dict(os.environ,{"FIXTURE_CHANGE":self.gl.change_url(3),"FIXTURE_SLUG":self.gh.slug}):
                 self.assertEqual(run_review(self.gh,3,self.state),"failed")
         self.assertEqual(posts.read_text().count("historically coupled to partner.py"), 4)
-        self.assertEqual(calls.read_text().splitlines(),["called","called"])
+        self.assertEqual(calls.read_text().splitlines(),["called"] * 4)
         self.assertEqual(posts.read_text().count("Skipped Cursor"),2)
         self.assertEqual(posts.read_text().count("[PR-Agent](https://github.com/the-pr-agent/pr-agent)"),6)
