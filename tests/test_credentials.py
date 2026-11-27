@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -8,7 +7,7 @@ from unittest.mock import patch
 
 from cursor_pr.config import project_from
 from cursor_pr.credentials import KEY, TOKEN, forge_credentials
-from cursor_pr.source import run_desk
+from cursor_pr.source import reviewer_token_file
 
 
 class ContainerCredentialsTest(unittest.TestCase):
@@ -24,7 +23,7 @@ class ContainerCredentialsTest(unittest.TestCase):
                         checkout=str(self.root), requester_ids=[17], visibility="public"))
                          for p in ("github", "gitlab")}
 
-    def test_both_provider_secrets_and_real_assay_custody(self):
+    def test_both_provider_secrets_without_assay_config(self):
         # Generate a disposable RSA key. Exercise the one-line Docker env-file format.
         pem = subprocess.check_output(["openssl","genrsa","2048"], stderr=subprocess.DEVNULL).decode()
         mounted = self.root / "mounted-token"
@@ -33,24 +32,18 @@ class ContainerCredentialsTest(unittest.TestCase):
         os.environ.update(REVIEW_GITHUB_PRIVATE_KEY=pem.strip().replace("\n","\\n"),
                           REVIEW_GITHUB_APP_ID="101", REVIEW_GITHUB_INSTALLATION_ID="202",
                           REVIEW_GITLAB_TOKEN_FILE=str(mounted))
-        with forge_credentials(self.projects, self.root):
-            runtime = Path(os.environ["ASSAY_CONFIG_HOME"])
-            self.assertEqual((runtime/"reviewer-app.pem").read_text().strip(), pem.strip())
-            for name in ("reviewer-app.pem","gitlab-reviewer.token"):
+        with forge_credentials(self.projects):
+            runtime = Path(os.environ["REVIEW_FORGE_DIR"])
+            self.assertEqual((runtime/"github.pem").read_text().strip(), pem.strip())
+            for name in ("github.pem","gitlab.token"):
                 self.assertEqual((runtime/name).stat().st_mode & 0o777, 0o600)
             self.assertNotIn(KEY, os.environ)
             self.assertNotIn(TOKEN+"_FILE", os.environ)
             self.assertEqual(os.environ["GITLAB_API_BASE"], "https://gitlab.com/api/v4")
-            self.assertEqual(os.environ["REVIEWER_INSTALL_ID"], "202")
-            roster = Path(os.environ["REVIEW_ASSAY_HOME"])/".config/assay/roster.env"
-            self.assertIn("example/gitlab=gitlab", roster.read_text())
-            self.assertIn("example/github:public", roster.read_text())
-            self.assertNotIn("fixture-pat", roster.read_text())
-            self.assertEqual(roster.stat().st_mode & 0o777, 0o600)
-            if shutil.which("desktoken"):
-                result = run_desk(["desktoken","--no-rotate","--forge","gitlab","reviewer",
-                                   "--repo","example/gitlab"], cwd=self.root)
-                self.assertEqual(Path(result.decode().strip()), runtime/"gitlab-reviewer.token")
+            self.assertEqual(os.environ["REVIEW_FORGE_INSTALL_ID"], "202")
+            self.assertEqual(reviewer_token_file("gitlab", "example/gitlab", self.root), runtime/"gitlab.token")
+            self.assertEqual(os.environ["REVIEW_FORGE_OPERATOR"], "owner")
+            self.assertNotIn("ASSAY_CONFIG_HOME", os.environ)
         self.assertFalse(runtime.exists())
         self.assertEqual(mounted.read_text(), "fixture-pat\n")
         self.assertFalse((self.root/"home/.config/assay").exists())
@@ -61,8 +54,8 @@ class ContainerCredentialsTest(unittest.TestCase):
         roster = Path.home()/".config/assay/roster.env"
         roster.parent.mkdir(parents=True)
         roster.write_text("existing settings")
-        with forge_credentials({"gl":self.projects["gitlab"]}, self.root):
-            self.assertEqual((Path(os.environ["ASSAY_CONFIG_HOME"])/"gitlab-reviewer.token").read_text(),
+        with forge_credentials({"gl":self.projects["gitlab"]}):
+            self.assertEqual((Path(os.environ["REVIEW_FORGE_DIR"])/"gitlab.token").read_text(),
                              "fixture-pat\n")
             self.assertNotIn("REVIEW_ASSAY_HOME", os.environ)
         self.assertEqual(roster.read_text(), "existing settings")
@@ -79,6 +72,6 @@ class ContainerCredentialsTest(unittest.TestCase):
         for provider, environment, error in cases:
             with self.subTest(provider=provider, error=error), patch.dict(os.environ, environment):
                 with self.assertRaisesRegex(ValueError,error) as caught:
-                    with forge_credentials({"project":self.projects[provider]}, self.root):
+                    with forge_credentials({"project":self.projects[provider]}):
                         self.fail("Invalid configuration was accepted")
                 self.assertNotIn("sensitive", str(caught.exception))

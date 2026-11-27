@@ -128,7 +128,7 @@ class ForgeStatusRequestTests(unittest.TestCase):
                                          *options, "--cache-dir", str(self.root / "cache"), "--max-input-tokens", "6000"])
         posts = []
         with patch.object(cli, "forge_change", return_value=change), \
-             patch.object(cli, "run_desk", side_effect=desk_error or (lambda argv: posts.append(argv))) as desk, \
+             patch.object(cli, "post_comment", side_effect=desk_error or (lambda *call: posts.append(call))) as desk, \
              patch.object(engine, "invoke", return_value={"findings": [finding()], "cursor_usage": None}), \
              (patch.object(cli, "review", side_effect=model) if model else contextlib.nullcontext()):
             report, code = cli.run_request(args)
@@ -153,9 +153,9 @@ class ForgeStatusRequestTests(unittest.TestCase):
                     self.assertEqual(request.headers["PRIVATE-TOKEN"], "fixture")
                     self.assertEqual((body["name"], body["state"], body["target_url"]),
                                  (NAME, "success", SITES[provider]))
-                # The summary comment still goes through deskpost, and the report holds no credential.
+                # The summary comment still goes through the forge helper, and the report holds no credential.
                 self.assertEqual(desk.call_count, 1)
-                self.assertEqual(desk.call_args.args[0][:4], ["deskpost", "comment", SLUG, "7"])
+                self.assertEqual(desk.call_args.args[1:3], (7, HEAD))
                 self.assertNotIn("fixture", json.dumps(report))
         self.assertEqual(self.clients, [{"timeout": 15, "follow_redirects": False, "mounts": {}}] * 2)
 
@@ -229,8 +229,21 @@ class ForgeStatusRequestTests(unittest.TestCase):
         self.assertEqual([str(r.url) for r in self.requests],
                          ["https://gitlab.example/api/v4/projects/org%2Fproject/statuses/" + HEAD, "https://api.github.com/repos/Org/Project/check-runs"])
 
+    def test_a_gitlab_instance_under_a_path_is_reached_at_its_api(self):
+        site = "https://gitlab.example/gitlab/" + SLUG + "/-/merge_requests/7"
+        with patch.dict(os.environ, {"GITLAB_API_BASE": "https://gitlab.example/gitlab/api/v4"}):
+            self.assertEqual(self.exercise("gitlab", "--forge-status", url=site)[0]["forge_status"], "posted")
+            # The project still has to sit under the instance's path, and the number still has to match.
+            for url in ("https://gitlab.example/other/" + SLUG + "/-/merge_requests/7",
+                        "https://gitlab.example/gitlab/" + SLUG + "/-/merge_requests/8"):
+                with self.subTest(url=url), self.assertLogs("cursor_pr.forge_status", level="WARNING"):
+                    self.assertEqual(self.exercise("gitlab", "--forge-status", url=url)[0]["forge_status"], "failed")
+        self.assertEqual([str(r.url) for r in self.requests],
+                         ["https://gitlab.example/gitlab/api/v4/projects/org%2Fproject/statuses/" + HEAD])
+        self.assertEqual(json.loads(self.requests[0].content)["target_url"], site)
+
     def test_a_failed_summary_publication_leaves_the_status_unattempted(self):
-        report, code, *_ = self.exercise("github", "--forge-status", desk_error=source.ReviewError("deskpost comment exited 1"))
+        report, code, *_ = self.exercise("github", "--forge-status", desk_error=source.ReviewError("pr-agent-forge comment exited 1"))
         self.assertEqual((code, report["publication"]), (2, "failed"))
         self.assertNotIn("forge_status", report)
         self.assertEqual(self.requests, [])
