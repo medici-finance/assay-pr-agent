@@ -1,4 +1,4 @@
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from datetime import datetime, timezone
 import json
 import os
@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 import httpx
 
-from cursor_pr import acknowledge
+from cursor_pr import acknowledge, source
 from cursor_pr.acknowledge import NOTICE, Acknowledgement
 from cursor_pr.config import project_from
 from cursor_pr.poll import Jobs, cycle, main
@@ -88,7 +88,7 @@ class MarkerTests(Offline):
             self.assertNotIn("private-token" if forge == "github" else "authorization", headers)
 
     def test_github_marker_uses_the_comment_reaction_endpoints(self):
-        ack = Acknowledgement(Jobs(self.state))
+        ack = Acknowledgement(Jobs(self.state), self.state)
         ack.queued(self.gh, 3, 81)
         self.assertEqual(self.calls, [("POST", GITHUB, self.calls[0][2], b'{"content":"eyes"}')])
         ack.finished(self.gh, 3, 81, "reviewed")
@@ -101,7 +101,7 @@ class MarkerTests(Offline):
         self.assertEqual([row["id"] for row in self.eyes], [11, 13])
 
     def test_gitlab_marker_uses_the_merge_request_award(self):
-        ack = Acknowledgement(Jobs(self.state))
+        ack = Acknowledgement(Jobs(self.state), self.state)
         ack.queued(self.gl, 3, 81)
         self.assertEqual(self.sent(), [
             ("GET", "https://gitlab.com/api/v4/user"),
@@ -118,7 +118,7 @@ class MarkerTests(Offline):
 
     def test_one_marker_per_request_and_a_shared_award_is_added_once_and_removed_last(self):
         jobs = Jobs(self.state)
-        ack = Acknowledgement(jobs)
+        ack = Acknowledgement(jobs, self.state)
         ack.queued(self.gh, 3, 81)
         ack.queued(self.gh, 3, 82)  # Another comment gets a reaction of its own.
         self.assertEqual(self.sent(), [("POST", GITHUB), ("POST", GITHUB.replace("comments/81/", "comments/82/"))])
@@ -132,8 +132,8 @@ class MarkerTests(Offline):
         self.calls.clear()
         ack.finished(self.gl, 3, 81, "reviewed")
         self.assertEqual(self.calls, [])  # A request is still waiting on this merge request.
-        jobs.finish((self.gl.key, 3, 81), "reviewed")
-        jobs.finish((self.gl.key, 3, 82), "reviewed")
+        for _ in range(2):
+            jobs.finish(jobs.next(), "reviewed")  # Only a started request is finished.
         self.calls.clear()
         ack.finished(self.gl, 3, 82, "reviewed")
         self.assertEqual(self.sent(), [("GET", "https://gitlab.com/api/v4/user"),
@@ -141,7 +141,7 @@ class MarkerTests(Offline):
         self.assertEqual([row["id"] for row in self.awards], [21, 23])
 
     def test_failures_are_logged_without_the_url_or_token_and_never_raised(self):
-        ack = Acknowledgement(Jobs(self.state))
+        ack = Acknowledgement(Jobs(self.state), self.state)
         def finished(project, number, comment):
             # The reviewer's own marker is there to be removed, beside everyone else's.
             self.eyes[:] = [dict(id=11, user=dict(id=OTHER), content="eyes"),
@@ -201,7 +201,7 @@ class NoticeTests(Offline):
             project_from(dict(provider=p, url=f"https://{p}.com/acme/{p}", requester_ids=[7],
                               checkout=tmp.name)) for p in ("github", "gitlab")]
         self.projects = {p.key: p for p in (self.gh, self.gl)}
-        for name in ("reviewer_token", "run_desk", "add", "remove"):
+        for name in ("reviewer_token", "run_forge", "post_comment", "add", "remove"):
             self.start(patch.object(acknowledge, name, side_effect=AssertionError(name + " ran in a test")))
 
     def status(self, project, number, comment):
@@ -209,49 +209,65 @@ class NoticeTests(Offline):
             return db.execute("SELECT status FROM requests WHERE project=? AND number=? AND comment=?",
                               (project, number, comment)).fetchone()[0]
 
-    def test_failed_review_posts_one_fixed_comment_through_deskpost_and_nothing_else(self):
-        ack = Acknowledgement(Jobs(self.state))
-        bodies = []
-        def desk(argv, *, cwd):
-            bodies.append(Path(argv[-1]).read_text())
-            self.assertEqual(cwd, self.gh.checkout)
-        with patch.object(acknowledge, "run_desk", side_effect=desk) as post, patch.object(acknowledge, "remove"):
+    def test_failed_review_posts_one_fixed_comment_on_the_current_head_and_nothing_else(self):
+        ack = Acknowledgement(Jobs(self.state), self.state)
+        head = "a" * 40
+        with patch.object(acknowledge, "run_forge", return_value=dict(headSha=head)) as read, \
+                patch.object(acknowledge, "post_comment") as post, patch.object(acknowledge, "remove"):
             ack.finished(self.gh, 3, 81, "failed")
             for status in ("reviewed", "partial", "empty", "over-budget", "model-unavailable"):
                 ack.finished(self.gh, 3, 81, status)
-            argv = post.call_args.args[0]
-            self.assertEqual(argv, ["deskpost", "comment", "acme/github", "3", "--kind", "mr", "--body-file", argv[-1]])
-            self.assertEqual(bodies, [NOTICE])
-            self.assertNotIn("--head", argv)
-            self.assertEqual(Path(argv[-1]).exists(), False)  # The body file was temporary.
-            self.assertEqual(post.call_count, 1)
-            post.side_effect = ReviewError("deskpost comment exited 5")
+            read.assert_called_once_with("change", self.gh, numbers=[3])
+            post.assert_called_once_with(self.gh, 3, head, NOTICE, self.state)
+            post.side_effect = ReviewError("pr-agent-forge comment exited 1: change is no longer open")
             with self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
                 ack.finished(self.gl, 3, 81, "failed")
-            self.assertEqual(post.call_args.args[0][:4], ["deskpost", "comment", "acme/gitlab", "3"])
+            self.assertEqual(post.call_args.args[:3], (self.gl, 3, head))
             self.assertEqual(logged.output, ["WARNING:cursor_pr.acknowledge:Could not report the failed review on "
-                                             "acme/gitlab#3: deskpost comment exited 5"])
+                                             "acme/gitlab#3: pr-agent-forge comment exited 1: change is no longer open"])
+            post.reset_mock()
+            read.return_value = dict(headSha="not a head")
+            with self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
+                ack.finished(self.gh, 3, 81, "failed")
+            post.assert_not_called()
+            self.assertIn("Forge did not identify the change head", logged.output[0])
+
+    def test_failure_notice_goes_to_the_forge_helper_as_a_head_bound_comment(self):
+        # The real path below the notice, with only the helper process and the credential replaced.
+        head, sent = "b" * 40, []
+
+        def helper(args, *, data=None, env=None, timeout=45, cwd=None):
+            sent.append((args, json.loads(data)))
+            return json.dumps(dict(headSha=head) if args[1] == "change" else None).encode()
+        with patch.object(acknowledge, "run_forge", side_effect=source.run_forge), \
+                patch.object(acknowledge, "post_comment", side_effect=source.post_comment), \
+                patch.object(source, "reviewer_token", return_value="fixture"), \
+                patch.object(source, "run", side_effect=helper):
+            acknowledge.notify(self.gh, 3, self.state)
+            acknowledge.notify(self.gh, 3, self.state)  # Once per head: the second is not posted again.
+        self.assertEqual([(args, request["Numbers"]) for args, request in sent[::2]],
+                         [(["pr-agent-forge", "change"], [3])] * 2)
+        self.assertEqual([args for args, _ in sent[1::2]], [["pr-agent-forge", "comment"]] * 2)
+        comments = [request["Publication"] for _, request in sent[1::2]]
+        self.assertEqual([(c["Number"], c["Head"], c["Body"], c["AlreadyPosted"]) for c in comments],
+                         [(3, head, NOTICE, False), (3, head, NOTICE, True)])
 
     def test_cycle_marks_each_new_request_once_and_reports_only_a_failed_review(self):
         jobs = Jobs(self.state)
         since = {key: datetime(2026, 11, 15, tzinfo=timezone.utc) for key in self.projects}
         ack, threads, outcomes, public, results = Mock(), {p.slug: [] for p in self.projects.values()}, [], [True], []
-        def desk(args, *, cwd, timeout, env=None):
-            if args[0] == "deskmonitor":
-                root = Path(env["PR_MONITOR_STATE_DIR"])
-                root.mkdir(parents=True, exist_ok=True)
-                (root / (args[2].replace("/", "__") + ".state")).write_text("3 abc ready OPEN CLEAN\n")
-                return b""
-            slug = args[3].split("#")[0]
-            return json.dumps(dict(schema=1, kind="comments", partial=[],
-                                   items=[dict(repo=slug, number=3, comments=threads[slug])])).encode()
+        def forge(verb, project, *, numbers=(), timeout=45):
+            if verb == "open":
+                return dict(numbers=[3], capped=False)
+            self.assertEqual((verb, numbers), ("comments", (3,)))
+            return dict(partial=[], items=[dict(number=3, comments=threads[project.slug])])
         request = dict(authorId=7, databaseId=81, authorType="User", body="/review",
                        createdAt="2026-11-15T11:11:00Z", updatedAt="2026-11-15T11:11:00Z",
                        url=self.gh.change_url(3) + "#issuecomment-81")
         def review(project, number, state):
             outcomes.append((project.slug, number))
             return results.pop(0)
-        with patch("cursor_pr.discovery.run_desk", side_effect=desk), \
+        with patch("cursor_pr.discovery.run_forge", side_effect=forge), \
              patch("cursor_pr.discovery.public_gitlab_request", side_effect=lambda *args: public[0]):
             for slug in threads:
                 threads[slug].append(request | dict(body="ordinary comment"))
@@ -274,6 +290,19 @@ class NoticeTests(Offline):
                              [(self.gh, 3, 83, "reviewed"), (self.gl, 3, 82, "failed")])
             cycle(self.projects, self.state, jobs, since, review, ack)  # Already recorded: no second marker.
             self.assertEqual((ack.queued.call_count, ack.finished.call_count), (2, 2))
+
+    def test_cycle_reports_how_the_row_says_the_review_ended(self):
+        # The review child settles its own row, then its report is lost: it posted, so no notice.
+        jobs, ack = Jobs(self.state), Mock()
+        jobs.enqueue(self.gh.key, 3, 81)
+
+        def review(project, number, state):
+            with closing(sqlite3.connect(self.state / "requests.sqlite3")) as db, db:
+                db.execute("UPDATE requests SET status='reviewed' WHERE status='started'")
+            return "failed"
+        with patch("cursor_pr.poll.poll_project"):
+            cycle(self.projects, self.state, jobs, dict.fromkeys(self.projects), review, ack)
+        ack.finished.assert_called_once_with(self.gh, 3, 81, "reviewed")
 
     def test_restart_tells_the_requester_about_a_review_it_gave_up_on(self):
         jobs = Jobs(self.state)
@@ -301,6 +330,17 @@ class NoticeTests(Offline):
         marker.return_value.finished.assert_called_once_with(self.gh, 3, 81, "failed")
         reopened = Jobs(self.state)
         self.assertEqual((reopened.abandoned, reopened.pending(self.gh.key, 3)), ([], False))
+
+    def test_restart_gives_up_on_a_review_whose_head_was_not_recorded(self):
+        # A queue from a version that kept no head: its running review cannot be repeated safely.
+        with closing(sqlite3.connect(self.state / "requests.sqlite3")) as db, db:
+            db.execute("""CREATE TABLE requests (project TEXT NOT NULL, number INTEGER NOT NULL,
+                comment INTEGER NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(project, number, comment))""")
+            db.execute("INSERT INTO requests VALUES (?, 3, 81, 'started', 1)", (self.gh.key,))
+        with self.assertLogs("cursor_pr.poll", level="WARNING"):
+            jobs = Jobs(self.state)
+        self.assertEqual(jobs.abandoned, [(self.gh.key, 3, 81)])
 
 
 if __name__ == "__main__":

@@ -1,8 +1,6 @@
-"""Discover review requests with Assay's released monitor and typed change reads."""
+"""Discover review requests in the current open forge conversations."""
 from datetime import datetime
-import hashlib
 from itertools import batched
-import json
 import logging
 import os
 from urllib.parse import quote
@@ -10,42 +8,34 @@ from urllib.parse import quote
 import httpx
 
 from .gitlab_tls import client_options
-from .source import ReviewError, reviewer_token, run_desk
+from .source import ReviewError, reviewer_token, run_forge
 
 log = logging.getLogger(__name__)
 
 
-def open_changes(project, state):
-    # deskmonitor's documented baseline includes the whole open population. Its
-    # event lines alone miss ordinary conversation comments on an unchanged head.
-    directory = state / "monitor" / hashlib.sha256(project.key.encode()).hexdigest()
-    run_desk(["deskmonitor", "pr", project.slug], cwd=project.checkout,
-        env={**os.environ, "PR_MONITOR_STATE_DIR": str(directory)}, timeout=120)
-    baseline = directory / (project.slug.replace("/", "__") + ".state")
-    numbers = []
-    for line in baseline.read_text().splitlines():
-        fields = line.split()
-        if len(fields) < 4 or not fields[0].isascii() or not fields[0].isdigit() or int(fields[0]) < 1:
-            raise ReviewError("Invalid deskmonitor PR baseline")
-        numbers.append(int(fields[0]))
+def open_changes(project):
+    result = run_forge("open", project, timeout=120)
+    numbers = result.get("numbers")
+    if (not isinstance(numbers, list)
+            or any(type(number) is not int or number < 1 for number in numbers)
+            or len(set(numbers)) != len(numbers)):
+        raise ReviewError("Invalid open change list")
+    if result.get("capped") is not False:
+        # Keep polling the returned changes, and surface the coverage limit.
+        log.warning("Open change list capped for %s", project.key)
     return numbers
 
 
 def comment_threads(project, numbers):
-    args = ["deskread", "comments"]
-    for number in numbers:
-        args.extend(["--change", f"{project.slug}#{number}"])
-    envelope = json.loads(run_desk(args, cwd=project.checkout, timeout=120))
-    if envelope.get("schema") != 1 or envelope.get("kind") != "comments":
-        raise ReviewError("Invalid deskread comments envelope")
+    result = run_forge("comments", project, numbers=numbers, timeout=120)
     threads = {}
-    for row in envelope["items"] or []:
+    for row in result["items"]:
         number = row["number"]
         if (type(number) is not int or number not in numbers or number in threads
-                or row.get("repo") != project.slug or not isinstance(row.get("comments"), list)):
-            raise ReviewError("Mismatched deskread comments item")
+                or not isinstance(row.get("comments"), list)):
+            raise ReviewError("Mismatched change comment item")
         threads[number] = row["comments"]
-    if envelope.get("partial") or set(threads) != set(numbers):
+    if result.get("partial") or set(threads) != set(numbers):
         log.warning("Incomplete comment read for %s; missing threads will be polled again", project.key)
     return threads
 
@@ -66,12 +56,12 @@ def is_request(project, number, note, since):
     if project.provider == "github":
         return (note.get("authorType") == "User"
                 and note.get("url") == f"{project.change_url(number)}#issuecomment-{comment}")
-    # GitLab's deskread comment has an immutable account ID but no actor type.
+    # GitLab's conversation list has an immutable account ID but no actor type.
     return note.get("authorType") in (None, "", "User")
 
 
 def public_gitlab_request(project, number, note):
-    # deskread v1.0.94 omits note visibility and rounds GitLab timestamps to
+    # The list adapter omits note visibility and rounds GitLab timestamps to
     # seconds. Check both on this single candidate before a public response.
     base = os.environ.get("GITLAB_API_BASE", "").rstrip("/")
     if base != project.url.removesuffix("/" + project.slug) + "/api/v4":
@@ -91,8 +81,8 @@ def public_gitlab_request(project, number, note):
             and bool(latest.get("created_at")) and latest["created_at"] == latest.get("updated_at"))
 
 
-def poll_project(project, state, jobs, since, ack=None):
-    for numbers in batched(open_changes(project, state), 16):
+def poll_project(project, jobs, since, ack=None):
+    for numbers in batched(open_changes(project), 16):
         try:
             threads = comment_threads(project, numbers)
         except Exception:
