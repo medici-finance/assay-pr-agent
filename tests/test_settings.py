@@ -129,6 +129,31 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual((setup.active_bundle(self.state) / "settings.json").read_bytes(), document)
         self.assertEqual(len(list(self.state.glob(".review-setup-*"))), 1)
 
+    def test_findings_caps_are_edited_per_tier_within_the_bound(self):
+        self.seed()
+        view = settings.view(self.state)
+        for name in ("REVIEW_MAX_FINDINGS", "REVIEW_MAX_FINDINGS_MID", "REVIEW_MAX_FINDINGS_MAX"):
+            row = item(view, name)
+            self.assertEqual((row["kind"], row["source"], row["value"], row["locked"]), ("number", "default", "6", False))
+        settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS_MID", "value": " 09 "})
+        settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS_MAX", "value": "12"})
+        saved = self.document()["settings"]
+        self.assertEqual((saved["REVIEW_MAX_FINDINGS_MID"], saved["REVIEW_MAX_FINDINGS_MAX"]), ("9", "12"))
+        self.assertNotIn("REVIEW_MAX_FINDINGS", saved)
+        self.assertEqual((item(settings.view(self.state), "REVIEW_MAX_FINDINGS_MID")["source"]), "saved")
+        self.assertEqual(setup.max_findings(self.state), {"regular": 6, "mid": 9, "max": 12})
+        document = (setup.active_bundle(self.state) / "settings.json").read_bytes()
+        for value in ("0", "13", "six", "+6", "6_0", "-1", ""):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "Enter an integer from 1 to 12"):
+                settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS", "value": value})
+        self.assertEqual((setup.active_bundle(self.state) / "settings.json").read_bytes(), document)
+        with patch.dict(os.environ, {"REVIEW_MAX_FINDINGS": "4"}):
+            row = item(settings.view(self.state), "REVIEW_MAX_FINDINGS")
+            self.assertEqual((row["locked"], row["source"], row["value"]), (True, "env", "4"))
+            self.assertIn("Set by REVIEW_MAX_FINDINGS in the environment", row["help"])
+            with self.assertRaisesRegex(ValueError, "container environment"):
+                settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS", "value": "5"})
+
     def test_another_installer_blocks_the_save(self):
         self.seed()
         with setup.installer_lock(self.state):
@@ -411,11 +436,14 @@ class SettingsTests(unittest.TestCase):
                             "owner:13", "", "", "", "codex", "", "", "paste"], ["fixture-forge"])
         settings.save(self.state, {"name": "REVIEW_SYNC_SECONDS", "value": "300"})
         settings.save(self.state, {"name": "REVIEW_OSV_DOWNLOAD_DATABASES", "value": "0"})
+        settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS_MAX", "value": "10"})
         setup.apply_saved_setup(self.state)
         self.assertEqual((os.environ["REVIEW_SYNC_SECONDS"], os.environ["REVIEW_OSV_DOWNLOAD_DATABASES"]), ("300", "0"))
+        self.assertEqual(os.environ["REVIEW_MAX_FINDINGS_MAX"], "10")
         wizard(self.state, ["y", "", "", "", "", "", "", "", "keep"], [])
         kept = self.document()["settings"]
         self.assertEqual((kept["REVIEW_SYNC_SECONDS"], kept["REVIEW_OSV_DOWNLOAD_DATABASES"]), ("300", "0"))
+        self.assertEqual(kept["REVIEW_MAX_FINDINGS_MAX"], "10")
 
 
 class SettingsSessionTests(unittest.TestCase):

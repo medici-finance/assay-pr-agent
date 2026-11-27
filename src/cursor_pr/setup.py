@@ -25,7 +25,7 @@ SETTINGS = ("REVIEW_OPERATOR", APP_ID, INSTALL_ID, "REVIEW_MODEL", "REVIEW_MAX_I
             *FINDINGS_SETTINGS.values(), "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER", "REVIEW_CURSOR_TEAM_ID", "REVIEW_AUTH_MODE", "REVIEW_LOGIN_PROFILE",
             "REVIEW_SYNC_SECONDS", "REVIEW_OSV_DOWNLOAD_DATABASES")
 # Only the settings page asks for these, so a wizard re-run keeps what it saved.
-PAGE_SETTINGS = ("REVIEW_SYNC_SECONDS", "REVIEW_OSV_DOWNLOAD_DATABASES")
+PAGE_SETTINGS = ("REVIEW_SYNC_SECONDS", "REVIEW_OSV_DOWNLOAD_DATABASES", *FINDINGS_SETTINGS.values())
 
 
 def state_dir():
@@ -182,6 +182,13 @@ def number(value):
     if not value.isascii() or not value.isdecimal() or int(value) <= 0:
         raise ValueError("Enter a positive integer")
     return value
+
+
+def findings_cap(value):
+    """A findings cap as the settings page saves it: plain digits within the bound."""
+    if not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= MAX_FINDINGS_LIMIT:
+        raise ValueError(f"Enter an integer from 1 to {MAX_FINDINGS_LIMIT}")
+    return str(int(value))
 
 
 def nonnegative(value):

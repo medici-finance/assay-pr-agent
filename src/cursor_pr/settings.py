@@ -9,7 +9,7 @@ import ssl
 import tempfile
 
 from . import accounts, gitlab_tls, providers, setup
-from .config import DEFAULT_MAX_INPUT_TOKENS, parse_projects
+from .config import DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, FINDINGS_SETTINGS, MAX_FINDINGS_LIMIT, parse_projects
 from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secret, validate_operator, validate_pem, validate_token
 from .login import login_directory, login_env
 
@@ -17,6 +17,12 @@ FIELDS = (
     {"name": "REVIEW_MAX_INPUT_TOKENS", "section": "Timing and limits", "label": "Maximum input tokens per review",
      "help": "Reviews whose estimated prompt exceeds this many tokens are skipped as over-budget.",
      "default": str(DEFAULT_MAX_INPUT_TOKENS)},
+    *({"name": FINDINGS_SETTINGS[tier], "section": "Timing and limits", "label": label,
+       "help": f"The most findings {command} asks the model for and reports, from 1 to {MAX_FINDINGS_LIMIT}.",
+       "default": str(DEFAULT_MAX_FINDINGS)}
+      for tier, label, command in (("regular", "Findings per review", "/review"),
+                                   ("mid", "Findings per mid review", "/review-mid"),
+                                   ("max", "Findings per max review", "/review-max"))),
     {"name": "REVIEW_POLL_SECONDS", "section": "Timing and limits", "label": "Seconds between polls",
      "help": "How often the reviewer looks for new /review comments.", "default": "120"},
     {"name": "REVIEW_SYNC_SECONDS", "section": "Timing and limits", "label": "Seconds between repository syncs",
@@ -125,6 +131,7 @@ def operator(value, config, state, old):
 
 VALIDATORS = {
     "REVIEW_MAX_INPUT_TOKENS": plain(setup.number), "REVIEW_POLL_SECONDS": plain(setup.number),
+    **dict.fromkeys(FINDINGS_SETTINGS.values(), plain(setup.findings_cap)),
     "REVIEW_SYNC_SECONDS": plain(setup.number), "REVIEW_QUALGEN_INTERVAL_SECONDS": plain(setup.nonnegative),
     "REVIEW_OSV_DOWNLOAD_DATABASES": plain(choice(("1", "0"))), "REVIEW_MODEL": model,
     "REVIEW_CURSOR_TEAM_ID": cursor_team, "REVIEW_OPERATOR": operator,
