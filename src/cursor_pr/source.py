@@ -102,6 +102,19 @@ def run_forge(verb, project, *, numbers=(), publication=None, timeout=45):
     return json.loads(run(["pr-agent-forge", verb], data=json.dumps(request).encode(), env=env, timeout=timeout))
 
 
+def publication(project, number, head, body, posted=False):
+    return dict(
+        Number=number, Head=head, Body=body, MaxVisibility=project.visibility, AlreadyPosted=posted,
+        HumanLogins=[os.environ["REVIEW_FORGE_OPERATOR"]] if os.getenv("REVIEW_FORGE_OPERATOR") else [],
+        PrivateRepositories=os.getenv("REVIEW_PRIVATE_REPOSITORIES", "").split(","),
+        WithheldIdentifiers=[item.strip().lower() for item in
+                             os.getenv("REVIEW_WITHHELD_IDENTIFIERS", "").split(",") if item.strip()])
+
+
+def check_publication(project, number, head, body):
+    run_forge("check-publication", project, publication=publication(project, number, head, body))
+
+
 def post_comment(project, number, head, body, state):
     if project is None:
         raise ReviewError("Use a --change address from the configured review projects")
@@ -112,12 +125,7 @@ def post_comment(project, number, head, body, state):
     with (directory / (key + ".lock")).open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         posted = receipt.is_file()
-        run_forge("comment", project, publication=dict(
-            Number=number, Head=head, Body=body, MaxVisibility=project.visibility, AlreadyPosted=posted,
-            HumanLogins=[os.environ["REVIEW_FORGE_OPERATOR"]] if os.getenv("REVIEW_FORGE_OPERATOR") else [],
-            PrivateRepositories=os.getenv("REVIEW_PRIVATE_REPOSITORIES", "").split(","),
-            WithheldIdentifiers=[item.strip().lower() for item in
-                                 os.getenv("REVIEW_WITHHELD_IDENTIFIERS", "").split(",") if item.strip()]))
+        run_forge("comment", project, publication=publication(project, number, head, body, posted))
         if not posted:
             private_file(receipt, "posted")
 

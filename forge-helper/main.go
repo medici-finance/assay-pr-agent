@@ -86,6 +86,11 @@ func execute(verb string, in request) (any, error) {
 			return client.Change(in.Numbers[0])
 		}
 		return client.ChangedFiles(in.Numbers[0])
+	case "check-publication":
+		// Use the same visibility, head, and content checks as comment publication.
+		// The checked-only path never sends a comment.
+		in.Publication.AlreadyPosted = true
+		return nil, client.PublishComment(in.Publication)
 	case "comment":
 		err := client.PublishComment(in.Publication)
 		return nil, err

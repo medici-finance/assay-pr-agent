@@ -1,4 +1,5 @@
 """Report a reviewed forge change on its head: a GitHub check run or a GitLab commit status."""
+from contextlib import contextmanager
 import logging
 import os
 import re
@@ -8,7 +9,7 @@ import httpx
 
 from .gitlab_tls import client_options
 from .scanners import fence, safe_path
-from .source import ReviewError, reviewer_token
+from .source import ReviewError, check_publication, reviewer_token
 
 log = logging.getLogger(__name__)
 NAME = "assay-pr-agent/review"
@@ -29,17 +30,20 @@ def change(address, url):
     """(provider, slug, GitLab API base) for a reviewed change. The link comes from the forge, so pin it."""
     slug, _, number = address.rpartition("#")
     site = urlsplit(url)
-    match = re.fullmatch(r"/([\w.-]+/[\w.-]+)/(pull|-/merge_requests)/([1-9][0-9]*)", site.path)
-    provider = "github" if match and match[2] == "pull" else "gitlab"
+    if (not re.fullmatch(r"[\w.-]+/[\w.-]+", slug) or not re.fullmatch(r"[1-9][0-9]*", number)
+            or not url.isprintable() or site.scheme != "https" or site.username is not None
+            or site.query or site.fragment or any(part in (".", "..") for part in slug.split("/"))):
+        raise ReviewError("The change URL does not match the reviewed address and forge")
+    if site.netloc == "github.com" and site.path == f"/{slug}/pull/{number}":
+        return "github", slug, ""
     base = os.getenv("GITLAB_API_BASE", "").rstrip("/")
     instance = urlsplit(base)
-    if (not match or match[1].casefold() != slug.casefold() or match[3] != number
-            or not url.isprintable() or site.scheme != "https" or site.username is not None
-            or site.query or site.fragment or (provider == "github" and site.netloc != "github.com")
-            or (provider == "gitlab" and not (base.endswith("/api/v4") and site.netloc == instance.netloc
-                                              and site.path.startswith(instance.path.removesuffix("/api/v4") + "/")))):
-        raise ReviewError("The change URL does not match the reviewed address and forge")
-    return provider, slug, base
+    prefix = instance.path.removesuffix("/api/v4")
+    if (base.endswith("/api/v4") and instance.scheme == "https" and instance.netloc == site.netloc
+            and instance.username is None and not (instance.query or instance.fragment)
+            and site.path == f"{prefix}/{slug}/-/merge_requests/{number}"):
+        return "gitlab", slug, base
+    raise ReviewError("The change URL does not match the reviewed address and forge")
 
 
 def tally(count, thing):
@@ -88,24 +92,42 @@ def gitlab(value, url, title, detail):
     return body
 
 
-def post(address, value, checkout):
-    """Create the status on the reviewed head. Raises on any refusal; never logs the credential."""
+@contextmanager
+def connection(address, url, checkout):
+    provider, slug, base = change(address, url)
+    token = reviewer_token(provider, slug, checkout)
+    if provider == "github":
+        headers, options = {"Authorization": "Bearer " + token}, {}
+    else:
+        headers, options = {"PRIVATE-TOKEN": token}, client_options()
+    mounts = {"https://" + urlsplit(url).netloc: httpx.HTTPTransport(**options)} if options else {}
+    # Redirects could carry the reviewer credential to another host.
+    with httpx.Client(timeout=15, follow_redirects=False, mounts=mounts) as client:
+        yield client, provider, slug, base, headers
+
+
+def post(address, value, project):
+    """Apply the comment publication policy before creating a status on the reviewed head."""
+    number = int(address.rsplit("#", 1)[1])
     url = value["source"]
     provider, slug, base = change(address, url)
+    if not project or project.provider != provider or project.slug != slug or project.change_url(number) != url:
+        raise ReviewError("The status target is not a configured review project")
     title, detail, head = facts(value)
-    token = reviewer_token(provider, slug, checkout)
-    options = client_options() if provider == "gitlab" else {}
-    mounts = {"https://" + urlsplit(url).netloc: httpx.HTTPTransport(**options)} if options else {}
-    with httpx.Client(timeout=15, follow_redirects=False, mounts=mounts) as client:
-        # A redirect would carry the credential to another host, so it is an error and not followed.
-        if provider == "github":
-            response = client.post(f"https://api.github.com/repos/{slug}/check-runs",
-                                   headers={"Authorization": "Bearer " + token},
-                                   json=github(value, url, title, detail, head))
-        else:
-            response = client.post(f"{base}/projects/{quote(slug, safe='')}/statuses/{head}",
-                                   headers={"PRIVATE-TOKEN": token}, json=gitlab(value, url, title, detail))
-        response.raise_for_status()
+    if provider == "github":
+        endpoint = f"https://api.github.com/repos/{slug}/check-runs"
+        body = github(value, url, title, detail, head)
+        output = body["output"]
+        checked = [output["title"], output["summary"]]
+        for row in output["annotations"]:
+            checked.extend((fence(row["path"]), row["message"]))
+    else:
+        endpoint = f"{base}/projects/{quote(slug, safe='')}/statuses/{head}"
+        body = gitlab(value, url, title, detail)
+        checked = [body["description"]]
+    check_publication(project, number, head, "\n\n".join(checked))
+    with connection(address, url, project.checkout) as (client, _, _, _, headers):
+        client.post(endpoint, headers=headers, json=body).raise_for_status()
 
 
 def outcome(args, value):
@@ -114,7 +136,7 @@ def outcome(args, value):
             and (getattr(args, "forge_status", False) or os.getenv("REVIEW_FORGE_STATUS") == "1")):
         return "skipped"
     try:
-        post(args.change, value, args.repo)
+        post(args.change, value, getattr(args, "forge_project", None))
     # Optional output must not fail a review, whatever the transport or the forge answer was.
     except Exception as error:
         reason = str(error) if isinstance(error, ReviewError) else (

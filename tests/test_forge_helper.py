@@ -93,6 +93,7 @@ class ForgeHelperTests(unittest.TestCase):
                         self.assertEqual(discovery.comment_threads(project, (9,))[9][0]["databaseId"], 14)
                         reviewed = source.forge_change("org/repo#9", project=project)
                         self.assertEqual((reviewed.head, reviewed.files[0].path), (original, "app.py"))
+                        source.check_publication(project, 9, original, "Status text checked.")
                         source.post_comment(project, 9, original, "Review finished.", root)
                         source.post_comment(project, 9, original, "Review finished.", root)
                         change["sha"] = "b" * 40
