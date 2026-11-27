@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -227,6 +228,20 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "different GitLab instance"):
                 settings.save(self.state, {"name": setup.TOKEN, "value": "replacement"})
 
+    def test_gitlab_override_loads_environment_tls_for_the_replacement_instance(self):
+        original = dict(provider="gitlab", url="https://gitlab.com/org/repo", requester_ids=[13])
+        self.seed(projects=[original], secrets={setup.TOKEN: "original-token", setup.gitlab_tls.CRL: REVOCATIONS})
+        replacement = dict(original, url="https://gitlab.example.org/org/repo")
+        certificate = self.state / "replacement-ca.pem"
+        certificate.write_text(CERTIFICATE)
+        with patch.dict(os.environ, {"REVIEW_PROJECTS": json.dumps([replacement]),
+                                     setup.TOKEN: "replacement-token", setup.gitlab_tls.CA + "_FILE": str(certificate)}):
+            site, token, verify = settings.gitlab_access(self.document(), setup.active_bundle(self.state))
+        self.assertEqual((site, token), ("https://gitlab.example.org", "replacement-token"))
+        self.assertIsInstance(verify, ssl.SSLContext)
+        self.assertIn(ssl.PEM_cert_to_DER_cert(CERTIFICATE), verify.get_ca_certs(binary_form=True))
+        self.assertFalse(verify.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)
+
     def test_github_ids_are_saved_in_runtime_format(self):
         self.seed()
         for name in (setup.APP_ID, setup.INSTALL_ID):
@@ -411,11 +426,16 @@ class SettingsTests(unittest.TestCase):
                             "owner:13", "", "", "", "codex", "", "", "paste"], ["fixture-forge"])
         settings.save(self.state, {"name": "REVIEW_SYNC_SECONDS", "value": "300"})
         settings.save(self.state, {"name": "REVIEW_OSV_DOWNLOAD_DATABASES", "value": "0"})
+        bundle = setup.active_bundle(self.state) / "settings.json"
+        config = json.loads(bundle.read_text())
+        config["settings"]["REVIEW_MAX_FINDINGS_MID"] = "4"
+        bundle.write_text(json.dumps(config))
         setup.apply_saved_setup(self.state)
         self.assertEqual((os.environ["REVIEW_SYNC_SECONDS"], os.environ["REVIEW_OSV_DOWNLOAD_DATABASES"]), ("300", "0"))
         wizard(self.state, ["y", "", "", "", "", "", "", "", "keep"], [])
         kept = self.document()["settings"]
         self.assertEqual((kept["REVIEW_SYNC_SECONDS"], kept["REVIEW_OSV_DOWNLOAD_DATABASES"]), ("300", "0"))
+        self.assertEqual(kept["REVIEW_MAX_FINDINGS_MID"], "4")
 
 
 class SettingsSessionTests(unittest.TestCase):

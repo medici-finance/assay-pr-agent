@@ -97,7 +97,20 @@ def gitlab_access(config, old):
             token = stored(config, old, TOKEN)
     except ValueError:
         token = None
-    return sorted(instances)[0], token, gitlab_tls.context(old) if same_instances else True
+    tls_environment = {name for name in gitlab_tls.NAMES if name in os.environ or name + "_FILE" in os.environ}
+    if not tls_environment:
+        verify = gitlab_tls.context(old) if same_instances else True
+    else:
+        with tempfile.TemporaryDirectory(prefix="review-gitlab-settings-") as temp:
+            bundle = Path(temp)
+            for name, filename in gitlab_tls.NAMES.items():
+                if name in tls_environment or (same_instances and name in config["secrets"]):
+                    private_file(bundle / filename, gitlab_tls.validate(name, stored(config, old, name)))
+            try:
+                verify = gitlab_tls.context(bundle)
+            except ssl.SSLError:
+                raise ValueError("The GitLab certificate files could not be loaded for TLS") from None
+    return sorted(instances)[0], token, verify
 
 
 def model(value, config, state, old):

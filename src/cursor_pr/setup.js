@@ -72,7 +72,8 @@ function heading(tag, text) {
 function field(item, project) {
   const node = row.cloneNode(true), find = selector => node.querySelector(selector);
   const key = (project ? project.url + " " : "") + item.name;
-  const box = find(".editor"), toggle = find(".change"), submit = find(".save"), drop = find(".remove"), problem = find(".error");
+  const box = find(".editor"), toggle = find(".change"), submit = find(".save"), drop = find(".remove");
+  const cancel = find(".cancel"), problem = find(".error");
   const text = find(".input"), area = find(".multi"), pick = find(".choice"), disk = find(".file");
   const masked = item.kind === "secret", control = item.choices ? pick : item.multiline || item.kind === "json" ? area : text;
   node.firstElementChild.dataset.key = key;
@@ -89,27 +90,56 @@ function field(item, project) {
   find(".import").hidden = !masked;
   drop.hidden = !(item.optional && ["stored", "mounted"].includes(item.state));
   toggle.hidden = item.locked || item.wizard;
+  const lockOtherRows = locked => {
+    for (const change of groups.querySelectorAll(".change")) change.disabled = locked;
+  };
+  let importVersion = 0, importing = false, saving = false;
+  const updateControls = () => {
+    submit.disabled = drop.disabled = control.disabled = importing || saving;
+    cancel.disabled = disk.disabled = saving;
+  };
   toggle.onclick = () => {
+    lockOtherRows(true);
     toggle.hidden = true; box.hidden = false; problem.textContent = "";
     if (!masked) control.value = item.value;
     control.focus();
   };
-  let importVersion = 0;
-  find(".cancel").onclick = () => {
+  cancel.onclick = () => {
     importVersion++;
+    importing = false;
+    updateControls();
     if (masked) { control.value = ""; disk.value = ""; }
+    lockOtherRows(false);
     box.hidden = true; toggle.hidden = false; toggle.focus();
   };
   disk.onchange = async () => {
-    const version = ++importVersion, chosen = disk.files[0];
+    const chosen = disk.files[0];
+    if (!chosen) return;
+    const version = ++importVersion;
     disk.value = "";
-    if (chosen && chosen.size <= (item.multiline ? 900000 : 24000)) {
+    importing = true;
+    problem.textContent = "";
+    updateControls();
+    try {
+      if (chosen.size > (item.multiline ? 900000 : 24000)) {
+        problem.textContent = "This file is too large to import.";
+        return;
+      }
       const value = await chosen.text();
       if (version === importVersion) control.value = value;
-    } else problem.textContent = "This file is too large to import.";
+    } catch {
+      if (version === importVersion) problem.textContent = "This file could not be read.";
+    } finally {
+      if (version === importVersion) {
+        importing = false;
+        updateControls();
+      }
+    }
   };
   const keep = async data => {
-    submit.disabled = drop.disabled = true;
+    if (importing || saving) return;
+    saving = true;
+    updateControls();
     try {
       const res = await fetch("/setting", {method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({id: step.id, name: item.name, ...(project ? {project: project.url} : {}), ...data}), cache: "no-store"});
@@ -124,7 +154,7 @@ function field(item, project) {
     } catch (error) {
       if (error.message === "key") show_unlock("Enter the setup key printed in the installer console.");
       else problem.textContent = "The installer could not be reached. Open http://127.0.0.1:8765/ in this browser and try again.";
-    } finally { submit.disabled = drop.disabled = false; }
+    } finally { saving = false; updateControls(); }
   };
   submit.onclick = () => keep({value: control.value});
   drop.onclick = () => keep({remove: true});
