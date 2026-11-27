@@ -141,6 +141,8 @@ def stopped(number, frame):
     # The supervisor asks before it ends the review. Leaving like any exit removes the temporary
     # files and ends the command being waited on. The row is not settled and stays started.
     global stopping
+    if stopping:
+        return  # Asked again while already leaving. Raising a second time would cut the cleanup short.
     stopping = True
     raise Stopped("cursor-review: stopped by its supervisor")
 
@@ -254,6 +256,8 @@ def execute(args):
             drift_base = target if valid_sha(target) else None
 
     if args.request:
+        if not getattr(args, "own_row", False):
+            raise ReviewError("The request's row was not checked against the change")
         prepared = claim_head(args, change.head)
         if prepared is not None:
             report, code = json.loads(prepared)
@@ -376,6 +380,8 @@ def main():
     # Load PR-Agent settings only from an empty directory, independent of the target repo.
     args.repo = args.repo.resolve()
     args.cache_dir = args.cache_dir.resolve()
+    if args.queue:
+        args.queue = args.queue.resolve()  # Before the working directory changes.
     if args.go_report:
         args.go_report = args.go_report.resolve()
     if args.qualgen_store:

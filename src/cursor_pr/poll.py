@@ -33,6 +33,11 @@ UNRECORDED = "marked failed, the head it started at was not recorded, a new /rev
 REVIEW_SECONDS = 1800
 # How long the supervisor is given to end a review before the poller stops waiting for it.
 STOP_SECONDS = 30
+# How long what a review printed is still read for once its supervisor has ended.
+DRAIN_SECONDS = 2
+# How long a poller waits for the lock at its start. A poller that was just stopped leaves the lock
+# with its review's supervisor for the few seconds that takes to end the review.
+LOCK_WAIT_SECONDS = 15
 SUPERVISOR = Path(__file__).with_name("supervise.py")
 
 # The instance lock's descriptor while this process holds it. A review's supervisor and the review
@@ -171,22 +176,27 @@ def supervised(argv, **options):
     the review's time is up, or when the review ends. This process tells it that it is gone by
     nothing more than exiting: the supervisor holds the read end of a pipe that only this process
     can write to. So a review never runs beside a later poller, however this one stops.
+
+    The supervisor, the review and all the review starts are one process group, which has the
+    supervisor's number. If the supervisor is stuck or was killed, this process ends that group.
     """
     lifeline, hold = os.pipe()
     # The supervisor holds the other end of this one for as long as it runs, and gives it to nobody.
     # It says that the supervisor has ended without the poller having to wait for it, which would
-    # give up the supervisor's number while the review's group, which has the same number, is needed.
+    # give up the supervisor's number while the group, which has the same number, is still needed.
     over, running = os.pipe()
     keep = (lock_fd,) if lock_fd is not None else ()
     process = None
     try:
+        # Without the poller's input: the group is not the terminal's foreground one, and a command
+        # that read from the terminal there would be stopped by it and hang.
         process = subprocess.Popen(
             [sys.executable, "-I", str(SUPERVISOR), str(lifeline), str(REVIEW_SECONDS),
-             ",".join(map(str, keep)), *argv], stdout=subprocess.PIPE, pass_fds=(lifeline, running, *keep),
-            process_group=0, **options)
+             ",".join(map(str, keep)), *argv], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            pass_fds=(lifeline, running, *keep), process_group=0, **options)
         os.close(running)
         running = None
-        return read_all(process.stdout.fileno(), REVIEW_SECONDS + STOP_SECONDS)
+        return read_report(process.stdout.fileno(), over, REVIEW_SECONDS + STOP_SECONDS)
     finally:
         # Closing the poller's end is what tells the supervisor to end the review: on a timeout,
         # on an interrupt, and on any other way out of here.
@@ -195,21 +205,44 @@ def supervised(argv, **options):
         if running is not None:
             os.close(running)
         if process is not None:
-            ended = closed_within(over, STOP_SECONDS)
-            # The review runs in the group the supervisor was started as the leader of. A supervisor
-            # that is stuck or was killed has not ended it, so the poller does. The supervisor has
-            # not been waited for yet, so its number, which is the group's, is still its own.
-            # The supervisor is stopped first, so that it cannot start anything more while its group
-            # is being ended.
-            if not ended:
-                process.kill()
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            ended = read_all(over, STOP_SECONDS) is not None
+            # Neither of these waits for the supervisor, so its number, which is the group's, is
+            # still its own when the group is ended. The supervisor is stopped first, so that it
+            # cannot start anything more meanwhile.
+            for end in ((os.kill,) if not ended else ()) + (os.killpg,):
+                try:
+                    end(process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
             process.wait()
             process.stdout.close()
         os.close(over)
+
+
+def read_report(report, over, seconds):
+    """What the review printed, or None when neither it nor its supervisor ended in time.
+
+    The report is complete when its pipe closes. If the supervisor ends first, nothing more is
+    coming from a review it ended, so what has been written by then is all there is: a command
+    that left the group and kept the pipe open does not keep the queue waiting.
+    """
+    parts = []
+    with selectors.DefaultSelector() as waiting:
+        waiting.register(report, selectors.EVENT_READ)
+        waiting.register(over, selectors.EVENT_READ)
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            readable = {key.fd for key, _ in waiting.select(left)}
+            if report in readable:
+                part = os.read(report, 65536)
+                if not part:
+                    return b"".join(parts)
+                parts.append(part)
+            elif over in readable:
+                # The supervisor has ended, and its group with it. Take what is still in the pipe.
+                waiting.unregister(over)
+                deadline = min(deadline, time.monotonic() + DRAIN_SECONDS)
+        return b"".join(parts) if over not in waiting.get_map() else None
 
 
 def read_all(descriptor, seconds):
@@ -225,10 +258,6 @@ def read_all(descriptor, seconds):
                     return b"".join(parts)
                 parts.append(part)
     return None
-
-
-def closed_within(descriptor, seconds):
-    return read_all(descriptor, seconds) is not None
 
 
 def cycle(projects, state, jobs, since, runner=None):
@@ -250,14 +279,22 @@ def cycle(projects, state, jobs, since, runner=None):
 
 
 @contextmanager
-def instance_lock(state):
+def instance_lock(state, wait=None):
     # A file of its own, not the directory: setup takes shared and exclusive locks on the
     # directory inode, and an exclusive lock there would block the setup wizard.
     global lock_fd
     fd = os.open(state / ".poller.lock", os.O_RDWR | os.O_CREAT, 0o600)
     held = lock_fd
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        deadline = time.monotonic() + (LOCK_WAIT_SECONDS if wait is None else wait)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.2)
         lock_fd = fd
         yield
     finally:

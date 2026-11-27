@@ -1,15 +1,20 @@
 """Run one queued review for the poller, and end it when the poller is gone or its time is up.
 
-The poller starts this as the leader of a new process group, and this starts the review in it. A review must
-never run beside a later poller, which would start the same request again, and a review that hangs
-must not keep the poller's lock for good. Both are decided here, outside the review, by a process
-that only waits:
+The poller starts this as the leader of a new process group, and this starts the review in it. A
+review must never run beside a later poller, which would start the same request again, and a review
+that hangs must not keep the poller's lock for good. Both are decided here, outside the review, by
+a process that only waits:
 
-  the poller is gone (its end of the lifeline closes)  -> the review's group is ended
-  the review runs past its time                        -> the review's group is ended
+  the poller is gone (its end of the lifeline closes)  -> the review is ended
+  the review runs past its time                        -> the review is ended
   the review ends                                      -> what it left running is ended
 
-The poller's lock is held here until the group is gone, so no other poller starts before that.
+This process, the review and all the review starts are one process group, apart from the poller's.
+A signal meant for the poller's group, from a terminal or from an operator, therefore reaches
+neither, and the poller's death is seen here on the lifeline, whatever ended it. The group ends
+together: the last thing this process does is end its own group, itself included. The poller's lock
+is held here until then, so no other poller starts before the review is gone. The poller knows the
+group by this process's number and ends it itself if this process cannot.
 
 Run by path, with only the standard library:  supervise.py LIFELINE SECONDS FDS COMMAND...
 LIFELINE is a descriptor the poller holds the other end of. FDS is a comma-separated list of
@@ -28,45 +33,45 @@ STOPPED = 124
 
 
 def supervise(lifeline, seconds, keep, command):
+    group = os.getpgrp()
+    if group != os.getpid():
+        # Ending its group would then end whoever started it.
+        print("cursor-review: the supervisor must be started as the leader of its own process group", file=sys.stderr)
+        return STOPPED
     # A signal to this process is read from a pipe like everything else it waits for, so it cannot
-    # arrive between two steps and end the supervisor with the review still running.
+    # arrive between two steps and end the supervisor with the review still running. One that this
+    # process was started to ignore stays ignored. SIGTERM is always taken: this process sends it
+    # to its own group and must outlive that.
     woken, wake = os.pipe()
     os.set_blocking(wake, False)
     signal.set_wakeup_fd(wake, warn_on_full_buffer=False)
-    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(number, lambda *received: None)
-    # The poller started this process as the leader of a new group. The review and all it starts
-    # stay in that group, whose number the poller knows, so the poller can end it if this process
-    # cannot. This process then steps out of it, so that ending the group does not end this too.
-    group = os.getpgrp()
-    if group != os.getpid():
-        print("cursor-review: the supervisor must be started as the leader of its own process group", file=sys.stderr)
-        return STOPPED
+    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+        if number == signal.SIGTERM or signal.getsignal(number) != signal.SIG_IGN:
+            signal.signal(number, lambda *received: None)
     # The review holds one end of this pipe and nothing it starts does. It closes when the review ends.
     ended, alive = os.pipe()
     review = subprocess.Popen(command, pass_fds=(*keep, alive))
     try:
         os.close(alive)
-        try:
-            os.setpgid(0, os.getpgid(os.getppid()))
-        except OSError:
-            pass  # The poller is gone already. The group is about to be ended, and this with it.
         reason = watch(lifeline, ended, woken, seconds)
         if reason:
+            # Said first: this process ends with its group.
+            print(f"cursor-review: the review was stopped: {reason}", file=sys.stderr, flush=True)
             # Asked first, so that it removes its temporary files and ends the command it waits on.
-            signal_group(group, signal.SIGTERM)
+            os.killpg(group, signal.SIGTERM)
             wait_for(ended, GRACE_SECONDS)
     except BaseException as failure:
         # Whatever goes wrong with the waiting, the review is not left running without it.
-        reason = f"its supervisor failed: {failure!r}"
+        print(f"cursor-review: the review was stopped: its supervisor failed: {failure!r}", file=sys.stderr, flush=True)
     finally:
-        # The group's number is this process's own, so it cannot have become another group's.
-        signal_group(group, signal.SIGKILL)
-    status = review.wait()
-    if reason:
-        print(f"cursor-review: the review was stopped: {reason}", file=sys.stderr, flush=True)
-        return STOPPED
-    return status if status >= 0 else STOPPED
+        try:
+            # The review itself first, and waited for, so that it is not left for another to wait for.
+            review.kill()
+            review.wait()
+        finally:
+            # Then the group: whatever the review started, and this process with it.
+            os.killpg(group, signal.SIGKILL)
+    return STOPPED
 
 
 def watch(lifeline, ended, woken, seconds):
@@ -96,15 +101,6 @@ def wait_for(descriptor, seconds):
         deadline = time.monotonic() + seconds
         while (left := deadline - time.monotonic()) > 0 and not waiting.select(left):
             pass
-
-
-def signal_group(group, number):
-    # Nothing is left to signal once every process of the group has ended. Linux then reports no such
-    # process. macOS reports a refusal for a group whose only member has ended and waits to be read.
-    try:
-        os.killpg(group, number)
-    except (ProcessLookupError, PermissionError):
-        pass
 
 
 def main(argv):
