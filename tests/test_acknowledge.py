@@ -204,11 +204,62 @@ class MarkerTests(Offline):
         with self.assertLogs("cursor_pr.acknowledge", level="WARNING"):
             ack.finished(self.gh, 3, 81, "reviewed")
         self.assertIsNotNone(ack.jobs.acknowledgement(job))
+        # Turned away for now: the same.
+        for status, headers in ((429, {}), (403, {"retry-after": "60"}), (403, {"x-ratelimit-remaining": "0"})):
+            with self.subTest(status=status, headers=headers):
+                limited = lambda request: httpx.Response(status, headers=headers, json={}, request=request)
+                with patch.object(self, "respond", limited), self.assertLogs("cursor_pr.acknowledge", level="WARNING"):
+                    ack.finished(self.gh, 3, 81, "reviewed")
+                self.assertIsNotNone(ack.jobs.acknowledgement(job))
         # Refused: this account has no reaction there and cannot have made one.
         self.refuse = {("POST", GITHUB): 403}
         ack.finished(self.gh, 3, 81, "reviewed")
         self.assertIsNone(ack.jobs.acknowledgement(job))
         self.assertNotIn("DELETE", [method for method, _ in self.sent()])
+
+    def test_request_queued_just_before_the_poller_stopped_is_marked_at_the_next_start(self):
+        jobs = Jobs(self.state)
+        for project in (self.gh, self.gl):
+            jobs.enqueue(project.key, 3, 81, acknowledge=True)  # Queued, and the poller stopped before marking.
+        jobs.enqueue(self.gh.key, 3, 82, acknowledge=True)
+        Acknowledgement(jobs, self.state).queued(self.gh, 3, 82)  # This one was marked.
+        self.calls.clear()
+        jobs = Jobs(self.state)
+        self.assertEqual(sorted(jobs.unmarked()), sorted([(self.gh.key, 3, 81), (self.gl.key, 3, 81)]))
+        ack = Acknowledgement(jobs, self.state)
+        for key, number, comment in jobs.unmarked():
+            ack.queued({self.gh.key: self.gh, self.gl.key: self.gl}[key], number, comment)
+        self.assertEqual(sorted(call for call in self.sent() if call[0] == "POST"),
+                         [("POST", GITHUB), ("POST", GITLAB + "?name=hourglass")])
+        self.assertEqual(jobs.unmarked(), [])  # Asked for once, whatever the answer.
+        # A marker that was refused is not asked for again at every start.
+        jobs.enqueue(self.gh.key, 3, 83, acknowledge=True)
+        self.refuse = {("POST", GITHUB.replace("/81/", "/83/")): 403}
+        with self.assertLogs("cursor_pr.acknowledge", level="WARNING"):
+            ack.queued(self.gh, 3, 83)
+        self.assertEqual(jobs.unmarked(), [])
+        # A request that finishes before its marker was ever asked for has nothing to remove.
+        jobs.enqueue(self.gh.key, 3, 84, acknowledge=True)
+        self.calls.clear()
+        ack.finished(self.gh, 3, 84, "reviewed")
+        self.assertEqual(self.calls, [])
+        self.assertIsNone(jobs.acknowledgement((self.gh.key, 3, 84)))
+
+    def test_removal_refused_for_good_is_not_owed_any_longer(self):
+        cases = [(self.gh, {("DELETE", GITHUB + "/12"): 403}), (self.gh, {("DELETE", GITHUB + "/12"): 301}),
+                 (self.gl, {("GET", GITLAB): 404}), (self.gl, {("GET", "https://gitlab.com/api/v4/user"): 403})]
+        for project, refuse in cases:
+            with self.subTest(refuse=refuse):
+                self.state = Path(self.enterContext(tempfile.TemporaryDirectory()))
+                ack = self.ack()
+                job = project.key, 3, 81
+                ack.jobs.record_marker(job, 12)
+                while started := ack.jobs.next():
+                    ack.jobs.finish(started, "reviewed")
+                self.refuse = refuse
+                with self.assertNoLogs("cursor_pr.acknowledge", level="WARNING"):
+                    ack.finished(project, 3, 81, "reviewed")
+                self.assertIsNone(ack.jobs.acknowledgement(job))
 
     def test_gitlab_marker_lookup_stops_on_the_matching_award(self):
         ack = self.ack()
@@ -237,7 +288,7 @@ class MarkerTests(Offline):
                  ({("GET", GITLAB): 403}, (self.gl, 3, 81), ack.queued, "Could not mark acme/gitlab#3 comment 81: HTTP 403"),
                  ({("POST", GITLAB): 404}, (self.gl, 3, 81), ack.queued, "Could not mark acme/gitlab#3 comment 81: HTTP 404"),
                  ({("DELETE", GITHUB + "/12"): 401}, (self.gh, 3, 81), finished, CLEAR + " 401"),
-                 ({("GET", "https://gitlab.com/api/v4/user"): 403}, (self.gl, 3, 81), finished, "Could not clear the queued marker on acme/gitlab#3 comment 81: HTTP 403")]
+                 ({("GET", "https://gitlab.com/api/v4/user"): 502}, (self.gl, 3, 81), finished, "Could not clear the queued marker on acme/gitlab#3 comment 81: HTTP 502")]
         for refuse, (project, number, comment), call, line in cases:
             with self.subTest(line=line):
                 self.refuse = refuse
@@ -306,7 +357,8 @@ class NoticeTests(Offline):
             for status in ("reviewed", "partial", "empty", "over-budget", "model-unavailable"):
                 ack.finished(self.gh, 3, 82, status)
             read.assert_called_once_with("change", self.gh, numbers=[3])
-            post.assert_called_once_with(self.gh, 3, head, NOTICE, self.state)
+            post.assert_called_once_with(self.gh, 3, head, NOTICE.format(request=self.gh.change_url(3) + "#issuecomment-81"),
+                                         self.state)
             post.side_effect = ReviewError("pr-agent-forge comment exited 1: change is no longer open")
             with self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
                 ack.finished(self.gl, 3, 81, "failed")
@@ -332,14 +384,17 @@ class NoticeTests(Offline):
                 patch.object(acknowledge, "post_comment", side_effect=source.post_comment), \
                 patch.object(source, "reviewer_token", return_value="fixture"), \
                 patch.object(source, "run", side_effect=helper):
-            acknowledge.notify(self.gh, 3, self.state)
-            acknowledge.notify(self.gh, 3, self.state)  # Once per head: the second is not posted again.
+            acknowledge.notify(self.gh, 3, 81, self.state)
+            acknowledge.notify(self.gh, 3, 81, self.state)  # Once per head: the second is not posted again.
+            acknowledge.notify(self.gh, 3, 82, self.state)  # Another request that failed at this head has its own.
         self.assertEqual([(args, request["Numbers"]) for args, request in sent[::2]],
-                         [(["pr-agent-forge", "change"], [3])] * 2)
-        self.assertEqual([args for args, _ in sent[1::2]], [["pr-agent-forge", "comment"]] * 2)
+                         [(["pr-agent-forge", "change"], [3])] * 3)
+        self.assertEqual([args for args, _ in sent[1::2]], [["pr-agent-forge", "comment"]] * 3)
         comments = [request["Publication"] for _, request in sent[1::2]]
         self.assertEqual([(c["Number"], c["Head"], c["Body"], c["AlreadyPosted"]) for c in comments],
-                         [(3, head, NOTICE, False), (3, head, NOTICE, True)])
+                         [(3, head, NOTICE.format(request=self.gh.change_url(3) + f"#issuecomment-{comment}"), posted)
+                          for comment, posted in ((81, False), (81, True), (82, False))])
+        self.assertIn("#note_81", NOTICE.format(request=self.gl.change_url(3) + acknowledge.NOTE["gitlab"] + "81"))
 
     def test_cycle_marks_each_new_request_once_and_reports_only_a_failed_review(self):
         jobs = Jobs(self.state)
@@ -406,11 +461,37 @@ class NoticeTests(Offline):
         self.assertIsNone(jobs.next())
         ack = Acknowledgement(jobs, self.state)
         with patch.object(acknowledge, "remove") as remove, patch.object(acknowledge, "notify") as notify:
-            for key, number, comment, status in jobs.unfinished_acknowledgements():
-                ack.finished(self.projects[key], number, comment, status)
+            ack.settle(self.projects)
         self.assertEqual([call.args[3] for call in remove.call_args_list], [181, 182])
-        notify.assert_called_once_with(self.gh, 3, self.state)
+        notify.assert_called_once_with(self.gh, 3, 82, self.state)
         self.assertEqual(jobs.unfinished_acknowledgements(), [])
+
+    def test_running_poller_tries_again_with_growing_pauses_and_gives_up(self):
+        jobs = Jobs(self.state)
+        job = (self.gh.key, 3, 81)
+        jobs.enqueue(*job, acknowledge=True)
+        jobs.record_marker(job, 181)
+        jobs.next()
+        now = [1_800_000_000.0]
+        tried = []
+        self.start(patch.object(acknowledge.time, "time", side_effect=lambda: now[0]))
+
+        def down(*args):
+            tried.append(now[0] - 1_800_000_000)
+            raise httpx.ConnectError("down")
+        with patch.object(acknowledge, "remove", side_effect=down), patch("cursor_pr.poll.poll_project"), \
+                self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
+            ack = Acknowledgement(jobs, self.state)
+            projects, since = {self.gh.key: self.gh}, {self.gh.key: datetime(2026, 1, 1, tzinfo=timezone.utc)}
+            jobs.finish(job, "reviewed")
+            ack.finished(self.gh, 3, 81, "reviewed")  # The review ends; the removal fails.
+            for _ in range(600):  # Ten hours of cycles in a poller that never restarts.
+                now[0] += 60
+                cycle(projects, self.state, jobs, since, ack=ack)
+        self.assertEqual(tried[:8], [0, 60, 180, 420, 900, 1860, 3780, 7380])  # 1, 2, 4, 8, 16, 32 and then 60 minutes.
+        self.assertEqual(len(tried), acknowledge.TRIES)
+        self.assertIn("Gave up on the queued marker or failure notice of acme/github#3 comment 81 after 12 tries", logged.output[-1])
+        self.assertIsNone(jobs.acknowledgement(job))
 
     def test_restart_tells_the_requester_about_a_review_it_gave_up_on(self):
         jobs = Jobs(self.state)
@@ -432,11 +513,12 @@ class NoticeTests(Offline):
              patch("cursor_pr.poll.load_config", return_value={self.gh.key: self.gh}), \
              patch("cursor_pr.poll.providers.cursor_account", side_effect=lambda: nullcontext()), \
              patch("cursor_pr.poll.forge_credentials", side_effect=lambda *args: nullcontext()), \
-             patch("cursor_pr.poll.cycle") as cycled, patch("cursor_pr.poll.logging.basicConfig"), \
-             patch("cursor_pr.acknowledge.Acknowledgement") as marker, self.assertLogs("cursor_pr.poll", level="WARNING"):
+             patch("cursor_pr.poll.poll_project") as polled, patch("cursor_pr.poll.logging.basicConfig"), \
+             patch.object(acknowledge, "remove"), patch.object(acknowledge, "notify") as notify, \
+             self.assertLogs("cursor_pr.poll", level="WARNING"):
             main()
-        marker.return_value.finished.assert_called_once_with(self.gh, 3, 81, "failed")
-        self.assertIs(cycled.call_args.kwargs["ack"], marker.return_value)  # The running poller marks too.
+        notify.assert_called_once_with(self.gh, 3, 81, self.state.resolve())
+        self.assertIsNotNone(polled.call_args.args[3])  # The running poller marks too.
         reopened = Jobs(self.state)
         self.assertEqual((reopened.abandoned, reopened.pending(self.gh.key, 3)), ([], False))
 

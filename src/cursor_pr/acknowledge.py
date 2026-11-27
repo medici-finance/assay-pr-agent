@@ -1,6 +1,7 @@
 """Mark a queued review request on the forge, and tell the requester when nothing was posted."""
 import logging
 import os
+import time
 from urllib.parse import quote
 
 import httpx
@@ -11,13 +12,32 @@ from .source import ReviewError, post_comment, reviewer_token, run_forge, valid_
 log = logging.getLogger(__name__)
 # The forge helper has no reaction operation, so the marker goes straight to each forge's API.
 MARK = {"github": ("eyes", "content"), "gitlab": ("hourglass", "name")}
-NOTICE = ("A `/review` request on this change did not produce a posted review: the review could not be "
+# Names its request, so that a second request failing at the same head gets a notice of its own:
+# the helper posts a given text once per head.
+NOTICE = ("The `/review` request {request} did not produce a posted review: the review could not be "
           "completed or published. Post `/review` again to retry it.\n")
+NOTE = {"github": "#issuecomment-", "gitlab": "#note_"}
+# A removal or notice that failed is tried again after this long, then after twice as long each time
+# up to an hour, and given up after this many tries, about six hours in all.
+RETRY_SECONDS = 60
+RETRY_CAP_SECONDS = 3600
+TRIES = 12
 PAGES = 5
 # Stored in place of a GitHub reaction's ID from just before the reaction is asked for until the
 # answer is recorded. A poller that stopped in between, or an answer that never arrived, leaves it:
 # a reaction may then exist whose ID nobody kept.
 UNKNOWN = 0
+# Stored from the moment a request is queued until its marker has been asked for once. A poller that
+# stopped in between finds it at its next start and marks the request then.
+PENDING = -1
+
+
+def refused(response):
+    """Whether the forge turned the request down for good, and not only for now."""
+    limited = (response.status_code in (401, 408, 429) or "retry-after" in response.headers
+               or response.headers.get("x-ratelimit-remaining") == "0")
+    # A redirect counts: none is followed, and a project that moved is not this credential's to write to.
+    return 300 <= response.status_code < 500 and not limited
 
 
 def request(project, method, url, headers, **options):
@@ -96,30 +116,37 @@ def add(project, number, comment, sending=lambda: None):
 
 
 def remove(project, number, comment, marker_id):
-    if project.provider == "github" and marker_id is None:
+    if project.provider == "github" and marker_id in (None, PENDING):
         return
     root, markers, headers = reviewer(project, number, comment)
     if project.provider == "github" and marker_id == UNKNOWN:
-        # Asking again is how GitHub tells an account the ID of the reaction it already has. Refused,
-        # as it is without the permission or once the comment is gone, there is none of ours to remove.
+        # Asking again is how GitHub tells an account the ID of the reaction it already has. Refused
+        # for good, as it is without the permission or once the comment is gone, there is none of ours
+        # to remove. Turned away for now, as by a rate limit, the removal stays owed.
         response = react(project, markers, headers)
-        if 400 <= response.status_code < 500:
+        if refused(response):
             return
         marker_id = reaction_id(response)
-    ident = marker_id if project.provider == "github" else own_award(project, root, markers, headers)
+    try:
+        ident = marker_id if project.provider == "github" else own_award(project, root, markers, headers)
+    except httpx.HTTPStatusError as err:
+        if refused(err.response):
+            return  # The merge request is gone or closed to this credential, and the award with it.
+        raise
     if ident is not None:
         response = request(project, "DELETE", f"{markers}/{ident}", headers)
-        if response.status_code != 404:
+        if not refused(response):  # Gone already, or no longer this credential's to remove.
             response.raise_for_status()
 
 
-def notify(project, number, state):
+def notify(project, number, comment, state):
     # The helper publishes only on the change's current head. The notice is about the request, not a
     # head, so it goes on whatever head the change has now, once per head like any comment.
     head = run_forge("change", project, numbers=[number]).get("headSha")
     if not valid_sha(head):
         raise ReviewError("Forge did not identify the change head")
-    post_comment(project, number, head, NOTICE, state)
+    request = f"{project.change_url(number)}{NOTE[project.provider]}{comment}"
+    post_comment(project, number, head, NOTICE.format(request=request), state)
 
 
 class Acknowledgement:
@@ -136,11 +163,10 @@ class Acknowledgement:
             try:
                 marker = add(project, number, comment, lambda: self.jobs.record_marker(job, UNKNOWN))
             except httpx.HTTPStatusError as err:
-                if project.provider == "github" and err.response.status_code < 500:
-                    self.jobs.record_marker(job, None)  # Refused, so there is no reaction to look for later.
+                if err.response.status_code < 500:
+                    self.jobs.record_marker(job, None)  # Answered and turned down: nothing was created.
                 raise
-            if marker is not None:
-                self.jobs.record_marker(job, marker)
+            self.jobs.record_marker(job, marker)  # Asked for. GitLab's award has no ID to keep.
         self.attempt(mark, "mark", project, number, comment)
 
     def finished(self, project, number, comment, status):
@@ -151,7 +177,7 @@ class Acknowledgement:
         marker, notice_sent = acknowledgement
 
         def report_failure():
-            notify(project, number, self.state)
+            notify(project, number, comment, self.state)
             self.jobs.record_notice(job)
 
         notice_needed = status == "failed" and not notice_sent
@@ -166,6 +192,20 @@ class Acknowledgement:
         cleared = self.attempt(clear, "clear the queued marker on", project, number, comment)
         if notified and cleared:
             self.jobs.clear_acknowledgement(job)
+            return
+        tries = self.jobs.acknowledgement_tries(job) + 1
+        if tries >= TRIES:
+            log.warning("Gave up on the queued marker or failure notice of %s#%d comment %d after %d tries",
+                        project.slug, number, comment, tries)
+            self.jobs.clear_acknowledgement(job)
+        else:
+            self.jobs.retry_acknowledgement(job, time.time() + min(RETRY_SECONDS * 2 ** (tries - 1), RETRY_CAP_SECONDS))
+
+    def settle(self, projects):
+        """Try again what a finished request still owes the forge and is due: its marker's removal, its notice."""
+        for key, number, comment, status in self.jobs.unfinished_acknowledgements(time.time()):
+            if key in projects:
+                self.finished(projects[key], number, comment, status)
 
     @staticmethod
     def attempt(action, verb, project, number, comment):

@@ -21,6 +21,7 @@ from .discovery import poll_project
 from .manager import ConfigurationWatch
 from .login import auth_mode, ensure_session, login_directory
 from . import acknowledge, buildinfo, history, setup, providers
+from .acknowledge import PENDING as MARK_PENDING
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +82,12 @@ class Jobs:
                 wait INTEGER NOT NULL, seen REAL NOT NULL, PRIMARY KEY(project, number))""")
             db.execute("""CREATE TABLE IF NOT EXISTS acknowledgements (
                 project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL, marker_id INTEGER,
-                notice_sent INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(project, number, comment))""")
+                notice_sent INTEGER NOT NULL DEFAULT 0, tries INTEGER NOT NULL DEFAULT 0,
+                retry_at REAL NOT NULL DEFAULT 0, PRIMARY KEY(project, number, comment))""")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(acknowledgements)")}
+            if "tries" not in columns:
+                db.execute("ALTER TABLE acknowledgements ADD COLUMN tries INTEGER NOT NULL DEFAULT 0")
+                db.execute("ALTER TABLE acknowledgements ADD COLUMN retry_at REAL NOT NULL DEFAULT 0")
             # Only the process holding the instance lock opens the queue, and a review child holds
             # that lock until it exits and settles its own row before it does. So a row still started
             # belongs to a review that was cut off. It runs once more, held to the head in its row if
@@ -115,8 +121,8 @@ class Jobs:
             inserted = db.execute("INSERT OR IGNORE INTO requests (project, number, comment, status) VALUES (?,?,?,?)",
                                   (project, number, comment, status))
             if acknowledge and inserted.rowcount:
-                db.execute("INSERT INTO acknowledgements (project, number, comment) VALUES (?,?,?)",
-                           (project, number, comment))
+                db.execute("INSERT INTO acknowledgements (project, number, comment, marker_id) VALUES (?,?,?,?)",
+                           (project, number, comment, MARK_PENDING))
 
     def next(self):
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -152,10 +158,29 @@ class Jobs:
             db.execute("INSERT OR REPLACE INTO schedule VALUES (?,?,?,?,?,?)",
                        (project, number, comments, newest, min(previous[2] * 2, cap) if quiet else interval, now))
 
-    def unfinished_acknowledgements(self):
+    def unfinished_acknowledgements(self, now=None):
+        """Finished requests that still owe the forge something; with a time, only those due a try by then."""
         with closing(sqlite3.connect(self.path)) as db:
             return db.execute("""SELECT project, number, comment, status FROM requests JOIN acknowledgements
-                USING (project, number, comment) WHERE status NOT IN ('queued','started')""").fetchall()
+                USING (project, number, comment) WHERE status NOT IN ('queued','started')
+                AND (?1 IS NULL OR retry_at <= ?1)""", (now,)).fetchall()
+
+    def acknowledgement_tries(self, job):
+        with closing(sqlite3.connect(self.path)) as db:
+            row = db.execute("SELECT tries FROM acknowledgements WHERE project=? AND number=? AND comment=?", job).fetchone()
+            return row[0] if row else 0
+
+    def retry_acknowledgement(self, job, at):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("""UPDATE acknowledgements SET tries=tries+1, retry_at=?
+                WHERE project=? AND number=? AND comment=?""", (at, *job))
+
+    def unmarked(self):
+        """Waiting requests whose marker was never asked for: the poller stopped right after queueing them."""
+        with closing(sqlite3.connect(self.path)) as db:
+            return db.execute("""SELECT project, number, comment FROM requests JOIN acknowledgements
+                USING (project, number, comment) WHERE status='queued' AND marker_id=?""",
+                              (MARK_PENDING,)).fetchall()
 
     def acknowledgement(self, job):
         with closing(sqlite3.connect(self.path)) as db:
@@ -347,6 +372,8 @@ def read_all(descriptor, seconds):
 
 
 def cycle(projects, state, jobs, since, runner=None, ack=None, idle=None):
+    if ack is not None:
+        ack.settle(projects)
     polled = [0, 0]
     for project in projects.values():
         try:
@@ -461,9 +488,9 @@ def main():
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         jobs = Jobs(state)
         ack = acknowledge.Acknowledgement(jobs, state)
-        for key, number, comment, status in jobs.unfinished_acknowledgements():
+        for key, number, comment in jobs.unmarked():
             if key in projects:
-                ack.finished(projects[key], number, comment, status)
+                ack.queued(projects[key], number, comment)
         since = {key: jobs.activated(key) for key in projects}
         log.info("Polling %s with %d seconds between cycles", ", ".join(projects), args.interval)
         # A cap no longer than the poll interval reads every change on every cycle, as before the schedule.
