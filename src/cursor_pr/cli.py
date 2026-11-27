@@ -46,76 +46,81 @@ def rank(path):
 
 
 def fit(files, checks, limit, *, title="", description="", advisories=(), rendered=None):
-    """Pack the prompt, leaving out whole files until it fits the input budget.
-
-    Returns the prompt parts, the estimate of what will be sent, the estimate of the full
-    prompt, and the paths left out. Nothing is left out when even one file cannot fit.
-    """
+    """Fill the prompt with reviewable patches first and use spare space for history."""
     if rendered is None:
         rendered = render_sections(files)
-    prompt, anchors, unseen, has_text = full_pack = pack(
-        files, checks, title=title, description=description, advisories=advisories, rendered=rendered)
+    if advisories:
+        original = pack(files, checks, title=title, description=description, advisories=advisories, rendered=rendered)
+        original_size = tokens(original[0]) if original[3] else 0
+        if original_size <= limit:
+            return original, original_size, original_size, []
+
+    packed, estimate, full, dropped, has_metadata = fit_patch(files, checks, limit, title, description, rendered)
+    if not advisories:
+        return packed, estimate, full, dropped
+    if estimate > limit:
+        return original, original_size, original_size, []
+
+    # The scope is fixed here. Refill the bounded history section with notices for
+    # shown files, and trim it before giving up any patch coverage.
+    notices = visible_advisories(advisories, packed[1])
+    if not has_metadata:
+        title = description = ""
+    skipped = frozenset(dropped)
+    for count in range(len(notices), 0, -1):
+        candidate = pack(files, checks, skipped, title, description, advisories=notices[:count], rendered=rendered)
+        candidate_size = tokens(candidate[0])
+        if candidate_size <= limit:
+            return candidate, candidate_size, original_size, dropped
+    return packed, estimate, original_size, dropped
+
+
+def fit_patch(files, checks, limit, title, description, rendered):
+    """Pack the prompt, leaving out whole files until it fits the input budget.
+
+    Returns the prompt, token estimates, skipped paths and whether author context was kept.
+    """
+    prompt, anchors, unseen, has_text = full_pack = pack(files, checks, title=title, description=description, rendered=rendered)
     estimated = full = tokens(prompt) if has_text else 0
     if full <= limit:
-        return full_pack, full, full, []
+        return full_pack, full, full, [], bool(title or description)
     if title or description:
-        plain = pack(files, checks, advisories=advisories, rendered=rendered)
+        plain = pack(files, checks, rendered=rendered)
         plain_estimate = tokens(plain[0])
         if plain_estimate <= limit:
-            return plain, plain_estimate, full, []
+            return plain, plain_estimate, full, [], False
+    # Measure each file with its scanner evidence before choosing what to leave out.
+    # A file that cannot fit alone leaves first, so a smaller file can still be reviewed.
     findings_by_path = defaultdict(list)
     for check in checks:
         for finding in check["findings"]:
             findings_by_path[finding["path"]].append(finding)
     overhead = tokens(pack([], [], title=title, description=description)[0])
     sizes = {}
-
-    def drop_order(anchors, visible):
-        # Use only the globally visible notices when estimating each file's contribution.
-        by_path = defaultdict(list)
-        for advisory in visible:
-            by_path[advisory["path"]].append(advisory)
-        pending = []
-        for file in files:
-            path = file.path
-            if not anchors.get(path):
-                continue
-            pending.append(path)
-            notices = by_path.get(path, ())
-            if path in sizes and sizes[path][0] == notices:
-                continue
-            file_checks = [{"findings": findings_by_path.get(path, ())}]
-            standalone, _, _, _ = pack([file], file_checks, title=title, description=description,
-                                        advisories=notices, rendered=rendered)
-            sizes[path] = notices, tokens(standalone) - overhead
-        pending.sort(key=lambda path: (overhead + sizes[path][1] <= limit, rank(path), -sizes[path][1], path))
-        return pending, by_path.keys()
-
-    visible = visible_advisories(advisories, anchors)
-    queue, advised_paths = drop_order(anchors, visible)
+    for file in files:
+        if rendered[file.path][0] is not None:
+            file_checks = [{"findings": findings_by_path.get(file.path, ())}]
+            standalone, _, _, _ = pack([file], file_checks, title=title, description=description, rendered=rendered)
+            sizes[file.path] = tokens(standalone) - overhead
+    queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
     while estimated > limit and queue:
-        # Recount when a removed notice can make room for a different one, or
-        # before dropping the last file. Other file sizes are approximate.
+        # Per-file sizes are approximate, so the last file only leaves after a real recount.
         dropped.append(queue.pop(0))
-        freed = sizes[dropped[-1]][1]
-        while len(queue) > 1 and freed < estimated - limit and dropped[-1] not in advised_paths:
+        freed = sizes[dropped[-1]]
+        while len(queue) > 1 and freed < estimated - limit:
             dropped.append(queue.pop(0))
-            freed += sizes[dropped[-1]][1]
-        prompt, anchors, unseen, has_text = pack(
-            files, checks, frozenset(dropped), title, description, advisories=advisories, rendered=rendered)
+            freed += sizes[dropped[-1]]
+        prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), title, description, rendered=rendered)
         estimated = tokens(prompt) if has_text else 0
-        if estimated > limit and dropped[-1] in advised_paths:
-            visible = visible_advisories(advisories, anchors)
-            queue, advised_paths = drop_order(anchors, visible)
     fits = has_text and estimated <= limit
     if (title or description) and (not fits or len(dropped) > 1):
-        fitted, estimate, _, skipped = fit(files, checks, limit, advisories=advisories, rendered=rendered)
+        fitted, estimate, _, skipped, _ = fit_patch(files, checks, limit, "", "", rendered)
         if fitted[3] and estimate <= limit and (not fits or len(skipped) < len(dropped)):
-            return fitted, estimate, full, skipped
+            return fitted, estimate, full, skipped, False
     if not fits:
-        return full_pack, full, full, []
-    return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped)
+        return full_pack, full, full, [], bool(title or description)
+    return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped), bool(title or description)
 
 
 def publish(address, head, report, *, project=None, state=None):

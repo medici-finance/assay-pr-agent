@@ -232,22 +232,15 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertNotIn("Change description", alone)
         self.assertIn("Use only the supplied history advisories, patch and scanner evidence. History advisories are notices", alone)
 
-    def test_fit_counts_the_advisories_when_deciding_which_file_cannot_fit(self):
-        def added(path, lines):
-            return source.File(path, f"@@ -0,0 +1,{len(lines)} @@\n" + "".join(f"+{line}\n" for line in lines), "added")
-        big = added("src/big.py", [f"VALUE_{n} = {n}" for n in range(40)])
-        small = added("tests/test_a.py", [f"assert {n}" for n in range(5)])
-        files = [big, small]
-        notices = [{"path": "src/big.py", "kind": "co-change", "detail": "word " * 10} for _ in range(6)]
-        bare_big = engine.tokens(engine.pack([big], [])[0])
-        bare_small = engine.tokens(engine.pack([small], [])[0])
-        advised_big = engine.tokens(engine.pack([big], [], advisories=notices)[0])
-        limit = max(bare_big, bare_small)
-        self.assertLess(limit, advised_big)
-        (prompt, *_), estimated, _, degraded = cli.fit(files, [], limit, advisories=notices)
-        self.assertEqual(degraded, [big.path])
-        self.assertEqual(estimated, bare_small)
-        self.assertNotIn("History advisories", prompt)
+    def test_fit_drops_excess_history_before_it_discards_a_patch(self):
+        files = [source.File(name, "@@ -0,0 +1 @@\n+x = 1\n", "added")
+                 for name in ("src/a.py", "tests/test_a.py")]
+        notices = [{"path": files[0].path, "kind": "co-change", "detail": "coupled to partner.py"}]
+        wanted = engine.pack(files, [])
+        limit = engine.tokens(wanted[0])
+        original_size = engine.tokens(engine.pack(files, [], advisories=notices)[0])
+        self.assertGreater(original_size, limit)
+        self.assertEqual(cli.fit(files, [], limit, advisories=notices), (wanted, limit, original_size, []))
 
     def test_fit_does_not_charge_files_for_advisories_hidden_by_the_cap(self):
         def added(path, count):
@@ -273,26 +266,26 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertEqual(packed[0], wanted[0])
         self.assertTrue(packed[1][hidden.path])
 
-    def test_fit_recounts_when_dropping_a_file_exposes_other_advisories(self):
+    def test_fit_refills_advisory_space_from_files_the_prompt_keeps(self):
         def added(path, count):
             body = "".join(f"+VALUE_{n} = {n}\n" for n in range(count))
             return source.File(path, f"@@ -0,0 +1,{count} @@\n" + body, "added")
 
-        lock = added("uv.lock", 5)
+        lock = added("uv.lock", 300)
         hidden = added("src/history.py", 8)
-        kept = added("tests/test_keep.py", 80)
+        kept = added("tests/test_keep.py", 20)
         notices = [
             {"path": file.path, "kind": "co-change", "detail": detail}
             for file, detail in ((lock, "coupled"), (hidden, "coupled to another file " * 12))
             for _ in range(12)
         ]
-        wanted = engine.pack([kept], [])
-        limit = engine.tokens(wanted[0])
-        self.assertLess(engine.tokens(engine.pack([lock], [], advisories=notices)[0]), limit)
-        self.assertGreater(engine.tokens(engine.pack([hidden], [], advisories=notices)[0]), limit)
+        wanted = engine.pack([hidden, kept], [], advisories=notices[12:13])
+        wanted_size = engine.tokens(wanted[0])
+        limit = wanted_size + 5
+        self.assertGreater(engine.tokens(engine.pack([hidden, kept], [], advisories=notices)[0]), limit)
 
         packed, estimate, _, degraded = cli.fit([lock, hidden, kept], [], limit, advisories=notices)
-        self.assertEqual((estimate, degraded), (limit, [hidden.path, lock.path]))
+        self.assertEqual((estimate, degraded), (wanted_size, [lock.path]))
         self.assertEqual(packed[0], wanted[0])
 
     def test_advisories_are_kept_only_for_files_with_shown_lines(self):
