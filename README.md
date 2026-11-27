@@ -2,6 +2,77 @@
 
 A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It builds on [PR-Agent](https://github.com/the-pr-agent/pr-agent). The PR-Agent contributors provide the review prompt, line-numbered diff formatter and token estimator used here. We ship their [MIT-licensed](https://github.com/the-pr-agent/pr-agent/blob/main/LICENSE) Python package in the container, with its original license notice. Choose Cursor Agent, Claude Code, or Codex CLI for inference. The `pr-agent-forge` helper uses Assay’s Go library for authenticated forge access when you use a change number. Local and CI runs require only the Git objects.
 
+## Security model
+
+The reviewer reads changes written by people who need no access to your deployment, and it posts under your reviewer identity. What sets it apart, at a glance:
+
+- Deterministic checks run first at zero model tokens: ShellCheck, actionlint, Hadolint, zizmor, OSV-Scanner and, when configured, Assay's Go analysis report.
+- One bounded model call per review, under a token budget of 6,000 estimated input tokens by default, with at most six findings by default (`REVIEW_MAX_FINDINGS`).
+- Bounded Qualgen history advisories for files shown in the prompt, with additional advisories in the review report.
+- Hardened for hostile pull requests: a requester allowlist for comment triggers, model tools disabled, untrusted input labelled, and a posted comment that is flattened and quoted as code.
+
+The rest of this section states what the code enforces, in the order a request meets it. The sections after it cover installation and operation.
+
+### Who can start a comment-triggered review
+
+The poller queues a review only when a new comment on an open change meets all of these requirements:
+
+- The body is `/review` and nothing else apart from surrounding whitespace. A quoted or decorated command such as `> /review` or `/review please` is an ordinary comment.
+- The author's numeric account ID is in the project's `requester_ids`. Setup resolves usernames to IDs once. The list is the control on who can spend model budget; nothing limits a listed account beyond one review per comment.
+- The comment is unedited, with equal created and updated timestamps, and is not older than the project's activation.
+- On GitHub, the author type is `User`, which refuses bots, organizations and mannequins, and the comment URL is that change's `#issuecomment-<id>`.
+- On GitLab, the conversation list that the forge helper reads omits note visibility and rounds timestamps to seconds, so the one otherwise eligible note is looked up once through the API with the reviewer token. It must be a non-internal, non-system note on that merge request, by the same author, with the same body and unedited according to the API's timestamps. The lookup rejects authors marked as bots. Allowlist human accounts because the API can omit the bot flag.
+
+A failed GitLab lookup is retried on the next poll, and a note that fails the lookup's checks, or that the lookup no longer finds, is recorded as ignored. Each comment starts at most one review, and when the review starts the change must still be open at its configured URL. A poll never calls the model. Operators can also run `cursor-review --change ... --post` directly. This uses the configured project and reviewer credentials and does not require a request comment or check its author allowlist.
+
+### What the model can and cannot do
+
+Each review can make one inference invocation of the selected provider CLI, with a 120-second timeout and no retry or fallback. If the prompt exceeds the token limit, inference is skipped and the review returns `over-budget` (see [Cost and coverage](#cost-and-coverage)). Direct Cursor runs can perform a separate account check before estimating the prompt. The answer must be one successful result of at most 32,768 characters with at most the configured number of findings, six by default. Tools are disabled per provider:
+
+- **Cursor** — `cursor-agent -p --mode=ask` in a temporary workspace holding a written `.cursor/cli.json` with an empty allow list and a deny list for shell, file read, file write, web fetch and MCP tools.
+- **Claude Code** — `claude -p --tools "" --strict-mcp-config --max-turns 1 --no-session-persistence`.
+- **Codex** — `codex exec --ephemeral --sandbox read-only`, with the shell tool, unified exec, multi-agent, apps and web search disabled and user configuration and rules ignored.
+
+The CLI receives an allow-listed environment: its own provider's key or sign-in profile and the path, locale, configuration, temporary, proxy and TLS settings. Forge credentials, CI secrets and other providers' keys are not in that environment, and no repository is present in its workspace.
+
+### Untrusted input and evidence binding
+
+The regular prompt contains PR-Agent's review rubric, scanner diagnostics that fall on shown lines, and the diff hunks. It can include the forge's title and description when available, or recent commit messages in a local or CI review. Mid and max can add surrounding code and other bounded context. Max can also include eligible conversation comments, excluding internal GitLab notes and earlier review summaries. Qualgen advisories may appear for files shown in the prompt. Hadolint, zizmor and OSV-Scanner output stays in the report. The prompt labels the diagnostics, patch and context as `untrusted data` and instructs the model to work without tools. The reviewer checks the change before and after reading its file list and refuses it if the head moves.
+
+A finding is accepted only if it names a reviewed file and cites a contiguous range of head lines that the shown hunks contain. One failing finding rejects the whole answer: the review ends as `model-unavailable` and its scanner results are still posted. A file name containing a C0 control character (below U+0020), or a duplicate file name, stops the review before the model is called.
+
+### The posted comment
+
+The reviewer's only forge write is one ordinary conversation comment, which the `pr-agent-forge` helper posts through Assay's forge library under the reviewer credential ([Publish a summary](#publish-a-summary)). It never submits a review verdict, approves, merges or edits a change. Before writing, the library checks that the repository's live visibility is within the project's configured `visibility`, that the change is still open and that its head is still the reviewed SHA. It also scans the body for an impersonated ruling by the configured operator, personal-data shapes and, on internal and public projects, references to private repositories and `REVIEW_WITHHELD_IDENTIFIERS`, and it refuses a body over 16 KiB. Once the agent writes a receipt to the state volume, it suppresses an identical retry for the same change and head, including after a restart. An interruption between forge acceptance and saving the receipt can result in a duplicate.
+
+Every pull request path, model title and message, scanner rule and message, and Qualgen notice is quoted as a code span. Its delimiters are one backtick longer than any run inside the text, and an inner space at each end keeps backticks in the text from joining the delimiters. That keeps Markdown, links and `@mentions` in those strings literal. Line breaks are collapsed in every line of the comment, so none of those strings can add a line, start a forge quick action or open a multi-line construct. The Hadolint, zizmor and OSV-Scanner summary shows at most 30 rows of 450 characters, and the Qualgen list at most 20 entries of 500 characters. The forge helper refuses a body over 16 KiB, so a comment that would exceed it is shortened instead. In a regular review the reviewer reserves space for each finding's location, title and at least 140 characters of its message, or the whole message when shorter. It shares the remaining space among the findings and says when a message was shortened. When that is not enough, or in a higher tier, every finding keeps a 60-character title and a 140-character message, and scanner, history and coverage rows that do not fit are counted as omitted. A comment that still exceeds the limit is not posted and the review reports a publication failure.
+
+### Local scanners
+
+ShellCheck, actionlint, Hadolint, zizmor and OSV-Scanner never read the checkout's working tree or follow a link. Each receives an immutable Git blob from the reviewed revision: ShellCheck and actionlint on standard input in an empty temporary directory, the other three as a file in a temporary directory with an environment of only `PATH` and `HOME` (plus the advisory database cache for OSV-Scanner). Each run has a timeout and a size cap, and Hadolint, zizmor and OSV-Scanner refuse anything that is not a regular file, such as a symlink or a submodule. For a managed checkout whose reviewed commit is missing locally, the reviewer fetches only that change's ref into a temporary checkout, uses it only if its SHA matches, and discards it. Nothing from the change is built or executed.
+
+### CI artifacts
+
+Hadolint, zizmor, OSV-Scanner and the Go analysis report can come from CI instead. A report is accepted only from the producer named for the project (`go_analysis` only when you set it) and from a finished run for the reviewed source commit. Downloads are capped at 8 MiB, follow redirects by hand over HTTPS, and the forge token is dropped before any redirect target is requested. The Go report must carry the `go-analysis/v1` schema, the repository, the reviewed source SHA, complete coverage and agreeing totals, exit code and gate. For Hadolint, zizmor and OSV-Scanner, an unusable or missing CI report triggers a local scan when the source and scanner are available. If coverage still cannot be obtained, the summary says `could not check`. The reviewer continues without unusable Go analysis evidence. Use producers whose pipeline definitions and outputs your team controls, including when relying on default scanner producer names. A name and matching SHA alone do not establish producer trust. [Use the Go report in a comment-triggered review](#use-the-go-report-in-a-comment-triggered-review) describes the Go analysis setup.
+
+### Credential custody
+
+Forge access always uses the reviewer credential from setup or the container environment. Before it polls, syncs or reviews, the agent copies that credential into a private runtime directory (in `/dev/shm` under Docker) and removes the credential variables from its own environment. On GitHub, the forge helper exchanges the App private key for an installation token restricted to the one repository, which the agent reuses until five minutes before it expires; on GitLab the configured reviewer token is used as it is, and nothing is rotated. The helper receives the credential on standard input for each call, and the GitLab note lookup, CI artifact downloads and git-sync read the same runtime copies. Every forge and provider credential file the agent writes, including those runtime copies, is plaintext, mode 0600 and replaced by an atomic rename. The agent removes recognized provider API keys, `REVIEW_FORGE_*` variables and recognized forge secret and TLS inputs from the environments of its forge helper, Git commands and ShellCheck and actionlint scanners. Keep unrelated credentials such as `GH_TOKEN` out of the service environment because those child processes can inherit them.
+
+The state volume holds the setup's credentials, the request queue, the cache, the publication receipts and Qualgen's history. Follow the existing advice to [protect the volume and its backups](#interactive-setup), to [treat the sign-in volume as a credential](#review-provider) and to [keep the state volume private](#qualgen-history-advisories).
+
+### Deployment hardening
+
+Discovery is polling only: there is no webhook, the reviewer and sync services publish no port, and the GitHub App is created with an inactive webhook and no events. The reviewer mounts the checkout volume read-only; only the sync service writes to it.
+
+`compose.yaml` and the Kubernetes manifests run every container with a read-only root filesystem, all capabilities dropped and no privilege escalation, with a 1 GiB temporary mount on `/tmp`. The manifests also set a non-root user, the runtime's default seccomp profile, no service account token and a `restricted` pod-security namespace, and define the `pr-agent-egress` NetworkPolicy: egress only, to DNS on port 53 and otherwise to the public internet, with RFC1918, CGNAT and link-local ranges (which include cloud metadata addresses) and IPv6 unique-local and link-local ranges blocked. [`k8s/README.md`](k8s/README.md) covers a forge or proxy on a private network and the policy's node-traffic limit.
+
+The image runs as UID 10001 and installs the Cursor Agent CLI from a release tarball pinned by version and SHA-256 digest, as it already does for Qualgen, Hadolint, zizmor and OSV-Scanner, instead of the `cursor.com/install` script that always fetches the current release. The forge helper is compiled from an Assay source commit pinned in the Dockerfile. The plain `docker run` commands in this README do not pass the equivalent runtime flags.
+
+### Limits
+
+A finding is still model output written after reading attacker-supplied code, so findings are advisory: prompt injection can change what the one comment says inside its code spans, or talk the model out of reporting, and a person decides what to do with a change. The tool restrictions are flags and configuration that each provider CLI enforces, not a sandbox this agent applies to the CLI process, which controls its own system context and requests. The scanners run as the service user without a filesystem sandbox, and ShellCheck and actionlint also inherit the filtered service environment, so a compromise of any scanner could read the credential files the service holds. Only line breaks are removed from posted text; other control and formatting characters, such as bidirectional overrides, pass through. The state volume holds credentials and repository history. The forge data behind the trigger checks, the GitHub token exchange and the visibility, head and body checks on a post are the behaviour of Assay's forge library, built into the helper from the pinned commit.
+
 ## Install with Docker Compose
 
 Start the containers from this checkout, then attach to the installer:
@@ -51,7 +122,7 @@ For new provider configurations the wizard defaults to CLI sign-in. Existing API
 
 Compose shares the writable `provider-login` volume between setup and reviewer. Protect it like a credential. The sync sidecar has no mount for this volume. The reviewer checks sign-in on startup. To switch accounts, attach to setup and press **r**. Use the browser to confirm the repository list and Cursor team. For plain Docker the default location is inside the existing state volume at `/state/provider-login`. To mount a separate writable directory, set `REVIEW_LOGIN_DIR` identically for setup and reviewer.
 
-For an environment-only deployment set `REVIEW_PROVIDER` to `cursor`, `codex` or `claude` and `REVIEW_AUTH_MODE=login`, then run the image once with `-it`, the persistent volumes, and the `login` command before starting the reviewer. For unattended API-key provisioning, set `REVIEW_AUTH_MODE=api-key` (the environment default). Each API key also supports a `_FILE` setting. Use `REVIEW_MODEL` to specify a model offered by the selected provider. The agent launches at most one provider CLI per eligible uncached request, with the same prompt estimate and timeout. CLIs control their own system context, internal requests and billing. Output includes `provider`, `model_invocations` and available `model_usage`. The cache separates providers and Cursor teams.
+For an environment-only deployment set `REVIEW_PROVIDER` to `cursor`, `codex` or `claude` and `REVIEW_AUTH_MODE=login`, then run the image once with `-it`, the persistent volumes, and the `login` command before starting the reviewer. For unattended API-key provisioning, set `REVIEW_AUTH_MODE=api-key` (the environment default). Each API key also supports a `_FILE` setting. Use `REVIEW_MODEL` to specify a model offered by the selected provider. A regular review uses at most one inference call. Higher tiers share their token budget across multiple calls. CLIs control their own system context, internal requests and billing. Output includes `provider`, `model_invocations` and available `model_usage`. The cache separates providers and Cursor teams.
 
 Cursor setup uses the CLI's `team list` and `team switch` commands. With multiple eligible teams you choose a numeric ID. With one, the installer selects it automatically. An empty membership list uses personal scope. An account with memberships but no selectable team fails setup. The service rechecks the configured account at startup and verifies the active team in an isolated Cursor configuration. For environment-only deployment set `REVIEW_CURSOR_TEAM_ID` when the account has multiple eligible teams. A failed membership lookup or selection stops startup before any review. These checks use Cursor's account service without starting an inference request.
 
@@ -63,11 +134,13 @@ In `REVIEW_PROJECTS`, use `"managed": true` in place of a checkout path for a ma
 
 ## Request a review in a PR or MR
 
-Post a new comment containing just `/review` on an open GitHub PR or GitLab MR. The service polls the configured projects every two minutes by default. It accepts new requests from the human accounts you configure and posts the result on the reviewed head. Setup takes GitHub or GitLab usernames and stores their numeric account IDs. A poll uses zero model tokens. Requests run one at a time with the existing prompt budget and cache.
+Post a new comment containing just `/review` on an open GitHub PR or GitLab MR. `/review-mid` and `/review-max` ask for a deeper review at 2 and 10 times the configured token limit; see [Review tiers](#review-tiers). The service polls the configured projects every two minutes by default. It accepts new requests from the human accounts you configure and posts the result on the reviewed head. Setup takes GitHub or GitLab usernames and stores their numeric account IDs. A poll uses zero model tokens. Requests run one at a time with the selected tier’s budget and the shared cache.
 
 The helper lists open changes and reads their conversations on every cycle, including changes with no new commits. The poller skips old commands, edits detectable from the forge timestamps, bot responses and ordinary messages. For GitLab, an otherwise eligible command gets a single [GitLab note lookup](https://docs.gitlab.com/api/notes/#retrieve-a-merge-request-note), using the configured GitLab reviewer credential and instance. Internal and system notes cannot start a review.
 
-Each project starts watching at its first activation. Keep the state volume across restarts to pick up requests posted during downtime on still-open changes. Queued reviews survive a restart. A review interrupted after starting needs a fresh `/review` to run again. Duplicate reads do not incur another model call. A deleted comment or a change closed between polls may never be observed.
+Each project starts watching at its first activation. Keep the state volume across restarts to pick up requests posted during downtime on still-open changes. Queued reviews survive a restart. So does a review that was running when the poller stopped: the next start queues it again. A request's row in the queue (`<state>/requests.sqlite3`) keeps its status, how often it was started, the head its review resolved and any prepared report still awaiting publication. The review writes that head to the row before the model is called, and writes how it ended to the row before it exits. A repeat is held to the head in its row. If the change has moved to another head, the repeat is not reviewed: the request is marked failed, with a line in the poller log naming the change and the comment, and needs a fresh `/review`. If an interrupted review had already prepared its report, the next attempt submits the same report without invoking the model again. An identical comment is suppressed. A request is started at most twice. One that was running when the poller stopped for the second time is marked failed instead, with the same log line, and needs a fresh `/review` to run again. A review that was running when a version that kept no head stopped is marked failed as well, because the head it started at is unknown. A review that finished after its poller was killed keeps its own outcome, so a restart never repeats a review that ran but could not publish its result; post `/review` again to retry it. Duplicate reads do not incur another model call. A deleted comment or a change closed between polls may never be observed.
+
+Only one poller may use a state volume. A second poller on the same volume waits up to 15 seconds for the lock, which covers a poller that was just stopped and whose last review is still being ended, and then exits with `Another poller is already running on this state volume`, because it would otherwise take the first poller’s running reviews for interrupted ones and run them again. Stop the old poller before starting its replacement, as the Compose and Kubernetes deployments in this repository do. A queued review does not outlive its poller. The poller starts each review under a small supervisor process, which ends the review and every command the review started when the poller is gone, however it stopped, and when the review has run for 30 minutes. The supervisor, the review and its commands form one process group apart from the poller's, so a signal meant for the poller, from a terminal or an operator, reaches none of them directly, and the review's input is not the poller's. It asks first, so that the review removes its temporary files, and ends it outright five seconds later. The supervisor and the review hold the lock as well, so a replacement poller starts only once the interrupted review is gone, and then queues its request again. In the container the poller is the first process, so stopping it stops everything in any case; the supervisor matters where the poller runs outside one. The state volume must support `flock`: a poller that cannot take the lock exits with `Polling lock:` and the reason. Versions before the lock do not take it, so stop a poller of such a version completely before the first start of this one. Started beside it, this version would mark the review the old poller is running as failed.
 
 ### Docker setup
 
@@ -204,18 +277,38 @@ cursor-review --repo /path/to/checkout --change 'org/repo#42' --model MODEL
 
 The local form compares the merge base to committed `HEAD`, or to an explicit `--head`. Both commits and their common ancestor must be available locally. The forge form uses an `owner/repo#number` address from the configured projects and requires `pr-agent-forge` on `PATH`. GitLab subgroup projects can use CI mode with local Git objects. It reads metadata before and after the file list, checks head and file-count consistency, and records missing patches as incomplete coverage.
 
+The prompt can include messages from up to 32 recent commits in a local or CI review, or a forge change's title and description when the forge helper reports them. The title and description are cut at 256 and 1,500 characters, labelled untrusted, and counted in the token estimate. The reviewer drops this optional context when doing so allows it to review more files within the token budget. Commit messages explain the history of a change. A complete forge description can guide checks for material discrepancies against the patch within the same cap as code findings. When the shown patch excludes changed files, the model needs visible contradictory lines to report a mismatch. The reviewer uses a truncated description for intent only.
+
+For each code finding, the prompt asks for a concrete scenario, the behavior on the base and head, and the change that introduced, worsened or exposed the problem. It asks the model to mark incomplete comparisons as unverified. Mid and max batch the findings in their existing verification pass and fit the source excerpts into the tier's remaining token budget. The JSON and posted summary carry the verifier's confidence for retained findings.
+
 ### Cost and coverage
 
 - `--estimate` makes zero Cursor calls. It performs the same diff preparation and static checks as a review.
-- The limit is **6,000 estimated input tokens** by default for the complete user-supplied prompt. The saved setup's `REVIEW_MAX_INPUT_TOKENS` setting (asked during setup, or set as an environment variable) changes it; `--max-input-tokens` overrides both for one run. An oversized review returns `over-budget` before invoking Cursor. Repeat `--path path/to/file` to explicitly select a smaller scope. The JSON lists the omitted paths.
-- Each run can launch Cursor **once**, with a 120-second timeout and at most three accepted findings. There is no model fallback, repair prompt, automatic retry or model polling. The cap covers the submitted prompt. Cursor controls its own system context, output and billed usage. `cursor_usage` is populated only if the CLI supplies it.
+- The limit is **6,000 estimated input tokens** by default for the complete user-supplied prompt. The saved setup's `REVIEW_MAX_INPUT_TOKENS` setting (asked during setup, or set as an environment variable) changes it; `--max-input-tokens` overrides both for one run. An oversized review is degraded instead of skipped: whole files leave the prompt until it fits, lock and minified files first, then tests, then documentation, then the remaining files from the largest down. The review reports `degraded`, the JSON lists the files in `degraded` with the full estimate in `full_input_tokens`, and a posted comment says `degraded` and names each file the model did not review (the first 50, then a count). Deterministic checks still cover those files. A review returns `over-budget` before invoking Cursor only when no single file fits. Repeat `--path path/to/file` to explicitly select a smaller scope. The JSON lists the omitted paths.
+- A regular review can call its provider **once**, with a 120-second timeout and at most `REVIEW_MAX_FINDINGS` accepted findings (six by default). Higher tiers can send additional prompts under the tier budget. The configured provider controls its own system context, output and billing. The report records usage supplied by each fresh pass and totals its numeric counters in `model_usage`.
 - Successful results are cached under `~/.cache/cursor-pr-review` (or `XDG_CACHE_HOME`). The container image sets `XDG_CACHE_HOME=/tmp/.cache` because its root filesystem is read-only, and its poller passes `--cache-dir /state/cache` for the reviews it runs. Identical evidence, scope identity, model selection and prompt reuse the result. The lock serializes duplicate local requests. For CI reuse across jobs, provide a persistent, trusted `--cache-dir`. Each ephemeral runner otherwise starts cold. Use an explicit model for reproducible comparisons.
 - JSON keeps scanner findings separate from model findings. A source file with no usable patch or head-side location (including a whole-file deletion) is listed as omitted. Missing scanner evidence stays visible even when the model finds nothing.
-- Exit 0 means the requested full review/estimate completed, including a review with findings. Exit 2 means partial coverage, budget refusal, a model/tool error or a publication failure. Inspect `state`, `checks` and `findings` when using this in CI.
+- Exit 0 means the requested full review/estimate completed, including a review with findings. Exit 2 means partial or degraded coverage, budget refusal, a model/tool error or a publication failure. Inspect `state`, `checks` and `findings` when using this in CI.
+
+### Review tiers
+
+`--tier` (or the comment command) sets the depth. Each tier's whole budget is a multiple of the configured limit, `REVIEW_MAX_INPUT_TOKENS` or `--max-input-tokens`, summed over the prompts prepared for its passes. A max review uses the same first prompt as mid when that prompt fits.
+
+| Tier | Command | Budget | Model calls | What the model sees |
+|---|---|---|---|---|
+| `regular` | `/review` | 1× | 1 | The patch and scanner evidence. Up to `REVIEW_MAX_FINDINGS` findings. |
+| `mid` | `/review-mid` | 2× | up to 2 | The patch and scanner evidence, together with context from outside the patch: the change description (or its commit messages), what the base changed in the same files, 25 lines around each hunk, and where the changed functions and types are used. Up to `REVIEW_MAX_FINDINGS_MID` findings, then a verification call that sees the findings, their patch context and nearby base and head lines when available. |
+| `max` | `/review-max` | 10× | up to 3 | The mid prompt, unchanged when it fits, so a cached mid result is reused. An independently budgeted deep pass can include files that the first pass left out, plus the whole changed source files, 15 lines around each use of a changed name, existing tests for the touched modules, and eligible earlier comments. Then verification of the findings across the completed passes. The report shows up to `REVIEW_MAX_FINDINGS_MAX` findings and prioritizes findings from the deep pass when the cap applies. |
+
+Code context comes from Git objects at the reviewed head. Earlier comments come from configured review requesters. The reviewer uses only visible GitHub comments and public GitLab notes. The reviewer sends both as untrusted data, and every finding must cite patch lines. It truncates or omits context to stay within the budget and reports each block’s status. The delivered tier is the highest whose context reached the model in a completed pass: mid needs a mid-tier block, and max also needs a block that only the deep pass adds. A block planned for a pass that failed is reported as `not sent`, and a review that reached no model reports no delivered tier. If the requested tier cannot be delivered, a planned pass fails, or findings cannot be verified, the review reports `degraded` and keeps available findings.
+
+Each tier's findings cap is a setting: `REVIEW_MAX_FINDINGS` for regular, `REVIEW_MAX_FINDINGS_MID` for mid and `REVIEW_MAX_FINDINGS_MAX` for max, each an integer from 1 to 12 and 6 by default. The container environment overrides the saved setup, and `--max-findings` overrides the requested tier's cap for one run. The prompt asks for at most that many issues and an answer with more is rejected. A max review's first and deep passes ask for the mid cap, and the report keeps up to the max cap across them. The cap is part of the prompt text, so a cached answer is reused only under the same cap. The upper bound of 12 keeps every finding in the 16 KiB comment even when each is shortened to its compact form and written in four-byte characters.
+
+The first prompt of a mid or max review can use up to 1.75 times the configured limit. Max planning reserves half the configured limit for verification. Verification can use all remaining tier tokens once the review prompts are sized. The first call may run for 240 seconds, the deep pass for 480 and verification for 120. Every provider reads its prompt on standard input. The JSON includes `tier`, `delivered`, `base_input_tokens`, `passes`, `context` and `verification`. The `max_input_tokens` field is the tier’s whole budget. Any allowed requester can use any tier.
 
 ### Static analysis
 
-ShellCheck and actionlint run on the reviewed head’s Git blobs in a temporary directory. The runner uses stdin and the tool defaults. To avoid duplicate shell findings, actionlint’s embedded ShellCheck integration is disabled. Standalone ShellCheck covers changed `.sh` and `.bash` files. If a forge head is absent locally, an applicable scanner reports `could-not-check`.
+ShellCheck and actionlint run on the reviewed head’s Git blobs in a temporary directory. The runner uses stdin and the tool defaults. To avoid duplicate shell findings, actionlint’s embedded ShellCheck integration is disabled. Standalone ShellCheck covers changed `.sh` and `.bash` files. If a forge head is absent locally, an applicable scanner reports `could-not-check`. For modified files with an available immutable base, the same tool checks the base blob when a head finding maps to unchanged source. The JSON and model evidence keep the head diagnostics and mark matches with `baseline_match`. A complete review groups matches that were shown to the model. The comment lists each match the model could not see. A matched warning can still lead to a model finding if the patch changes its reachability or impact. A failed or unavailable comparison leaves each head diagnostic visible on its own. The extra scan uses local runtime only.
 
 To reuse Assay’s Go linters, pass `--go-report path/to/report.json` from its [pinned analysis action](https://github.com/medici-finance/assay/tree/main/actions/go-analysis). Supply an artifact from a trusted producer. The runner checks the `go-analysis/v1` schema, source SHA, coverage count, totals and gate, then imports new and worsened findings for the selected files. Scanner diagnostics outside the shown hunks remain in the report. Only diagnostics located in the supplied patch consume model context.
 
@@ -230,7 +323,7 @@ In container setup, enter the project's trusted Go analysis workflow or job. Alt
 
 The worker looks up the report only when processing an authorized `/review`. It accepts a completed scan from a failed lint job, verifies the repository and analyzed source SHA, then imports new and worsened findings for changed paths. Findings inside the shown hunks share the existing Cursor prompt and token budget. The summary includes imported findings outside the hunks as well.
 
-If CI is still running or the report is missing, expired, unreadable, invalid or for a different head, the summary marks Go analysis as `could not check`. The rest of the review proceeds with the existing one-call ceiling. A new `/review` after CI finishes can pick up the report. Ordinary polls and CI completion never trigger a model call.
+If CI is still running or the report is missing, expired, unreadable, invalid or for a different head, the summary marks Go analysis as `could not check`. The rest of the review proceeds under the selected tier’s budget. A new `/review` after CI finishes can pick up the report. Ordinary polls and CI completion never trigger a model call.
 
 ### Hadolint, zizmor and OSV-Scanner
 
@@ -273,7 +366,13 @@ Set `REVIEW_QUALGEN_INTERVAL_SECONDS` in Docker or enter the refresh interval du
 
 An authorized GitHub or GitLab `/review` runs `qualgen check` for the changed paths and adds its notices to the posted summary. A notice can identify a frequently co-changed file that is missing from the change. The summary identifies the mined commit and marks paths with insufficient history. Live reference notices are included only when the checkout is at the reviewed head. While the first snapshot is being built, the review reports that history is unavailable. The comment shows up to 20 entries; the JSON includes the full advisory list.
 
-Qualgen uses local CPU, disk and Git history. Its output goes directly into the summary, outside the Cursor prompt, token estimate and model cache key. An over-budget review or a model failure can still publish historical advisories.
+Qualgen uses local CPU, disk and Git history. Its advisories go into the review prompt as untrusted data, at most 12 entries for files with reviewable hunks in the prompt, with each detail cut at 300 characters, so they count toward the token estimate and are part of the model cache key. The reviewer fits the patch first. In higher tiers, the advisories share space with optional context while keeping each included context block and preserving the token allowance for verification. The model checks these hints against the patch. The advisories are also added to the posted summary, and an estimate, an over-budget review or a model failure still reports them.
+
+### Base drift
+
+Every review compares the change with the tip of its base, using local Git objects and no model tokens. The JSON `drift` object and the posted summary give the number of base commits the head lacks, the changed files that the base has also changed since the branch point, and stale references: a name quoted in backticks on an added documentation line (`.md`, `.rst`, `.txt`, `.adoc`) that was in the tree at the branch point and is no longer anywhere on the base. A merge can be textually clean and still leave such a sentence describing something the base removed. At most 60 names are looked up per review and the comment shows 10 rows of each kind.
+
+Local reviews use the requested base. GitHub CI uses the event’s base SHA. GitLab CI reports drift when it supplies a target-branch SHA. A forge review resolves the forge's base branch name as `origin/<branch>` or a local branch in the checkout. A managed checkout has neither, so its synced `HEAD` is reported as a default-branch comparison when the target ref is unavailable. For a managed project the reviewer now fetches every reviewed head, 50 commits deep, into a temporary directory; before, it fetched one commit and only when a scanner needed the source. A change whose branch point is more than 50 commits behind its head, or whose base or head is not available locally, reports `Base drift could not be checked`. That does not change the review state or exit code.
 
 ### GitHub Actions and GitLab CI
 
@@ -291,6 +390,53 @@ Add `--post` to the `--change` command to post the reviewed commit and findings 
 
 The standalone poller supports `/review`. For additional upstream PR-Agent chat commands such as `/ask` and `/improve`, see [GitHub integration](https://docs.pr-agent.ai/installation/github/) and [GitLab integration](https://docs.pr-agent.ai/installation/gitlab/). GitLab pipeline jobs alone do not receive comment events. The upstream comment server and this CLI are separate entry points.
 
+### Export SARIF
+
+Add `--sarif review.sarif` to any review or estimate to write the same findings as a [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html) log after the JSON report is printed. The log has one run whose driver is `assay-pr-agent` and one result per model finding and per ShellCheck, actionlint, Go analysis, hadolint, zizmor or OSV-Scanner finding. `ruleId` is the scanner rule or `model-finding`. The report keeps no scanner severity, so `level` is a fixed mapping: `warning` for model findings and OSV-Scanner vulnerabilities, `note` for every other scanner finding. Each result names a repository-relative, percent-encoded `artifactLocation.uri` and, when the finding has a line, `region.startLine`, plus `region.endLine` for a model finding. OSV-Scanner findings carry no line, so they name the lockfile without a region. Messages are cut at 1,000 characters and a finding without a safe relative path is left out. `partialFingerprints.primaryLocationLineHash` starts with the same line hash that the `upload-sarif` action computes: a hash of the 100 characters from the start of the finding's line, ignoring spaces and tabs, so the text that follows the line is part of the value, with a number that keeps identical lines apart. A suffix based on the finding’s full message and span length distinguishes results on the same line independently of their order. A rerun that rephrases the finding can produce a new fingerprint because the model report has no stable issue ID. Findings the log cannot tell apart, such as two ShellCheck SC2086 on one line with one message, keep one identity. A line added above a finding leaves its fingerprint unchanged if the hashed context and its occurrence count stay the same. The text is read from the reviewed head in `--repo` or from the verified temporary checkout for a managed `--change` review. When the reviewed source is unavailable, including files larger than 1 MB, the fingerprint uses the line number, span length and full message. A change in source availability or line number can change that fingerprint. A finding without a line is identified by its path, rule and message. `invocations[0].executionSuccessful` is `true` only for the `reviewed`, `empty` and `estimate` states. The path is resolved against the directory you run the command from, not `--repo`. If the file cannot be written, the JSON report is still printed, the reason goes to stderr and the exit code is 2. The poller does not request the export.
+
+GitHub code scanning accepts SARIF 2.1.0 files from third-party tools. It is available for public repositories on GitHub.com and for organization-owned repositories with GitHub Code Security enabled. The job needs `contents: read` to check out the source. Uploading with `upload-sarif` needs `security-events: write` and, for private repositories, `actions: read`. Actions skips the steps after a failed one, and `cursor-review` exits 2 for partial coverage, an over-budget prompt or a failed model, so the upload states that it also runs after a failure when the file exists. In a `pull_request` workflow, check out the source head with full history so annotation lines match the commit reviewed by `--ci`. Both examples remove old report files before the review so a reused workspace cannot upload a stale log.
+
+```yaml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rm -f review.sarif review.json
+      - id: review
+        run: cursor-review --ci --max-input-tokens 4000 --sarif review.sarif > review.json
+      - uses: github/codeql-action/upload-sarif@v4
+        if: ${{ !cancelled() && (steps.review.outcome == 'success' || steps.review.outcome == 'failure') && hashFiles('review.sarif') != '' }}
+        with:
+          sarif_file: review.sarif
+```
+
+GitLab ingests SARIF 2.1.0 from an `artifacts:reports:sarif` artifact on GitLab Ultimate: generally available in GitLab 19.2, and from 18.11 with the `sarif_ingestion` feature flag, which is on by default from 19.1. The findings appear in the pipeline Security tab and in the merge request security widget. GitLab deduplicates findings with the same rule, path and line range. Exact-span model findings with the same `model-finding` rule and multiple occurrences of one OSV advisory in a single lockfile can therefore appear as one entry. Use `review.json` for the complete result list. For this example, use a detached merge request pipeline so the working tree matches the reviewed source head. GitLab ingests the findings only when the job succeeds, and `cursor-review` exits 2 for partial coverage, an over-budget prompt or a failed model, so keep that exit status from failing the job and read the outcome from `review.json`:
+
+```yaml
+review:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "detached"'
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - rm -f review.sarif review.json
+    - cursor-review --ci --max-input-tokens 4000 --sarif review.sarif > review.json || review_exit=$?
+    - test -s review.sarif
+  artifacts:
+    when: always
+    paths: [review.json]
+    reports:
+      sarif: review.sarif
+```
+
+The test suite checks the log's contents and never uploads it to a forge. [Upload a SARIF file to GitHub](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/uploading-a-sarif-file-to-github) · [SARIF support for code scanning](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning) · [GitLab SARIF reports](https://docs.gitlab.com/user/application_security/detect/sarif/)
+
 ## Verification
 
 ```sh
@@ -298,6 +444,8 @@ uv run --frozen python -m unittest discover -s tests -v
 ```
 
 The fixtures exercise GitHub and GitLab polling, restart handling, the Assay forge envelope/command contract, caching, the budget cutoff, incomplete inputs and Cursor failure handling. Install ShellCheck to run the integration fixtures. Tests substitute a local executable for inference and never post externally.
+
+Before proposing a change to this repository, coding agents follow [AGENTS.md](AGENTS.md), which includes running this reviewer's own prompt on the branch.
 
 ## License
 

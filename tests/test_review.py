@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from cursor_pr import cli, engine, source
+from cursor_pr import checks, cli, engine, source
 
 
 class ReviewTest(unittest.TestCase):
@@ -32,7 +32,9 @@ class ReviewTest(unittest.TestCase):
         self.shim.write_text("#!/usr/bin/env python3\nimport json,os,pathlib,sys\n"
             "assert sys.argv[1:5]==['-p','--mode=ask','--output-format','json']\n"
             "assert json.loads(pathlib.Path('.cursor/cli.json').read_text())['permissions']['allow']==[]\n"
-            "assert 'SC2086' in sys.argv[-1] and 'example.sh' in sys.argv[-1]\n"
+            "prompt = sys.stdin.read()\n"
+            "assert sys.argv[5:] in ([], ['--trust'], ['--trust', '--model', sys.argv[-1]])\n"
+            "assert 'SC2086' in prompt and 'example.sh' in prompt\n"
             "assert 'GH_TOKEN' not in os.environ and not pathlib.Path('.git').exists()\n"
             f"with open({str(self.calls)!r}, 'a') as f: f.write('call\\n')\n"
             f"print({json.dumps(envelope)!r})\n")
@@ -42,7 +44,8 @@ class ReviewTest(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         # Tests exercise the saved and default budgets; a shell REVIEW_MAX_INPUT_TOKENS would win over both.
-        os.environ.pop("REVIEW_MAX_INPUT_TOKENS", None)
+        for name in ("REVIEW_MAX_INPUT_TOKENS", *cli.FINDINGS_SETTINGS.values()):
+            os.environ.pop(name, None)
 
     def git(self, *args):
         return subprocess.check_output(["git","-c","user.name=Test","-c","user.email=test@example.org",
@@ -65,10 +68,119 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(result["findings"][0]["line"],2)
         self.assertTrue(self.check(*args)[1]["cache_hit"])
         self.assertEqual(self.calls.read_text().splitlines(),["call"])
-        self.git("commit", "--allow-empty", "-qm", "same patch with new head")
+        # The messages are part of the prompt: a new head with the same patch and message
+        # reuses the result, and a different message would be a different review.
+        self.git("commit", "--amend", "--no-edit", "-q", "--date", "2001-02-03T04:05:06Z")
         self.assertTrue(self.check(*args)[1]["cache_hit"])
         self.assertFalse(self.check(*args, "--model", "another-model")[1]["cache_hit"])
         self.assertEqual(self.calls.read_text().splitlines(), ["call", "call"])
+
+    def test_scanner_marks_an_equivalent_shifted_warning_without_hiding_it(self):
+        script = self.root / "example.sh"
+        tail = "# Padding outside the changed hunk.\n" * 20 + "echo $later\n"
+        old_source = "#!/bin/sh\necho $argument\n" + tail
+        script.write_text(old_source)
+        self.git("add", "example.sh")
+        self.git("commit", "-qm", "Add a distant scanner warning")
+        old_head = self.git("rev-parse", "HEAD")
+        script.write_text("#!/bin/sh\n# The existing warning moves.\necho $argument\necho $new\n" + tail)
+        self.git("add", "example.sh")
+        self.git("commit", "-qm", "Add another argument")
+        warning = {"code": 2086, "column": 6, "endColumn": 8, "level": "info", "message": "Quote the argument."}
+        shifted = dict(warning, line=3, endLine=3)
+        new = dict(warning, line=4, endLine=4)
+        previous = dict(warning, line=2, endLine=2)
+        distant = dict(warning, line=25, endLine=25)
+        distant_previous = dict(warning, line=23, endLine=23)
+        for old, expected in (([previous], [3]), ([dict(previous, level="style")], [])):
+            with self.subTest(previous=old):
+                with patch.object(checks.shutil, "which", return_value="/scanner"), \
+                     patch.object(checks, "scan_blob", side_effect=[[shifted, new, distant], [*old, distant_previous]]) as scan, \
+                     patch.object(engine, "invoke", return_value={"findings": [], "cursor_usage": None}):
+                    code, report = self.check("--base", old_head)
+                check, = report["checks"]
+                self.assertEqual(code, 0)
+                self.assertEqual([row["line"] for row in check["findings"]], [3, 4, 25])
+                self.assertEqual([row["line"] for row in check["findings"] if row.get("baseline_match")], [*expected, 25])
+                self.assertEqual([row["line"] for row in check["findings"] if row.get("shown_to_model")], expected)
+                self.assertEqual(check["existing_findings"], 1 + len(expected))
+                self.assertEqual([call.args[2] for call in scan.call_args_list],
+                                 [script.read_bytes(), old_source.encode()])
+                if expected:
+                    change = source.local_change(self.root, old_head, "HEAD")
+                    self.assertIn('"baseline_match": true', engine.pack(change.files, [check])[0])
+                    with patch.object(cli, "post_comment") as post:
+                        cli.publish("example/repo#1", change.head, report)
+                    body = post.call_args.args[3]
+                    self.assertIn("Scanner diagnostics also reported on the base: 1.", body)
+                    self.assertIn(":4 ", body)
+                    self.assertIn(":25 ", body)
+                    self.assertNotIn(":3 ", body)
+                    with patch.object(cli, "post_comment") as post:
+                        cli.publish("example/repo#1", change.head, dict(report, state="degraded"))
+                    self.assertIn(":3 ", post.call_args.args[3])
+        with patch.object(checks.shutil, "which", return_value="/scanner"), \
+             patch.object(checks, "scan_blob", side_effect=[[shifted, new], source.ReviewError("base unavailable")]):
+            code, report = self.check("--base", old_head, "--estimate")
+        self.assertEqual(code, 0)
+        self.assertEqual([row["line"] for row in report["checks"][0]["findings"]], [3, 4])
+        self.assertNotIn("existing_findings", report["checks"][0])
+
+    def test_baseline_budget_excludes_time_spent_scanning_head(self):
+        diff = "@@ -1 +1,2 @@\n+#!/bin/sh\n echo $value\n"
+        files = [source.File(path, diff, "modified") for path in ("first.sh", "second.sh")]
+        old, head = b"echo $value\n", b"#!/bin/sh\necho $value\n"
+        elapsed = 0
+        calls = []
+
+        def scan(tool, args, content, timeout=20):
+            nonlocal elapsed
+            calls.append(content)
+            elapsed += 16 if content == head else 3
+            return [{"line": 2 if content == head else 1, "code": 2086, "message": "Quote the argument."}]
+
+        with patch.object(checks.time, "monotonic", side_effect=lambda: elapsed), \
+             patch.object(checks.shutil, "which", return_value="/scanner"), \
+             patch.object(checks, "blob", side_effect=[head, old, head, old]), \
+             patch.object(checks, "scan_blob", side_effect=scan):
+            results = checks.scan_files(self.root, "head", files, base="base")
+        self.assertEqual(calls, [head, old, head, old])
+        self.assertEqual([check["existing_findings"] for check in results], [1, 1])
+
+    def test_baseline_stops_preparing_candidates_at_the_deadline(self):
+        file = source.File("script.sh", "@@ -1 +1,2 @@\n+#!/bin/sh\n echo $value\n", "modified")
+        warning = {"line": 2, "code": 2086, "message": "Quote the argument."}
+        elapsed = 0
+
+        def map_line(*args):
+            nonlocal elapsed
+            elapsed += 2
+            return 1
+
+        with patch.object(checks.time, "monotonic", side_effect=lambda: elapsed), \
+             patch.object(checks, "base_line", side_effect=map_line) as mapping, \
+             patch.object(checks, "scan_blob") as scan:
+            matches = checks.baseline_matches(file, [warning] * 10, b"#!/bin/sh\necho $value\n",
+                                              b"echo $value\n", "shellcheck", [], 3)
+        self.assertFalse(matches)
+        self.assertEqual(mapping.call_count, 2)
+        scan.assert_not_called()
+
+    def test_baseline_git_reads_share_the_remaining_budget(self):
+        with patch.object(checks.time, "monotonic", side_effect=[0, 3]), \
+             patch.object(checks, "git", side_effect=[b"4", b"text"]) as git:
+            self.assertEqual(checks.blob(self.root, "base", "file.sh", deadline=5), b"text")
+        self.assertEqual([call.kwargs["timeout"] for call in git.call_args_list], [5, 2])
+
+    def test_actionlint_baseline_maps_related_locations(self):
+        old = b"jobs:\n  build: {}\n  build: {}\n"
+        head = b"# Shift the whole file\n" + old
+        file = source.File(".github/workflows/ci.yml", "@@ -1,3 +1,4 @@\n+# Shift the whole file\n"
+                           " jobs:\n   build: {}\n   build: {}\n", "modified")
+        existing = {"line": 3, "column": 3, "kind": "syntax", "message": "previously defined at line:2,col:3"}
+        shifted = dict(existing, line=4, message="previously defined at line:3,col:3")
+        with patch.object(checks, "scan_blob", return_value=[existing]):
+            self.assertEqual(checks.baseline_matches(file, [shifted], head, old, "actionlint", [], float("inf")), {0})
 
     def test_budget_comes_from_saved_setup_unless_overridden(self):
         bundle = self.root/"state/.review-setup-fixture"
@@ -137,7 +249,8 @@ class ReviewTest(unittest.TestCase):
                 code, result = self.check("--change", "org/repo#1", "--post")
                 self.assertEqual(code, 0, result)
                 self.assertEqual(result["source"], project.change_url(1))
-                self.assertEqual([call.args[0] for call in read.call_args_list], ["change", "change-files", "change"])
+                self.assertEqual([call.args[0] for call in read.call_args_list],
+                                 ["change", "change-files", "change-with-description"])
                 self.assertTrue(all(call.args[1] == project and call.kwargs["numbers"] == [1]
                                     for call in read.call_args_list))
                 self.assertEqual(post.call_args.args[:3], (project, 1, self.head))
@@ -154,6 +267,24 @@ class ReviewTest(unittest.TestCase):
                 with patch.object(source, "run_forge", side_effect=[first, result, last]):
                     with self.assertRaisesRegex(source.ReviewError, "Forge files do not match the reviewed head"):
                         source.forge_change("org/repo#1", project=project)
+
+    def test_optional_forge_description_is_head_bound_and_best_effort(self):
+        project, (first, files, last) = self.forge_fixture("github")
+        described = dict(last, title=" Verify acceptance criteria ", body=" The new state is visible. ")
+        with patch.object(source, "run_forge", side_effect=[first, files, described]) as read:
+            change = source.forge_change("org/repo#1", project=project, with_description=True)
+        self.assertEqual((change.title, change.description),
+                         ("Verify acceptance criteria", "The new state is visible."))
+        self.assertEqual(read.call_args.args[0], "change-with-description")
+
+        with patch.object(source, "run_forge", side_effect=[first, files, source.ReviewError("unsupported"), last]):
+            change = source.forge_change("org/repo#1", project=project, with_description=True)
+        self.assertEqual(change.description, "")
+
+        moved = dict(described, headSha="b" * 40)
+        with patch.object(source, "run_forge", side_effect=[first, files, moved]):
+            with self.assertRaisesRegex(source.ReviewError, "Change moved during the forge read"):
+                source.forge_change("org/repo#1", project=project, with_description=True)
 
     def test_failed_post_reports_reason(self):
         project, reads = self.forge_fixture("github")

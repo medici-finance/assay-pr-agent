@@ -15,16 +15,17 @@ import uuid
 
 from . import accounts, dialog, providers, provision, gitlab_tls
 from .login import auth_mode, ensure_session, login_directory, login_env
-from .config import DEFAULT_MAX_INPUT_TOKENS, parse_projects, project_base, prompt_config
+from .config import (DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, FINDINGS_SETTINGS, MAX_FINDINGS_LIMIT,
+                     parse_projects, project_base, prompt_config)
 from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secret, validate_pem, validate_token
 
 CURSOR = "CURSOR_API_KEY"
 SECRETS = {CURSOR: "cursor.key", "ANTHROPIC_API_KEY": "claude.key", "CODEX_API_KEY": "codex.key", KEY: "github.pem", TOKEN: "gitlab.token", **gitlab_tls.NAMES}
+# Carry saved settings that the wizard does not ask for into the next bundle.
+PRESERVED_SETTINGS = (*FINDINGS_SETTINGS.values(), "REVIEW_SYNC_SECONDS", "REVIEW_OSV_DOWNLOAD_DATABASES")
 SETTINGS = ("REVIEW_OPERATOR", APP_ID, INSTALL_ID, "REVIEW_MODEL", "REVIEW_MAX_INPUT_TOKENS",
-            "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER", "REVIEW_CURSOR_TEAM_ID", "REVIEW_AUTH_MODE", "REVIEW_LOGIN_PROFILE",
-            "REVIEW_SYNC_SECONDS", "REVIEW_OSV_DOWNLOAD_DATABASES")
-# Only the settings page asks for these, so a wizard re-run keeps what it saved.
-PAGE_SETTINGS = ("REVIEW_SYNC_SECONDS", "REVIEW_OSV_DOWNLOAD_DATABASES")
+            "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER",
+            "REVIEW_CURSOR_TEAM_ID", "REVIEW_AUTH_MODE", "REVIEW_LOGIN_PROFILE", *PRESERVED_SETTINGS)
 
 
 def state_dir():
@@ -136,29 +137,42 @@ def apply_saved_setup(state, *, sync_only=False):
             os.environ.setdefault(k, v)
 
 
-def max_input_tokens(state):
-    """Effective prompt budget: container environment, then saved setup, then the default.
+def saved_integer(state, name, default, upper=None):
+    """Effective integer setting: container environment, then saved setup, then the default.
 
     Environment values keep the int() syntax the CLI has always accepted, such as
     "6_000" or "+6000"; the saved setting is written by the wizard as plain digits.
     """
-    value = os.environ.get("REVIEW_MAX_INPUT_TOKENS")
+    value = os.environ.get(name)
     saved = value is None and (state / "setup").is_symlink()
     if saved:
         with locked(state, fcntl.LOCK_SH):
             settings = json.loads((active_bundle(state) / "settings.json").read_text())["settings"]
-        value = settings.get("REVIEW_MAX_INPUT_TOKENS")
+        value = settings.get(name)
     if value is None:
-        return DEFAULT_MAX_INPUT_TOKENS
+        return default
     if isinstance(value, str):
         value = value.strip()
         try:
             value = int(value) if not saved or (value.isascii() and value.isdecimal()) else None
         except ValueError:
             value = None
-    if type(value) is not int or value < 1:
-        raise ValueError("REVIEW_MAX_INPUT_TOKENS must be a positive integer")
+    if type(value) is not int or value < 1 or (upper is not None and value > upper):
+        raise ValueError(f"{name} must be " + (f"an integer from 1 to {upper}" if upper else "a positive integer"))
     return value
+
+
+def max_input_tokens(state):
+    """Effective prompt budget."""
+    return saved_integer(state, "REVIEW_MAX_INPUT_TOKENS", DEFAULT_MAX_INPUT_TOKENS)
+
+
+def max_findings(state, *, tier=None, override=None):
+    """Resolve the caps used by one request, or check every tier at poller startup."""
+    requested = FINDINGS_SETTINGS if tier is None else (("mid", "max") if tier == "max" else (tier,))
+    return {name: override if name == tier and override is not None else
+            saved_integer(state, FINDINGS_SETTINGS[name], DEFAULT_MAX_FINDINGS, MAX_FINDINGS_LIMIT)
+            for name in requested}
 
 
 def ask(label, default=""):
@@ -343,7 +357,7 @@ def configure_locked(state, force_login):
     projects = parse_projects(accounts.shape(rows))
     forges = {p.provider for p in projects.values()}
     previous = prev.get("settings", {})
-    settings = {name: previous[name] for name in PAGE_SETTINGS if name in previous}
+    settings = {name: previous[name] for name in PRESERVED_SETTINGS if name in previous}
 
     def setting(name, label, validate, default=""):
         settings[name] = retry(lambda: validate(ask(label, previous.get(name, default))))
