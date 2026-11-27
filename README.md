@@ -37,7 +37,7 @@ The CLI receives an allow-listed environment: its own provider's key or sign-in 
 
 ### Untrusted input and evidence binding
 
-The regular prompt contains PR-Agent's review rubric, scanner diagnostics that fall on shown lines, and the diff hunks. Mid and max can add bounded change details and surrounding code. Max can also include eligible conversation comments, excluding internal GitLab notes and earlier review summaries. Hadolint, zizmor, OSV-Scanner and Qualgen output stays in the report. The prompt labels the diagnostics, patch and context as `untrusted data` and instructs the model to work without tools. The reviewer checks the change before and after reading its file list and refuses it if the head moves.
+The regular prompt contains PR-Agent's review rubric, scanner diagnostics that fall on shown lines, and the diff hunks. It can include the forge's title and description when available, or recent commit messages in a local or CI review. Mid and max can add surrounding code and other bounded context. Max can also include eligible conversation comments, excluding internal GitLab notes and earlier review summaries. Hadolint, zizmor, OSV-Scanner and Qualgen output stays in the report. The prompt labels the diagnostics, patch and context as `untrusted data` and instructs the model to work without tools. The reviewer checks the change before and after reading its file list and refuses it if the head moves.
 
 A finding is accepted only if it names a reviewed file and cites a contiguous range of head lines that the shown hunks contain. One failing finding rejects the whole answer: the review ends as `model-unavailable` and its scanner results are still posted. A file name containing a C0 control character (below U+0020), or a duplicate file name, stops the review before the model is called.
 
@@ -273,6 +273,8 @@ cursor-review --repo /path/to/checkout --change 'org/repo#42' --model MODEL
 
 The local form compares the merge base to committed `HEAD`, or to an explicit `--head`. Both commits and their common ancestor must be available locally. The forge form uses an `owner/repo#number` address from the configured projects and requires `pr-agent-forge` on `PATH`. GitLab subgroup projects can use CI mode with local Git objects. It reads metadata before and after the file list, checks head and file-count consistency, and records missing patches as incomplete coverage.
 
+The prompt can include messages from up to 32 recent commits in a local or CI review, or a forge change's title and description when the forge helper reports them. The title and description are cut at 256 and 1,500 characters, labelled untrusted, and counted in the token estimate. The reviewer drops this optional context when doing so allows it to review more files within the token budget.
+
 ### Cost and coverage
 
 - `--estimate` makes zero Cursor calls. It performs the same diff preparation and static checks as a review.
@@ -289,7 +291,7 @@ The local form compares the merge base to committed `HEAD`, or to an explicit `-
 | Tier | Command | Budget | Model calls | What the model sees |
 |---|---|---|---|---|
 | `regular` | `/review` | 1× | 1 | The patch and scanner evidence. Up to 3 findings. |
-| `mid` | `/review-mid` | 2× | up to 2 | The regular prompt, then context from outside the patch: the change description (or its commit messages), what the base changed in the same files, 25 lines around each hunk, and where the changed functions and types are used. Up to 6 findings, then a verification call that sees only the findings and the lines they cite and may drop findings but not add any. |
+| `mid` | `/review-mid` | 2× | up to 2 | The patch and scanner evidence, together with context from outside the patch: the change description (or its commit messages), what the base changed in the same files, 25 lines around each hunk, and where the changed functions and types are used. Up to 6 findings, then a verification call that sees only the findings and the lines they cite and may drop findings but not add any. |
 | `max` | `/review-max` | 10× | up to 3 | The mid prompt, unchanged when it fits, so a cached mid result is reused. An independently budgeted deep pass can include files that the first pass left out, plus the whole changed source files, 15 lines around each use of a changed name, existing tests for the touched modules, and eligible earlier comments. Then verification of the findings across the completed passes, up to 10. |
 
 Code context comes from Git objects at the reviewed head. Earlier comments come from the forge. The reviewer sends both as untrusted data, and every finding must cite patch lines. It truncates or omits context to stay within the budget and reports each block’s status. The delivered tier is the highest whose context reached the model in a completed pass: mid needs a mid-tier block, and max also needs a block that only the deep pass adds. A block planned for a pass that failed is reported as `not sent`, and a review that reached no model reports no delivered tier. If the requested tier cannot be delivered, a planned pass fails, or findings cannot be verified, the review reports `degraded` and keeps available findings.

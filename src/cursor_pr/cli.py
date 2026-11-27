@@ -40,7 +40,7 @@ DEEP_FOCUS = ("Look for what only this wider view shows: a caller the change bre
 USED = ("included", "truncated")
 
 
-def fit(files, checks, limit, cap=MAX_FINDINGS, *, focus="", rendered=None):
+def fit(files, checks, limit, cap=MAX_FINDINGS, *, title="", description="", focus="", rendered=None):
     """Pack the prompt, leaving out whole files until it fits the input budget.
 
     Returns the prompt parts, the estimate of what will be sent, the estimate of the full
@@ -48,22 +48,29 @@ def fit(files, checks, limit, cap=MAX_FINDINGS, *, focus="", rendered=None):
     """
     if rendered is None:
         rendered = render_sections(files)
-    prompt, anchors, unseen, has_text = full_pack = pack(files, checks, max_findings=cap, focus=focus, rendered=rendered)
+    prompt, anchors, unseen, has_text = full_pack = pack(
+        files, checks, title=title, description=description, max_findings=cap, focus=focus, rendered=rendered)
     estimated = full = tokens(prompt) if has_text else 0
     if full <= limit:
         return full_pack, full, full, []
+    if title or description:
+        plain = pack(files, checks, max_findings=cap, focus=focus, rendered=rendered)
+        plain_estimate = tokens(plain[0])
+        if plain_estimate <= limit:
+            return plain, plain_estimate, full, []
     # Measure each file with its scanner evidence before choosing what to leave out.
     # A file that cannot fit alone leaves first, so a smaller file can still be reviewed.
     findings_by_path = defaultdict(list)
     for check in checks:
         for finding in check["findings"]:
             findings_by_path[finding["path"]].append(finding)
-    overhead = tokens(pack([], [], max_findings=cap, focus=focus)[0])
+    overhead = tokens(pack([], [], title=title, description=description, max_findings=cap, focus=focus)[0])
     sizes = {}
     for file in files:
         if rendered[file.path][0] is not None:
             file_checks = [{"findings": findings_by_path.get(file.path, ())}]
-            standalone, _, _, _ = pack([file], file_checks, max_findings=cap, focus=focus, rendered=rendered)
+            standalone, _, _, _ = pack(
+                [file], file_checks, title=title, description=description, max_findings=cap, focus=focus, rendered=rendered)
             sizes[file.path] = tokens(standalone) - overhead
     queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
@@ -74,9 +81,15 @@ def fit(files, checks, limit, cap=MAX_FINDINGS, *, focus="", rendered=None):
         while len(queue) > 1 and freed < estimated - limit:
             dropped.append(queue.pop(0))
             freed += sizes[dropped[-1]]
-        prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), max_findings=cap, focus=focus, rendered=rendered)
+        prompt, anchors, unseen, has_text = pack(
+            files, checks, frozenset(dropped), title, description, max_findings=cap, focus=focus, rendered=rendered)
         estimated = tokens(prompt) if has_text else 0
-    if not has_text or estimated > limit:
+    fits = has_text and estimated <= limit
+    if (title or description) and (not fits or len(dropped) > 1):
+        fitted, estimate, _, skipped = fit(files, checks, limit, cap, focus=focus, rendered=rendered)
+        if fitted[3] and estimate <= limit and (not fits or len(skipped) < len(dropped)):
+            return fitted, estimate, full, skipped
+    if not fits:
         return full_pack, full, full, []
     return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped)
 
@@ -372,7 +385,9 @@ def execute(args):
     first_tier = "regular" if tier == "regular" else "mid"
     cap = CAPS[first_tier]
     rendered = render_sections(files)
-    (prompt, anchors, unseen, has_text), estimated, full, dropped = fit(files, checks, limit, cap, rendered=rendered)
+    metadata = {"title": change.title, "description": change.description} if tier == "regular" else {}
+    (prompt, anchors, unseen, has_text), estimated, full, dropped = fit(
+        files, checks, limit, cap, rendered=rendered, **metadata)
     plans, fates, deep_fates = [], [], []
     first_paths = set()
     if has_text and estimated <= limit:

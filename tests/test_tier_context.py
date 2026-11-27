@@ -2,13 +2,12 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
-from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 from cursor_pr import context, discovery, engine
 from cursor_pr.config import project_from
-from cursor_pr.source import File, local_change
+from cursor_pr.source import Change, File, local_change
 
 
 class TierContextTests(unittest.TestCase):
@@ -187,6 +186,8 @@ class CallSiteTests(unittest.TestCase):
 
     def test_description_without_a_branch_point_is_unavailable(self):
         head, _ = self.change(self.module.replace("return 3", "return 30"))
-        change = SimpleNamespace(description="", head=head)
+        change = Change(head, [], str(self.repo))
         self.assertIsNone(context.description(change, self.repo, self.repo, ""))
         self.assertEqual(context.description(change, self.repo, self.repo, self.git("rev-parse", "main")), "change")
+        described = Change(head, [], str(self.repo), title="Review title", description="Review body")
+        self.assertEqual(context.description(described, self.repo, self.repo, ""), "Review title\n\nReview body")

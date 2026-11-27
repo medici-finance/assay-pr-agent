@@ -198,8 +198,9 @@ def call_sites(repo, head, files, radius=0):
 @guarded
 def description(change, root, head_repo, fork):
     """What the author says the change does: the forge description, else its commit messages."""
-    if change.description.strip():
-        return change.description.strip()
+    metadata = "\n\n".join(text for text in (change.title, change.description) if text)
+    if metadata:
+        return metadata
     if not fork:
         raise ReviewError("no branch point for the commit messages")
     objects = git(root, "rev-parse", "--path-format=absolute", "--git-path", "objects") if head_repo != root else None

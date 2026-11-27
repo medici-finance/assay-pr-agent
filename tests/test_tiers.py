@@ -113,11 +113,13 @@ class TierTests(unittest.TestCase):
                 self.assertEqual((code, estimated["state"]), (0, "estimate"))
         self.assertEqual(self.prompts(), [])
 
-    def test_regular_review_is_one_call_with_the_plain_prompt(self):
+    def test_regular_review_is_one_call_with_main_prompt_and_commit_context(self):
         self.answers(review=answer(finding(42, "Real")))
         code, report = self.check()
-        files = sorted(cli.local_change(self.root, "main", self.head).files, key=lambda f: f.path)
-        self.assertEqual(self.prompts(), [["review", engine.pack(files, [])[0]]])
+        change = cli.local_change(self.root, "main", self.head)
+        files = sorted(change.files, key=lambda f: f.path)
+        prompt = engine.pack(files, [], title=change.title, description=change.description)[0]
+        self.assertEqual(self.prompts(), [["review", prompt]])
         self.assertEqual((code, report["state"], report["tier"], report["delivered"]), (0, "reviewed", "regular", "regular"))
         self.assertEqual(report["verification"], {"state": "not-needed"})
 
@@ -127,7 +129,8 @@ class TierTests(unittest.TestCase):
         self.assertEqual((first, second), ("review", "verification"))
         files = sorted(cli.local_change(self.root, "main", self.head).files, key=lambda f: f.path)
         plain = engine.pack(files, [], max_findings=6)[0]
-        self.assertTrue(prompt.startswith(plain + "\nContext from outside the patch"))  # Regular, plus more.
+        self.assertTrue(prompt.startswith(plain + "\nContext from outside the patch"))
+        self.assertEqual(prompt.count("double the value"), 1)
         for expected in ("# Change description\ndouble the value", "Compute now doubles its input.",
                          "# Surrounding code\n## src/app.py lines 14-70 at the head", "14: # filler 13",
                          "# Call sites\n## Uses of compute", "src/caller.py:3: RESULT = compute(3)"):
@@ -152,6 +155,7 @@ class TierTests(unittest.TestCase):
         code, report = self.check("--tier", "max")
         self.assertEqual([kind for kind, _ in self.prompts()], ["deep", "verification"])  # The mid pass was cached.
         deep = self.prompts()[0][1]
+        self.assertEqual(deep.count("double the value"), 1)
         self.assertEqual([(row["name"], row["state"]) for row in report["passes"]],
                          [("review", "cached"), ("deep", "called"), ("verification", "called")])
         self.assertEqual(report["passes"][0]["estimated_input_tokens"], engine.tokens(mid_prompt))
