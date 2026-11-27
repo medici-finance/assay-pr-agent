@@ -82,8 +82,14 @@ def request(project, method, url, headers, deadline=None, **options):
     one to its host: while it runs no other is started there, which is no try and is made up for in
     a later cycle. So a forge that does this costs one thread and one connection, not one per call,
     and no other forge's calls.
+
+    The limit of it: a thread cannot be stopped from outside. For as long as a forge keeps such a
+    response open, the markers and removals for that host wait, uncounted, and are made when it ends.
     """
-    left = TIMEOUT_SECONDS if deadline is None else min(TIMEOUT_SECONDS, deadline - time.monotonic())
+    # One reading of the clock for both, so that nothing between them moves the cutoff past the deadline.
+    now = time.monotonic()
+    left = TIMEOUT_SECONDS if deadline is None else min(TIMEOUT_SECONDS, deadline - now)
+    cutoff = now + left
     if left < SHORTEST_SECONDS:
         raise OutOfTime()  # Too little is as good as none: no request is worth starting for it.
     # One name for one host, however its URL is written: any case, the default port given or not.
@@ -93,8 +99,6 @@ def request(project, method, url, headers, deadline=None, **options):
         raise Busy()
     unanswered.pop(host, None)
     answer = queue.SimpleQueue()
-    # Counted from here, so that a thread slow to start takes its delay out of the wait, not on top.
-    cutoff = time.monotonic() + left
     # A forge that is only slow runs into httpx's own timeout, just before the wait here is over:
     # the error then names what was slow, and its thread has ended when the next call is made.
     patience = left - SHORTEST_SECONDS / 2
