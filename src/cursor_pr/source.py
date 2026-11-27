@@ -9,7 +9,9 @@ from .providers import KEYS
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import select
 import subprocess
+import time
 
 
 class ReviewError(Exception):
@@ -128,6 +130,8 @@ def valid_sha(value):
 
 TITLE_LIMIT = 256
 DESCRIPTION_LIMIT = 1500
+DESCRIPTION_COMMITS = 32
+TRUNCATED = " …[truncated]"
 
 
 def bounded_text(value, limit):
@@ -135,7 +139,7 @@ def bounded_text(value, limit):
     if not isinstance(value, str) or not value.strip():
         return ""
     value = "".join(c for c in value if c.isprintable() or c in "\n\t").strip()
-    return value if len(value) <= limit else value[:limit].rstrip() + " …[truncated]"
+    return value if len(value) <= limit else value[:limit].rstrip() + TRUNCATED
 
 
 @dataclass(frozen=True)
@@ -228,11 +232,45 @@ def local_change(root, base, head):
             # Git can emit a textual hunk in another encoding. Count it as unavailable.
             patch = ""
         files.append(File(path, patch, status, not bool(patch), known_no_text=known_no_text))
-    # Without a forge description, the commit messages are the author's account of the change.
-    messages = git(root, "log", "--reverse", "--format=%s%n%n%b%x00", base + ".." + head, "--").decode("utf8", "replace")
-    return Change(head, files, str(root.resolve()), tip, "", "",
-                  description=bounded_text("\n\n".join(m.strip() for m in messages.split("\0") if m.strip()),
-                                           DESCRIPTION_LIMIT))
+    return Change(head, files, str(root.resolve()), base=tip, description=local_description(root, base, head))
+
+
+def local_description(root, base, head):
+    """Collect bounded optional context from the most recent commits in chronological order."""
+    byte_limit = 4 * DESCRIPTION_LIMIT
+    output = bytearray()
+    deadline = time.monotonic() + 45
+    args = ["git", "--literal-pathspecs", "-C", str(root), "log", "--no-show-signature", "--reverse", f"-{DESCRIPTION_COMMITS + 1}",
+            "--format=%s%n%n%b%x00", base + ".." + head, "--"]
+    try:
+        with subprocess.Popen(args, env=child_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+            try:
+                while len(output) <= byte_limit:
+                    remaining = max(0, deadline - time.monotonic())
+                    if not select.select([process.stdout], [], [], remaining)[0]:
+                        return ""
+                    chunk = os.read(process.stdout.fileno(), byte_limit + 1 - len(output))
+                    if not chunk:
+                        if process.wait(timeout=max(0, deadline - time.monotonic())):
+                            return ""
+                        break
+                    output.extend(chunk)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    # Preserve the newest commits when the count is capped. A final incomplete message
+    # from reaching the byte limit is useful as a prefix, with the truncation signalled.
+    clipped = len(output) > byte_limit
+    messages = output[:byte_limit].decode("utf8", "replace").split("\0")
+    if clipped:
+        chosen = messages[:DESCRIPTION_COMMITS]
+    else:
+        chosen = messages[:-1][-DESCRIPTION_COMMITS:]
+        clipped = len(messages) - 1 > DESCRIPTION_COMMITS
+    description = bounded_text("\n\n".join(m.strip() for m in chosen if m.strip()), DESCRIPTION_LIMIT)
+    return description + TRUNCATED if clipped and not description.endswith(TRUNCATED) else description
 
 
 def ci_refs():
