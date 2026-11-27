@@ -11,6 +11,8 @@ from .gitlab_tls import client_options
 from .source import ReviewError, reviewer_token, run_forge
 
 log = logging.getLogger(__name__)
+# A request is a comment holding exactly one of these commands; the value is the review tier.
+COMMANDS = {"/review": "regular", "/review-mid": "mid", "/review-max": "max"}
 
 
 def open_changes(project):
@@ -26,8 +28,8 @@ def open_changes(project):
     return numbers
 
 
-def comment_threads(project, numbers):
-    result = run_forge("comments", project, numbers=numbers, timeout=120)
+def comment_threads(project, numbers, *, verb="comments"):
+    result = run_forge(verb, project, numbers=numbers, timeout=120)
     threads = {}
     for row in result["items"]:
         number = row["number"]
@@ -44,7 +46,7 @@ def is_request(project, number, note, since):
     author, comment = note.get("authorId"), note.get("databaseId")
     if (type(author) is not int or author not in project.requesters
             or type(comment) is not int or comment < 1 or not isinstance(note.get("body"), str)
-            or note["body"].strip() != "/review" or not note.get("createdAt")
+            or note["body"].strip() not in COMMANDS or not note.get("createdAt")
             or note["createdAt"] != note.get("updatedAt")):
         return False
     try:
@@ -60,24 +62,57 @@ def is_request(project, number, note, since):
     return note.get("authorType") in (None, "", "User")
 
 
-def public_gitlab_request(project, number, note):
-    # The list adapter omits note visibility and rounds GitLab timestamps to
-    # seconds. Check both on this single candidate before a public response.
+def gitlab_notes(project, number):
     base = os.environ.get("GITLAB_API_BASE", "").rstrip("/")
     if base != project.url.removesuffix("/" + project.slug) + "/api/v4":
         raise ReviewError("GITLAB_API_BASE must match the project's HTTPS instance /api/v4")
     token = reviewer_token("gitlab", project.slug, project.checkout)
-    url = f"{base}/projects/{quote(project.slug, safe='')}/merge_requests/{number}/notes/{note['databaseId']}"
+    return f"{base}/projects/{quote(project.slug, safe='')}/merge_requests/{number}/notes", token
+
+
+def visible_gitlab_note(note, number):
+    return (note.get("internal") is False and not note.get("confidential")
+            and note.get("system") is False and note.get("noteable_type") == "MergeRequest"
+            and note.get("noteable_iid") == number)
+
+
+def context_comments(project, number):
+    """Read visible context comments from authorized review requesters."""
+    if project.provider == "github":
+        notes = comment_threads(project, [number], verb="context-comments").get(number)
+        if notes is None:
+            return None
+        return [note for note in notes if type(note.get("authorId")) is int
+                and note["authorId"] in project.requesters and note.get("authorType") == "User"
+                and type(note.get("databaseId")) is int and note["databaseId"] > 0
+                and note.get("url") == f"{project.change_url(number)}#issuecomment-{note['databaseId']}"]
+    url, token = gitlab_notes(project, number)
+    response = httpx.get(url, headers={"PRIVATE-TOKEN": token}, follow_redirects=False, timeout=15,
+                         params={"per_page": 20, "activity_filter": "only_comments",
+                                 "sort": "desc", "order_by": "created_at"},
+                         **client_options())
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list):
+        raise ReviewError("Invalid GitLab note list")
+    return [row for row in reversed(rows) if isinstance(row, dict) and visible_gitlab_note(row, number)
+            and isinstance(author := row.get("author"), dict) and type(author.get("id")) is int
+            and author["id"] in project.requesters and not author.get("bot")]
+
+
+def public_gitlab_request(project, number, note):
+    # The list adapter omits note visibility and rounds GitLab timestamps to
+    # seconds. Check both on this single candidate before a public response.
+    notes_url, token = gitlab_notes(project, number)
+    url = f"{notes_url}/{note['databaseId']}"
     response = httpx.get(url, headers={"PRIVATE-TOKEN": token}, follow_redirects=False, timeout=15, **client_options())
     if response.status_code == 404:
         return False
     response.raise_for_status()
     latest = response.json()
-    return (latest.get("internal") is False and not latest.get("confidential")
-            and latest.get("system") is False and latest.get("noteable_type") == "MergeRequest"
-            and latest.get("noteable_iid") == number and latest.get("id") == note["databaseId"]
+    return (visible_gitlab_note(latest, number) and latest.get("id") == note["databaseId"]
             and latest.get("author", {}).get("id") == note["authorId"]
-            and not latest["author"].get("bot") and latest.get("body", "").strip() == "/review"
+            and not latest["author"].get("bot") and latest.get("body", "").strip() == note["body"].strip()
             and bool(latest.get("created_at")) and latest["created_at"] == latest.get("updated_at"))
 
 
@@ -104,4 +139,7 @@ def poll_project(project, jobs, since):
                     if not public:
                         jobs.enqueue(project.key, number, comment, "ignored")
                         continue
+                tier = COMMANDS[note["body"].strip()]
+                if tier != "regular":
+                    jobs.set_tier(project.key, number, comment, tier)
                 jobs.enqueue(project.key, number, comment)

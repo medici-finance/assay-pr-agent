@@ -14,6 +14,8 @@ from .setup import apply_saved_setup, state_dir
 from .source import git, reviewer_token_file, ReviewError
 
 log = logging.getLogger(__name__)
+# History fetched with a change head, so its merge base with the synced branch can be found.
+CHANGE_DEPTH = 50
 
 
 def sync_ref(provider, url, root, ref, depth, password, cwd):
@@ -57,7 +59,7 @@ def scan_checkout(root, project, number, head):
         candidate = directory / "current"
         try:
             password = reviewer_token_file(project.provider, project.slug, root)
-            sync_ref(project.provider, project.url, directory, f"refs/{namespace}/{number}/head", 1, password, root)
+            sync_ref(project.provider, project.url, directory, f"refs/{namespace}/{number}/head", CHANGE_DEPTH, password, root)
             if git(candidate, "rev-parse", "HEAD").decode().strip() == head:
                 root = candidate
         except (OSError, subprocess.SubprocessError, ReviewError):
