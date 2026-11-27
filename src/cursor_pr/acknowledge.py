@@ -43,18 +43,15 @@ def reviewer(project, number, comment):
     return root, markers, {"PRIVATE-TOKEN": token}
 
 
-def own_markers(project, root, markers, headers):
-    """IDs of the markers this credential added. Only its account ID tells ours from anyone else's."""
+def own_award(project, root, markers, headers):
+    """ID of this credential's GitLab award, if present."""
     response = request(project, "GET", root + "/user", headers)
     response.raise_for_status()
     account = response.json()
     if not isinstance(account, dict) or type(account.get("id")) is not int or account["id"] < 1:
         raise ReviewError("The forge did not identify the reviewer account")
-    emoji, field = MARK[project.provider]
-    found = []
     for page in range(1, PAGES + 1):
-        response = request(project, "GET", markers, headers, params={"per_page": 100, "page": page, field: emoji}
-                           if field == "content" else {"per_page": 100, "page": page})
+        response = request(project, "GET", markers, headers, params={"per_page": 100, "page": page})
         response.raise_for_status()
         rows = response.json()
         if not isinstance(rows, list):
@@ -62,10 +59,10 @@ def own_markers(project, root, markers, headers):
         for row in rows:
             if (isinstance(row, dict) and type(row.get("id")) is int and row["id"] > 0
                     and isinstance(row.get("user"), dict) and type(row["user"].get("id")) is int
-                    and row["user"]["id"] == account["id"] and row.get(field) == emoji):
-                found.append(row["id"])
+                    and row["user"]["id"] == account["id"] and row.get("name") == "hourglass"):
+                return row["id"]
         if len(rows) < 100:
-            return found
+            return None
     raise ReviewError("Too many markers to search")
 
 
@@ -73,30 +70,25 @@ def add(project, number, comment):
     root, markers, headers = reviewer(project, number, comment)
     emoji, field = MARK[project.provider]
     if field == "name":
-        if own_markers(project, root, markers, headers):
+        if own_award(project, root, markers, headers):
             return  # An account can award an emoji once, so this one already says a request is waiting.
         response = request(project, "POST", markers, headers, params={"name": emoji})
     else:
         response = request(project, "POST", markers, headers, json={"content": emoji})
     response.raise_for_status()  # GitHub answers 200 when this account has already reacted.
+    if project.provider == "github":
+        row = response.json()
+        if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] < 1 or row.get(field) != emoji:
+            raise ReviewError("The forge did not identify the reviewer's reaction")
+        return row["id"]
 
 
-def own_reaction(project, markers, headers):
-    """The ID of this credential's reaction on the comment. An App installation token may not read
-    GET /user, but adding a reaction it already has answers 200 with that reaction, ID included."""
-    response = request(project, "POST", markers, headers, json={"content": "eyes"})
-    response.raise_for_status()
-    row = response.json()
-    if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] < 1 or row.get("content") != "eyes":
-        raise ReviewError("The forge did not identify the reviewer's reaction")
-    return [row["id"]]
-
-
-def remove(project, number, comment):
+def remove(project, number, comment, marker_id):
+    if project.provider == "github" and marker_id is None:
+        return
     root, markers, headers = reviewer(project, number, comment)
-    found = (own_reaction(project, markers, headers) if project.provider == "github"
-             else own_markers(project, root, markers, headers))
-    for ident in found:
+    ident = marker_id if project.provider == "github" else own_award(project, root, markers, headers)
+    if ident is not None:
         response = request(project, "DELETE", f"{markers}/{ident}", headers)
         if response.status_code != 404:
             response.raise_for_status()
@@ -119,25 +111,45 @@ class Acknowledgement:
         self.state = state
 
     def queued(self, project, number, comment):
-        self.attempt(lambda: add(project, number, comment), "mark", project, number, comment)
+        def mark():
+            marker = add(project, number, comment)
+            if marker is not None:
+                self.jobs.record_marker((project.key, number, comment), marker)
+        self.attempt(mark, "mark", project, number, comment)
 
     def finished(self, project, number, comment, status):
-        if status == "failed":
-            self.attempt(lambda: notify(project, number, self.state), "report the failed review on", project, number, None)
+        job = project.key, number, comment
+        acknowledgement = self.jobs.acknowledgement(job)
+        if acknowledgement is None:
+            return
+        marker, notice_sent = acknowledgement
+
+        def report_failure():
+            notify(project, number, self.state)
+            self.jobs.record_notice(job)
+
+        notice_needed = status == "failed" and not notice_sent
+        notified = not notice_needed or self.attempt(
+            report_failure, "report the failed review on", project, number, None)
 
         def clear():
-            # GitLab's one marker belongs to the merge request and stays while another request waits there.
+            # GitLab's marker stays while another request is waiting; its last request clears it.
             if project.provider != "gitlab" or not self.jobs.pending(project.key, number):
-                remove(project, number, comment)
-        self.attempt(clear, "clear the queued marker on", project, number, comment)
+                remove(project, number, comment, marker)
+
+        cleared = self.attempt(clear, "clear the queued marker on", project, number, comment)
+        if notified and cleared:
+            self.jobs.clear_acknowledgement(job)
 
     @staticmethod
     def attempt(action, verb, project, number, comment):
         try:
             action()
+            return True
         except Exception as err:
             # httpx errors quote the request URL. Report the status, or the class, and nothing else.
             detail = f"HTTP {err.response.status_code}" if isinstance(err, httpx.HTTPStatusError) else (
                      str(err) if isinstance(err, ReviewError) else type(err).__name__)
             log.warning("Could not %s %s#%d%s: %s", verb, project.slug, number,
                         f" comment {comment}" if comment else "", detail)
+            return False
