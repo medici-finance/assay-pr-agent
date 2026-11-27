@@ -54,10 +54,11 @@ def section(f):
     return f"Change {f.status} {f.previous}\n{rendered}", anchors
 
 
-def pack(files, checks, skip=frozenset(), title="", description="", advisories=()):
+def pack(files, checks, skip=frozenset(), title="", description="", advisories=(), scoped=False):
     """Build the prompt. Paths in skip are left out to fit the budget and get no anchors.
 
-    The third result lists the files that have no text to review, which is not a loss of coverage.
+    scoped says the caller passed only some of the changed files. The third result lists the
+    files that have no text to review, which is not a loss of coverage.
     """
     template = distribution("pr-agent").locate_file("pr_agent/settings/pr_reviewer_prompts.toml")
     with template.open("rb") as stream:
@@ -92,6 +93,10 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
              "added or updated that the patch does not add or change; behaviour it claims with no supporting change in "
              "the patch; changes unrelated to its stated purpose; stubbed or placeholder code (pass, TODO, "
              "NotImplementedError, an empty handler) presented as done." if change else "")
+    # A test or behaviour the description claims may sit in a changed file that is not shown.
+    if change and (scoped or no_text or any(f.path in skip for f in files)):
+        about += (" The patch does not show every changed file, so a claim about a file that is not shown "
+                  "is not a mismatch.")
     about += (" History advisories are notices from the repository's own history about files in this change, "
               "such as a file that usually changes together with a changed one. They are hints to check against "
               "the patch, not findings, and a finding still has to cite head lines present in the shown hunks." if notices else "")
@@ -175,12 +180,16 @@ def finding(issue, anchors):
     if not header or not body:
         return None, dict(dropped, reason="empty finding")
     valid = {"path": path, "line": start, "end_line": end, "title": header, "message": body}
-    quote = quoted(issue)
-    if not "".join(quote.split()):
+    quote, asked = quoted(issue)
+    parts = checkable(quote)
+    if not parts:
         # Nothing to check against the patch is not a mismatch: the finding is kept and marked.
         return dict(valid, evidence="unverified"), None
     cited = ("".join(anchors[path][line].split()) for line in range(start, end + 1))
-    if not quoted_in_order(quote, cited):
+    if not quoted_in_order(parts, cited):
+        if not asked:
+            # A fenced block in the text may be a suggested fix rather than a quote.
+            return dict(valid, evidence="unverified"), None
         return None, dict(dropped, reason="quoted code does not match the cited lines")
     return dict(valid, evidence="verified"), None
 
@@ -188,22 +197,32 @@ def finding(issue, anchors):
 FENCED = re.compile(r"`{3,}[^\n]*\n(.*?)`{3,}", re.S)
 # A quoted line as the patch shows it: indented, numbered, and marked as added.
 SHOWN = re.compile(r"\s*(?:\d+\s)?\+?")
+# Lines that stand for no code: an elision such as "..." or "# …", and the patch's hunk markers.
+PLACEHOLDER = re.compile(r"(?:#|//)?(?:\.{3,}|…)|__(?:new|old)hunk__")
 
 
 def quoted(issue):
-    """The code a finding quotes: its relevant_code field, else the first fenced block of its text."""
+    """The code a finding quotes, and whether it is the relevant_code field the prompt asks for.
+
+    Without that field, the first fenced block of its text stands in.
+    """
     code = issue.get("relevant_code")
     if isinstance(code, str):
-        return code
+        return code, True
     found = FENCED.search(issue["issue_content"])
-    return found.group(1) if found else ""
+    return (found.group(1) if found else ""), False
 
 
-def quoted_in_order(quote, cited):
+def checkable(quote):
+    """The quoted lines as code to look for: display, whitespace and placeholder lines removed."""
+    parts = ("".join(SHOWN.sub("", part, count=1).split()) for part in quote.splitlines())
+    return [part for part in parts if part and not PLACEHOLDER.fullmatch(part)]
+
+
+def quoted_in_order(parts, cited):
     """Every quoted line appears, in order, inside the cited head lines. Whitespace does not count."""
     remaining = iter(cited)
-    return all(any("".join(SHOWN.sub("", part, count=1).split()) in line for line in remaining)
-               for part in quote.splitlines() if part.strip())
+    return all(any(part in line for line in remaining) for part in parts)
 
 
 def invoke(prompt, model, anchors):
