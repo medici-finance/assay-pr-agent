@@ -71,6 +71,31 @@ class CapturePromptTest(unittest.TestCase):
         self.assertFalse((self.root / "out" / "branch.prompt.txt").exists())
         self.assertFalse(self.started.exists())
 
+    def test_a_failed_run_removes_an_earlier_prompt(self):
+        self.assertEqual(self.capture().returncode, 0)
+        result = self.capture("--max-input-tokens", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse((self.root / "out" / "branch.prompt.txt").exists())
+        self.assertFalse((self.root / "out" / "branch.anchors.json").exists())
+
+    def test_reports_why_the_model_step_failed(self):
+        spec = importlib.util.spec_from_file_location("capture_prompt", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        err, out = io.StringIO(), io.StringIO()
+        def failed(row, *_, **__):
+            # What run_pass records when the stand-in's signature no longer matches the call.
+            row.update(state="failed", model_invocations=0)
+            return None, "review() got an unexpected keyword argument"
+
+        with patch.object(cli, "run_pass", failed), \
+             contextlib.redirect_stderr(err), contextlib.redirect_stdout(out), patch.dict(os.environ, self.env, clear=True):
+            code = module.main(["capture-prompt.py", str(self.root / "out" / "branch"), "--repo", str(self.repo),
+                                "--base", self.base, "--cache-dir", str(self.root / "cache")])
+        self.assertEqual(code, 1)
+        self.assertIn("state: model-unavailable", err.getvalue())
+        self.assertIn("error: review() got an unexpected keyword argument", err.getvalue())
+
     def test_refuses_other_tiers(self):
         result = self.capture("--tier", "mid")
         self.assertEqual(result.returncode, 1)

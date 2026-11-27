@@ -37,9 +37,16 @@ def main(argv):
         return fail("only the regular tier is captured: its prompt is the one the deployed reviewer sends first")
     if args.max_input_tokens is None:
         options += ["--max-input-tokens", DEFAULT_BUDGET]
-    for module, name in ((cli, "review"), (cli.providers, "cursor_account"), (engine, "invoke")):
+    prompt_file = Path(f"{prefix}.prompt.txt")
+    anchors_file = Path(f"{prefix}.anchors.json")
+    # A failed run must not leave an earlier run's prompt to be reviewed as if it were current.
+    prompt_file.unlink(missing_ok=True)
+    anchors_file.unlink(missing_ok=True)
+    providers = getattr(cli, "providers", None)
+    for module, label, name in ((cli, "cursor_pr.cli", "review"), (providers, "cursor_pr.cli.providers", "cursor_account"),
+                                (engine, "cursor_pr.engine", "invoke")):
         if not callable(getattr(module, name, None)):
-            return fail(f"{module.__name__}.{name} no longer exists; update this script to match cli.py")
+            return fail(f"{label}.{name} no longer exists; update this script to match cli.py")
 
     captured = []
 
@@ -52,7 +59,7 @@ def main(argv):
 
     out = io.StringIO()
     with patch.object(cli, "review", side_effect=capture), \
-         patch.object(cli.providers, "cursor_account", contextlib.nullcontext), \
+         patch.object(providers, "cursor_account", contextlib.nullcontext), \
          patch.object(engine, "invoke", side_effect=refuse), \
          patch.object(sys, "argv", ["cursor-review", *options]), \
          contextlib.redirect_stdout(out):
@@ -64,15 +71,14 @@ def main(argv):
     if not captured:
         return fail(f"the review never reached the model step (state: {report.get('state')}, "
                     f"estimated input tokens: {report.get('estimated_input_tokens')}, "
-                    f"limit: {report.get('prompt_limit')}); nothing was written")
+                    f"limit: {report.get('prompt_limit')}"
+                    + (f", error: {report['error']}" if report.get("error") else "") + "); nothing was written")
     if len(captured) > 1:
         return fail(f"the review sent {len(captured)} prompts; this script expects one")
     prompt, anchors = captured[0]
-    prompt_file = Path(f"{prefix}.prompt.txt")
-    anchors_file = Path(f"{prefix}.anchors.json")
     prompt_file.parent.mkdir(parents=True, exist_ok=True)
-    prompt_file.write_text(prompt)
-    anchors_file.write_text(json.dumps({path: sorted(lines) for path, lines in anchors.items()}, indent=1))
+    prompt_file.write_text(prompt, encoding="utf-8")
+    anchors_file.write_text(json.dumps({path: sorted(lines) for path, lines in anchors.items()}, indent=1), encoding="utf-8")
     print(f"prompt: {prompt_file}")
     print(f"anchors: {anchors_file}")
     print(f"estimated input tokens: {report['estimated_input_tokens']} (limit {report['prompt_limit']})")

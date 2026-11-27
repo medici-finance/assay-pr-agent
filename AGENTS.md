@@ -28,7 +28,7 @@ Before you open a pull request, and before you push new commits to one, run this
    - The base is the branch your pull request targets. For a pull request stacked on another branch, use `origin/<that-branch>` in place of `origin/main`.
    - `--max-input-tokens 200000` is far above the deployed budget so the whole change fits. Keep it.
    - If files were left out, or the change is mostly tests, documentation or data, capture again with `--path <file>` (repeatable, exact changed paths) for the source files. Review the rest yourself.
-   - The script never calls a model. It stops with an error, and writes nothing, if the review would not have reached the model step (nothing to review, or over budget) or if `cursor_pr.cli` changed so that it can no longer capture the prompt. In that case fix the script as part of your change.
+   - The script never calls a model. It removes any earlier output at the same prefix first, then stops with an error and writes nothing if the review would not have reached the model step (nothing to review, or over budget) or if `cursor_pr.cli` changed so that it can no longer capture the prompt. In that case fix the script as part of your change.
 
 3. **Get an independent review of the prompt.** Start a fresh subagent that has seen nothing else of your work. Give it the prompt file path and the instruction below, with the two placeholders filled in. On the first run, write `none` under the second.
 
