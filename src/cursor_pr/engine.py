@@ -31,9 +31,40 @@ class CursorFailure(ReviewError):
         self.usage = usage
 
 
-def pack(files, checks):
+def hunks(f):
+    """Parsed hunks of one file's patch."""
+    # Parse under a fixed synthetic name; the source envelope owns the actual filename.
+    parsed = PatchSet("--- a/file\n+++ b/file\n" + f.patch.rstrip("\n") + "\n")
+    if len(parsed) != 1 or not parsed[0]:
+        raise ReviewError("Incomplete or unrecognized patch in " + f.path)
+    return parsed[0]
+
+
+def section(f):
+    """Prompt text and head-side anchors for one file; no text when it has no reviewable patch."""
     from pr_agent.algo.git_patch_processing import decouple_and_convert_to_hunks_with_lines_numbers
     from pr_agent.algo.types import FilePatchInfo
+    if f.absent or not f.patch:
+        return None, set()
+    anchors = {line.target_line_no for hunk in hunks(f) for line in hunk if line.target_line_no is not None}
+    if not anchors:
+        return None, anchors
+    rendered = decouple_and_convert_to_hunks_with_lines_numbers(f.patch, FilePatchInfo("", "", f.patch, f.path))
+    return f"Change {f.status} {f.previous}\n{rendered}", anchors
+
+
+def render_sections(files):
+    """Validate paths and render each patch once for full and reduced prompts."""
+    rendered = {}
+    for file in files:
+        if not file.path or any(ord(char) < 32 for char in file.path) or file.path in rendered:
+            raise ReviewError("Invalid or duplicate forge filename")
+        rendered[file.path] = section(file)
+    return rendered
+
+
+def pack(files, checks, skip=frozenset(), *, rendered=None):
+    """Build the prompt. Paths in skip are left out to fit the budget and get no anchors."""
     template = distribution("pr-agent").locate_file("pr_agent/settings/pr_reviewer_prompts.toml")
     with template.open("rb") as stream:
         rubric = tomllib.load(stream)["pr_review_prompt"]["system"]
@@ -41,26 +72,14 @@ def pack(files, checks):
         num_max_findings=MAX_FINDINGS,
         diff_hunk_format="New hunks are numbered at the head; old hunks show the former code.",
     )
+    patches = render_sections(files).items() if rendered is None else ((f.path, rendered[f.path]) for f in files)
     sections, anchors, omitted = [], {}, []
-    for f in files:
-        if not f.path or any(ord(c) < 32 for c in f.path) or f.path in anchors:
-            raise ReviewError("Invalid or duplicate forge filename")
-        anchors[f.path] = set()
-        if f.absent or not f.patch:
-            omitted.append(f.path)
-            continue
-        # Parse under a fixed synthetic name; the source envelope owns the actual filename.
-        parsed = PatchSet("--- a/file\n+++ b/file\n" + f.patch.rstrip("\n") + "\n")
-        if len(parsed) != 1 or not parsed[0]:
-            raise ReviewError("Incomplete or unrecognized patch in " + f.path)
-        for hunk in parsed[0]:
-            anchors[f.path].update(line.target_line_no for line in hunk if line.target_line_no is not None)
-        if not anchors[f.path]:
-            omitted.append(f.path)
-            continue
-        info = FilePatchInfo("", "", f.patch, f.path)
-        rendered = decouple_and_convert_to_hunks_with_lines_numbers(f.patch, info)
-        sections.append(f"Change {f.status} {f.previous}\n{rendered}")
+    for path, (text, lines) in patches:
+        anchors[path] = set() if path in skip else lines
+        if text is None:
+            omitted.append(path)
+        elif path not in skip:
+            sections.append(text)
     evidence = [finding for check in checks for finding in check["findings"]
                 if finding["line"] in anchors.get(finding["path"], set())]
     prompt = (instructions + "\nUse only the supplied patch and scanner evidence. Do not use tools. "
