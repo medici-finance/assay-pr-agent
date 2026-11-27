@@ -123,6 +123,20 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertEqual(degraded, ["src/big.py"])
         self.assertLessEqual(estimated, limit)
 
+    def test_fit_omits_metadata_before_dropping_files_that_fit(self):
+        body = "".join(f"+VALUE_{n} = {n}\n" for n in range(30))
+        files = [source.File(path, "@@ -0,0 +1,30 @@\n" + body, "added")
+                 for path in ("src/a.py", "tests/test_a.py")]
+        checks = [{"findings": [{"path": files[1].path, "line": 1, "title": "Scanner finding"}]}]
+        metadata = {"title": "Add values", "description": "word " * 80}
+        plain = engine.pack(files, checks)
+        limit = engine.tokens(plain[0])
+        full = engine.tokens(engine.pack(files, checks, **metadata)[0])
+        self.assertGreater(full, limit)
+        self.assertLess(engine.tokens(engine.pack(files[:1], checks, **metadata)[0]), limit)
+
+        self.assertEqual(cli.fit(files, checks, limit, **metadata), (plain, limit, full, []))
+
     def test_fit_retries_without_metadata_before_refusing_the_review(self):
         files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
         limit = engine.tokens(engine.pack(files, [])[0])
