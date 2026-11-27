@@ -11,7 +11,8 @@ import threading
 
 from .drift import git
 from .engine import hunks, rank, tokens
-from .source import ReviewError, child_env, git as git_bytes
+from .providers import LABELS
+from .source import ReviewError, child_env, git as git_bytes, valid_sha
 
 MID = ("change description", "overlap with the base", "surrounding code", "call sites")
 DEEP = ("change description", "overlap with the base", "earlier comments", "whole changed files",
@@ -45,9 +46,10 @@ def blob(repo, head, path):
         return None
 
 
-def live(files):
-    """Changed files that still exist at the head and have a text patch, source files first."""
-    rows = [f for f in files if f.patch and not f.absent and f.status not in ("removed", "deleted", "D")]
+def live(files, *, include_removed=False):
+    """Changed files with text patches, source files first."""
+    rows = [f for f in files if f.patch and not f.absent
+            and (include_removed or f.status not in ("removed", "deleted", "D"))]
     return sorted((f for f in rows if rank(f.path)), key=lambda f: (-rank(f.path), f.path))
 
 
@@ -94,17 +96,24 @@ def surrounding(repo, head, files, radius=25):
 def symbols(files):
     """Names of functions and types the change defines or edits inside."""
     found = []
-    for f in live(files):
-        for hunk in hunks(f):
-            # The header names the definition the hunk starts in; a later definition line takes over.
-            current = DEFINITION.match(hunk.section_header or "")
-            current = current and current[1]
+    for file in live(files, include_removed=True):
+        for hunk in hunks(file):
+            # Track the enclosing definition on each side so renames find callers of both names.
+            header = DEFINITION.match(hunk.section_header or "")
+            before = after = header[1] if header else None
             for line in hunk:
-                if not line.is_removed and (match := DEFINITION.match(line.value)):
-                    current = match[1]
-                if (line.is_added or line.is_removed) and current and current not in found:
-                    found.append(current)
-    return found[:MAX_SYMBOLS]
+                match = DEFINITION.match(line.value)
+                if match:
+                    if line.source_line_no is not None:
+                        before = match[1]
+                    if line.target_line_no is not None:
+                        after = match[1]
+                touched = before if line.is_removed else after if line.is_added else None
+                if touched and touched not in found:
+                    found.append(touched)
+                    if len(found) == MAX_SYMBOLS:
+                        return found
+    return found
 
 
 def git_lines(repo, *args, alternates=None):
@@ -239,11 +248,19 @@ def existing_tests(repo, head, files):
     return "\n\n".join(parts)
 
 
+def is_review_summary(body):
+    first, _, remainder = body.partition("\n")
+    label, _, head = first.partition(" review of ")
+    state = remainder.partition("\n")[0].strip()
+    return (label in LABELS.values() and valid_sha(head)
+            and state in ("reviewed", "partial", "empty", "degraded", "over-budget", "model-unavailable"))
+
+
 @guarded
 def earlier_comments(notes):
     """The change's conversation so far, newest last, each comment bounded."""
     rows = [note["body"].strip() for note in notes if isinstance(note.get("body"), str)]
-    rows = [body for body in rows if body and not body.startswith("/review")]
+    rows = [body for body in rows if body and not body.startswith("/review") and not is_review_summary(body)]
     return "\n\n".join(f"## Comment {index}\n{body[:1500]}" for index, body in enumerate(rows[-10:], 1))
 
 

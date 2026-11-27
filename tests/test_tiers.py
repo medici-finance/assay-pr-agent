@@ -293,6 +293,23 @@ class TierTests(unittest.TestCase):
             "The deep pass did not complete.",
             "A verification pass kept 1 of 3 findings."])
 
+    def test_large_high_tier_comment_preserves_findings_and_static_summary(self):
+        report = self.check("--tier", "max", "--estimate")[1]
+        message = "多" * 1700
+        findings = [dict(path="src/app.py", line=n, end_line=n, title=f"Finding {n}", message=message)
+                    for n in range(1, 11)]
+        checks = [{"tool": "fixture", "state": "could-not-check", "path": "src/example.py", "findings": []}]
+        report.update(state="reviewed", provider="cursor", findings=findings, checks=checks)
+        with patch.object(cli, "post_comment") as post:
+            cli.publish("org/repo#1", self.head, report)
+        comment = post.call_args.args[3]
+        self.assertLessEqual(len(comment.encode("utf-8")), cli.FORGE_COMMENT_BYTES)
+        for n in range(1, 11):
+            self.assertIn(f"Finding {n} ", comment)
+        self.assertIn("fixture: could not check", comment)
+        self.assertIn("JSON report retains", comment)
+        self.assertTrue(all(item["message"] == message for item in report["findings"]))
+
     def test_one_oversized_changed_file_does_not_remove_the_others_context(self):
         self.write("src/generated.py", "".join(f"TABLE_{n} = {n}\n" for n in range(context.MAX_BLOB // 10)))
         self.commit("add a large generated file")

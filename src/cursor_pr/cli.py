@@ -30,6 +30,7 @@ from .source import ReviewError, ci_refs, forge_change, local_change, post_comme
 
 
 MAX_DEGRADED_ROWS = 50
+FORGE_COMMENT_BYTES = 16 * 1024
 # Each tier's whole budget is this multiple of the configured input-token limit.
 TIERS = {"regular": 1, "mid": 2, "max": 10}
 CAPS = {"regular": MAX_FINDINGS, "mid": 6, "max": 10}
@@ -144,18 +145,52 @@ def total_usage(passes):
     return totals or None
 
 
+def finding_line(issue, *, compact=False):
+    # Fence displayed text after clipping so the shortened value stays literal.
+    path = fence(issue["path"], 120 if compact else None)
+    title = fence(issue["title"], 60 if compact else None)
+    message = fence(issue["message"], 140 if compact else None)
+    return f"- {path}:{issue['line']} — {title}. {message}"
+
+
+def comment_text(rows):
+    # A finding may quote multiline source, including forge quick actions.
+    return "\n".join(" ".join(line.splitlines()) for line in rows) + "\n"
+
+
+def fit_tier_comment(header, findings, details, footer):
+    """Keep the tier summary and shortened findings before optional evidence rows."""
+    body = comment_text(header + [finding_line(issue, compact=True) for issue in findings]
+                        + ["Some details were shortened to fit the forge comment. The JSON report retains them."])
+    end = comment_text(footer)
+    omitted = f"{len(details)} additional rows omitted."
+    remaining = FORGE_COMMENT_BYTES - len((body + end + omitted + "\n").encode("utf-8"))
+    included = []
+    for row in details:
+        rendered = comment_text([row])
+        size = len(rendered.encode("utf-8"))
+        if size <= remaining:
+            included.append(rendered)
+            remaining -= size
+    if len(included) < len(details):
+        included.append(f"{len(details) - len(included)} additional rows omitted.\n")
+    return body + "".join(included) + end
+
+
 def publish(address, head, report, *, project=None, state=None):
     _, number = address.rsplit("#", 1)
     label = providers.LABELS[report.get("provider", "cursor")]
     body = [f"{label} review of {head}", report["state"]]
     degraded = report.get("degraded") or []
+    coverage = []
     if degraded:
         body.append(f"Degraded review: the full prompt is an estimated {report['full_input_tokens']} tokens, "
                     f"over the limit of {report.get('prompt_limit', report['max_input_tokens'])}. "
                     f"{label} did not review these files:")
-        body.extend(f"- Not reviewed (token limit): {fence(path)}" for path in degraded[:MAX_DEGRADED_ROWS])
+        coverage.extend(f"- Not reviewed (token limit): {fence(path)}" for path in degraded[:MAX_DEGRADED_ROWS])
         if len(degraded) > MAX_DEGRADED_ROWS:
-            body.append(f"- Not reviewed (token limit): {len(degraded) - MAX_DEGRADED_ROWS} more files")
+            coverage.append(f"- Not reviewed (token limit): {len(degraded) - MAX_DEGRADED_ROWS} more files")
+    intro, body = body, []
     tier = report.get("tier", "regular")
     if tier != "regular" and report.get("delivered") is None:
         # Nothing reached the model: the state line below says why, and no tier or context was delivered.
@@ -182,8 +217,8 @@ def publish(address, head, report, *, project=None, state=None):
             body.append(f"A verification pass kept {check['after']} of {check['before']} findings.")
     # Paths come from the PR and titles/messages from the model: quote them as code
     # so the reviewer identity never posts a Markdown link or @mention for an attacker.
-    for issue in report["findings"]:
-        body.append(f"- {fence(issue['path'])}:{issue['line']} — {fence(issue['title'])}. {fence(issue['message'])}")
+    header, body = body, []
+    findings = [finding_line(issue) for issue in report["findings"]]
     if report["state"] == "over-budget":
         body.append(f"Skipped {label}. Estimated prompt {report['estimated_input_tokens']} tokens "
                     f"exceeds the limit of {report.get('prompt_limit', report['max_input_tokens'])}.")
@@ -205,9 +240,12 @@ def publish(address, head, report, *, project=None, state=None):
         body.extend(["", *drift.summary(report["drift"]), ""])
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {fence(path)}")
-    body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
-    # A finding may quote a multiline source fragment, including forge quick actions.
-    text = "\n".join(" ".join(line.splitlines()) for line in body) + "\n"
+    footer = ["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."]
+    text = comment_text(intro + coverage + header + findings + body + footer)
+    if tier != "regular" and len(text.encode("utf-8")) > FORGE_COMMENT_BYTES:
+        text = fit_tier_comment(intro + header, report["findings"], body + coverage, footer)
+        if len(text.encode("utf-8")) > FORGE_COMMENT_BYTES:
+            raise ReviewError("Higher-tier review exceeded the forge comment limit")
     post_comment(project, int(number), head, text, state if state is not None else state_dir())
 
 

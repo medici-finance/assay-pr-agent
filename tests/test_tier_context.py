@@ -66,6 +66,15 @@ class TierContextTests(unittest.TestCase):
         self.assertTrue(text.startswith("## one.py at the head"))
         blob.assert_called_once_with(None, "head", "one.py")
 
+    def test_prior_review_summaries_do_not_displace_human_comments(self):
+        notes = [{"body": "Please keep this design note."},
+                 *[{"body": f"Codex review of {'a' * 40}\nreviewed\nOld model finding {i}"} for i in range(12)],
+                 {"body": "/review-max"}, {"body": "This is a new design note."}]
+        context_text = context.earlier_comments(notes)
+        self.assertIn("## Comment 1\nPlease keep this design note.", context_text)
+        self.assertIn("## Comment 2\nThis is a new design note.", context_text)
+        self.assertNotIn("Old model finding", context_text)
+
     def test_verification_preserves_distinct_findings_at_the_same_location(self):
         issue = dict(path="app.py", line=1, end_line=1, title="First issue", message="First defect")
         other = dict(issue, title="Other issue", message="Different defect")
@@ -116,6 +125,16 @@ class CallSiteTests(unittest.TestCase):
         # The hunk header names beta_fn and the hunk shows the def line of gamma_fn; only gamma_fn changes.
         _, files = self.change(self.module.replace("return 3", "return 30"))
         self.assertEqual(context.symbols(files), ["gamma_fn"])
+
+    def test_renamed_and_removed_definitions_keep_their_old_caller_names(self):
+        head, files = self.change(self.module.replace("def gamma_fn", "def renamed_fn"))
+        self.assertEqual(context.symbols(files), ["gamma_fn", "renamed_fn"])
+        self.assertIn("## Uses of gamma_fn\na:b.py:1: x = gamma_fn()", context.call_sites(self.repo, head, files))
+
+        self.git("rm", "app.py")
+        self.git("commit", "-qm", "remove module")
+        deleted = local_change(self.repo, "main", "HEAD").files
+        self.assertIn("gamma_fn", context.symbols(deleted))
 
     def test_one_name_does_not_crowd_another_out_of_a_file(self):
         head, files = self.change(self.module.replace("return 1", "return 10"))
