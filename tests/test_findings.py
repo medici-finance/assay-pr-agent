@@ -319,6 +319,36 @@ class QuotedEvidenceTests(unittest.TestCase):
                                      shown("  result = 1  "))
         self.assertEqual(parsed["findings"][0]["evidence"], "verified")
 
+    def test_raw_quote_preserves_relative_indentation(self):
+        anchors = shown("    if ready:", "        send()", "    finish()")
+        for quote, expected in (("if ready:\n    send()\nfinish()", "verified"),
+                                ("if ready:\n    send()\n    finish()", "unverified")):
+            with self.subTest(quote=quote):
+                parsed = engine.parse_answer(envelope([dict(issue(start=1, end=3), relevant_code=quote)]), anchors)
+                self.assertEqual(parsed["findings"][0]["evidence"], expected)
+
+    def test_covered_alignment_must_include_a_substantive_match(self):
+        parsed = engine.parse_answer(envelope([dict(issue(start=1, end=2), relevant_code="1 +x\n...")]),
+                                     shown("x", "1 +x"))
+        self.assertEqual(parsed["findings"][0]["evidence"], "unverified")
+
+    def test_non_ascii_space_is_not_a_blank_source_line(self):
+        parsed = engine.parse_answer(envelope([dict(issue(start=1, end=3), relevant_code="before()\nafter()")]),
+                                     shown("before()", "\u00a0", "after()"))
+        self.assertEqual(parsed["findings"][0]["evidence"], "unverified")
+
+    def test_an_elision_scans_a_blank_run_once_per_quote_line(self):
+        class BlankLine(str):
+            inspections = 0
+
+            def strip(self, *args):
+                BlankLine.inspections += 1
+                return super().strip(*args)
+
+        cited = [(n, BlankLine(" ")) for n in range(1, 101)] + [(101, "return x")]
+        self.assertTrue(engine.covers(engine.checkable("...\nreturn x"), cited))
+        self.assertLess(BlankLine.inspections, 4 * len(cited))
+
     def test_blank_cited_lines_need_no_quote(self):
         anchors = shown("first = 1", "", "second = 2")
         parsed = engine.parse_answer(envelope([dict(issue(start=1, end=3), relevant_code="first = 1\nsecond = 2")]), anchors)
@@ -360,6 +390,12 @@ class QuotedEvidenceTests(unittest.TestCase):
         fix = issue(start=4, end=4, body="It adds up.\n```\ntotal = sum(items)\n```\n")
         parsed = self.parse(fix)
         self.assertEqual(([f["evidence"] for f in parsed["findings"]], parsed["dropped"]), (["unverified"], []))
+
+    def test_a_fenced_quote_can_contain_a_shorter_backtick_run(self):
+        source_line = 'const fence = "```";'
+        body = "````js\n" + source_line + "\n````"
+        [finding] = engine.parse_answer(envelope([issue(start=1, end=1, body=body)]), shown(source_line))["findings"]
+        self.assertEqual(finding["evidence"], "verified")
 
     def test_pack_records_the_text_of_every_shown_head_line(self):
         patch = "@@ -1,2 +1,2 @@\n first()\n-old\n+  third( x )\n"

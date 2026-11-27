@@ -555,8 +555,7 @@ def finding(issue, anchors, *, normalized=False, verification=False):
 def quoted_evidence(code, message, lines, start, end):
     """Return an evidence status, or None when the explicit quote contradicts the patch."""
     asked = isinstance(code, str)
-    block = FENCED.search(message) if not asked else None
-    quote = code if asked else block.group(1) if block else ""
+    quote = code if asked else fenced_quote(message)
     parts = checkable(quote)
     concrete = [part for part in parts if part is not ELIDED]
     if not concrete or not isinstance(lines, dict):
@@ -565,18 +564,31 @@ def quoted_evidence(code, message, lines, start, end):
     if not quoted_in_order(concrete, cited):
         # A fenced block in the message may be a suggested fix.
         return None if asked else "unverified"
-    strong = any(substantive(line) for part in concrete for index, line in cited if matches(part, index, line))
-    return "verified" if strong and covers(parts, cited) else "unverified"
+    if covers(parts, cited, single_line=len(concrete) == 1):
+        return "verified"
+    quote_margin = common_indent(part[0] for part in concrete)
+    source_margin = common_indent(line for _, line in cited if line.strip(" \t"))
+    if quote_margin != source_margin and covers(parts, cited, quote_margin=quote_margin, source_margin=source_margin):
+        return "verified"
+    return "unverified"
 
 
-FENCED = re.compile(r"`{3,}[^\n]*\n(.*?)`{3,}", re.S)
+FENCE_START = re.compile(r"(?m)^[ \t]*(`{3,})(?!`)[^`\r\n]*\r?\n")
 # A quoted line as the patch shows it: indented, numbered, and marked as added.
 SHOWN = re.compile(r"([1-9]\d*) (?:\+| )(.*)")
 # An explicit elision such as "..." or "# …": it stands for cited lines the quote leaves out.
 ELISION = re.compile(r"(?:#|//)?(?:\.{3,}|…)")
 # The patch display's hunk markers stand for no code at all.
 MARKER = re.compile(r"__(?:new|old)hunk__")
-ELIDED = "elided"
+ELIDED = object()
+
+
+def fenced_quote(message):
+    opening = FENCE_START.search(message)
+    if opening is None:
+        return ""
+    closing = re.compile(rf"(?m)^[ \t]*`{{{len(opening[1])},}}[ \t]*\r?$").search(message, opening.end())
+    return message[opening.end():closing.start()] if closing else ""
 
 
 def quoted(issue):
@@ -599,7 +611,7 @@ def checkable(quote):
     parts = []
     for raw in quote.split("\n"):
         raw = raw.removesuffix("\r")
-        text = raw.strip(" \t")
+        text = raw.rstrip(" \t")
         shown = SHOWN.fullmatch(raw.lstrip(" \t"))
         if shown:
             parts.append((text, shown[1], shown[2]))
@@ -617,7 +629,7 @@ def checkable(quote):
 
 def matches(part, index, line):
     text, number, content = part
-    return text == line.strip(" \t") or (number == str(index) and content == line)
+    return text.lstrip(" \t") == line.strip(" \t") or (number == str(index) and content == line)
 
 
 def quoted_in_order(parts, cited):
@@ -626,24 +638,48 @@ def quoted_in_order(parts, cited):
     return all(any(matches(part, index, line) for index, line in remaining) for part in parts)
 
 
-def covers(parts, cited):
-    """Whether the quote accounts for every non-blank cited line, each quoted or inside an explicit elision."""
-    reach = {0}  # the cited positions the quote so far can have accounted for exactly
+def common_indent(lines):
+    return os.path.commonprefix([line[:len(line) - len(line.lstrip(" \t"))] for line in lines])
+
+
+def evidence_matches(part, index, line, quote_margin, source_margin, single_line):
+    text, number, content = part
+    if number == str(index) and content == line:
+        return True
+    line = line.rstrip(" \t")
+    if single_line:
+        return text.lstrip(" \t") == line.lstrip(" \t")
+    return (text.startswith(quote_margin) and line.startswith(source_margin)
+            and text.removeprefix(quote_margin) == line.removeprefix(source_margin))
+
+
+def covers(parts, cited, *, quote_margin="", source_margin="", single_line=False):
+    """Find coverage with consistent indentation and a substantive match on the same alignment."""
+    reach = {0: False}  # next cited position -> whether any alignment here matched substantive code
     for part in parts:
+        if not reach:
+            return False
         if part is ELIDED:
-            reach = set(range(min(reach), len(cited) + 1)) if reach else set()
+            strong_from = min((pos for pos, strong in reach.items() if strong), default=len(cited) + 1)
+            reach = {pos: pos >= strong_from for pos in range(min(reach), len(cited) + 1)}
             continue
-        step = set()
-        for position in sorted(reach):
-            while position < len(cited):
-                if matches(part, *cited[position]):
-                    step.add(position + 1)
-                if cited[position][1].strip():
+        step = {}
+        last = max(reach)
+        reachable = strong = False
+        for position in range(min(reach), len(cited)):
+            if position in reach:
+                reachable = True
+                strong = strong or reach[position]
+            index, line = cited[position]
+            if reachable and evidence_matches(part, index, line, quote_margin, source_margin, single_line):
+                step[position + 1] = strong or substantive(line)
+            if line.strip(" \t"):
+                if position >= last:
                     break
-                position += 1
+                reachable = strong = False
         reach = step
-    last_nonblank = max((position for position, (_, line) in enumerate(cited) if line.strip()), default=-1)
-    return any(position > last_nonblank for position in reach)
+    last_nonblank = max((pos for pos, (_, line) in enumerate(cited) if line.strip(" \t")), default=-1)
+    return any(strong and pos > last_nonblank for pos, strong in reach.items())
 
 
 def substantive(content):
