@@ -1,6 +1,7 @@
 import argparse
 import fcntl
 from contextlib import ExitStack
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -23,7 +24,7 @@ from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
 from .engine import CursorFailure, pack, review, section, tokens
-from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
+from .source import ReviewError, ci_refs, classify_absent, forge_change, local_change, post_comment, valid_sha
 
 
 LOCKS = {"package-lock.json", "pnpm-lock.yaml", "go.sum", "npm-shrinkwrap.json"}
@@ -222,6 +223,10 @@ def execute(args):
             if args.expected_change_url != project.change_url(number):
                 raise ReviewError("Managed checkout and reviewed project differ")
             checkout = stack.enter_context(scan_checkout(root, project, number, change.head))
+        if args.change:
+            # A local diff already tells binary from text; a forge's missing patch is checked against the head blob.
+            change = dataclasses.replace(change, files=classify_absent(checkout, change.head, change.files))
+            files = sorted((f for f in change.files if f.path in selected), key=lambda f: f.path)
         checks = scan_files(checkout, change.head, files)
         deadline = time.monotonic() + 180
         for tool, path in missing:
@@ -294,6 +299,9 @@ def execute(args):
         report["coverage"]["reviewed"] = prompt_files - len(degraded)
         if cached:
             report["cursor_usage"] = None
+    if report.get("dropped") and not report["findings"]:
+        # The model answered but nothing it said could be checked: as unusable as no answer, whatever the coverage.
+        return dict(report, state="findings-dropped"), 2
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
     if degraded:
         report["state"] = "degraded"
