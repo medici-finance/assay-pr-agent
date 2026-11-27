@@ -19,8 +19,8 @@ import yaml
 from . import context, drift, engine, history, providers, scanners
 from .scanners import fence
 from .login import auth_mode, login_directory
-from .setup import locked, apply_saved_setup, load_provider_key, max_input_tokens, state_dir
-from .config import DEFAULT_MAX_INPUT_TOKENS, load_config, project_from
+from .setup import locked, apply_saved_setup, load_provider_key, max_findings, max_input_tokens, state_dir
+from .config import DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, FINDINGS_SETTINGS, MAX_FINDINGS_LIMIT, load_config, project_from
 from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import go_report, scan_files
@@ -34,7 +34,6 @@ MAX_DEGRADED_ROWS = 50
 FORGE_COMMENT_BYTES = 16 * 1024
 # Each tier's whole budget is this multiple of the configured input-token limit.
 TIERS = {"regular": 1, "mid": 2, "max": 10}
-CAPS = {"regular": MAX_FINDINGS, "mid": 6, "max": 10}
 TIMEOUTS = {"regular": 120, "mid": 240, "max": 480}
 DEEP_FOCUS = ("Look for what only this wider view shows: a caller the change breaks, behaviour the existing "
               "tests do not cover, and a description or earlier comment the change contradicts or leaves unanswered.")
@@ -160,15 +159,48 @@ def total_usage(passes):
     return totals or None
 
 
-def finding_line(issue, *, compact=False, shorten_path=False):
+def finding_line(issue, *, compact=False, shorten_path=False, clip=None):
     # Fence displayed text after clipping so the shortened value stays literal.
     path = issue["path"]
     if shorten_path and len(path) > 80:
         tag = hashlib.sha256(path.encode("utf-8")).hexdigest()[:12]
         path = f"…/{path[-80:]} [{tag}]"
     title = fence(issue["title"], 60 if compact else None)
-    message = fence(issue["message"], 140 if compact else None)
-    return f"- {fence(path)}:{issue['line']} — {title}. {message}"
+    message = fence(issue["message"], 140 if compact else clip)
+    return f"- {fence(path)}:{issue['line']} — {title}. {message}" + (" (shortened)" if clip else "")
+
+
+def size_of(text):
+    return len(text.encode("utf-8"))
+
+
+def shortened_finding(issue, allowance):
+    """The finding row with the longest message that fits, keeping at least the compact 140 characters."""
+    low, high, best = 140, len(issue["message"]), None
+    while low <= high:
+        middle = (low + high) // 2
+        row = comment_text([finding_line(issue, clip=middle)])
+        if size_of(row) <= allowance:
+            best, low = row, middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def bounded_findings(issues, space):
+    """Share space evenly among findings, shortening only the longest messages; None when they cannot fit."""
+    full = [comment_text([finding_line(issue)]) for issue in issues]
+    rows = list(full)
+    remaining = space
+    order = sorted(range(len(issues)), key=lambda index: size_of(full[index]))
+    for position, index in enumerate(order):
+        share = remaining // (len(order) - position)
+        if size_of(rows[index]) > share:
+            rows[index] = shortened_finding(issues[index], share)
+            if rows[index] is None:
+                return None
+        remaining -= size_of(rows[index])
+    return rows
 
 
 def comment_text(rows):
@@ -269,7 +301,7 @@ def publish(address, head, report, *, project=None, state=None):
             body.append(f"A verification pass kept {check['after']} of {check['before']} findings.")
         if omitted_findings := report.get("omitted_findings"):
             noun = "finding" if omitted_findings == 1 else "findings"
-            body.append(f"{omitted_findings} {noun} omitted by the {CAPS[tier]}-finding tier limit.")
+            body.append(f"{omitted_findings} {noun} omitted by the {report['max_findings']}-finding tier limit.")
     # Paths come from the PR and titles/messages from the model: quote them as code
     # so the reviewer identity never posts a Markdown link or @mention for an attacker.
     header, body = body, []
@@ -297,11 +329,27 @@ def publish(address, head, report, *, project=None, state=None):
     extra = [f"- Not reviewed (token limit): {extra_coverage} more files"] if extra_coverage else []
     footer = ["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."]
     text = comment_text(intro + coverage + extra + header + findings + body + outside + footer)
-    if tier != "regular" and len(text.encode("utf-8")) > FORGE_COMMENT_BYTES:
+    # The forge helper refuses a body over 16 KiB: shorten rather than lose the whole comment.
+    if tier == "regular" and findings and size_of(text) > FORGE_COMMENT_BYTES:
+        # Keep every other row whole and shorten the longest finding messages first.
+        before = comment_text(intro + coverage + extra + header + ["Some findings were shortened to fit the forge comment."])
+        after = comment_text(body + outside + footer)
+        rows = bounded_findings(report["findings"], FORGE_COMMENT_BYTES - size_of(before + after))
+        if rows is not None:
+            text = before + "".join(rows) + after
+    if size_of(text) > FORGE_COMMENT_BYTES:
         text = fit_tier_comment(intro + header, report["findings"], coverage, extra_coverage, outside, body, footer)
-        if len(text.encode("utf-8")) > FORGE_COMMENT_BYTES:
-            raise ReviewError("Higher-tier review exceeded the forge comment limit")
+        if size_of(text) > FORGE_COMMENT_BYTES:
+            raise ReviewError("Review exceeded the forge comment limit")
     post_comment(project, int(number), head, text, state if state is not None else state_dir())
+
+
+def findings_option(value):
+    """A findings cap as the environment accepts it: int() syntax within the bound."""
+    number = int(value)
+    if not 1 <= number <= MAX_FINDINGS_LIMIT:
+        raise ValueError(f"findings cap must be from 1 to {MAX_FINDINGS_LIMIT}")
+    return number
 
 
 def parser():
@@ -322,6 +370,9 @@ def parser():
     p.add_argument("--model", help="Explicit provider model (otherwise the CLI default)")
     p.add_argument("--max-input-tokens", type=int,
                    help=f"Preflight estimate limit (default {DEFAULT_MAX_INPUT_TOKENS}, or the saved REVIEW_MAX_INPUT_TOKENS setting)")
+    p.add_argument("--max-findings", type=findings_option,
+                   help=f"Findings cap of the requested tier, 1 to {MAX_FINDINGS_LIMIT} (default {DEFAULT_MAX_FINDINGS}, or the "
+                        "saved " + ", ".join(FINDINGS_SETTINGS.values()) + " setting for that tier)")
     p.add_argument("--tier", choices=list(TIERS), default="regular",
                    help="Review depth: mid and max add context beyond the patch at 2 and 10 times the token limit")
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling the model")
@@ -400,12 +451,13 @@ def execute(args):
         checks.append(go)
 
     tier, base = args.tier, args.max_input_tokens
+    caps = getattr(args, "findings_caps", None) or dict.fromkeys(TIERS, DEFAULT_MAX_FINDINGS)
     budget = base * TIERS[tier]
     backend = providers.provider()
     # Mid and max send the same first prompt, so a max review reuses a cached mid result.
     limit = base if tier == "regular" else 2 * base - base // 4
     first_tier = "regular" if tier == "regular" else "mid"
-    cap = CAPS[first_tier]
+    cap = caps[first_tier]
     rendered = render_sections(files)
     metadata = {"title": change.title, "description": change.description} if tier == "regular" else {}
     (prompt, anchors, unseen, has_text), estimated, full, dropped = fit(
@@ -452,7 +504,7 @@ def execute(args):
               "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
               "findings": [], "cursor_usage": None, "full_input_tokens": full, "degraded": degraded,
               "drift": drifted, "passes": passes, "context": list(context_fates.values()),
-              "verification": {"state": "not-needed"}, "delivered": planned_tier}
+              "verification": {"state": "not-needed"}, "delivered": planned_tier, "max_findings": caps[tier]}
     if static:
         report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
@@ -498,11 +550,13 @@ def execute(args):
                     findings = verdict["findings"]
                     report["verification"] = {"state": "filtered", "before": before, "after": len(findings)}
                 break
-    cap = CAPS[tier]
+    cap = caps[tier]
     if len(findings) > cap:
         report["omitted_findings"] = len(findings) - cap
         from_deep = [issue for issue in findings if issue in deep_findings]
         from_first = [issue for issue in findings if issue not in deep_findings]
+        # A max cap below the mid cap can leave more deep findings than the cap allows.
+        from_deep = from_deep[:cap]
         findings = from_first[:cap - len(from_deep)] + from_deep
     report.update(findings=findings, cursor_usage=total_usage(passes),
                   cache_hit=bool(passes) and all(row["state"] == "cached" for row in passes),
@@ -565,6 +619,9 @@ def main():
                 stack.enter_context(providers.cursor_account())
             if args.max_input_tokens is None:
                 args.max_input_tokens = max_input_tokens(state)
+            args.findings_caps = max_findings(state)
+            if args.max_findings is not None:
+                args.findings_caps[args.tier] = args.max_findings
             if args.model is None:
                 args.model = os.getenv("REVIEW_MODEL")
             if args.change:

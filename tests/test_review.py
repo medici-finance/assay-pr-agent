@@ -44,7 +44,8 @@ class ReviewTest(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         # Tests exercise the saved and default budgets; a shell REVIEW_MAX_INPUT_TOKENS would win over both.
-        os.environ.pop("REVIEW_MAX_INPUT_TOKENS", None)
+        for name in ("REVIEW_MAX_INPUT_TOKENS", *cli.FINDINGS_SETTINGS.values()):
+            os.environ.pop(name, None)
 
     def git(self, *args):
         return subprocess.check_output(["git","-c","user.name=Test","-c","user.email=test@example.org",

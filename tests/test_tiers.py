@@ -65,7 +65,8 @@ class TierTests(unittest.TestCase):
                                       "REVIEW_STATE_DIR": str(Path(tmp.name) / "state")})
         env.start()
         self.addCleanup(env.stop)
-        os.environ.pop("REVIEW_MAX_INPUT_TOKENS", None)
+        for name in ("REVIEW_MAX_INPUT_TOKENS", *cli.FINDINGS_SETTINGS.values()):
+            os.environ.pop(name, None)
 
     def git(self, *args):
         return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.org",
@@ -170,7 +171,48 @@ class TierTests(unittest.TestCase):
         self.assertEqual(report["verification"], {"state": "filtered", "before": 3, "after": 2})
         self.assertLessEqual(report["estimated_input_tokens"], report["max_input_tokens"])
 
+    def test_configured_cap_is_asked_for_and_enforced_per_tier(self):
+        # The fixture's review answer has two findings.
+        os.environ["REVIEW_MAX_FINDINGS"] = "1"
+        code, report = self.check()
+        self.assertEqual((code, report["state"], report["max_findings"]), (2, "model-unavailable", 1))
+        self.assertIn("A concise list (0-1 issues)", self.prompts()[-1][1])
+        os.environ["REVIEW_MAX_FINDINGS"] = "2"
+        code, report = self.check()
+        self.assertEqual((code, report["state"], report["cache_hit"]), (0, "reviewed", False))
+        self.assertIn("A concise list (0-2 issues)", self.prompts()[-1][1])
+        self.assertEqual(len(report["findings"]), 2)
+        self.assertTrue(self.check()[1]["cache_hit"])
+        # The option overrides the requested tier only, and a new cap is a new prompt and cache entry.
+        code, report = self.check("--max-findings", "3")
+        self.assertEqual((report["state"], report["max_findings"], report["cache_hit"]), ("reviewed", 3, False))
+        self.assertIn("A concise list (0-3 issues)", self.prompts()[-1][1])
+        (self.bin / "prompts").unlink()
+        os.environ["REVIEW_MAX_FINDINGS_MID"] = "4"
+        code, report = self.check("--tier", "mid")
+        self.assertEqual(report["max_findings"], 4)
+        self.assertIn("A concise list (0-4 issues)", self.prompts()[0][1])
+        (self.bin / "prompts").unlink()
+        os.environ["REVIEW_MAX_FINDINGS_MAX"] = "1"
+        found = [finding(42, "Real"), finding(41, "Spurious"), finding(43, "Deep")]
+        self.answers(deep=answer(found[0], found[2]), verification=answer(*found))
+        code, report = self.check("--tier", "max")
+        # Two deep findings and a cap of one: the report keeps one deep finding.
+        self.assertEqual((report["max_findings"], report["omitted_findings"]), (1, 2))
+        self.assertEqual([f["title"] for f in report["findings"]], ["Real"])
+        # A max review's first pass is the mid prompt, under the mid cap, and reuses the cached mid answer.
+        self.assertEqual(report["passes"][0]["state"], "cached")
+
+    def test_cli_rejects_a_cap_outside_the_bound(self):
+        for value in ("0", "13", "x"):
+            with self.subTest(value=value), self.assertRaises(SystemExit), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                cli.parser().parse_args(["--base", "main", "--max-findings", value])
+        self.assertEqual(cli.parser().parse_args(["--base", "main", "--max-findings", "12"]).max_findings, 12)
+
     def test_max_retains_deep_findings_and_reports_the_cap(self):
+        # The cap PR #43 gave the max tier, now set through its environment override.
+        os.environ["REVIEW_MAX_FINDINGS_MAX"] = "10"
         first = [finding(42, f"First {index}") for index in range(1, 7)]
         deep = [finding(42, f"Deep {index}") for index in range(1, 7)]
         self.answers(review=answer(*first), deep=answer(*deep))
@@ -246,7 +288,7 @@ class TierTests(unittest.TestCase):
     def test_tier_falls_back_to_the_one_below_and_says_so(self):
         change = cli.local_change(self.root, "main", self.head)
         files = sorted(change.files, key=lambda f: f.path)
-        patch_size = engine.tokens(engine.pack(files, [], max_findings=cli.CAPS["mid"])[0])
+        patch_size = engine.tokens(engine.pack(files, [], max_findings=cli.DEFAULT_MAX_FINDINGS)[0])
         # The first-pass allowance leaves room for the patch, with too little left for context.
         tight = (patch_size + 60) * 4 // 7
         code, report = self.check("--tier", "mid", "--max-input-tokens", str(tight))
@@ -527,6 +569,19 @@ class TierRequestTests(unittest.TestCase):
             self.assertEqual("--tier" in argv, expected)
             if expected:
                 self.assertEqual(argv[argv.index("--tier") + 1], tier)
+
+    def test_poller_passes_the_cap_of_the_requested_tier(self):
+        done = subprocess.CompletedProcess([], 0, stdout=json.dumps({"state": "reviewed",
+                                                                     "publication": "posted-or-already-present"}))
+        os.environ.update(REVIEW_MAX_FINDINGS="2", REVIEW_MAX_FINDINGS_MID="5")
+        for tier, expected in (("regular", "2"), ("mid", "5"), ("max", None)):
+            with patch("cursor_pr.poll.subprocess.run", return_value=done) as run, \
+                 patch("cursor_pr.poll.history.interval", return_value=0):
+                self.assertEqual(run_review(self.gh, 3, self.state, tier), "reviewed")
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[argv.index("--max-findings") + 1] if "--max-findings" in argv else None, expected)
+            # The child inherits the other tiers' caps, which a max review's first pass needs.
+            self.assertEqual(run.call_args.kwargs["env"]["REVIEW_MAX_FINDINGS_MID"], "5")
 
 
 if __name__ == "__main__":

@@ -15,13 +15,14 @@ import uuid
 
 from . import accounts, dialog, providers, provision, gitlab_tls
 from .login import auth_mode, ensure_session, login_directory, login_env
-from .config import DEFAULT_MAX_INPUT_TOKENS, parse_projects, project_base, prompt_config
+from .config import (DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, FINDINGS_SETTINGS, MAX_FINDINGS_LIMIT,
+                     parse_projects, project_base, prompt_config)
 from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secret, validate_pem, validate_token
 
 CURSOR = "CURSOR_API_KEY"
 SECRETS = {CURSOR: "cursor.key", "ANTHROPIC_API_KEY": "claude.key", "CODEX_API_KEY": "codex.key", KEY: "github.pem", TOKEN: "gitlab.token", **gitlab_tls.NAMES}
 SETTINGS = ("REVIEW_OPERATOR", APP_ID, INSTALL_ID, "REVIEW_MODEL", "REVIEW_MAX_INPUT_TOKENS",
-            "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER", "REVIEW_CURSOR_TEAM_ID", "REVIEW_AUTH_MODE", "REVIEW_LOGIN_PROFILE")
+            *FINDINGS_SETTINGS.values(), "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER", "REVIEW_CURSOR_TEAM_ID", "REVIEW_AUTH_MODE", "REVIEW_LOGIN_PROFILE")
 
 
 def state_dir():
@@ -123,29 +124,40 @@ def apply_saved_setup(state, *, sync_only=False):
             os.environ.setdefault(k, v)
 
 
-def max_input_tokens(state):
-    """Effective prompt budget: container environment, then saved setup, then the default.
+def saved_integer(state, name, default, upper=None):
+    """Effective integer setting: container environment, then saved setup, then the default.
 
     Environment values keep the int() syntax the CLI has always accepted, such as
     "6_000" or "+6000"; the saved setting is written by the wizard as plain digits.
     """
-    value = os.environ.get("REVIEW_MAX_INPUT_TOKENS")
+    value = os.environ.get(name)
     saved = value is None and (state / "setup").is_symlink()
     if saved:
         with locked(state, fcntl.LOCK_SH):
             settings = json.loads((active_bundle(state) / "settings.json").read_text())["settings"]
-        value = settings.get("REVIEW_MAX_INPUT_TOKENS")
+        value = settings.get(name)
     if value is None:
-        return DEFAULT_MAX_INPUT_TOKENS
+        return default
     if isinstance(value, str):
         value = value.strip()
         try:
             value = int(value) if not saved or (value.isascii() and value.isdecimal()) else None
         except ValueError:
             value = None
-    if type(value) is not int or value < 1:
-        raise ValueError("REVIEW_MAX_INPUT_TOKENS must be a positive integer")
+    if type(value) is not int or value < 1 or (upper is not None and value > upper):
+        raise ValueError(f"{name} must be " + (f"an integer from 1 to {upper}" if upper else "a positive integer"))
     return value
+
+
+def max_input_tokens(state):
+    """Effective prompt budget."""
+    return saved_integer(state, "REVIEW_MAX_INPUT_TOKENS", DEFAULT_MAX_INPUT_TOKENS)
+
+
+def max_findings(state):
+    """Effective findings cap of each review tier."""
+    return {tier: saved_integer(state, name, DEFAULT_MAX_FINDINGS, MAX_FINDINGS_LIMIT)
+            for tier, name in FINDINGS_SETTINGS.items()}
 
 
 def ask(label, default=""):
