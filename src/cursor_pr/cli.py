@@ -22,7 +22,7 @@ from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
-from .engine import CursorFailure, pack, review, section, tokens
+from .engine import CursorFailure, encodings, pack, review, section, tokens
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment
 
 
@@ -55,10 +55,19 @@ def fit(files, checks, limit, *, title="", description="", advisories=(), scoped
     estimated = full = tokens(prompt, model) if has_text else 0
     if full <= limit:
         return full_pack, full, full, []
-    sizes = {f.path: tokens(text, model) for f in files if (text := section(f)[0])}
+    model_encodings = encodings(model)
+    counters = (model,) if len(model_encodings) == 1 else model_encodings
+
+    def counts(text):
+        return tuple(tokens(text, counter) for counter in counters)
+
+    file_counts = {f.path: counts(text) for f in files if (text := section(f)[0])}
+    sizes = {path: max(counts) for path, counts in file_counts.items()}
     # A file that cannot fit even alone leaves first, so it never takes a file that fits with it.
-    overhead = tokens(pack(files, checks, frozenset(sizes), title, description, advisories, scoped)[0], model)
-    queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
+    overhead = counts(pack(files, checks, frozenset(sizes), title, description, advisories, scoped)[0])
+    fits_alone = {path for path, counts in file_counts.items()
+                  if all(base + extra <= limit for base, extra in zip(overhead, counts, strict=True))}
+    queue = sorted(sizes, key=lambda path: (path in fits_alone, rank(path), -sizes[path], path))
     dropped = []
     while estimated > limit and queue:
         # Per-file sizes are approximate, so the last file only leaves after a real recount.
