@@ -67,6 +67,21 @@ Before you open a pull request, and before you push new commits to one, run this
 
 Fifteen is the cap for this run only. The deployed reviewer's lower cap keeps the comments it posts on a pull request short. This run is for you, the author, and should surface everything at once.
 
+## When a pull request keeps coming back
+
+A revision is one push to a pull request made in answer to review findings, whether they came from the deployed reviewer, from a person or from the procedure above. Count them; the pull request's history of review comments and pushes tells you the number if you did not make them all. After the fifth revision, do not start a sixth by fixing the newest findings. Step back first:
+
+1. **Reread what the pull request is for.** Its description and the issue behind it, not the latest findings.
+2. **Put the findings of all rounds side by side** and name what they have in common: the mechanism, assumption or input that keeps producing them. Findings that each patch the previous fix are the usual sign: a guard, then a guard for the guard.
+3. **Look for a different solution that removes that cause** instead of answering each case. Typical ones: accept less (a narrower input, fewer options, one supported path), give the job to something that already does it, move the state to one place, or leave the troublesome part out of this pull request.
+4. **Decide and say so in the pull request description:**
+   - A different design removes the cause: replace the old one with it. Do not add it on top. Say what was replaced and why, and run the review above on the result as on a new change.
+   - The design is right and the findings share a cause that can be removed within it, such as one check written in several places that can become one: remove that cause in one change, and say what it was.
+   - The design is right and the findings are unrelated to each other: say that, with the common cause you looked for and did not find, and go on.
+   - The better design changes what the pull request delivers, or you cannot tell which is right: stop and ask the owner, with both options and what each costs.
+
+Step back again after every further five revisions. The runs of the procedure above that happen before one push are part of one revision; its limit of four runs is separate from this count.
+
 ## Do not
 
 - Call a model CLI or API to answer the prompt (`codex`, `cursor-agent`, `claude -p` and the like) unless the owner asks.
