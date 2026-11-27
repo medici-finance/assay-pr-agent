@@ -45,7 +45,7 @@ def rank(path):
     return 3
 
 
-def fit(files, checks, limit, *, title="", description="", advisories=(), scoped=False, commit_messages=False):
+def fit(files, checks, limit, *, title="", description="", advisories=(), scoped=False, commit_messages=False, model=None):
     """Pack the prompt, leaving out whole files until it fits the input budget.
 
     Returns the prompt parts, the estimate of what will be sent, the estimate of the full
@@ -54,13 +54,13 @@ def fit(files, checks, limit, *, title="", description="", advisories=(), scoped
     prompt, anchors, no_text, has_text = full_pack = pack(files, checks, title=title, description=description,
                                                          advisories=advisories, scoped=scoped,
                                                          commit_messages=commit_messages)
-    estimated = full = tokens(prompt) if has_text else 0
+    estimated = full = tokens(prompt, model) if has_text else 0
     if full <= limit:
         return full_pack, full, full, []
     # Measure each file with the evidence and caveats the reduced review would include.
     singleton_scoped = scoped or len(files) > 1
     overhead = tokens(pack([], [], title=title, description=description, scoped=singleton_scoped,
-                           commit_messages=commit_messages)[0])
+                           commit_messages=commit_messages)[0], model)
     advised_paths = {advisory["path"] for advisory in advisories}
     sizes = {}
     for file in files:
@@ -68,7 +68,7 @@ def fit(files, checks, limit, *, title="", description="", advisories=(), scoped
             standalone, _, _, _ = pack([file], checks, title=title, description=description,
                                         advisories=advisories, scoped=singleton_scoped,
                                         commit_messages=commit_messages)
-            sizes[file.path] = tokens(standalone) - overhead
+            sizes[file.path] = tokens(standalone, model) - overhead
     queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
     while estimated > limit and queue:
@@ -80,10 +80,10 @@ def fit(files, checks, limit, *, title="", description="", advisories=(), scoped
             freed += sizes[dropped[-1]]
         prompt, anchors, no_text, has_text = pack(files, checks, frozenset(dropped), title, description, advisories, scoped,
                                                  commit_messages=commit_messages)
-        estimated = tokens(prompt) if has_text else 0
+        estimated = tokens(prompt, model) if has_text else 0
     if not has_text or estimated > limit:
         if title or description:
-            fitted, estimate, _, skipped = fit(files, checks, limit, advisories=advisories, scoped=scoped)
+            fitted, estimate, _, skipped = fit(files, checks, limit, advisories=advisories, scoped=scoped, model=model)
             if fitted[3] and estimate <= limit:
                 return fitted, estimate, full, skipped
         return full_pack, full, full, []
@@ -254,7 +254,7 @@ def execute(args):
     qualgen = history.screen(root, args.qualgen_store, selected, change.head) if args.qualgen_store else None
     (prompt, anchors, no_text, has_text), estimated, full, degraded = fit(
         files, checks, args.max_input_tokens, title=change.title, description=change.description,
-        advisories=qualgen["advisories"] if qualgen else (), scoped=selected != paths, commit_messages=not args.change)
+        advisories=qualgen["advisories"] if qualgen else (), scoped=selected != paths, commit_messages=not args.change, model=args.model)
     # An absent forge patch does not establish that the file has no text.
     unavailable = {f.path for f in files if f.patch_unavailable}
     omitted = sorted((paths - selected) | unavailable)
