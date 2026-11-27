@@ -2,11 +2,13 @@ import argparse
 from collections import defaultdict
 import fcntl
 import hashlib
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 import json
 import os
 from pathlib import Path
 import re
+import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -361,6 +363,84 @@ def publish(address, head, report, *, project=None, state=None):
     post_comment(project, int(number), head, text, state if state is not None else state_dir())
 
 
+class Stopped(SystemExit):
+    pass
+
+
+# Set once the supervisor has asked this review to stop.
+stopping = False
+
+
+def stopped(number, frame):
+    # The supervisor asks before it ends the review. Leaving like any exit removes the temporary
+    # files and ends the command being waited on. The row is not settled and stays started.
+    global stopping
+    if stopping:
+        return  # Asked again while already leaving. Raising a second time would cut the cleanup short.
+    stopping = True
+    raise Stopped("cursor-review: stopped by its supervisor")
+
+
+def request_row(args):
+    project, number, comment = args.request
+    return project, int(number), int(comment)
+
+
+def open_queue(args):
+    # The poller's queue as it is. A wrong path is an error, not a new empty database.
+    return closing(sqlite3.connect(args.queue.resolve().as_uri() + "?mode=rw", uri=True))
+
+
+def claim_head(args, head):
+    # The row of the request under review takes the head before any other work. A repeat of the
+    # request finds the head of its interrupted start there and is refused at another. Read and
+    # written in one transaction on the row the poller reads, so the two cannot disagree.
+    try:
+        with open_queue(args) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT head, prepared FROM requests WHERE project=? AND number=? AND comment=?
+                AND status='started'""", request_row(args)).fetchone()
+            if row is None:
+                raise ReviewError("The queue has no running request for this review")
+            if row[0] and row[0] != head:
+                raise ReviewError(f"Change is at {head}, not at {row[0]}, the head of its interrupted start")
+            db.execute("UPDATE requests SET head=? WHERE project=? AND number=? AND comment=?",
+                       (head, *request_row(args)))
+            return row[1]
+    except sqlite3.Error as err:
+        raise ReviewError(f"Review queue: {err}") from err
+
+
+def prepare_publication(args, report, code):
+    # A restart can retry the same publication without repeating a model call or changing its text.
+    try:
+        with open_queue(args) as db, db:
+            db.execute("""UPDATE requests SET prepared=? WHERE project=? AND number=? AND comment=?
+                AND status='started' AND head=? AND prepared IS NULL""",
+                       (json.dumps([report, code]), *request_row(args), report["head"]))
+    except sqlite3.Error as err:
+        raise ReviewError(f"Review queue: {err}") from err
+
+
+def settle(args, status):
+    # How the review ended, on the request's row and before the lock is released, so that a poller
+    # that has stopped reading finds it there. The first one stands: a report that only failed to
+    # print did not fail. Never raises, because it also runs while a failure is being reported.
+    if not getattr(args, "own_row", False):
+        return  # Not shown to be this review's row. The failure being reported is what stands.
+    try:
+        with open_queue(args) as db, db:
+            db.execute("""UPDATE requests SET status=?, prepared=NULL WHERE project=? AND number=? AND comment=?
+                AND status='started'""", (status, *request_row(args)))
+    except (sqlite3.Error, ValueError, OSError) as err:
+        print(f"cursor-review: could not record how the review ended: {err}", file=sys.stderr)
+
+
+def review_outcome(report):
+    # What the poller keeps for a finished review: its state once its result is on the change.
+    return report["state"] if report.get("publication") == "posted-or-already-present" else "failed"
+
+
 def parser():
     p = argparse.ArgumentParser(description="Run one bounded code review and emit a JSON report.")
     mode = p.add_mutually_exclusive_group(required=True)
@@ -368,6 +448,9 @@ def parser():
     mode.add_argument("--base", help="Local base revision to compare against")
     mode.add_argument("--ci", action="store_true", help="Use provider CI event SHAs in the checkout")
     p.add_argument("--expected-change-url", help="Require this exact open forge change before reviewing")
+    p.add_argument("--queue", type=Path, help="The poller's request queue, with --request")
+    p.add_argument("--request", nargs=3, metavar=("PROJECT", "NUMBER", "COMMENT"),
+                   help="The queued request under review: its row takes the head and how the review ended")
     p.add_argument("--head", help="Local head revision (default HEAD with --base)")
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="Checkout for local Git and scanners")
     p.add_argument("--path", action="append", default=[], help="Limit review to an exact changed path; repeatable")
@@ -390,6 +473,8 @@ def parser():
 def execute(args):
     if args.max_input_tokens < 1 or (args.head and not args.base) or (args.post and (not args.change or args.estimate)):
         raise ReviewError("Invalid budget or incompatible --head/--post options")
+    if bool(args.queue) != bool(args.request) or (args.request and not args.change):
+        raise ReviewError("--queue and --request go together and require --change")
     root = args.repo.resolve()
     if args.expected_change_url and not args.change:
         raise ReviewError("--expected-change-url requires --change")
@@ -406,6 +491,14 @@ def execute(args):
         if args.ci and not github_pr and os.getenv("CI_PIPELINE_SOURCE") == "merge_request_event":
             target = os.getenv("CI_MERGE_REQUEST_TARGET_BRANCH_SHA")
             drift_base = target if valid_sha(target) else None
+
+    if args.request:
+        if not getattr(args, "own_row", False):
+            raise ReviewError("The request's row was not checked against the change")
+        prepared = claim_head(args, change.head)
+        if prepared is not None:
+            report, code = json.loads(prepared)
+            return report, code
 
     paths = {f.path for f in change.files}
     selected = set(args.path) if args.path else paths
@@ -614,6 +707,8 @@ def execute(args):
 
 def run_request(args):
     report, code = execute(args)
+    if args.request and args.post:
+        prepare_publication(args, report, code)
     backend = report["provider"]
     if backend != "cursor":
         report["model_invocations"] = report["cursor_invocations"]
@@ -632,15 +727,30 @@ def run_request(args):
 
 
 def main():
-    args = parser().parse_args()
+    options = parser()
+    args = options.parse_args()
+    # Refused here, before this process may settle a row: a mistaken call must not end a request
+    # that another review is running.
+    if bool(args.queue) != bool(args.request) or (args.request and not args.change):
+        options.error("--queue and --request go together and require --change")
+    if args.request:
+        try:
+            request_row(args)
+        except ValueError:
+            options.error("--request takes a project, a change number and a comment number")
     # Load PR-Agent settings only from an empty directory, independent of the target repo.
     args.repo = args.repo.resolve()
     args.cache_dir = args.cache_dir.resolve()
+    if args.queue:
+        args.queue = args.queue.resolve()  # Before the working directory changes.
     if args.go_report:
         args.go_report = args.go_report.resolve()
     if args.qualgen_store:
         args.qualgen_store = args.qualgen_store.resolve()
     old = Path.cwd()
+    global stopping
+    stopping = False
+    asked = signal.signal(signal.SIGTERM, stopped) if args.request else None
     try:
         with ExitStack() as stack:
             state = state_dir().resolve()
@@ -675,6 +785,12 @@ def main():
                 args.expected_change_url = project.change_url(number)
                 if args.scanner_ci is None:
                     args.scanner_ci = project.scanner_ci
+                if args.request:
+                    # The row is this review's own only if it is for this change. Until that is
+                    # known, nothing here settles it: it may be the row of another, running review.
+                    if request_row(args)[:2] != (project.key, int(number)):
+                        raise ReviewError("--request names another change than --change")
+                    args.own_row = True
                 args.forge_project = project
                 args.forge_state = state
                 args.managed_project = project if project.managed else None
@@ -684,13 +800,25 @@ def main():
             from pr_agent.algo.token_handler import TokenEncoder  # noqa: F401
             os.chdir(args.repo)
             report, status = run_request(args)
-        print(json.dumps(report, ensure_ascii=True, indent=2))
+            if args.request:
+                # At once, before the cleanup or the report can fail.
+                settle(args, review_outcome(report))
+        print(json.dumps(report, ensure_ascii=True, indent=2), flush=True)
         return status
     except (ReviewError, OSError, ValueError, TypeError, KeyError, AttributeError,
             UnidiffParseError, yaml.YAMLError, subprocess.TimeoutExpired) as err:
+        if stopping:
+            # Something failed while leaving because the supervisor asked. That is still an interrupted
+            # review, whose row stays started, not one that ran and failed.
+            raise Stopped(f"cursor-review: stopped by its supervisor ({err})") from err
+        if args.request:
+            # Before the diagnostic, which fails when nobody reads it any more.
+            settle(args, "failed")
         print(f"cursor-review: {err}", file=sys.stderr)
         return 2
     finally:
+        if args.request:
+            signal.signal(signal.SIGTERM, asked)
         os.chdir(old)
 
 

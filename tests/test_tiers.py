@@ -573,10 +573,9 @@ class TierRequestTests(unittest.TestCase):
         self.assertEqual(Jobs(self.state).tier((self.gh.key, 3, 83)), "max")  # Survives a restart.
 
     def test_poller_passes_the_tier_to_the_review_command(self):
-        done = subprocess.CompletedProcess([], 0, stdout=json.dumps({"state": "reviewed",
-                                                                     "publication": "posted-or-already-present"}))
+        done = json.dumps({"state": "reviewed", "publication": "posted-or-already-present"}).encode()
         for tier, expected in (("regular", False), ("mid", True), ("max", True)):
-            with patch("cursor_pr.poll.subprocess.run", return_value=done) as run, \
+            with patch("cursor_pr.poll.supervised", return_value=done) as run, \
                  patch("cursor_pr.poll.history.interval", return_value=0):
                 self.assertEqual(run_review(self.gh, 3, self.state, tier), "reviewed")
             argv = run.call_args.args[0]
