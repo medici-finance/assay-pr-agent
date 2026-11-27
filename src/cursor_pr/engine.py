@@ -58,7 +58,7 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
     """Build the prompt. Paths in skip are left out to fit the budget and get no anchors.
 
     scoped says the caller passed only some of the changed files. The third result lists the
-    files that have no text to review, which is not a loss of coverage.
+    files without reviewable text in the supplied patch.
     """
     template = distribution("pr-agent").locate_file("pr_agent/settings/pr_reviewer_prompts.toml")
     with template.open("rb") as stream:
@@ -72,7 +72,6 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
         if not f.path or any(ord(c) < 32 for c in f.path) or f.path in anchors:
             raise ReviewError("Invalid or duplicate forge filename")
         text, anchors[f.path] = section(f)
-        # Deleted, binary, or a patch the forge did not serve: there was no text to review.
         if text is None:
             no_text.append(f.path)
         elif f.path in skip:
@@ -115,9 +114,9 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
 def encodings(model):
     """The encoders to count a prompt with for this model: one where its family is public, both otherwise."""
     name = (model or "").lower()
-    if re.search(r"gpt-4o|gpt-4\.1|gpt-5|(?<![a-z0-9])o[134](?:-|$)", name):
+    if re.search(r"gpt-4o|gpt-4\.[15]|gpt-5|(?<![a-z0-9])o[134](?:-|$)", name):
         return ("gpt-4o",)
-    return ("gpt-4",) if re.search(r"gpt-4|gpt-3\.5", name) else ("gpt-4", "gpt-4o")
+    return ("gpt-4",) if re.search(r"gpt-4|gpt-3\.?5", name) else ("gpt-4", "gpt-4o")
 
 
 def tokens(prompt, model=None):
