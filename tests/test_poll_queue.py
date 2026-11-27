@@ -70,11 +70,16 @@ def comment(number, body="looks good to me"):
 
 # A process that holds a lock on the file it is given and then waits. Whether it has ended is read
 # from the lock, which a process that was killed has released even before anyone has waited for it.
-BUSY = """import fcntl, sys, time
+BUSY = """import fcntl, os, sys, time
 held = open(sys.argv[1], "w")
 fcntl.flock(held, fcntl.LOCK_EX)
 open(sys.argv[1] + ".ready", "w").close()
-time.sleep(120)
+if len(sys.argv) == 2:
+    time.sleep(120)
+else:
+    deadline = time.monotonic() + 120
+    while not os.path.exists(sys.argv[2]) and time.monotonic() < deadline:
+        time.sleep(0.02)
 """
 # A poller that holds the instance lock and is waiting for a review when it is killed.
 POLLER = f"""from pathlib import Path
@@ -944,17 +949,21 @@ class SupervisedTests(unittest.TestCase):
         self.assertTrue(printed.startswith(b"x"))
 
     def test_command_that_left_the_group_with_the_report_pipe_does_not_hold_the_queue(self):
+        daemon = self.state / "daemon"
+        release = self.state / "release-daemon"
         review = ("import subprocess, sys\n"
-                  f"subprocess.Popen([sys.executable, '-c', {BUSY!r}, sys.argv[1]], start_new_session=True)\n"
+                  f"subprocess.Popen([sys.executable, '-c', {BUSY!r}, *sys.argv[1:]], start_new_session=True)\n"
                   "import os, time\nwhile not os.path.exists(sys.argv[1] + '.ready'): time.sleep(0.02)\n"
                   "print('report')\n")
 
-        def end_daemon():  # It left the group on purpose, so the test ends it.
-            subprocess.run(["pkill", "-KILL", "-f", str(self.state / "daemon")], check=False)
+        def end_daemon():  # The test lets this holder exit after checking the poller's report.
+            release.touch()
+            self.assertTrue(gone(daemon, within=5))
+
         self.addCleanup(end_daemon)
         with patch("cursor_pr.poll.DRAIN_SECONDS", 0.3):
             began = time.monotonic()
-            self.assertEqual(poll.supervised([sys.executable, "-c", review, str(self.state / "daemon")]), b"report\n")
+            self.assertEqual(poll.supervised([sys.executable, "-c", review, str(daemon), str(release)]), b"report\n")
         self.assertLess(time.monotonic() - began, 10)
 
     def test_poller_ends_the_group_while_the_supervisor_still_has_its_number(self):

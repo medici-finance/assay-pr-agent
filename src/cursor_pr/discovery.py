@@ -164,10 +164,9 @@ def poll_project(project, jobs, since, ack=None, idle=None):
                 tier = COMMANDS[note["body"].strip()]
                 if tier != "regular":
                     jobs.set_tier(project.key, number, comment, tier)
+                # Marked by the cycle once the reading is done, within a time budget: see Acknowledgement.mark.
                 jobs.enqueue(project.key, number, comment, acknowledge=ack is not None)
                 active.add(number)
-                if ack is not None:
-                    ack.queued(project, number, comment)
         # An incomplete read says nothing about the changes it asked for, so it never advances the schedule.
         # A request it did return is the exception: it is recorded now and will not count as new again,
         # so its change goes back to the poll interval here or never.

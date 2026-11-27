@@ -227,8 +227,9 @@ class MarkerTests(Offline):
         jobs = Jobs(self.state)
         self.assertEqual(sorted(jobs.unmarked()), sorted([(self.gh.key, 3, 81), (self.gl.key, 3, 81)]))
         ack = Acknowledgement(jobs, self.state)
-        for key, number, comment in jobs.unmarked():
-            ack.queued({self.gh.key: self.gh, self.gl.key: self.gl}[key], number, comment)
+        with patch("cursor_pr.poll.poll_project"):
+            cycle({self.gh.key: self.gh, self.gl.key: self.gl}, self.state, jobs, {self.gh.key: None, self.gl.key: None},
+                  lambda *args: self.assertEqual(jobs.unmarked(), []) or "reviewed", ack=ack)  # Marked before any review.
         self.assertEqual(sorted(call for call in self.sent() if call[0] == "POST"),
                          [("POST", GITHUB), ("POST", GITLAB + "?name=hourglass")])
         self.assertEqual(jobs.unmarked(), [])  # Asked for once, whatever the answer.
@@ -260,6 +261,59 @@ class MarkerTests(Offline):
                 with self.assertNoLogs("cursor_pr.acknowledge", level="WARNING"):
                     ack.finished(project, 3, 81, "reviewed")
                 self.assertIsNone(ack.jobs.acknowledgement(job))
+
+    def test_recovered_reaction_is_not_asked_for_again_while_a_notice_is_still_owed(self):
+        job = self.gh.key, 3, 81
+        ack = self.ack()
+        ack.jobs.record_marker(job, acknowledge.UNKNOWN)
+        self.eyes.append(dict(id=12, user=dict(id=ME), content="eyes"))
+        with patch.object(acknowledge, "notify", side_effect=ReviewError("change is no longer open")), \
+                self.assertLogs("cursor_pr.acknowledge", level="WARNING"):
+            ack.finished(self.gh, 3, 81, "failed")  # The reaction is found and removed; the notice fails.
+            self.assertEqual(self.sent(), [("POST", GITHUB), ("DELETE", GITHUB + "/12")])
+            ack.finished(self.gh, 3, 81, "failed")  # Only the notice is tried again.
+        self.assertEqual(self.sent(), [("POST", GITHUB), ("DELETE", GITHUB + "/12")])
+        self.assertEqual([row["id"] for row in self.eyes], [11, 13])
+        # A removal that fails after the ID was found goes on from the ID, not from another ask.
+        job = self.gh.key, 3, 82
+        ack.jobs.record_marker(job, acknowledge.UNKNOWN)
+        other = GITHUB.replace("/81/", "/82/")
+        self.calls.clear()
+        with self.assertLogs("cursor_pr.acknowledge", level="WARNING"):
+            with patch.object(acknowledge, "remove", side_effect=httpx.ConnectError("down")):
+                ack.finished(self.gh, 3, 82, "reviewed")
+        ack.finished(self.gh, 3, 82, "reviewed")
+        self.assertEqual([method for method, _ in self.sent()], ["POST", "DELETE"])
+        self.assertIsNone(ack.jobs.acknowledgement(job))
+
+    def test_gitlab_award_is_removed_by_a_waiting_request_that_had_no_record(self):
+        jobs = Jobs(self.state)
+        jobs.enqueue(self.gl.key, 3, 80)  # Queued by a version that kept no acknowledgements.
+        jobs.enqueue(self.gl.key, 3, 81, acknowledge=True)
+        ack = Acknowledgement(jobs, self.state)
+        ack.queued(self.gl, 3, 81)
+        mine = lambda: [row for row in self.awards if row["user"]["id"] == ME and row["name"] == "hourglass"]
+        self.assertEqual(len(mine()), 1)
+        for comment in (81, 80):  # The newer request finishes first, as when the older one was resumed.
+            with closing(sqlite3.connect(self.state / "requests.sqlite3")) as db, db:
+                db.execute("UPDATE requests SET status='reviewed' WHERE comment=?", (comment,))
+            ack.finished(self.gl, 3, comment, "reviewed")
+            self.assertEqual(len(mine()), 1 if comment == 81 else 0)
+        self.assertEqual(jobs.unfinished_acknowledgements(), [])
+
+    def test_a_forge_that_answers_slowly_holds_the_queue_back_only_so_long(self):
+        jobs = Jobs(self.state)
+        for comment in range(81, 121):
+            jobs.enqueue(self.gh.key, 3, comment, acknowledge=True)
+        clock, marked = [0.0], []
+
+        def slow(project, number, comment):
+            marked.append(comment)
+            clock[0] += 15  # Each marker waits for its timeout.
+        ack = Acknowledgement(jobs, self.state)
+        with patch.object(acknowledge.time, "monotonic", side_effect=lambda: clock[0]), patch.object(ack, "queued", slow):
+            ack.mark({self.gh.key: self.gh})
+        self.assertEqual(marked, [81, 82])  # Twenty seconds, and the reviews start.
 
     def test_gitlab_marker_lookup_stops_on_the_matching_award(self):
         ack = self.ack()
@@ -399,7 +453,8 @@ class NoticeTests(Offline):
     def test_cycle_marks_each_new_request_once_and_reports_only_a_failed_review(self):
         jobs = Jobs(self.state)
         since = {key: datetime(2026, 11, 15, tzinfo=timezone.utc) for key in self.projects}
-        ack, threads, outcomes, public, results = Mock(), {p.slug: [] for p in self.projects.values()}, [], [True], []
+        ack, threads, outcomes, public, results = Mock(jobs=jobs), {p.slug: [] for p in self.projects.values()}, [], [True], []
+        ack.mark.side_effect = lambda projects: Acknowledgement.mark(ack, projects)  # The real choice of what to mark.
         def forge(verb, project, *, numbers=(), timeout=45):
             if verb == "open":
                 return dict(numbers=[3], capped=False)
