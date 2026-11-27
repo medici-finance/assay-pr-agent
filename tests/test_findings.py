@@ -114,7 +114,12 @@ class QuotedEvidenceTests(unittest.TestCase):
                  ("return total\ntotal += item", 4, 5, "quoted code does not match the cited lines"),
                  ("return total", 2, 3, "quoted code does not match the cited lines"),
                  ("raise ValueError", 4, 5, "quoted code does not match the cited lines"),
-                 ("", 4, 5, "unverified"))
+                 ("", 4, 5, "unverified"),
+                 ("    for item in items:\n    ...\n    return total", 3, 5, "verified"),
+                 ("3 +    for item in items:\n# …\n5 +    return total", 3, 5, "verified"),
+                 ("__new hunk__\n4 +        total += item", 4, 4, "verified"),
+                 ("4 +\n5 +", 4, 5, "unverified"),
+                 ("...\nraise ValueError", 4, 5, "quoted code does not match the cited lines"))
         for quote, start, end, expected in cases:
             with self.subTest(quote=quote):
                 parsed = self.parse(dict(issue(start=start, end=end), relevant_code=quote))

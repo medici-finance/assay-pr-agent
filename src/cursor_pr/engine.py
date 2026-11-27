@@ -169,11 +169,12 @@ def finding(issue, anchors):
         return None, dict(dropped, reason="empty finding")
     valid = {"path": path, "line": start, "end_line": end, "title": header, "message": body}
     quote, asked = quoted(issue)
-    if not "".join(quote.split()):
+    parts = checkable(quote)
+    if not parts:
         # Nothing to check against the patch is not a mismatch: the finding is kept and marked.
         return dict(valid, evidence="unverified"), None
     cited = ("".join(anchors[path][line].split()) for line in range(start, end + 1))
-    if not quoted_in_order(quote, cited):
+    if not quoted_in_order(parts, cited):
         if not asked:
             # A fenced block in the text may be a suggested fix rather than a quote.
             return dict(valid, evidence="unverified"), None
@@ -184,6 +185,8 @@ def finding(issue, anchors):
 FENCED = re.compile(r"`{3,}[^\n]*\n(.*?)`{3,}", re.S)
 # A quoted line as the patch shows it: indented, numbered, and marked as added.
 SHOWN = re.compile(r"\s*(?:\d+\s)?\+?")
+# Lines that stand for no code: an elision such as "..." or "# …", and the patch's hunk markers.
+PLACEHOLDER = re.compile(r"(?:#|//)?(?:\.{3,}|…)|__(?:new|old)hunk__")
 
 
 def quoted(issue):
@@ -198,11 +201,16 @@ def quoted(issue):
     return (found.group(1) if found else ""), False
 
 
-def quoted_in_order(quote, cited):
+def checkable(quote):
+    """The quoted lines as code to look for: display, whitespace and placeholder lines removed."""
+    parts = ("".join(SHOWN.sub("", part, count=1).split()) for part in quote.splitlines())
+    return [part for part in parts if part and not PLACEHOLDER.fullmatch(part)]
+
+
+def quoted_in_order(parts, cited):
     """Every quoted line appears, in order, inside the cited head lines. Whitespace does not count."""
     remaining = iter(cited)
-    return all(any("".join(SHOWN.sub("", part, count=1).split()) in line for line in remaining)
-               for part in quote.splitlines() if part.strip())
+    return all(any(part in line for line in remaining) for part in parts)
 
 
 def invoke(prompt, model, anchors):
