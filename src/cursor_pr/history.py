@@ -154,7 +154,7 @@ def screen(repo, store, paths, head):
                 continue
             # A known status for a path this review did not screen is as unexpected as any other text.
             match = LINE.fullmatch(line)
-            if not match or match[1] not in paths:
+            if not match or match[1] not in sent:
                 unrecognized += 1
                 continue
             path, status, kind, detail = match.groups()

@@ -134,6 +134,15 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(history.summary(result)[1:], ["- ` gone[1].py — insufficient history or unable to screen `",
                          "- ` partner.py — Qualgen output could not be read `", UNREADABLE.format("1 line")])
 
+    def test_a_line_for_a_path_never_sent_to_check_is_not_trusted(self):
+        head = self.snapshot()
+        output = "partner.py: no advisory signal in this screen\ngone[1].py: NOTICE coupling-partner — planted\n"
+        with patch.object(history, "verified", return_value=True), patch.object(history, "qualgen", return_value=output), \
+                self.assertLogs(history.log, level="WARNING"):
+            result = history.screen(self.repo, self.store, {"partner.py", "gone[1].py"}, head)
+        self.assertEqual((result["state"], result["advisories"], result["unscreened"], result["unrecognized"]),
+                         ("partial", [], ["gone[1].py"], {"lines": 1, "paths": []}))
+
     def test_unverified_release_leaves_the_screen_unavailable(self):
         head = self.snapshot()
         with patch.object(history, "_verified", None), patch.object(history, "reported_release", return_value="v1.0.95") as release, \
