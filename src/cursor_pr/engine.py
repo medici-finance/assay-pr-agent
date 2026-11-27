@@ -579,28 +579,29 @@ def quoted_evidence(code, message, lines, start, end, budget):
     asked = isinstance(code, str)
     if not budget.spend(len(code if asked else message)):
         return "unverified"
-    quote = code if asked else (fenced_quote(message) or "")
-    parts = checkable(quote)
-    concrete = [part for part in parts if part is not ELIDED]
-    if not concrete or not isinstance(lines, dict) or not budget.spend(end - start + 1):
+    quote = code if asked else fenced_quote(message)
+    if not quote or not isinstance(lines, dict) or not budget.spend(end - start + 1):
         return "unverified"
     cited = [(line, lines[line].rstrip("\r\n")) for line in range(start, end + 1)]
+    status = quote_coverage(quote, cited, budget)
+    if not asked:
+        # A fenced block in the message may be a suggested fix.
+        return status or "unverified"
+    if status == "verified" or ("```" not in code and "~~~" not in code):
+        return status
+    if not budget.spend(len(code) + len(cited)):
+        return "unverified"
+    wrapped = fenced_quote(code, whole=True)
+    return (quote_coverage(wrapped, cited, budget) or status) if wrapped is not None else status
+
+
+def quote_coverage(quote, cited, budget):
+    parts = checkable(quote)
+    concrete = [part for part in parts if part is not ELIDED]
+    if not concrete:
+        return "unverified"
     if not quoted_in_order(concrete, cited):
-        if not asked:
-            # A fenced block in the message may be a suggested fix.
-            return "unverified"
-        if not budget.spend(len(code) + len(cited)):
-            return "unverified"
-        # Try a standalone Markdown wrapper only after checking the literal quote.
-        wrapped = fenced_quote(code, whole=True)
-        if wrapped is None:
-            return None
-        parts = checkable(wrapped)
-        concrete = [part for part in parts if part is not ELIDED]
-        if not concrete:
-            return "unverified"
-        if not quoted_in_order(concrete, cited):
-            return None
+        return None
     if covers(parts, cited, single_line=len(concrete) == 1, budget=budget):
         return "verified"
     for quote_margin, source_margin in candidate_margins(concrete, cited, budget):
@@ -623,9 +624,18 @@ BLANK_GLYPHS = frozenset("\u115f\u1160\u2800\u3164\uffa0")
 
 def fenced_quote(message, *, whole=False):
     tokens = MARKDOWN.parse(message)
-    if whole and len(tokens) != 1:
+    fence = next((token for token in tokens if token.type == "fence"), None)
+    if fence is None:
         return None
-    return next((token.content for token in tokens if token.type == "fence"), None)
+    if whole:
+        if len(tokens) != 1:
+            return None
+        # The parser can consume link definitions without producing any tokens.
+        start, end = fence.map
+        lines = re.split(r"\r\n|\r|\n", message)
+        if any(line.strip(" \t") for line in lines[:start] + lines[end:]):
+            return None
+    return fence.content
 
 
 def checkable(quote):

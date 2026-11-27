@@ -446,11 +446,19 @@ class QuotedEvidenceTests(unittest.TestCase):
         parsed = engine.parse_answer(envelope([exact]), anchors)
         self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
         self.assertEqual(parsed["dropped"], [])
-        for quote in ("```python\nreturn value * 3\n```", "Prose before the quote.\n\n" + exact["relevant_code"]):
+        for quote in ("```python\nreturn value * 3\n```",
+                      "Prose before the quote.\n\n" + exact["relevant_code"],
+                      exact["relevant_code"] + "\n\n[ref]: /elsewhere"):
             with self.subTest(quote=quote):
                 wrong = engine.parse_answer(envelope([dict(exact, relevant_code=quote)]), anchors)
                 self.assertEqual(wrong["findings"], [])
                 self.assertEqual(wrong["dropped"][0]["reason"], "quoted code does not match the cited lines")
+
+    def test_wrapped_quote_can_cover_code_outside_a_literal_fence(self):
+        quote = "```python\n...\nsend()\n...\n```"
+        raw = envelope([dict(issue(start=1, end=5), relevant_code=quote)])
+        parsed = engine.parse_answer(raw, shown("Before.", "```python", "send()", "```", "After."))
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
 
     def test_explicit_quote_can_include_literal_source_fences(self):
         quote = "```text\nvalue\n```"
