@@ -125,6 +125,29 @@ review:
         self.assertEqual([finding["line"] for finding in parsed["findings"]], [2, 2])
         decode.assert_called_once()
 
+    def test_dropped_path_detail_stays_bounded_without_losing_reasons(self):
+        raw = envelope([issue(), issue(body=""), issue(), issue()])
+        with patch.object(engine, "DROPPED_PATH_CHARS", len("a.py")):
+            parsed = engine.parse_answer(raw, ANCHORS, limit=1)
+        self.assertEqual([row["path"] for row in parsed["findings"]], ["a.py"])
+        self.assertEqual(parsed["dropped"], [
+            {"path": "a.py", "line": 2, "reason": "empty finding"},
+            {"path": "", "line": 2, "reason": "over the finding limit"},
+            {"path": "", "line": 2, "reason": "over the finding limit"},
+        ])
+
+    def test_aliased_finding_text_is_normalized_once(self):
+        document = """
+message: &message "  A shared finding description.  "
+review:
+  key_issues_to_review:
+  - {relevant_file: a.py, start_line: 2, end_line: 2, issue_header: First, issue_content: *message}
+  - {relevant_file: a.py, start_line: 2, end_line: 2, issue_header: Second, issue_content: *message}
+"""
+        (first, _), (second, _) = engine.answer_findings(document, ANCHORS)
+        self.assertEqual(first["message"], "A shared finding description.")
+        self.assertIs(first["message"], second["message"])
+
     def test_long_yaml_merge_chain_preserves_findings_from_shared_defaults(self):
         raw = json.loads(envelope([]))
         parents = ["base: &p0 {relevant_file: a.py, start_line: 2, end_line: 2, issue_content: Details.}"]

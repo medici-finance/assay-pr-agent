@@ -24,6 +24,7 @@ from .providers import KEYS, LABELS, provider
 
 VERSION = "1"
 MAX_FINDINGS = DEFAULT_MAX_FINDINGS
+DROPPED_PATH_CHARS = 32_768
 LOCKS = {"package-lock.json", "pnpm-lock.yaml", "go.sum", "npm-shrinkwrap.json"}
 
 
@@ -388,7 +389,7 @@ def answer_mapping(node, mappings):
     return mappings[node]
 
 
-def answer_finding(fields, loader, citations):
+def answer_finding(fields, loader, scalars):
     item = {}
     if (status := fields.get("verification_status")) is not None:
         if not isinstance(status, yaml.ScalarNode):
@@ -400,16 +401,18 @@ def answer_finding(fields, loader, citations):
     for name in FINDING_TEXT_FIELDS:
         value = fields.get(name)
         if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "str":
-            item[name] = value.value
+            if value not in scalars:
+                scalars[value] = value.value.strip()
+            item[name] = scalars[value]
     for name in FINDING_LINE_FIELDS:
         value = fields.get(name)
         if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "int":
-            if value not in citations:
+            if value not in scalars:
                 try:
-                    citations[value] = loader.construct_yaml_int(value)
+                    scalars[value] = loader.construct_yaml_int(value)
                 except (ValueError, IndexError):
-                    citations[value] = None
-            item[name] = citations[value]
+                    scalars[value] = None
+            item[name] = scalars[value]
     return item
 
 
@@ -422,7 +425,7 @@ def answer_findings(answer, anchors):
         issues = answer_mapping(document.get("review"), mappings).get("key_issues_to_review")
         if not isinstance(issues, yaml.SequenceNode) or issues.tag != YAML_TAG + "seq":
             raise ReviewError("Invalid Cursor finding list")
-        entries, citations = {}, {}
+        entries, scalars = {}, {}
         for node in issues.value:
             if node not in entries:
                 try:
@@ -430,8 +433,8 @@ def answer_findings(answer, anchors):
                 except ReviewError:
                     item = None
                 else:
-                    item = answer_finding(fields, loader, citations)
-                entries[node] = finding(item, anchors)
+                    item = answer_finding(fields, loader, scalars)
+                entries[node] = finding(item, anchors, normalized=True)
             yield entries[node]
     except RecursionError:
         raise ReviewError("YAML nesting in the review response is too deep") from None
@@ -466,18 +469,23 @@ def parse_answer(raw, anchors, limit=MAX_FINDINGS, *, verification=False):
         checked = answer_findings(answer, anchors)
     # A bad finding costs the others nothing: the call is already paid for and there is no retry.
     clean, dropped = [], []
+    path_budget = DROPPED_PATH_CHARS
     for valid, why in checked:
-        if why:
-            dropped.append(why)
-        elif len(clean) >= limit:
-            dropped.append({"path": valid["path"], "line": valid["line"], "reason": "over the finding limit"})
-        else:
+        if not why and len(clean) < limit:
             clean.append(dict(valid))
+            continue
+        why = why or {"path": valid["path"], "line": valid["line"], "reason": "over the finding limit"}
+        path_size = len(why["path"])
+        if path_size > path_budget:
+            why = dict(why, path="")
+        else:
+            path_budget -= path_size
+        dropped.append(why)
     usage = value.get("usage")
     return {"findings": clean, "dropped": dropped, "cursor_usage": usage if isinstance(usage, dict) else None}
 
 
-def finding(issue, anchors):
+def finding(issue, anchors, *, normalized=False):
     """One validated finding, or the record of why it was dropped. A reason is fixed text, never the model's."""
     dropped = {"path": "", "line": None, "reason": "malformed finding"}
     if not isinstance(issue, dict):
@@ -485,7 +493,8 @@ def finding(issue, anchors):
     path, start, end = issue.get("relevant_file"), issue.get("start_line"), issue.get("end_line")
     header, body = issue.get("issue_header"), issue.get("issue_content")
     if isinstance(path, str):
-        path = path.strip()
+        if not normalized:
+            path = path.strip()
         if path in anchors:
             dropped["path"] = path
     if type(start) is int and 0 < start <= 2**31 - 1:
@@ -498,7 +507,8 @@ def finding(issue, anchors):
         return None, dict(dropped, reason="cited line outside the reviewed patch")
     if not isinstance(header, str) or not isinstance(body, str):
         return None, dropped
-    header, body = header.strip(), body.strip()
+    if not normalized:
+        header, body = header.strip(), body.strip()
     if not header or not body:
         return None, dict(dropped, reason="empty finding")
     validated = {"path": path, "line": start, "end_line": end, "title": header, "message": body}
