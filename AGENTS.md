@@ -76,6 +76,7 @@ A revision is one push to a pull request made in answer to review findings, whet
 3. **Look for a different solution that removes that cause** instead of answering each case. Typical ones: accept less (a narrower input, fewer options, one supported path), give the job to something that already does it, move the state to one place, or leave the troublesome part out of this pull request.
 4. **Decide and say so in the pull request description:**
    - A different design removes the cause: replace the old one with it. Do not add it on top. Say what was replaced and why, and run the review above on the result as on a new change.
+   - The design is right and the findings share a cause that can be removed within it, such as one check written in several places that can become one: remove that cause in one change, and say what it was.
    - The design is right and the findings are unrelated to each other: say that, with the common cause you looked for and did not find, and go on.
    - The better design changes what the pull request delivers, or you cannot tell which is right: stop and ask the owner, with both options and what each costs.
 
