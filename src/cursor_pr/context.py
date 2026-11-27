@@ -59,6 +59,7 @@ def numbered(lines, first):
 def surrounding(repo, head, files, radius=25):
     """The head lines around each hunk, so a finding can rest on what encloses the change."""
     parts = []
+    remaining = MAX_RAW
     for f in live(files):
         text = blob(repo, head, f.path)
         if text is None:
@@ -75,8 +76,19 @@ def surrounding(repo, head, files, radius=25):
             else:
                 spans.append([first, last])
         for first, last in spans:
-            parts.append(f"## {f.path} lines {first}-{last} at the head\n{numbered(lines[first - 1:last], first)}")
-    return "\n\n".join(parts)
+            separator = "\n\n" if parts else ""
+            heading = f"{separator}## {f.path} lines {first}-{last} at the head\n"
+            parts.append(heading[:remaining])
+            remaining -= len(parts[-1])
+            for number in range(first, last + 1):
+                if not remaining:
+                    break
+                newline = "\n" if number > first else ""
+                parts.append(f"{newline}{number}: {lines[number - 1]}"[:remaining])
+                remaining -= len(parts[-1])
+            if not remaining:
+                return "".join(parts)
+    return "".join(parts)
 
 
 def symbols(files):

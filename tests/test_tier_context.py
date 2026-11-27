@@ -48,6 +48,16 @@ class TierContextTests(unittest.TestCase):
             with patch.object(context, "MAX_RAW", 50):
                 self.assertEqual(list(context.git_lines(repo, "grep", "-I", "-F", "-e", "x", head)), [])
 
+    def test_surrounding_stops_reading_when_the_context_limit_is_reached(self):
+        patch_text = "@@ -1,2 +1,2 @@\n alpha\n-beta_before\n+beta\n"
+        files = [File(f"{name}.py", patch_text, "modified") for name in ("one", "two")]
+        expected = "## one.py lines 1-2 at the head\n1: alpha\n2: beta"
+        with patch.object(context, "MAX_RAW", len(expected) - 2), \
+             patch.object(context, "blob", return_value="alpha\nbeta\n") as blob:
+            text = context.surrounding(None, "head", files, radius=0)
+        self.assertEqual(text, expected[:-2])
+        blob.assert_called_once_with(None, "head", "one.py")
+
     def test_whole_files_stops_reading_when_the_context_limit_is_reached(self):
         files = [File(f"{name}.py", "present", "modified") for name in ("one", "two", "three")]
         with patch.object(context, "MAX_RAW", 45), patch.object(context, "blob", return_value="x" * 40) as blob:
