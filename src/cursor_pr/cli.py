@@ -405,17 +405,18 @@ def publish(address, head, report, *, project=None, state=None):
     elif not report["findings"]:
         body.append("No model findings in the reviewed scope.")
     summarize_matches = report["state"] == "reviewed"
-    existing = sum(check.get("existing_findings", 0) for check in report["checks"]) if summarize_matches else 0
-    if existing:
-        body.append(f"Scanner diagnostics also reported on the base: {existing}.")
+    summarized = 0
     for check in report["checks"]:
         if check["state"] != "complete":
             body.append(f"- {check['tool']}: could not check {fence(check.get('path') or check.get('reason', ''))}")
         for item in check["findings"]:
-            if summarize_matches and item.get("baseline_match"):
+            if summarize_matches and item.get("baseline_match") and item.get("shown_to_model"):
+                summarized += 1
                 continue
             detail = " ".join(part for part in (fence(item["rule"]), fence(item.get("message", ""))) if part)
             body.append(f"- {fence(item['path'])}:{item['line']} — {detail}")
+    if summarized:
+        body.append(f"Scanner diagnostics also reported on the base: {summarized}.")
     if report.get("static_checks"):
         body.extend(["", *scanners.summary(report["static_checks"]), ""])
     if "qualgen" in report:
@@ -770,10 +771,16 @@ def execute_review(args, verification_resources):
             last_error = error
             continue
         completed.append((row["name"], blocks))
-        coverage.update({path: lines for path, lines in locations.items() if lines})
+        for path, lines in locations.items():
+            if lines:
+                coverage.setdefault(path, set()).update(lines)
         if depth == "max":
             deep_findings = answer["findings"]
         findings = merge_findings(findings, answer["findings"])
+    for check in checks:
+        for item in check["findings"]:
+            if item.get("baseline_match") and item["line"] in coverage.get(item["path"], ()):
+                item["shown_to_model"] = True
     # Report only what reached the model: a block of a pass that failed was not sent.
     sent = merged_fates(blocks for _, blocks in completed)
     report["context"] = [sent.get(name) or (dict(row, state="not sent") if row["state"] in USED else row)
@@ -794,6 +801,8 @@ def execute_review(args, verification_resources):
             if verdict is not None:
                 findings = verdict["findings"]
                 report["verification"] = {"state": "filtered", "before": before, "after": len(findings)}
+        if report["verification"]["state"] == "unavailable":
+            findings = [dict(finding, verification_status="unverified") for finding in findings]
     cap = caps[tier]
     if len(findings) > cap:
         report["omitted_findings"] = len(findings) - cap

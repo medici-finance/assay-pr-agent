@@ -76,35 +76,45 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(self.calls.read_text().splitlines(), ["call", "call"])
 
     def test_scanner_marks_an_equivalent_shifted_warning_without_hiding_it(self):
-        old_head = self.head
         script = self.root / "example.sh"
-        script.write_text("#!/bin/sh\n# The existing warning moves.\necho $argument\necho $new\n")
+        tail = "# Padding outside the changed hunk.\n" * 20 + "echo $later\n"
+        old_source = "#!/bin/sh\necho $argument\n" + tail
+        script.write_text(old_source)
+        self.git("add", "example.sh")
+        self.git("commit", "-qm", "Add a distant scanner warning")
+        old_head = self.git("rev-parse", "HEAD")
+        script.write_text("#!/bin/sh\n# The existing warning moves.\necho $argument\necho $new\n" + tail)
         self.git("add", "example.sh")
         self.git("commit", "-qm", "Add another argument")
         warning = {"code": 2086, "column": 6, "endColumn": 8, "level": "info", "message": "Quote the argument."}
         shifted = dict(warning, line=3, endLine=3)
         new = dict(warning, line=4, endLine=4)
         previous = dict(warning, line=2, endLine=2)
+        distant = dict(warning, line=25, endLine=25)
+        distant_previous = dict(warning, line=23, endLine=23)
         for old, expected in (([previous], [3]), ([dict(previous, level="style")], [])):
             with self.subTest(previous=old):
                 with patch.object(checks.shutil, "which", return_value="/scanner"), \
-                     patch.object(checks, "scan_blob", side_effect=[[shifted, new], old]) as scan:
-                    code, report = self.check("--base", old_head, "--estimate")
+                     patch.object(checks, "scan_blob", side_effect=[[shifted, new, distant], [*old, distant_previous]]) as scan, \
+                     patch.object(engine, "invoke", return_value={"findings": [], "cursor_usage": None}):
+                    code, report = self.check("--base", old_head)
                 check, = report["checks"]
                 self.assertEqual(code, 0)
-                self.assertEqual([row["line"] for row in check["findings"]], [3, 4])
-                self.assertEqual([row["line"] for row in check["findings"] if row.get("baseline_match")], expected)
-                self.assertEqual(check.get("existing_findings", 0), len(expected))
+                self.assertEqual([row["line"] for row in check["findings"]], [3, 4, 25])
+                self.assertEqual([row["line"] for row in check["findings"] if row.get("baseline_match")], [*expected, 25])
+                self.assertEqual([row["line"] for row in check["findings"] if row.get("shown_to_model")], expected)
+                self.assertEqual(check["existing_findings"], 1 + len(expected))
                 self.assertEqual([call.args[2] for call in scan.call_args_list],
-                                 [script.read_bytes(), b"#!/bin/sh\necho $argument\n"])
+                                 [script.read_bytes(), old_source.encode()])
                 if expected:
                     change = source.local_change(self.root, old_head, "HEAD")
                     self.assertIn('"baseline_match": true', engine.pack(change.files, [check])[0])
                     with patch.object(cli, "post_comment") as post:
-                        cli.publish("example/repo#1", change.head, dict(report, state="reviewed"))
+                        cli.publish("example/repo#1", change.head, report)
                     body = post.call_args.args[3]
                     self.assertIn("Scanner diagnostics also reported on the base: 1.", body)
                     self.assertIn(":4 ", body)
+                    self.assertIn(":25 ", body)
                     self.assertNotIn(":3 ", body)
                     with patch.object(cli, "post_comment") as post:
                         cli.publish("example/repo#1", change.head, dict(report, state="degraded"))
@@ -115,6 +125,27 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([row["line"] for row in report["checks"][0]["findings"]], [3, 4])
         self.assertNotIn("existing_findings", report["checks"][0])
+
+    def test_baseline_budget_excludes_time_spent_scanning_head(self):
+        diff = "@@ -1 +1,2 @@\n+#!/bin/sh\n echo $value\n"
+        files = [source.File(path, diff, "modified") for path in ("first.sh", "second.sh")]
+        old, head = b"echo $value\n", b"#!/bin/sh\necho $value\n"
+        elapsed = 0
+        calls = []
+
+        def scan(tool, args, content, timeout=20):
+            nonlocal elapsed
+            calls.append(content)
+            elapsed += 16 if content == head else 3
+            return [{"line": 2 if content == head else 1, "code": 2086, "message": "Quote the argument."}]
+
+        with patch.object(checks.time, "monotonic", side_effect=lambda: elapsed), \
+             patch.object(checks.shutil, "which", return_value="/scanner"), \
+             patch.object(checks, "blob", side_effect=[head, old, head, old]), \
+             patch.object(checks, "scan_blob", side_effect=scan):
+            results = checks.scan_files(self.root, "head", files, base="base")
+        self.assertEqual(calls, [head, old, head, old])
+        self.assertEqual([check["existing_findings"] for check in results], [1, 1])
 
     def test_actionlint_baseline_maps_related_locations(self):
         old = b"jobs:\n  build: {}\n  build: {}\n"

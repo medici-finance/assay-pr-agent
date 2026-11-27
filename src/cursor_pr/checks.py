@@ -136,7 +136,7 @@ def baseline_matches(file, rows, head, base, tool, args, deadline):
 
 def scan_files(root, head, files, *, base_root=None, base=""):
     checks = []
-    deadline = time.monotonic() + BASE_SCAN_SECONDS
+    baseline_remaining = BASE_SCAN_SECONDS
     for file in files:
         path = file.path
         if file.status in ("removed", "deleted", "D") or file.absent:
@@ -156,13 +156,14 @@ def scan_files(root, head, files, *, base_root=None, base=""):
                 raise ReviewError("immutable source unavailable")
             rows = scan_blob(tool, args, content)
             matched = set()
-            if (rows and base and file.patch and file.status in ("modified", "M")
-                    and time.monotonic() < deadline):
+            if rows and base and file.patch and file.status in ("modified", "M") and baseline_remaining > 0:
+                started = time.monotonic()
                 old = blob(base_root if base_root is not None else root, base, file.path)
                 if old is None and base_root is not None and base_root != root:
                     old = blob(root, base, file.path)
                 if old is not None:
-                    matched = baseline_matches(file, rows, content, old, tool, args, deadline)
+                    matched = baseline_matches(file, rows, content, old, tool, args, started + baseline_remaining)
+                baseline_remaining -= time.monotonic() - started
             if tool == "shellcheck":
                 findings = [{"path": path, "rule": f"SC{r['code']}", "line": r["line"],
                              "message": r["message"]} for r in rows]

@@ -360,6 +360,7 @@ class TierTests(unittest.TestCase):
         self.assertEqual(report["verification"], {"state": "unavailable", "before": 2})
         self.assertEqual([(row["title"], row["message"]) for row in report["findings"]],
                          [("Real", "Real detail."), ("Spurious", "Spurious detail.")])
+        self.assertEqual([row["verification_status"] for row in report["findings"]], ["unverified", "unverified"])
         self.assertEqual(report["passes"][-1]["state"], "failed")
         self.assertEqual(report["passes"][-1]["model_usage"]["input_tokens"], 15)
         self.assertEqual(report["model_invocations"], 2)
@@ -371,6 +372,11 @@ class TierTests(unittest.TestCase):
         self.assertEqual([row["state"] for row in report["passes"]], ["cached", "called"])
         self.assertEqual([row["title"] for row in report["findings"]], ["Real"])
         self.assertEqual(report["model_invocations"], 1)
+
+        with patch.object(cli, "fit_verification", return_value=(None, 0)):
+            code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["verification"]["state"]), (2, "unavailable"))
+        self.assertEqual([row["verification_status"] for row in report["findings"]], ["unverified", "unverified"])
 
     def test_tier_falls_back_to_the_one_below_and_says_so(self):
         change = cli.local_change(self.root, "main", self.head)
