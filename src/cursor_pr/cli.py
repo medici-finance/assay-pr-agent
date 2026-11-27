@@ -56,7 +56,9 @@ def fit(files, checks, limit, *, title="", description="", advisories=()):
     if full <= limit:
         return full_pack, full, full, []
     sizes = {f.path: tokens(text) for f in files if (text := section(f)[0])}
-    queue = sorted(sizes, key=lambda path: (rank(path), -sizes[path], path))
+    # A file that cannot fit even alone leaves first, so it never takes a file that fits with it.
+    overhead = tokens(pack(files, checks, frozenset(sizes), title, description)[0])
+    queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
     while estimated > limit and queue:
         # Per-file sizes are approximate, so the last file only leaves after a real recount.
@@ -180,7 +182,7 @@ def execute(args):
                 static[tool, path] = {"tool": tool, "path": path, "source": "local", "state": "could-not-check",
                                       "findings": [], "reason": "static check time budget exhausted"}
         if args.change:
-            drifted = drift.forge(root, checkout, change, bool(project))
+            drifted = drift.forge(root, checkout, change, bool(project), files)
         else:
             drifted = drift.check(root, change.head, change.base, files)
     go = None
