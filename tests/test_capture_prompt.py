@@ -43,7 +43,9 @@ class CapturePromptTest(unittest.TestCase):
                         REVIEW_STATE_DIR=str(self.root / "state"))
 
     def git(self, *args):
-        return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.org", *args],
+        # Nothing of the developer's own Git configuration: a signing key would stop or prompt the commits.
+        return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.org",
+                                        "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *args],
                                        cwd=self.repo, text=True).strip()
 
     def capture(self, *args):
@@ -110,6 +112,48 @@ class CapturePromptTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("unexpected diagnostic", err.getvalue())
         self.assertIn("stopped before producing a report (exit 2)", err.getvalue())
+
+    def test_an_earlier_capture_that_cannot_be_removed_stops_the_run(self):
+        out = self.root / "out"
+        (out / "branch.prompt.txt").mkdir(parents=True)  # Not a file this script could have written.
+        result = self.capture()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("capture-prompt: could not remove an earlier capture", result.stderr)
+        self.assertFalse((out / "branch.anchors.json").exists())
+        self.assertFalse(self.started.exists())
+
+    def test_a_capture_that_cannot_be_written_leaves_neither_file(self):
+        # In this process, so that the write of the prompt can be made to fail after the anchors are written.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("capture_prompt", SCRIPT)
+        script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(script)
+        out = self.root / "out"
+        write = Path.write_text
+
+        def full(path, *args, **kwargs):
+            if path.name == "branch.prompt.txt":
+                write(path, "half a prompt", encoding="utf-8")
+                raise OSError(28, "No space left on device")
+            return write(path, *args, **kwargs)
+
+        err = io.StringIO()
+        with patch.dict(os.environ, self.env, clear=True), patch.object(Path, "write_text", full), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = script.main(["capture-prompt.py", str(out / "branch"), "--repo", str(self.repo), "--base", self.base,
+                                "--cache-dir", str(self.root / "cache")])
+        self.assertEqual(code, 1)
+        self.assertIn("capture-prompt: could not write the capture", err.getvalue())
+        self.assertEqual(sorted(path.name for path in out.iterdir()), [])
+        self.assertFalse(self.started.exists())
+
+    def test_fixture_commits_do_not_use_the_developers_signing_setup(self):
+        (self.repo / "more.py").write_text("x = 1\n")
+        self.git("add", "more.py")
+        self.env_signing = dict(os.environ, GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="commit.gpgsign",
+                                GIT_CONFIG_VALUE_0="true", GIT_CONFIG_KEY_1="gpg.program", GIT_CONFIG_VALUE_1="false")
+        with patch.dict(os.environ, self.env_signing):
+            self.git("commit", "-qm", "Committed although signing is on and cannot work")
 
     def test_refuses_other_tiers(self):
         result = self.capture("--tier", "mid")

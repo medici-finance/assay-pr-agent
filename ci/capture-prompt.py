@@ -33,8 +33,11 @@ def main(argv):
     anchors_file = Path(f"{prefix}.anchors.json")
     # First of all, before any option can be refused: a run that fails for whatever reason must not
     # leave an earlier run's prompt to be reviewed as if it were current.
-    prompt_file.unlink(missing_ok=True)
-    anchors_file.unlink(missing_ok=True)
+    try:
+        prompt_file.unlink(missing_ok=True)
+        anchors_file.unlink(missing_ok=True)
+    except OSError as err:
+        return fail(f"could not remove an earlier capture ({err}); choose another OUT_PREFIX")
     args = cli.parser().parse_args(options)
     for name, flag in LOCAL_ONLY.items():
         if getattr(args, name):
@@ -78,9 +81,20 @@ def main(argv):
     if len(captured) > 1:
         return fail(f"the review sent {len(captured)} prompts; this script expects one")
     prompt, anchors = captured[0]
-    prompt_file.parent.mkdir(parents=True, exist_ok=True)
-    prompt_file.write_text(prompt, encoding="utf-8")
-    anchors_file.write_text(json.dumps({path: sorted(lines) for path, lines in anchors.items()}, indent=1), encoding="utf-8")
+    try:
+        prompt_file.parent.mkdir(parents=True, exist_ok=True)
+        # The anchors first: the prompt is what gets reviewed, so it appears only when all else is written.
+        anchors_file.write_text(json.dumps({path: sorted(lines) for path, lines in anchors.items()}, indent=1),
+                                encoding="utf-8")
+        prompt_file.write_text(prompt, encoding="utf-8")
+    except OSError as err:
+        # Neither file is left: half a capture must not look like one that is ready for review.
+        for written in (prompt_file, anchors_file):
+            try:
+                written.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return fail(f"could not write the capture ({err}); nothing was left behind")
     print(f"prompt: {prompt_file}")
     print(f"anchors: {anchors_file}")
     print(f"estimated input tokens: {report['estimated_input_tokens']} (limit {report['prompt_limit']})")
