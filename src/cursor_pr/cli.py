@@ -133,12 +133,27 @@ def publish(address, head, report, *, project=None, state=None):
                     + ", ".join(fence(path) for path in report["not_reviewable"][:20]) + more + ".")
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {fence(path)}")
-    if "receipt" in report:
-        body.extend(["", *receipt.render(report["receipt"])])
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
     # A finding may quote a multiline source fragment, including forge quick actions.
-    text = "\n".join(" ".join(line.splitlines()) for line in body) + "\n"
-    post_comment(project, int(number), head, text, state if state is not None else state_dir())
+    lines = [" ".join(line.splitlines()) for line in body]
+    destination = state if state is not None else state_dir()
+    dedupe_body = "\n".join(lines) + "\n"
+    if "receipt" in report:
+        # Retrying a post may hit the model cache and change the receipt, but the review is the same.
+        lines[-2:-2] = ["", *receipt.render(report["receipt"])]
+        post_comment(project, int(number), head, "\n".join(lines) + "\n", destination, dedupe_body=dedupe_body)
+    else:
+        post_comment(project, int(number), head, dedupe_body, destination)
+
+
+def has_reviewable_text(file):
+    """An unavailable or malformed patch cannot establish that the file has no text."""
+    if file.patch_unavailable:
+        return True
+    try:
+        return bool(section(file)[1])
+    except (ReviewError, UnidiffParseError):
+        return True
 
 
 def parser():
@@ -224,21 +239,24 @@ def execute(args):
     (prompt, anchors, no_text, has_text), estimated, full, degraded = fit(
         files, checks, args.max_input_tokens, title=change.title, description=change.description,
         advisories=qualgen["advisories"] if qualgen else (), scoped=selected != paths, model=args.model)
-    # Only what a review could have covered and did not is a loss of coverage.
-    omitted = sorted(paths - selected)
+    # An absent forge patch does not establish that the file has no text.
+    unavailable = {f.path for f in files if f.patch_unavailable}
+    omitted = sorted((paths - selected) | unavailable)
     backend = providers.provider()
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
               "estimated_input_tokens": estimated, "max_input_tokens": args.max_input_tokens,
-              "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "not_reviewable": no_text,
+              "cursor_invocations": 0, "cache_hit": False, "omitted": omitted,
+              "not_reviewable": [path for path in no_text if path not in unavailable],
               "checks": checks,
               "findings": [], "cursor_usage": None, "full_input_tokens": full, "degraded": degraded,
               "drift": drifted}
-    # What the review could cover and did: the denominators of the receipt.
-    deselected, text = paths - selected, len(files) - len(no_text)
-    # A degraded review is over the limit in full but reviews what it kept; only a refusal reviews nothing.
-    reviewed = 0 if estimated > args.max_input_tokens else text - len(degraded)
-    report["coverage"] = {"changed": len(paths), "text": text + len(deselected), "reviewed": reviewed,
-                          "skipped": text - reviewed, "excluded": len(deselected), "no_text": len(no_text)}
+    deselected = [f for f in change.files if f.path not in selected]
+    known_no_text = len(report["not_reviewable"]) + sum(not has_reviewable_text(f) for f in deselected)
+    prompt_files = len(files) - len(no_text)
+    report["coverage"] = {"changed": len(paths), "text": len(paths) - known_no_text, "reviewed": 0,
+                          "skipped": prompt_files if estimated > args.max_input_tokens else len(degraded),
+                          "excluded": len(deselected), "no_text": known_no_text,
+                          "unavailable": len(unavailable) + sum(f.patch_unavailable for f in deselected)}
     if static:
         report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
@@ -248,7 +266,7 @@ def execute(args):
     if estimated > args.max_input_tokens:
         return dict(report, state="over-budget"), 2
     if args.estimate:
-        return dict(report, state="estimate"), 2 if degraded else 0
+        return dict(report, state="estimate"), 2 if degraded or unavailable else 0
     if has_text:
         try:
             answer, cached = review(prompt, args.model, anchors, args.cache_dir,
@@ -262,6 +280,7 @@ def execute(args):
             return dict(report, state="model-unavailable", error=str(err) if isinstance(err, ReviewError)
                         else type(err).__name__, cursor_invocations=None), 2
         report.update(answer, cache_hit=cached, cursor_invocations=int(not cached))
+        report["coverage"]["reviewed"] = prompt_files - len(degraded)
         if cached:
             report["cursor_usage"] = None
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
