@@ -443,7 +443,9 @@ class TierTests(unittest.TestCase):
         keep = dict(finding(42, "Real"), verification_status="INVALID_DATE")
         malformed_status = yaml.safe_dump({"review": {"key_issues_to_review": [keep]}}).replace("INVALID_DATE", "2026-02-30")
         for name, verdict in (("merge", "review: {<<: invalid, key_issues_to_review: []}"),
-                              ("status", malformed_status)):
+                              ("status", malformed_status),
+                              ("metadata", "review: {key_issues_to_review: [], checked_on: 2026-02-30}"),
+                              ("tagged", "review: {key_issues_to_review: [], count: !!int ''}")):
             with self.subTest(name=name):
                 self.answers(verification=verdict)
                 code, report = self.check("--tier", "mid", "--model", name)

@@ -125,6 +125,17 @@ review:
         self.assertEqual([finding["line"] for finding in parsed["findings"]], [2, 2])
         decode.assert_called_once()
 
+    def test_long_yaml_merge_chain_preserves_findings_from_shared_defaults(self):
+        raw = json.loads(envelope([]))
+        parents = ["base: &p0 {relevant_file: a.py, start_line: 2, end_line: 2, issue_content: Details.}"]
+        parents.extend(f"k{i}: &p{i} {{<<: *p{i-1}}}" for i in range(1, 1051))
+        raw["result"] = "\n".join([*parents, "review:", "  key_issues_to_review:",
+                                    "  - {<<: *p1050, issue_header: Chain End}",
+                                    "  - {<<: *p500, issue_header: Chain Middle}"])
+        parsed = engine.parse_answer(json.dumps(raw), ANCHORS)
+        self.assertEqual([finding["title"] for finding in parsed["findings"]], ["Chain End", "Chain Middle"])
+        self.assertEqual(parsed["dropped"], [])
+
     def test_the_answer_itself_must_still_be_valid(self):
         base = {"type": "result", "subtype": "success", "is_error": False}
         bad = [json.dumps(dict(base, subtype="error", result="{}")),

@@ -339,28 +339,53 @@ ANSWER_FIELDS = frozenset(("review", "key_issues_to_review", "verification_statu
                            *FINDING_TEXT_FIELDS, *FINDING_LINE_FIELDS))
 
 
-def answer_mapping(node, mappings):
+def answer_mapping_fields(node):
     if not isinstance(node, yaml.MappingNode) or node.tag != YAML_TAG + "map":
         raise ReviewError("Expected a YAML mapping in the review response")
-    if node in mappings:
-        if mappings[node] is None:
-            raise ReviewError("Invalid YAML merge in the review response")
-        return mappings[node]
-    # Mark in-progress and failed nodes so aliases cannot hide a failed merge or create a cycle.
-    mappings[node] = None
-    merged, explicit = {}, {}
+    parents, explicit = [], {}
     for key, value in node.value:
         if not isinstance(key, yaml.ScalarNode):
             raise ReviewError("Expected a scalar key in the review response")
         if key.tag == YAML_TAG + "merge":
-            parents = value.value if isinstance(value, yaml.SequenceNode) and value.tag == YAML_TAG + "seq" else [value]
-            for parent in reversed(parents):
-                merged.update(answer_mapping(parent, mappings))
+            if isinstance(value, yaml.SequenceNode) and value.tag == YAML_TAG + "seq":
+                parents.extend(reversed(value.value))
+            else:
+                parents.append(value)
         elif key.tag == YAML_TAG + "str" and key.value in ANSWER_FIELDS:
             explicit[key.value] = value
-    merged.update(explicit)
-    mappings[node] = merged
-    return merged
+    return parents, explicit
+
+
+def answer_mapping(node, mappings):
+    # A chain of YAML aliases can be deep even when the text itself is not nested.
+    pending, active = [(node, None)], set()
+    try:
+        while pending:
+            current, fields = pending.pop()
+            if current in mappings:
+                if mappings[current] is None:
+                    raise ReviewError("Invalid YAML merge in the review response")
+                continue
+            if fields is None:
+                if current in active:
+                    raise ReviewError("Cyclic YAML merge in the review response")
+                active.add(current)
+                fields = answer_mapping_fields(current)
+                pending.append((current, fields))
+                pending.extend((parent, None) for parent in reversed(fields[0]))
+            else:
+                parents, explicit = fields
+                merged = {}
+                for parent in parents:
+                    merged.update(mappings[parent])
+                merged.update(explicit)
+                mappings[current] = merged
+                active.remove(current)
+    except ReviewError:
+        # Completed ancestors remain reusable; only mappings that depend on the failure are invalid.
+        mappings.update(dict.fromkeys(active))
+        raise
+    return mappings[node]
 
 
 def answer_finding(fields, loader, citations):
@@ -388,7 +413,7 @@ def answer_finding(fields, loader, citations):
     return item
 
 
-def answer_findings(answer):
+def answer_findings(answer, anchors):
     """Read the flat finding schema without constructing unrelated YAML values."""
     loader = yaml.SafeLoader(answer)
     try:
@@ -402,10 +427,11 @@ def answer_findings(answer):
             if node not in entries:
                 try:
                     fields = answer_mapping(node, mappings)
-                except (ReviewError, RecursionError):
-                    entries[node] = None
+                except ReviewError:
+                    item = None
                 else:
-                    entries[node] = answer_finding(fields, loader, citations)
+                    item = answer_finding(fields, loader, citations)
+                entries[node] = finding(item, anchors)
             yield entries[node]
     except RecursionError:
         raise ReviewError("YAML nesting in the review response is too deep") from None
@@ -413,7 +439,7 @@ def answer_findings(answer):
         loader.dispose()
 
 
-def parse_answer(raw, anchors, limit=MAX_FINDINGS):
+def parse_answer(raw, anchors, limit=MAX_FINDINGS, *, verification=False):
     value = json.loads(raw)
     if value.get("type") != "result" or value.get("subtype") != "success" or value.get("is_error") is not False:
         raise ReviewError("Cursor did not return a successful terminal result")
@@ -425,16 +451,28 @@ def parse_answer(raw, anchors, limit=MAX_FINDINGS):
         answer = fenced.group(1)
     if len(answer) > 32_768:
         raise ReviewError("Cursor answer exceeds the review size limit")
+    if verification:
+        # A verdict can remove original findings, so validate its entire YAML document.
+        try:
+            issues = yaml.safe_load(answer)["review"]["key_issues_to_review"]
+        except RecursionError:
+            raise ReviewError("YAML nesting in the review response is too deep") from None
+        except (ValueError, TypeError, LookupError, AttributeError, OverflowError, yaml.YAMLError):
+            raise ReviewError("Invalid YAML verifier response") from None
+        if not isinstance(issues, list) or len(issues) > limit:
+            raise ReviewError("Invalid verifier finding list")
+        checked = (finding(issue, anchors) for issue in issues)
+    else:
+        checked = answer_findings(answer, anchors)
     # A bad finding costs the others nothing: the call is already paid for and there is no retry.
     clean, dropped = [], []
-    for issue in answer_findings(answer):
-        valid, why = finding(issue, anchors)
+    for valid, why in checked:
         if why:
             dropped.append(why)
         elif len(clean) >= limit:
             dropped.append({"path": valid["path"], "line": valid["line"], "reason": "over the finding limit"})
         else:
-            clean.append(valid)
+            clean.append(dict(valid))
     usage = value.get("usage")
     return {"findings": clean, "dropped": dropped, "cursor_usage": usage if isinstance(usage, dict) else None}
 
@@ -465,12 +503,14 @@ def finding(issue, anchors):
         return None, dict(dropped, reason="empty finding")
     validated = {"path": path, "line": start, "end_line": end, "title": header, "message": body}
     status = issue.get("verification_status")
-    if status in ("confirmed", "unverified"):
+    if status is not None:
+        if status not in ("confirmed", "unverified"):
+            return None, dropped
         validated["verification_status"] = status
     return validated, None
 
 
-def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120):
+def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120, *, verification=False):
     global started
     backend = provider()
     label = LABELS[backend]
@@ -558,7 +598,7 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120):
                 break
         raise CursorFailure(f"{label} exited {response.returncode}: {reason}. No retry was made.")
     try:
-        return parse_answer(response.stdout, anchors, limit)
+        return parse_answer(response.stdout, anchors, limit, verification=verification)
     except (ReviewError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError) as err:
         try:
             usage = json.loads(response.stdout).get("usage")
@@ -570,6 +610,8 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120):
 
 def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout=120, originals=None):
     signature = json.dumps([VERSION, "pr-agent:0.50.0", model, source, prompt], ensure_ascii=False)
+    if originals is not None:
+        signature = json.dumps(["strict-verifier", signature])
     if provider() != "cursor" or os.getenv("REVIEW_CURSOR_TEAM_ID"):
         signature = json.dumps([provider(), os.getenv("REVIEW_CURSOR_TEAM_ID") if provider() == "cursor" else None, signature])
     key = hashlib.sha256(signature.encode()).hexdigest()
@@ -590,6 +632,8 @@ def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout
                 return cached, True
         # The plain review keeps the call it always made.
         extra = {} if (limit, timeout) == (MAX_FINDINGS, 120) else {"limit": limit, "timeout": timeout}
+        if originals is not None:
+            extra["verification"] = True
         result = invoke(prompt, model, anchors, **extra)
         if originals is None:
             for finding in result["findings"]:
