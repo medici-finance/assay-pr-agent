@@ -26,8 +26,8 @@ from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
 from .discovery import context_comments
-from .engine import (MAX_FINDINGS, CursorFailure, merge_findings, pack, rank, render_sections, review, tokens,
-                     verification, visible_advisories)
+from .engine import (MAX_FINDINGS, CursorFailure, merge_findings, pack, prompt_advisories, rank, render_sections,
+                     review, tokens, verification, visible_advisories)
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
 
 
@@ -502,26 +502,31 @@ def execute(args):
                 deep_fates = [dict(row, state="dropped") if row["state"] in USED else row for row in deep_fates]
 
     if tier != "regular" and advisories:
-        # Decide both patch scopes before spending from their shared budget. History
-        # may use only space above one base budget reserved for verification.
-        remaining = budget - base - sum(row["estimated_input_tokens"] for row, _, _, _ in plans)
+        # Share the existing context allowance. The original pass sizes bound
+        # history-bearing prompts, preserving the patch scope and verification budget.
+        history_name = "history advisories (untrusted data)"
         for index, (row, _, locations, blocks) in enumerate(plans):
-            if remaining <= 0:
-                break
             is_deep = row["name"] == "deep"
-            packed, skipped, context_text = ((deep_pack, deep_dropped, deep_context) if is_deep
-                                             else (first_pack, dropped, first_context))
-            original_size = row["estimated_input_tokens"]
-            history_limit = min(deep_limit if is_deep else base, original_size + remaining)
-            packed, size = add_history(files, checks, packed, original_size, history_limit, skipped, advisories,
-                                       context=context_text, max_findings=cap, focus=DEEP_FOCUS if is_deep else "",
-                                       rendered=rendered)
-            increase = size - original_size
-            remaining -= increase
-            if tier == "max" and not is_deep:
-                deep_limit -= increase
-            row["estimated_input_tokens"] = size
-            plans[index] = row, packed[0], locations, blocks
+            names, skipped, original_context = ((context.DEEP, deep_dropped, deep_context) if is_deep
+                                                 else (context.MID, dropped, first_context))
+            notices = prompt_advisories(advisories, locations)
+            if not original_context or not notices:
+                continue
+            history_text = "\n".join(json.dumps(notice, ensure_ascii=False) for notice in notices)
+            wider, fates_with_history = context.assemble(
+                (*names, history_name), {**raw, history_name: history_text}, tokens(original_context))
+            replacements = fates_with_history[:-1]
+            if fates_with_history[-1]["state"] not in USED or any(
+                    old["state"] in USED and new["state"] not in USED
+                    for old, new in zip(blocks, replacements, strict=True)):
+                continue
+            candidate = pack(files, checks, frozenset(skipped), context=wider, max_findings=cap,
+                             focus=DEEP_FOCUS if is_deep else "", rendered=rendered)[0]
+            size = tokens(candidate)
+            if size <= row["estimated_input_tokens"]:
+                row["estimated_input_tokens"] = size
+                blocks[:] = replacements
+                plans[index] = row, candidate, locations, blocks
 
     passes = [row for row, _, _, _ in plans]
     context_fates = merged_fates([fates, deep_fates])

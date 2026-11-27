@@ -171,6 +171,7 @@ class TierTests(unittest.TestCase):
         self.assertLessEqual(report["estimated_input_tokens"], report["max_input_tokens"])
 
     def test_qualgen_reaches_both_max_passes_without_replacing_tier_context(self):
+        _, baseline = self.check("--tier", "max", "--estimate")
         qualgen = {"state": "complete", "advisories": [
             {"path": "src/app.py", "kind": "co-change", "detail": "Review the callers."},
             {"path": "not-in-the-patch.py", "kind": "co-change", "detail": "Unrelated advice."},
@@ -179,6 +180,8 @@ class TierTests(unittest.TestCase):
             code, report = self.check("--tier", "max", "--qualgen-store", str(self.root / "qualgen"))
         screen.assert_called_once()
         self.assertEqual((code, report["delivered"], report["qualgen"]), (0, "max", qualgen))
+        for original, advised in zip(baseline["passes"], report["passes"][:2], strict=True):
+            self.assertLessEqual(advised["estimated_input_tokens"], original["estimated_input_tokens"])
         calls = self.prompts()
         self.assertEqual([kind for kind, _ in calls], ["review", "deep", "verification"])
         for _, prompt in calls[:2]:
@@ -208,17 +211,18 @@ class TierTests(unittest.TestCase):
         self.assertEqual((advised["delivered"], advised["degraded"]), ("max", []))
 
     def test_history_leaves_room_to_verify_a_mid_finding(self):
-        issue = dict(finding(42, "Check the returned value"), issue_content="behavior " * 530 + "here")
+        issue = dict(finding(42, "Check the returned value"), issue_content="behavior " * 1330 + "here")
         self.answers(review=answer(issue), verification=answer(issue))
         qualgen = {"state": "complete", "advisories": [
             {"path": "src/app.py", "kind": "co-change", "detail": "Check prior use of this path. " * 9},
         ], "unscreened": []}
-        args = ("--tier", "mid", "--max-input-tokens", "1000")
+        args = ("--tier", "mid", "--max-input-tokens", "1400")
         with patch.object(context, "gather", return_value={"change description": "The patch adjusts a returned value."}), \
              patch.object(cli.history, "screen", return_value=qualgen):
             _, plain = self.check(*args)
             code, advised = self.check(*args, "--qualgen-store", str(self.root / "qualgen"))
         self.assertEqual(plain["verification"]["state"], "filtered")
+        self.assertGreater(plain["passes"][-1]["estimated_input_tokens"], plain["base_input_tokens"])
         self.assertEqual((code, advised["verification"]["state"]), (0, "filtered"))
         self.assertEqual(advised["qualgen"], qualgen)
 
