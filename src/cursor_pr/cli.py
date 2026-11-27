@@ -149,7 +149,7 @@ def publish(address, head, report, *, project=None, state=None):
     if "receipt" in report:
         # Retrying a post may hit the model cache and change the receipt, but the review is the same.
         lines[-2:-2] = ["", *receipt.render(report["receipt"])]
-        post_comment(project, int(number), head, "\n".join(lines) + "\n", destination, dedupe_body=dedupe_body)
+        post_comment(project, int(number), head, "\n".join(lines) + "\n", destination, dedupe_body)
     else:
         post_comment(project, int(number), head, dedupe_body, destination)
 
