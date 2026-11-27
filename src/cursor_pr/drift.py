@@ -10,7 +10,7 @@ from .source import ReviewError, child_env, run
 
 DOCS = (".md", ".rst", ".txt", ".adoc")
 SPAN = re.compile(r"`+([^`\n]+)`+")
-WORD = re.compile(r"[A-Za-z_][\w-]{3,}")
+WORD = re.compile(r"(?<![\w-])[A-Za-z_][\w-]{3,}")
 MAX_NAMES = 60   # names looked up per review
 MAX_ROWS = 10    # rows of each kind in the posted summary
 
@@ -46,7 +46,8 @@ def present(repo, tree, words, timeout=20):
     """The subset of words that occur as whole words anywhere in a tree."""
     if not words:
         return set()
-    args = ["git", "--literal-pathspecs", "-C", str(repo), "grep", "-I", "-F", "-w", "-o", "-h", "--no-color"]
+    args = ["git", "--literal-pathspecs", "-C", str(repo), "grep", "-I", "-F", "-h",
+            "--no-line-number", "--no-column", "--no-color"]
     for word in sorted(words):
         args.extend(["-e", word])
     found = set()
@@ -55,7 +56,7 @@ def present(repo, tree, words, timeout=20):
         timer.start()
         try:
             for raw in proc.stdout:
-                found.add(raw.decode("utf8", "replace").rstrip("\n"))
+                found.update(word for word in WORD.findall(raw.decode("utf8", "replace")) if word in words)
                 if found >= words:
                     proc.kill()  # Every name is accounted for; the rest of the tree is not needed.
                     break
@@ -74,6 +75,8 @@ def check(root, head, base, files, *, head_repo=None):
     checkout that holds the head; it borrows root's objects only to find the merge base.
     """
     result = {"state": "could-not-check", "behind": None, "both": [], "references": []}
+    if not base:
+        return result
     try:
         tip = commit(root, base)
         if head_repo is None:
@@ -85,17 +88,15 @@ def check(root, head, base, files, *, head_repo=None):
         behind = int(git(root, "rev-list", "--count", f"{fork}..{tip}"))
         result.update(base=tip, fork=fork, behind=behind)
         if behind:
-            moved = set(git(root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only",
-                            fork, tip, "--").splitlines())
+            moved = set(git(root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z",
+                            fork, tip, "--").split("\0"))
             # A renamed file's old path counts too: the base may have edited it there.
             result["both"] = sorted(moved & {p for f in files for p in (f.path, f.previous) if p})
             wanted = names(files)
             gone = set(wanted) - present(root, tip, set(wanted))
             # Removed on the base means it was there when the change branched. A name that
             # was never in the tree is a new or external one and says nothing about drift.
-            # Search the branch point for the same names as the tip: grep -o reports one match
-            # where names overlap, so a smaller set there would find a name the tip pass hid.
-            removed = present(root, fork, set(wanted)) & gone
+            removed = present(root, fork, gone)
             result["references"] = sorted(({"path": wanted[n][0], "line": wanted[n][1], "name": n} for n in removed),
                                           key=lambda row: (row["path"], row["line"], row["name"]))
         result["state"] = "complete"
@@ -120,8 +121,11 @@ def forge(root, checkout, change, managed, files=None):
             base = commit(root, candidate)
         except (ReviewError, OSError, subprocess.SubprocessError):
             continue
-        return check(root, change.head, base, change.files if files is None else files,
-                     head_repo=None if checkout == root else checkout)
+        result = check(root, change.head, base, change.files if files is None else files,
+                       head_repo=None if checkout == root else checkout)
+        if candidate == "HEAD":
+            result["comparison"] = "default branch"
+        return result
     return {"state": "could-not-check", "behind": None, "both": [], "references": []}
 
 
@@ -129,10 +133,12 @@ def summary(result):
     if result["state"] != "complete":
         return ["Base drift could not be checked."]
     base = result["base"][:12]
+    comparison = result.get("comparison", "base")
+    heading = f"Default-branch comparison (default branch {base})" if comparison == "default branch" else f"Base drift (base {base})"
     if not result["behind"]:
-        return [f"Base drift (base {base}): none, the head contains the base tip."]
+        return [f"{heading}: none, the head contains the {comparison} tip."]
     count = result["behind"]
-    lines = [f"Base drift (base {base}): the head is {count} commit{'s' if count != 1 else ''} behind."]
+    lines = [f"{heading}: the head is {count} commit{'s' if count != 1 else ''} behind."]
     both = result["both"]
     if both:
         more = f" and {len(both) - MAX_ROWS} more" if len(both) > MAX_ROWS else ""
@@ -140,7 +146,7 @@ def summary(result):
                      + ", ".join(fence(path, 200) for path in both[:MAX_ROWS]) + more)
     for row in result["references"][:MAX_ROWS]:
         lines.append(f"- {fence(row['path'], 200)}:{row['line']} — {fence(row['name'], 80)} "
-                     "is quoted here but no longer appears on the base.")
+                     f"is quoted here but no longer appears on the {comparison}.")
     if len(result["references"]) > MAX_ROWS:
         lines.append(f"{len(result['references']) - MAX_ROWS} additional stale references omitted from this comment.")
     return lines

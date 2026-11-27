@@ -72,6 +72,13 @@ class DriftTests(unittest.TestCase):
         renamed = File("moved.py", "", "renamed", True, "shared.py")
         self.assertEqual(drift.check(self.root, self.head, "main", [renamed])["both"], ["shared.py"])
 
+    def test_overlap_uses_literal_non_ascii_paths(self):
+        path = "café.md"
+        self.write(path, "Base text.\n")
+        self.commit("add documentation on the base")
+        changed = File(path, "", "added", True)
+        self.assertEqual(drift.check(self.root, self.head, "main", [changed])["both"], [path])
+
     def test_forge_drift_covers_only_the_selected_files(self):
         self.move_main()
         change = Change(self.head, self.files(), "url", base_ref="main")
@@ -88,6 +95,8 @@ class DriftTests(unittest.TestCase):
 
     def test_name_only_inside_a_longer_quoted_name_is_not_reported(self):
         self.write("cli.py", "# run drift-check\n")
+        self.git("config", "grep.lineNumber", "true")
+        self.git("config", "grep.column", "true")
         self.commit("add the command")
         self.git("switch", "-qc", "overlap")
         self.write("README.md", "# Project\n\nUse `drift-check`, which runs `drift`.\n")
@@ -98,6 +107,21 @@ class DriftTests(unittest.TestCase):
         self.commit("main moves without touching the command")
         result = drift.check(self.root, head, "main", local_change(self.root, "main", head).files)
         self.assertEqual((result["state"], result["behind"], result["references"]), ("complete", 1, []))
+
+    def test_stale_names_respect_hyphens_and_ignore_git_output_prefixes(self):
+        self.write("commands.py", "# old-tool next-tool\n")
+        self.commit("add two commands")
+        self.git("switch", "-qc", "command-docs")
+        self.write("README.md", "Use `old`, `old-tool`, and `next-tool`.\n")
+        self.commit("document the commands")
+        head = self.git("rev-parse", "HEAD")
+        self.git("switch", "-q", "main")
+        self.write("commands.py", "# tools removed\n")
+        self.commit("remove both commands")
+        self.git("config", "grep.lineNumber", "true")
+        self.git("config", "grep.column", "true")
+        result = drift.check(self.root, head, "main", local_change(self.root, "main", head).files)
+        self.assertEqual([row["name"] for row in result["references"]], ["next-tool", "old-tool"])
 
     def test_head_that_contains_the_base_tip_has_no_drift(self):
         result = drift.check(self.root, self.head, "main", self.files())
@@ -132,6 +156,8 @@ class DriftTests(unittest.TestCase):
                 result = drift.forge(managed, fetched, change, True)
                 self.assertEqual(result["state"], state)
                 if state == "complete":
+                    self.assertEqual(result["comparison"], "default branch")
+                    self.assertTrue(drift.summary(result)[0].startswith("Default-branch comparison"))
                     self.assertEqual((result["base"], result["behind"], result["both"],
                                       [row["name"] for row in result["references"]]),
                                      (tip, 2, ["shared.py"], ["oldtool"]))
@@ -140,6 +166,19 @@ class DriftTests(unittest.TestCase):
         hostile = Change(self.head, self.files(), "url", base_ref="main..feature")
         self.assertEqual(drift.forge(self.root, self.root, hostile, False)["state"], "could-not-check")
         self.assertEqual(drift.forge(self.root, self.root, change, False)["behind"], 2)
+
+    def test_gitlab_ci_checks_drift_against_a_separate_target_sha_when_available(self):
+        tip = self.move_main()
+        argv = ["cursor-review", "--repo", str(self.root), "--ci", "--estimate"]
+        env = {"REVIEW_STATE_DIR": str(self.top / "state"), "GITHUB_ACTIONS": "false",
+               "CI_PIPELINE_SOURCE": "merge_request_event", "CI_MERGE_REQUEST_DIFF_BASE_SHA": self.fork,
+               "CI_MERGE_REQUEST_SOURCE_BRANCH_SHA": self.head}
+        for target, expected in ((tip, 2), ("", None)):
+            with self.subTest(target=target), patch("sys.argv", argv), \
+                 patch.dict(os.environ, dict(env, CI_MERGE_REQUEST_TARGET_BRANCH_SHA=target)), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(cli.main(), 0)
+                self.assertEqual(json.loads(out.getvalue())["drift"]["behind"], expected)
 
     def test_review_report_and_posted_comment_carry_the_drift(self):
         tip = self.move_main()

@@ -23,8 +23,8 @@ from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
 from .discovery import comment_threads
-from .engine import MAX_FINDINGS, CursorFailure, kept, pack, rank, review, section, tokens, verification
-from .source import ReviewError, ci_refs, forge_change, local_change, post_comment
+from .engine import MAX_FINDINGS, CursorFailure, kept, pack, rank, review, tokens, verification
+from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
 
 
 MAX_DEGRADED_ROWS = 50
@@ -47,9 +47,14 @@ def fit(files, checks, limit, cap=MAX_FINDINGS):
     estimated = full = tokens(prompt) if has_text else 0
     if full <= limit:
         return full_pack, full, full, []
-    sizes = {f.path: tokens(text) for f in files if (text := section(f)[0])}
-    # A file that cannot fit even alone leaves first, so it never takes a file that fits with it.
-    overhead = tokens(pack(files, checks, frozenset(sizes), max_findings=cap)[0])
+    # Measure each file with its scanner evidence before choosing what to leave out.
+    # A file that cannot fit alone leaves first, so a smaller file can still be reviewed.
+    overhead = tokens(pack([], [], max_findings=cap)[0])
+    sizes = {}
+    for file in files:
+        if file.path not in unseen:
+            standalone, _, _, _ = pack([file], checks, max_findings=cap)
+            sizes[file.path] = tokens(standalone) - overhead
     queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
     while estimated > limit and queue:
@@ -168,6 +173,11 @@ def execute(args):
     else:
         base, head = ci_refs() if args.ci else (args.base, args.head or "HEAD")
         change = local_change(root, base, head)
+        drift_base = change.base
+        github_pr = os.getenv("GITHUB_ACTIONS") == "true" and os.getenv("GITHUB_EVENT_NAME") == "pull_request"
+        if args.ci and not github_pr and os.getenv("CI_PIPELINE_SOURCE") == "merge_request_event":
+            target = os.getenv("CI_MERGE_REQUEST_TARGET_BRANCH_SHA")
+            drift_base = target if valid_sha(target) else None
 
     paths = {f.path for f in change.files}
     selected = set(args.path) if args.path else paths
@@ -199,7 +209,7 @@ def execute(args):
         if args.change:
             drifted = drift.forge(root, checkout, change, bool(project), files)
         else:
-            drifted = drift.check(root, change.head, change.base, files)
+            drifted = drift.check(root, change.head, drift_base, files)
         notes = None
         if args.tier == "max" and args.change:
             number = int(args.change.rsplit("#", 1)[1])

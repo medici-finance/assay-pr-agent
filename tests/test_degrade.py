@@ -106,6 +106,18 @@ class DegradeTests(unittest.TestCase):
         self.assertIn("src/big.py", report["degraded"])
         self.assertLessEqual(report["estimated_input_tokens"], limit)
 
+    def test_file_that_cannot_fit_with_its_scanner_evidence_leaves_first(self):
+        files = source.local_change(self.root, "HEAD~1", self.head).files
+        app, guide = (next(file for file in files if file.path == path)
+                      for path in ("src/app.py", "docs/guide.md"))
+        checks = [{"findings": [{"path": app.path, "line": 2, "message": "Scanner details. " * 900}]}]
+        limit = cli.tokens(cli.pack([guide], checks)[0])
+        (_, anchors, _, has_text), estimated, _, dropped = cli.fit([app, guide], checks, limit)
+        self.assertTrue(has_text)
+        self.assertLessEqual(estimated, limit)
+        self.assertEqual(dropped, [app.path])
+        self.assertTrue(anchors[guide.path])
+
     def test_posted_comment_is_marked_degraded_and_lists_the_unreviewed_files(self):
         project = project_from(dict(provider="github", url="https://github.com/org/repo",
                                     checkout=str(self.root), requester_ids=[1]))
