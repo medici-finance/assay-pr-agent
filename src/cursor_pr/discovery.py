@@ -116,7 +116,7 @@ def public_gitlab_request(project, number, note):
             and bool(latest.get("created_at")) and latest["created_at"] == latest.get("updated_at"))
 
 
-def poll_project(project, jobs, since):
+def poll_project(project, jobs, since, ack=None):
     for numbers in batched(open_changes(project), 16):
         try:
             threads = comment_threads(project, numbers)
@@ -142,4 +142,5 @@ def poll_project(project, jobs, since):
                 tier = COMMANDS[note["body"].strip()]
                 if tier != "regular":
                     jobs.set_tier(project.key, number, comment, tier)
-                jobs.enqueue(project.key, number, comment)
+                # Marked by the cycle once the reading is done, within a time budget: see Acknowledgement.mark.
+                jobs.enqueue(project.key, number, comment, acknowledge=ack is not None)

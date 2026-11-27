@@ -20,7 +20,7 @@ from .credentials import SETUP_INPUTS, forge_credentials
 from .discovery import poll_project
 from .manager import ConfigurationWatch
 from .login import auth_mode, ensure_session, login_directory
-from . import buildinfo, history, setup, providers
+from . import acknowledge, buildinfo, history, setup, providers
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +76,23 @@ class Jobs:
                 db.execute("ALTER TABLE requests ADD COLUMN prepared TEXT")
             db.execute("""CREATE TABLE IF NOT EXISTS activations (
                 project TEXT PRIMARY KEY, since TEXT NOT NULL)""")
+            upgraded = db.execute("SELECT 1 FROM sqlite_master WHERE name='acknowledgements'").fetchone() is None
+            db.execute("""CREATE TABLE IF NOT EXISTS acknowledgements (
+                project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,
+                notice_sent INTEGER NOT NULL DEFAULT 0, tries INTEGER NOT NULL DEFAULT 0,
+                retry_at REAL NOT NULL DEFAULT 0, cleared INTEGER NOT NULL DEFAULT 0,
+                notice_tries INTEGER NOT NULL DEFAULT 0, notice_retry_at REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY(project, number, comment))""")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(acknowledgements)")}
+            for column, kind in (("tries", "INTEGER"), ("retry_at", "REAL"), ("cleared", "INTEGER"),
+                                 ("notice_tries", "INTEGER"), ("notice_retry_at", "REAL")):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE acknowledgements ADD COLUMN {column} {kind} NOT NULL DEFAULT 0")
+            if upgraded:
+                # Requests a version without acknowledgements left waiting. With a record, they are
+                # marked and, when one fails, reported like any other.
+                db.execute("""INSERT INTO acknowledgements (project, number, comment)
+                    SELECT project, number, comment FROM requests WHERE status IN ('queued','started')""")
             # Only the process holding the instance lock opens the queue, and a review child holds
             # that lock until it exits and settles its own row before it does. So a row still started
             # belongs to a review that was cut off. It runs once more, held to the head in its row if
@@ -85,6 +102,8 @@ class Jobs:
                 settled.append((job, "failed", GIVEN_UP) if attempts >= 2 else (job, "queued", "queued again"))
                 db.execute("""UPDATE requests SET status=?, prepared=CASE WHEN ?='failed' THEN NULL ELSE prepared END
                     WHERE project=? AND number=? AND comment=?""", (settled[-1][1], settled[-1][1], *job))
+            db.executemany("INSERT OR IGNORE INTO acknowledgements (project, number, comment) VALUES (?,?,?)",
+                           [job for job, status, _ in settled if status == "failed"])
         for job, _, reason in settled:
             log.warning("Review of %s #%d comment %d was interrupted by a restart; %s", *job, reason)
 
@@ -100,10 +119,13 @@ class Jobs:
             return db.execute("SELECT 1 FROM requests WHERE project=? AND number=? AND comment=?",
                               (project, number, comment)).fetchone() is not None
 
-    def enqueue(self, project, number, comment, status="queued"):
+    def enqueue(self, project, number, comment, status="queued", *, acknowledge=False):
         with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("INSERT OR IGNORE INTO requests (project, number, comment, status) VALUES (?,?,?,?)",
-                       (project, number, comment, status))
+            inserted = db.execute("INSERT OR IGNORE INTO requests (project, number, comment, status) VALUES (?,?,?,?)",
+                                  (project, number, comment, status))
+            if acknowledge and inserted.rowcount:
+                db.execute("INSERT INTO acknowledgements (project, number, comment) VALUES (?,?,?)",
+                           (project, number, comment))
 
     def next(self):
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -111,7 +133,73 @@ class Jobs:
                 SELECT rowid FROM requests WHERE status='queued' ORDER BY rowid LIMIT 1)
                 RETURNING project, number, comment""").fetchone()
 
+    def pending(self, project, number):
+        with closing(sqlite3.connect(self.path)) as db:
+            return db.execute("SELECT 1 FROM requests WHERE project=? AND number=? AND status IN ('queued','started')",
+                              (project, number)).fetchone() is not None
+
+    # What a finished request owes the forge is two things, each with its own tries and its own time
+    # of the next one: the marker's removal (cleared, tries, retry_at) and, after a failure, the
+    # notice (notice_sent, notice_tries, notice_retry_at).
+    PARTS = {"cleared": ("tries", "retry_at"), "notice_sent": ("notice_tries", "notice_retry_at")}
+
+    def unfinished_acknowledgements(self, now=None):
+        """Finished requests that still owe the forge something; with a time, only those with a part due by then."""
+        with closing(sqlite3.connect(self.path)) as db:
+            return db.execute("""SELECT project, number, comment, status FROM requests JOIN acknowledgements
+                USING (project, number, comment) WHERE status NOT IN ('queued','started')
+                AND (?1 IS NULL OR (cleared=0 AND retry_at <= ?1)
+                     OR (status='failed' AND notice_sent=0 AND notice_retry_at <= ?1))""", (now,)).fetchall()
+
+    def owed(self, job):
+        """The request's record as a dict of each part, its tries and its next time, or None when it has none."""
+        with closing(sqlite3.connect(self.path)) as db:
+            row = db.execute("""SELECT cleared, tries, retry_at, notice_sent, notice_tries, notice_retry_at
+                FROM acknowledgements WHERE project=? AND number=? AND comment=?""", job).fetchone()
+        return row and dict(zip(("cleared", "cleared_tries", "cleared_retry_at",
+                                 "notice_sent", "notice_sent_tries", "notice_sent_retry_at"), row))
+
+    def retry_acknowledgement(self, job, part, at):
+        tries, retry_at = self.PARTS[part]
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(f"""UPDATE acknowledgements SET {tries}={tries}+1, {retry_at}=?
+                WHERE project=? AND number=? AND comment=?""", (at, *job))
+
+    def record_acknowledgement(self, job, part):
+        """The part is done with: carried out, or given up. With nothing left owed, the record goes
+        in the same transaction, so that no poller stopping here leaves one nobody looks at again."""
+        assert part in self.PARTS
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(f"UPDATE acknowledgements SET {part}=1 WHERE project=? AND number=? AND comment=?", job)
+            db.execute("""DELETE FROM acknowledgements WHERE project=?1 AND number=?2 AND comment=?3 AND cleared=1
+                AND (notice_sent=1 OR EXISTS (SELECT 1 FROM requests WHERE project=?1 AND number=?2 AND comment=?3
+                                              AND status NOT IN ('queued','started','failed')))""", job)
+
+    def waiting_acknowledgements(self):
+        """Requests that are waiting for their review and are to be marked on the forge."""
+        with closing(sqlite3.connect(self.path)) as db:
+            return db.execute("""SELECT project, number, comment FROM requests JOIN acknowledgements
+                USING (project, number, comment) WHERE status='queued' ORDER BY requests.rowid""").fetchall()
+
+    def acknowledgement(self, job):
+        """Whether the request's notice was sent and its marker removed, or None when it owes the forge nothing."""
+        with closing(sqlite3.connect(self.path)) as db:
+            return db.execute("""SELECT notice_sent, cleared FROM acknowledgements
+                WHERE project=? AND number=? AND comment=?""", job).fetchone()
+
+    def acknowledge_pending(self, project, number):
+        """Give every waiting request on the change a record, so that the last to finish clears its marker."""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("""INSERT OR IGNORE INTO acknowledgements (project, number, comment)
+                SELECT project, number, comment FROM requests
+                WHERE project=? AND number=? AND status IN ('queued','started')""", (project, number))
+
+    def clear_acknowledgement(self, job):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("DELETE FROM acknowledgements WHERE project=? AND number=? AND comment=?", job)
+
     def finish(self, job, status):
+        """Settle a review the child did not settle itself, and return how the request ended."""
         with closing(sqlite3.connect(self.path)) as db, db:
             # The review child settles its own row. This is for a review that did not get that far.
             db.execute("""UPDATE requests SET status=?, prepared=NULL WHERE project=? AND number=? AND comment=?
@@ -121,6 +209,7 @@ class Jobs:
         if row and row[0] == "failed" and row[1] > 1:
             # The head may have moved on since the first start, or the retry failed like the first did.
             log.warning("Review of %s #%d comment %d was not completed by its retry; a new /review retries it", *job)
+        return row[0] if row else status
 
     # Tiers live in their own table: a request without a row is a plain /review.
     TIERS = "CREATE TABLE IF NOT EXISTS tiers (project TEXT, number INTEGER, comment INTEGER, tier TEXT NOT NULL, " \
@@ -280,16 +369,22 @@ def read_all(descriptor, seconds):
     return None
 
 
-def cycle(projects, state, jobs, since, runner=None):
+def cycle(projects, state, jobs, since, runner=None, ack=None):
+    if ack is not None:
+        ack.settle(projects)
     for project in projects.values():
         try:
-            poll_project(project, jobs, since[project.key])
+            poll_project(project, jobs, since[project.key], ack)
         except Exception:
             log.exception("Poll failed for %s; will retry next cycle", project.key)
+    if ack is not None:
+        ack.mark(projects)
     while job := jobs.next():
         key, number, comment = job
         status = "failed"
         if key in projects:
+            if ack is not None:
+                ack.starting(projects[key], number, comment)
             try:
                 tier = jobs.tier(job)
                 extra = () if tier == "regular" else (tier,)
@@ -297,7 +392,10 @@ def cycle(projects, state, jobs, since, runner=None):
                           else run_review(projects[key], number, state, tier, comment))
             except Exception:
                 log.exception("Review failed for %s #%d comment %d", key, number, comment)
-        jobs.finish(job, status)
+        # The row, not the report, says how it ended: the child settles it before its report can fail.
+        status = jobs.finish(job, status)
+        if ack is not None and key in projects:
+            ack.finished(projects[key], number, comment, status)
 
 
 @contextmanager
@@ -383,6 +481,7 @@ def main():
             parser.exit(2, f"Polling configuration: {err}\n")
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         jobs = Jobs(state)
+        ack = acknowledge.Acknowledgement(jobs, state)
         since = {key: jobs.activated(key) for key in projects}
         log.info("Polling %s with %d seconds between cycles", ", ".join(projects), args.interval)
         if mine_seconds:
@@ -392,7 +491,7 @@ def main():
             if watch.enabled and any(p.managed and not p.checkout.is_dir() for p in projects.values()):
                 watch.wait(2)
                 continue
-            cycle(projects, state, jobs, since)
+            cycle(projects, state, jobs, since, ack=ack)
             watch.wait(args.interval)
 
 
