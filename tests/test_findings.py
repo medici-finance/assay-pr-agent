@@ -101,6 +101,12 @@ review:
                 with self.assertRaises(source.ReviewError):
                     engine.parse_answer(json.dumps(raw), ANCHORS)
 
+    def test_invalid_yaml_key_in_the_envelope_is_rejected(self):
+        raw = json.loads(envelope([]))
+        raw["result"] = "!!bool invalid: metadata\nreview: {key_issues_to_review: []}"
+        with self.assertRaises(source.ReviewError):
+            engine.parse_answer(json.dumps(raw), ANCHORS)
+
     def test_bad_yaml_merge_in_one_finding_leaves_valid_siblings(self):
         raw = json.loads(envelope([]))
         good, bad = issue(), dict(issue(header="Bad Merge"), **{"<<": "BAD_MERGE"})
@@ -147,6 +153,15 @@ review:
         (first, _), (second, _) = engine.answer_findings(document, ANCHORS)
         self.assertEqual(first["message"], "A shared finding description.")
         self.assertIs(first["message"], second["message"])
+
+    def test_invalid_unicode_is_dropped_without_losing_astral_text(self):
+        text = "Unexpected 🐍 Value"
+        raw = envelope([issue(header=text), issue(header=chr(0xD800))])
+        for verification in (False, True):
+            with self.subTest(verification=verification):
+                parsed = engine.parse_answer(raw, ANCHORS, verification=verification)
+                self.assertEqual([row["title"] for row in parsed["findings"]], [text])
+                self.assertEqual([row["reason"] for row in parsed["dropped"]], ["malformed finding"])
 
     def test_long_yaml_merge_chain_preserves_findings_from_shared_defaults(self):
         raw = json.loads(envelope([]))

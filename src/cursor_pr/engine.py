@@ -22,7 +22,7 @@ from .setup import state_dir
 from .config import DEFAULT_MAX_FINDINGS
 from .providers import KEYS, LABELS, provider
 
-VERSION = "1"
+VERSION = "2"
 MAX_FINDINGS = DEFAULT_MAX_FINDINGS
 DROPPED_PATH_CHARS = 32_768
 LOCKS = {"package-lock.json", "pnpm-lock.yaml", "go.sum", "npm-shrinkwrap.json"}
@@ -334,13 +334,14 @@ def tokens(prompt):
 
 
 YAML_TAG = "tag:yaml.org,2002:"
+YAML_VALUE_ERRORS = (ValueError, TypeError, LookupError, AttributeError, OverflowError, yaml.YAMLError)
 FINDING_TEXT_FIELDS = ("relevant_file", "issue_header", "issue_content")
 FINDING_LINE_FIELDS = ("start_line", "end_line")
 ANSWER_FIELDS = frozenset(("review", "key_issues_to_review", "verification_status",
                            *FINDING_TEXT_FIELDS, *FINDING_LINE_FIELDS))
 
 
-def answer_mapping_fields(node):
+def answer_mapping_fields(node, loader):
     if not isinstance(node, yaml.MappingNode) or node.tag != YAML_TAG + "map":
         raise ReviewError("Expected a YAML mapping in the review response")
     parents, explicit = [], {}
@@ -352,12 +353,19 @@ def answer_mapping_fields(node):
                 parents.extend(reversed(value.value))
             else:
                 parents.append(value)
-        elif key.tag == YAML_TAG + "str" and key.value in ANSWER_FIELDS:
-            explicit[key.value] = value
+        elif key.tag == YAML_TAG + "str":
+            if key.value in ANSWER_FIELDS:
+                explicit[key.value] = value
+        elif key.tag != YAML_TAG + "value":
+            # Unknown keys need not be retained, but must still be valid YAML keys.
+            try:
+                hash(loader.construct_object(key))
+            except YAML_VALUE_ERRORS:
+                raise ReviewError("Invalid YAML mapping key in the review response") from None
     return parents, explicit
 
 
-def answer_mapping(node, mappings):
+def answer_mapping(node, mappings, loader):
     # A chain of YAML aliases can be deep even when the text itself is not nested.
     pending, active = [(node, None)], set()
     try:
@@ -371,7 +379,7 @@ def answer_mapping(node, mappings):
                 if current in active:
                     raise ReviewError("Cyclic YAML merge in the review response")
                 active.add(current)
-                fields = answer_mapping_fields(current)
+                fields = answer_mapping_fields(current, loader)
                 pending.append((current, fields))
                 pending.extend((parent, None) for parent in reversed(fields[0]))
             else:
@@ -389,6 +397,14 @@ def answer_mapping(node, mappings):
     return mappings[node]
 
 
+def normalized_text(text):
+    # PyYAML leaves escaped UTF-16 surrogate pairs as two code units.
+    try:
+        return text.encode("utf-16", "surrogatepass").decode("utf-16").strip()
+    except UnicodeDecodeError:
+        return None
+
+
 def answer_finding(fields, loader, scalars):
     item = {}
     if (status := fields.get("verification_status")) is not None:
@@ -402,7 +418,7 @@ def answer_finding(fields, loader, scalars):
         value = fields.get(name)
         if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "str":
             if value not in scalars:
-                scalars[value] = value.value.strip()
+                scalars[value] = normalized_text(value.value)
             item[name] = scalars[value]
     for name in FINDING_LINE_FIELDS:
         value = fields.get(name)
@@ -421,15 +437,15 @@ def answer_findings(answer, anchors):
     loader = yaml.SafeLoader(answer)
     try:
         mappings = {}
-        document = answer_mapping(loader.get_single_node(), mappings)
-        issues = answer_mapping(document.get("review"), mappings).get("key_issues_to_review")
+        document = answer_mapping(loader.get_single_node(), mappings, loader)
+        issues = answer_mapping(document.get("review"), mappings, loader).get("key_issues_to_review")
         if not isinstance(issues, yaml.SequenceNode) or issues.tag != YAML_TAG + "seq":
             raise ReviewError("Invalid Cursor finding list")
         entries, scalars = {}, {}
         for node in issues.value:
             if node not in entries:
                 try:
-                    fields = answer_mapping(node, mappings)
+                    fields = answer_mapping(node, mappings, loader)
                 except ReviewError:
                     item = None
                 else:
@@ -460,7 +476,7 @@ def parse_answer(raw, anchors, limit=MAX_FINDINGS, *, verification=False):
             issues = yaml.safe_load(answer)["review"]["key_issues_to_review"]
         except RecursionError:
             raise ReviewError("YAML nesting in the review response is too deep") from None
-        except (ValueError, TypeError, LookupError, AttributeError, OverflowError, yaml.YAMLError):
+        except YAML_VALUE_ERRORS:
             raise ReviewError("Invalid YAML verifier response") from None
         if not isinstance(issues, list) or len(issues) > limit:
             raise ReviewError("Invalid verifier finding list")
@@ -494,8 +510,8 @@ def finding(issue, anchors, *, normalized=False):
     header, body = issue.get("issue_header"), issue.get("issue_content")
     if isinstance(path, str):
         if not normalized:
-            path = path.strip()
-        if path in anchors:
+            path = normalized_text(path)
+        if path is not None and path in anchors:
             dropped["path"] = path
     if type(start) is int and 0 < start <= 2**31 - 1:
         dropped["line"] = start
@@ -508,7 +524,9 @@ def finding(issue, anchors, *, normalized=False):
     if not isinstance(header, str) or not isinstance(body, str):
         return None, dropped
     if not normalized:
-        header, body = header.strip(), body.strip()
+        header, body = normalized_text(header), normalized_text(body)
+        if header is None or body is None:
+            return None, dropped
     if not header or not body:
         return None, dict(dropped, reason="empty finding")
     validated = {"path": path, "line": start, "end_line": end, "title": header, "message": body}

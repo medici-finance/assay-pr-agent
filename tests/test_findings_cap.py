@@ -38,6 +38,19 @@ class FindingsCapTests(unittest.TestCase):
 
 
 class CacheKeyTests(unittest.TestCase):
+    def test_a_cached_answer_from_the_previous_parser_is_reviewed_again(self):
+        old_answer = {"findings": [{"path": "app.py", "line": 1, "end_line": 1,
+                                    "title": "Old finding", "message": "Old details."}], "cursor_usage": None}
+        invalid = {"findings": [], "dropped": [{"path": "app.py", "line": 1, "reason": "malformed finding"}],
+                   "cursor_usage": None}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(engine, "provider", return_value="cursor"), \
+                patch.object(engine, "invoke", side_effect=[old_answer, invalid]) as model:
+            args = ("same prompt", None, {"app.py": {1}}, Path(tmp), "same source")
+            with patch.object(engine, "VERSION", "1"):
+                self.assertEqual(engine.review(*args), (old_answer, False))
+            self.assertEqual(engine.review(*args), (invalid, False))
+            self.assertEqual(model.call_count, 2)
+
     def test_an_answer_cached_under_another_cap_is_not_reused(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False), \
                 patch.object(engine, "provider", return_value="cursor"), \
