@@ -226,7 +226,8 @@ def execute(args):
               "drift": drifted}
     # What the review could cover and did: the denominators of the receipt.
     deselected, text = paths - selected, len(files) - len(no_text)
-    reviewed = 0 if full > args.max_input_tokens else text - len(degraded)
+    # A degraded review is over the limit in full but reviews what it kept; only a refusal reviews nothing.
+    reviewed = 0 if estimated > args.max_input_tokens else text - len(degraded)
     report["coverage"] = {"changed": len(paths), "text": text + len(deselected), "reviewed": reviewed,
                           "skipped": text - reviewed, "excluded": len(deselected), "no_text": len(no_text)}
     if static:

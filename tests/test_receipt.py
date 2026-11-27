@@ -56,6 +56,29 @@ class ReceiptTests(unittest.TestCase):
                          "Coverage: no text files to review. Findings: 0 model and 0 static; 0 dropped; 0 without a quote to check. "
                          "Checks: 0 of 0 complete.")
 
+    def test_a_model_failure_reviews_nothing(self):
+        built = receipt.build(report(state="model-unavailable"))
+        self.assertEqual(built["coverage"], {"reviewed": 0, "text": 3, "percent": 0})
+
+    def test_usage_with_only_cached_tokens_is_not_stated(self):
+        line = receipt.render(receipt.build(report(model_usage={"cacheReadTokens": 66})))[0]
+        self.assertEqual(line, "Receipt: 1 model call. Prompt 2,314 of 6,000 estimated input tokens.")
+
+    def test_a_degraded_review_counts_the_files_it_kept(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        big = source.File("big.py", "@@ -0,0 +1,400 @@\n" + "".join(f"+value_{n} = compute({n})\n" for n in range(400)), "added")
+        args = cli.parser().parse_args(["--change", "org/repo#1", "--repo", tmp.name, "--cache-dir", str(Path(tmp.name) / "cache"),
+                                        "--max-input-tokens", "2500"])
+        with patch.object(cli, "forge_change", return_value=source.Change("a" * 40, [APP, big], "org/repo#1")), \
+             patch.object(cli, "scan_files", return_value=[]), \
+             patch.object(engine, "invoke", return_value={"findings": [], "dropped": [], "cursor_usage": None}), \
+             patch.object(cli.drift, "forge", return_value={"state": "could-not-check", "behind": None, "both": [], "references": []}):
+            report, _ = cli.run_request(args)
+        self.assertEqual((report["state"], report["degraded"]), ("degraded", ["big.py"]))
+        self.assertEqual((report["coverage"]["reviewed"], report["coverage"]["skipped"]), (1, 1))
+        self.assertEqual(report["receipt"]["coverage"], {"reviewed": 1, "text": 2, "percent": 50})
+
     def test_the_lines_carry_nothing_from_the_change(self):
         hostile = report(findings=[{"path": "@all", "title": "[x](https://evil.example)", "message": "y"}],
                          model_usage={"input_tokens": 5})
