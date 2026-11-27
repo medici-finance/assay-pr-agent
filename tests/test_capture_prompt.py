@@ -17,6 +17,15 @@ SCRIPT = Path(__file__).resolve().parent.parent / "ci" / "capture-prompt.py"
 
 
 class CapturePromptTest(unittest.TestCase):
+    @property
+    def clean(self):
+        # The environment without the developer's own: no review settings, no Git variables (which
+        # name another repository when the tests run from a Git hook), and no user or system Git
+        # configuration (hooks, templates, signing, diff settings).
+        env = {key: value for key, value in os.environ.items() if not key.startswith(("REVIEW_", "GIT_"))}
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        return env
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -38,19 +47,18 @@ class CapturePromptTest(unittest.TestCase):
             shim = bin_dir / name
             shim.write_text(f"#!/bin/sh\necho {name} >> {self.started}\nexit 1\n")
             shim.chmod(0o700)
-        self.env = {key: value for key, value in os.environ.items() if not key.startswith("REVIEW_")}
-        self.env.update(PATH=str(bin_dir) + os.pathsep + os.environ["PATH"], CURSOR_API_KEY="fixture",
+        self.env = dict(self.clean, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"], CURSOR_API_KEY="fixture",
                         REVIEW_STATE_DIR=str(self.root / "state"))
 
     def git(self, *args):
-        # Nothing of the developer's own Git configuration: a signing key would stop or prompt the commits.
         return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.org",
-                                        "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *args],
+                                        "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *args], env=self.clean,
                                        cwd=self.repo, text=True).strip()
 
     def capture(self, *args):
+        base = () if "--base" in args else ("--base", self.base)
         return subprocess.run([sys.executable, str(SCRIPT), str(self.root / "out" / "branch"), "--repo", str(self.repo),
-                               "--base", self.base, "--cache-dir", str(self.root / "cache"), *args],
+                               *base, "--cache-dir", str(self.root / "cache"), *args],
                               env=self.env, capture_output=True, text=True, timeout=120)
 
     def test_writes_the_prompt_without_starting_a_model_cli(self):
@@ -76,7 +84,7 @@ class CapturePromptTest(unittest.TestCase):
     def test_a_failed_run_removes_an_earlier_prompt(self):
         # However the retry fails: over budget, an option this script refuses, one the parser refuses.
         for retry, code in ((("--max-input-tokens", "1"), 1), (("--tier", "mid"), 1), (("--estimate",), 1),
-                            (("--no-such-option",), 2)):
+                            (("--no-such-option",), 1), (("--max-input-tokens", "many"), 2)):
             with self.subTest(retry=retry):
                 self.assertEqual(self.capture().returncode, 0)
                 self.assertTrue((self.root / "out" / "branch.prompt.txt").exists())
@@ -132,7 +140,7 @@ class CapturePromptTest(unittest.TestCase):
         write = Path.write_text
 
         def full(path, *args, **kwargs):
-            if path.name == "branch.prompt.txt":
+            if path.name.startswith("branch.prompt.txt"):
                 write(path, "half a prompt", encoding="utf-8")
                 raise OSError(28, "No space left on device")
             return write(path, *args, **kwargs)
@@ -147,18 +155,104 @@ class CapturePromptTest(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in out.iterdir()), [])
         self.assertFalse(self.started.exists())
 
-    def test_fixture_commits_do_not_use_the_developers_signing_setup(self):
-        (self.repo / "more.py").write_text("x = 1\n")
-        self.git("add", "more.py")
-        self.env_signing = dict(os.environ, GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="commit.gpgsign",
-                                GIT_CONFIG_VALUE_0="true", GIT_CONFIG_KEY_1="gpg.program", GIT_CONFIG_VALUE_1="false")
-        with patch.dict(os.environ, self.env_signing):
-            self.git("commit", "-qm", "Committed although signing is on and cannot work")
+    def test_fixture_and_capture_ignore_the_developers_git_environment(self):
+        # As when the suite runs from a hook of another repository, with signing on that cannot work.
+        other = self.root / "other"
+        other.mkdir()
+        subprocess.run(["git", "init", "-q", str(other)], check=True, env=self.clean)
+        theirs = dict(GIT_DIR=str(other / ".git"), GIT_WORK_TREE=str(other), GIT_INDEX_FILE=str(other / ".git" / "index"),
+                      GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="commit.gpgsign", GIT_CONFIG_VALUE_0="true",
+                      GIT_CONFIG_KEY_1="gpg.program", GIT_CONFIG_VALUE_1="false")
+        with patch.dict(os.environ, theirs):
+            (self.repo / "more.py").write_text("x = 1\n")
+            self.git("add", "more.py")
+            self.git("commit", "-qm", "Committed in the fixture, unsigned")
+            self.assertEqual(self.git("log", "-1", "--format=%s"), "Committed in the fixture, unsigned")
+            self.env = dict(self.env, **{key: value for key, value in self.clean.items() if key.startswith("GIT_")})
+            result = self.capture()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("more.py", (self.root / "out" / "branch.prompt.txt").read_text())
+        log = subprocess.run(["git", "-C", str(other), "log", "--oneline"], capture_output=True, text=True, env=self.clean)
+        self.assertEqual(log.stdout, "")  # Nothing was committed to the other repository.
+
+    def test_no_provider_starts_its_cli(self):
+        for provider, key in (("cursor", "CURSOR_API_KEY"), ("codex", "CODEX_API_KEY"), ("claude", "ANTHROPIC_API_KEY")):
+            with self.subTest(provider=provider):
+                self.env = dict(self.env, REVIEW_PROVIDER=provider, **{key: "fixture"})
+                result = self.capture()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(self.started.exists(), self.started.read_text() if self.started.exists() else "")
+
+    def test_capture_needs_no_credential(self):
+        self.env = {key: value for key, value in self.env.items() if not key.endswith("_API_KEY")}
+        result = self.capture()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.started.exists())
+
+    def test_only_a_local_change_against_a_base_is_captured(self):
+        out = self.root / "out" / "branch"
+        common = [sys.executable, str(SCRIPT), str(out), "--repo", str(self.repo), "--cache-dir", str(self.root / "cache")]
+        for options, said in ((["--base", ""], "--base REV is required and must not be empty"),
+                              (["--base", " "], "--base REV is required and must not be empty"),
+                              (["--base", self.base, "--post"], "--post is not supported"),
+                              (["--base", self.base, "--model", "x"], "--model is not supported"),
+                              (["--base", self.base, "--tier=mid"], "--tier is not supported"),
+                              (["--change", "acme/api#3"], "--change is not supported"),
+                              (["--ci"], "--ci is not supported")):
+            with self.subTest(options=options):
+                result = subprocess.run([*common, *options], env=self.env, capture_output=True, text=True, timeout=120)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("capture-prompt: " + said, result.stderr)
+                self.assertFalse(Path(f"{out}.prompt.txt").exists())
+        missing = subprocess.run(common, env=self.env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(missing.returncode, 2)  # The parser's own refusal: one of its sources is required.
+        self.assertFalse(self.started.exists())
+
+    def test_says_which_commit_was_captured_and_warns_about_work_not_committed(self):
+        head = self.git("rev-parse", "HEAD")
+        result = self.capture()
+        self.assertIn(f"captured: {self.base}..{head[:12]}", result.stdout)
+        self.assertNotIn("warning", result.stderr)
+        (self.repo / "example.py").write_text("def total(rows):\n    return 1\n")
+        (self.repo / "new.py").write_text("y = 2\n")
+        result = self.capture()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("capture-prompt: warning: 2 uncommitted or untracked path(s)", result.stderr)
+        prompt = (self.root / "out" / "branch.prompt.txt").read_text()
+        self.assertNotIn("return 1", prompt)  # Only what is committed is in the prompt.
+        self.assertNotIn("new.py", prompt)
+
+    def test_what_cursor_review_printed_is_kept_when_it_exits(self):
+        result = self.capture("--base", "no-such-revision")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("capture-prompt:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse((self.root / "out" / "branch.prompt.txt").exists())
+
+    def test_an_interrupted_write_leaves_nothing(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("capture_prompt_interrupted", SCRIPT)
+        script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(script)
+        out = self.root / "out"
+        replace = Path.replace
+
+        def interrupted(path, target):
+            if Path(target).name == "branch.prompt.txt":
+                raise KeyboardInterrupt
+            return replace(path, target)
+
+        with patch.dict(os.environ, self.env, clear=True), patch.object(Path, "replace", interrupted), \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(KeyboardInterrupt):
+            script.main(["capture-prompt.py", str(out / "branch"), "--repo", str(self.repo), "--base", self.base,
+                         "--cache-dir", str(self.root / "cache")])
+        self.assertEqual(sorted(path.name for path in out.iterdir()), [])
 
     def test_refuses_other_tiers(self):
         result = self.capture("--tier", "mid")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("only the regular tier", result.stderr)
+        self.assertIn("--tier is not supported", result.stderr)
         self.assertFalse(self.started.exists())
 
     def test_fails_when_the_patched_name_is_gone(self):

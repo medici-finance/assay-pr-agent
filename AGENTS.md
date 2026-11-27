@@ -12,7 +12,7 @@ CI runs the same suite on Python 3.12 inside the built image, with networking di
 
 ## Review your branch before you submit it
 
-Before you open a pull request, and before you push new commits to one, run this repository's own review on your branch, uncapped, and fix what it finds. The deployed reviewer returns at most three findings per run, so a large change can take many rounds of comments to clear. This procedure gets everything in one pass, before anyone else reads the change.
+Before you open a pull request, and before you push new commits to one, run this repository's own review on your branch, uncapped, and fix what it finds. The deployed reviewer returns only a few findings per run, so a large change can take many rounds of comments to clear. This procedure brings them up together, before anyone else reads the change.
 
 1. **Commit your work.** The capture reads committed changes between the base and `HEAD` only.
 
@@ -20,15 +20,17 @@ Before you open a pull request, and before you push new commits to one, run this
 
    ```sh
    git fetch origin
-   SCRATCH=$(mktemp -d)
-   uv run --frozen --python 3.12 python ci/capture-prompt.py "$SCRATCH/review" --base "$(git merge-base origin/main HEAD)" --max-input-tokens 200000
+   BASE="$(git merge-base origin/main HEAD)" && test -n "$BASE" && \
+     uv run --frozen --python 3.12 python ci/capture-prompt.py /tmp/review-capture/branch --base "$BASE" --max-input-tokens 200000
    ```
 
-   - `$SCRATCH` is a scratch directory outside the repository. The script writes `$SCRATCH/review.prompt.txt` and `$SCRATCH/review.anchors.json`, and prints the estimated tokens and any files left out of the prompt.
-   - The base is the branch your pull request targets. For a pull request stacked on another branch, use `origin/<that-branch>` in place of `origin/main`.
+   - Run it as one command. `/tmp/review-capture/branch` is the output prefix: use any fixed path outside the repository, and write it out again in later steps; a shell variable does not survive in a harness that starts a new shell per command. The script writes `<prefix>.prompt.txt` and `<prefix>.anchors.json`.
+   - The base is the branch your pull request targets. For a pull request stacked on another branch, use `origin/<that-branch>` in place of `origin/main`. If `git merge-base` prints nothing, as in a shallow clone, the command stops there: fetch more history (`git fetch --unshallow origin`) and run it again.
+   - Read what the script prints. `captured: <base>..<commit>` is what the prompt holds: check the commit is your `HEAD`. A warning about uncommitted or untracked paths means part of your work is not in the prompt: commit it and capture again. `files left out` names changed files that are not in the prompt.
    - `--max-input-tokens 200000` is far above the deployed budget so the whole change fits. Keep it.
    - If files were left out, or the change is mostly tests, documentation or data, capture again with `--path <file>` (repeatable, exact changed paths) for the source files. Review the rest yourself.
-   - The script never calls a model. It removes any earlier output at the same prefix first, then stops with an error and writes nothing if the review would not have reached the model step (nothing to review, or over budget) or if `cursor_pr.cli` changed so that it can no longer capture the prompt. In that case fix the script as part of your change.
+   - If the script prints more than about 60,000 estimated input tokens, the prompt is more than one reader can hold together with its instruction and answer. Split it: several captures with different output prefixes, each with `--path` for a group of related files, and one fresh subagent per capture.
+   - The script takes `--base`, `--head`, `--repo`, `--path`, `--max-input-tokens`, `--cache-dir`, `--go-report` and `--qualgen-store`, and refuses every other option. It needs no credential and never calls a model. It removes any earlier output at the same prefix first, and leaves no file behind when it fails. It stops with an error if the review would not have reached the model step (nothing to review, or over budget) or if `cursor_pr.cli` changed so that it can no longer capture the prompt. Only in that last case, fix the script as part of your change.
 
 3. **Get an independent review of the prompt.** Start a fresh subagent that has seen nothing else of your work. Give it the prompt file path and the instruction below, with the two placeholders filled in. On the first run, write `none` under the second.
 
@@ -59,7 +61,7 @@ Before you open a pull request, and before you push new commits to one, run this
 
 5. **Fix the real ones,** each with a test that fails without the fix. A finding that needs a design decision or a large change: do not attempt it; leave it open and say so.
 
-6. **Repeat after substantial fixes.** Commit, capture again and run a new fresh subagent, passing every finding already handled (fixed or judged not real) in the second placeholder. Stop when a run returns nothing new that is real.
+6. **Repeat until a run finds nothing new.** If you changed any code after a run, or a run returned the full 15, commit, capture again and run a new fresh subagent, passing every finding already handled (fixed or judged not real) in the second placeholder. Stop when a run returns nothing new that is real. If the fourth run still does, stop there as well: push what you have and list what is open in the pull request description.
 
 7. **Push,** once.
 
