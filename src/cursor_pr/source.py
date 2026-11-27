@@ -102,12 +102,12 @@ def run_forge(verb, project, *, numbers=(), publication=None, timeout=45):
     return json.loads(run(["pr-agent-forge", verb], data=json.dumps(request).encode(), env=env, timeout=timeout))
 
 
-def post_comment(project, number, head, body, state):
+def post_comment(project, number, head, body, state, *, dedupe_body=None):
     if project is None:
         raise ReviewError("Use a --change address from the configured review projects")
     directory = state / "publications"
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    key = hashlib.sha256(json.dumps([project.key, number, head, body]).encode()).hexdigest()
+    key = hashlib.sha256(json.dumps([project.key, number, head, body if dedupe_body is None else dedupe_body]).encode()).hexdigest()
     receipt = directory / (key + ".posted")
     with (directory / (key + ".lock")).open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -145,6 +145,11 @@ class File:
     status: str
     absent: bool = False
     previous: str = ""
+    known_no_text: bool = False
+
+    @property
+    def patch_unavailable(self):
+        return self.absent and not self.known_no_text and self.status not in ("removed", "deleted", "D")
 
 
 @dataclass(frozen=True)
@@ -215,11 +220,14 @@ def local_change(root, base, head):
     files = []
     for status, path in zip(names[0:-1:2], names[1::2], strict=True):
         raw = git(root, *flags, "--unified=3", base, head, "--", path)
+        known_no_text = False
         try:
             patch = to_hunk_only_patch(raw.decode("utf8"))
+            known_no_text = not patch
         except UnicodeDecodeError:
+            # Git can emit a textual hunk in another encoding. Count it as unavailable.
             patch = ""
-        files.append(File(path, patch, status, not bool(patch)))
+        files.append(File(path, patch, status, not bool(patch), known_no_text=known_no_text))
     # Without a forge description, the commit messages are the author's account of the change.
     messages = git(root, "log", "--reverse", "--format=%s%n%n%b%x00", base + ".." + head, "--").decode("utf8", "replace")
     return Change(head, files, str(root.resolve()), tip, "", "",

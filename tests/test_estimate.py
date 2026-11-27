@@ -14,10 +14,10 @@ def count(name, text):
 
 class EstimateTests(unittest.TestCase):
     def test_the_encoding_follows_the_model(self):
-        for model in ("gpt-5-codex", "GPT-4.1-mini", "o3-mini", "o1-preview", "gpt-4o", "o3", "o1"):
+        for model in ("gpt-5-codex", "GPT-4.1-mini", "gpt-4.5-preview", "o3-mini", "o1-preview", "gpt-4o", "o3", "o1"):
             with self.subTest(model=model):
                 self.assertEqual(engine.encodings(model), ("gpt-4o",))
-        for model in ("gpt-4-turbo", "gpt-3.5-turbo"):
+        for model in ("gpt-4-turbo", "gpt-3.5-turbo", "gpt-35-turbo"):
             with self.subTest(model=model):
                 self.assertEqual(engine.encodings(model), ("gpt-4",))
         for model in ("claude-sonnet-4-5", "opus", "cursor-default", "gemini-2.5-pro", "pro4-x", "", None):
@@ -41,6 +41,16 @@ class EstimateTests(unittest.TestCase):
         self.assertEqual(degraded, ["big.py"])
         self.assertGreater(len(counter.call_args_list), 4)
         self.assertEqual({call.args[1] if len(call.args) > 1 else None for call in counter.call_args_list}, {"gpt-4-turbo"})
+
+    def test_fallback_budget_uses_the_same_encoding_for_overhead_and_each_file(self):
+        description = "日本語のテキストです" * 150
+        large = source.File("large.py", "@@ -0,0 +1 @@\n+#" + " tiktoken" * 1000 + "\n", "added")
+        small = source.File("tests/test_small.py", "@@ -0,0 +1 @@\n+#" + " tiktoken" * 120 + "\n", "added")
+        files = [large, small]
+        prompt = engine.pack(files, [], frozenset({large.path}), description=description)[0]
+        limit = engine.tokens(prompt)
+        _, estimated, _, degraded = cli.fit(files, [], limit, description=description)
+        self.assertEqual((estimated, degraded), (limit, [large.path]))
 
 
 if __name__ == "__main__":
