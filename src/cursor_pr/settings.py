@@ -128,17 +128,38 @@ def model(value, config, state, old):
     return None if value in ("", "auto") else value
 
 
+def cursor_login_home(state, profile):
+    return Path(login_env("cursor", login_directory(state, profile))["HOME"])
+
+
 def cursor_team(value, config, state, old):
     saved = config["settings"]
+    saved_backend = saved.get("REVIEW_PROVIDER", "cursor")
+    saved_profile = saved.get("REVIEW_LOGIN_PROFILE", "")
     backend, mode = setup.effective_backend(saved)
-    if mode == "api-key":
-        with tempfile.TemporaryDirectory(prefix="review-team-check-") as temp:
-            # Like the poller, check against a throwaway configuration.
-            return providers.eligible_team(stored(config, old, setup.CURSOR), value, Path(temp))
-    # Never switch the live sign-in profile here: a review may be using it.
-    profile = saved.get("REVIEW_LOGIN_PROFILE", "") if backend == saved.get("REVIEW_PROVIDER", "cursor") else ""
-    home = login_env("cursor", login_directory(state, os.getenv("REVIEW_LOGIN_PROFILE", profile)))["HOME"]
-    return providers.eligible_team(None, value, Path(home))
+    profile = os.getenv("REVIEW_LOGIN_PROFILE", saved_profile if backend == saved_backend else "")
+    with tempfile.TemporaryDirectory(prefix="review-team-check-") as temp:
+        scratch = Path(temp)
+        # Inspect team membership without switching the live sign-in profile.
+        effective = ((stored(config, old, setup.CURSOR), scratch) if mode == "api-key"
+                     else (None, cursor_login_home(state, profile)))
+        chosen = providers.eligible_team(effective[0], value, effective[1])
+        if saved_backend != "cursor":
+            return chosen
+        if saved.get("REVIEW_AUTH_MODE") == "login":
+            fallback = (None, cursor_login_home(state, saved_profile))
+        elif location := config["secrets"].get(setup.CURSOR):
+            fallback = ((old / location).read_text().strip(), scratch)
+        else:
+            return chosen  # The saved API-key setup requires an environment-supplied key.
+        if fallback != effective:
+            key, home = fallback
+            with tempfile.TemporaryDirectory(prefix="review-saved-team-check-") as saved_temp:
+                try:
+                    providers.eligible_team(key, chosen, Path(saved_temp) if key is not None else home)
+                except ValueError as err:
+                    raise ValueError(f"The saved Cursor account cannot use that team. {err}") from None
+        return chosen
 
 
 def operator(value, config, state, old):
@@ -328,13 +349,25 @@ def replace_credential(config, name, value, remove, written):
     written[name] = (validate_pem(value) if name == KEY
                      else gitlab_tls.validate(name, value) if name in gitlab_tls.NAMES else validate_token(value))
     if name == setup.CURSOR:
-        team = os.getenv("REVIEW_CURSOR_TEAM_ID", config["settings"].get("REVIEW_CURSOR_TEAM_ID", ""))
+        saved = config["settings"]
+        saved_team = saved.get("REVIEW_CURSOR_TEAM_ID", "")
+        teams = [os.getenv("REVIEW_CURSOR_TEAM_ID", saved_team)]
+        if saved.get("REVIEW_PROVIDER", "cursor") == "cursor" and saved.get("REVIEW_AUTH_MODE") != "login":
+            teams.append(saved_team)
         with tempfile.TemporaryDirectory(prefix="review-team-check-") as temp:
             try:
-                providers.select_team(written[name], team, Path(temp))
+                for team in dict.fromkeys(teams):
+                    providers.select_team(written[name], team, Path(temp))
             except ValueError as err:
                 raise ValueError(f"{err} Use the setup wizard if the key and team need to change together.") from None
     config["secrets"][name] = setup.SECRETS[name]
+
+
+def references_bundle(path, bundle):
+    """Whether an absolute reference depends on this bundle's files or symlinks."""
+    root = bundle.resolve()
+    # Check the target and its path prefixes. A symlink in the old bundle can point outside it.
+    return any(Path(os.path.realpath(part)).is_relative_to(root) for part in (path, *path.parents))
 
 
 def save(state, change, *, revision=None):
@@ -367,9 +400,11 @@ def save(state, change, *, revision=None):
                     raise ValueError("Unknown credential in saved setup")
                 if secret in written:
                     private_file(bundle / setup.SECRETS[secret], written[secret])
-                elif not Path(location).is_absolute():
-                    # A mounted file stays a reference; a stored copy moves with its bundle.
-                    shutil.copy(old / location, bundle / setup.SECRETS[secret])
+                elif not Path(location).is_absolute() or references_bundle(Path(location), old):
+                    # Copy credentials whose configured paths would break when the old bundle is removed.
+                    destination = bundle / setup.SECRETS[secret]
+                    shutil.copyfile(old / location, destination)
+                    destination.chmod(0o600)
                     config["secrets"][secret] = setup.SECRETS[secret]
             if written.keys() & gitlab_tls.NAMES.keys():
                 try:
