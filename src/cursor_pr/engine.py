@@ -151,7 +151,7 @@ def finding(issue, anchors):
     header, body = issue.get("issue_header"), issue.get("issue_content")
     if isinstance(path, str):
         dropped["path"] = path.strip()[:500]
-    if type(start) is int:
+    if type(start) is int and 0 < start <= 2**31 - 1:
         dropped["line"] = start
     if not isinstance(path, str) or type(start) is not int or type(end) is not int:
         return None, dropped
