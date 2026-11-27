@@ -3,6 +3,7 @@
 Both started as copies of PR-Agent 0.50.0 (``pr_agent/algo/git_patch_processing.py``) and have been
 rewritten here; README.md beside this file lists what changed. MIT licensed; see LICENSE.pr-agent.
 """
+import json
 import re
 
 # Characters that some readers take as a line break. Inside a line of the change they could make text
@@ -35,7 +36,7 @@ def numbered(name, hunks):
     ``__old hunk__`` with the base side unnumbered (``-`` removed, a space unchanged). Every line of
     the change is shown with a marker or a number in front, so none can look like these markers.
     """
-    out = [f"\n\n## File: '{one_line(name.strip())}'\n"]
+    out = [f"\n\n## File: {json.dumps(name)}\n"]
     for hunk in hunks:
         # Content lines only: unidiff also keeps "\ No newline at end of file" and trailing blank lines.
         lines = [line for line in hunk if line.line_type in ("+", "-", " ")]

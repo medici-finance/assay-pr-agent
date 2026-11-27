@@ -161,12 +161,13 @@ def finding(issue, anchors):
     path, start, end = issue.get("relevant_file"), issue.get("start_line"), issue.get("end_line")
     header, body = issue.get("issue_header"), issue.get("issue_content")
     if isinstance(path, str):
-        dropped["path"] = path.strip()[:500]
+        dropped["path"] = path[:500]
     if type(start) is int:
         dropped["line"] = start
     if not isinstance(path, str) or type(start) is not int or type(end) is not int:
         return None, dropped
-    path = path.strip()
+    if path not in anchors:
+        path = path.strip()
     lines = anchors.get(path, set())
     if (start > end or start not in lines or end not in lines or end - start >= len(lines)
             or not all(line in lines for line in range(start, end + 1))):

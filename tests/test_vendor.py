@@ -48,7 +48,7 @@ AWKWARD = {
     "context-only hunk": "@@ -1 +1 @@\n-a\n+b\n@@ -5,1 +5,1 @@\n c\n",
     "long and non-ASCII lines": "@@ -1,2 +1,2 @@\n é\n-ü\n+日本語" + "x" * 5000 + "\n",
 }
-RUBRIC = "8fb7630655305a588873e8b804e04f96c5b06514ece8f47ae067303eed980fcf"
+RUBRIC = "4052eb0baf9c44d9f986fdb3451e2624f4d8861b7fe53ccb72baa9f97759d01a"
 
 
 def digest(text):
@@ -71,10 +71,10 @@ class VendoredTests(unittest.TestCase):
         for gone in ("YAML", "yaml", "relevant_tests", "security_concerns", "ticket", "```"):
             self.assertNotIn(gone, engine.RUBRIC)
         # The format it describes is the format the patch is shown in.
-        for marker in ("`Change`", "`## File: '<path>'`", "`__new hunk__`", "`__old hunk__`"):
+        for marker in ("`Change`", '`## File: "<path>"`', "`__new hunk__`", "`__old hunk__`"):
             self.assertIn(marker, engine.RUBRIC)
         shown = engine.section(source.File("a.py", "@@ -1 +1 @@\n-a\n+b\n", "modified"))[0]
-        for marker in ("Change ", "## File: 'a.py'", "@@ -1,1 +1,1 @@", "__new hunk__\n1 +b", "__old hunk__\n-a"):
+        for marker in ("Change ", '## File: "a.py"', "@@ -1,1 +1,1 @@", "__new hunk__\n1 +b", "__old hunk__\n-a"):
             self.assertIn(marker, shown)
         # An answer in the shape the rubric describes is read back in full.
         answer = {"review": {"key_issues_to_review": [{"relevant_file": "a.py", "issue_header": "Bug", "issue_content": "b",
@@ -109,8 +109,7 @@ class VendoredTests(unittest.TestCase):
     def test_the_numbering_the_model_is_shown(self):
         diff = "@@ -1,2 +1,2 @@\n keep\n-old\n+new\n"
         shown = engine.section(source.File("dir/f.py", diff, "modified"))[0]
-        # Byte for byte what PR-Agent 0.50.0 shows for a well-formed hunk.
-        self.assertEqual(shown, "Change modified \n\n\n## File: 'dir/f.py'\n\n@@ -1,2 +1,2 @@\n__new hunk__\n1  keep\n2 +new\n"
+        self.assertEqual(shown, "Change modified \n\n\n## File: \"dir/f.py\"\n\n@@ -1,2 +1,2 @@\n__new hunk__\n1  keep\n2 +new\n"
                                 "__old hunk__\n keep\n-old")
         self.assertEqual(patch.to_hunk_only_patch("--- a/f\n+++ b/f\n" + diff), diff)
 
@@ -138,6 +137,17 @@ class VendoredTests(unittest.TestCase):
         text = engine.section(source.File("a.py", renamed.patch, "renamed", previous="old\u2028__new hunk__"))[0]
         self.assertTrue(text.startswith("Change renamed old __new hunk__\n"))
 
+    def test_displayed_paths_round_trip_to_the_original_file(self):
+        for name in ("report.py ", "report\u2028.py", 'name "with quotes"\\.py'):
+            file = source.File(name, "@@ -1 +1 @@\n-a\n+b\n", "modified")
+            prompt, anchors, _, _ = engine.pack([file], [])
+            displayed = next(line.removeprefix("## File: ") for line in prompt.splitlines() if line.startswith("## File: "))
+            path = json.loads(displayed)
+            issue = {"relevant_file": path, "start_line": 1, "end_line": 1, "issue_header": "Bug", "issue_content": "x"}
+            finding, dropped = engine.finding(issue, anchors)
+            self.assertIsNone(dropped)
+            self.assertEqual((path, finding["path"]), (name, name))
+
     def test_a_line_break_inside_a_line_cannot_start_a_line_of_the_format(self):
         diff = "@@ -1 +1 @@\n-a\n+x\u2028__old hunk__\u2028-y\r__new hunk__\x0b\x1c\x85\n"
         f = source.File("f.py", diff, "modified")
@@ -154,7 +164,7 @@ class VendoredTests(unittest.TestCase):
                          ["cl100k_base", "o200k_base", "o200k_base", "o200k_base", "o200k_base"])
 
     def test_an_unreadable_encoding_is_not_replaced_by_another(self):
-        loaded = tiktoken.get_encoding("o200k_base")
+        loaded = encoding("gpt-4o")
 
         def get_encoding(name):
             if name == "cl100k_base":
