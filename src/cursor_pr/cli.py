@@ -190,8 +190,8 @@ def settle(args, status):
     # How the review ended, on the request's row and before the lock is released, so that a poller
     # that has stopped reading finds it there. The first one stands: a report that only failed to
     # print did not fail. Never raises, because it also runs while a failure is being reported.
-    if not args.queue:
-        return  # --request without --queue: that failure is the one being reported.
+    if not getattr(args, "own_row", False):
+        return  # Not shown to be this review's row. The failure being reported is what stands.
     try:
         with open_queue(args) as db, db:
             db.execute("""UPDATE requests SET status=?, prepared=NULL WHERE project=? AND number=? AND comment=?
@@ -418,6 +418,12 @@ def main():
                 args.expected_change_url = project.change_url(number)
                 if args.scanner_ci is None:
                     args.scanner_ci = project.scanner_ci
+                if args.request:
+                    # The row is this review's own only if it is for this change. Until that is
+                    # known, nothing here settles it: it may be the row of another, running review.
+                    if request_row(args)[:2] != (project.key, int(number)):
+                        raise ReviewError("--request names another change than --change")
+                    args.own_row = True
                 args.forge_project = project
                 args.forge_state = state
                 args.managed_project = project if project.managed else None

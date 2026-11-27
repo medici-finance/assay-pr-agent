@@ -69,7 +69,8 @@ def started(path, within=15):
 
 def child_of(state, job):
     # The options the poller gives the review child for a request, as the child's parser reads them.
-    return argparse.Namespace(queue=state / "requests.sqlite3", request=[job[0], str(job[1]), str(job[2])])
+    return argparse.Namespace(queue=state / "requests.sqlite3", request=[job[0], str(job[1]), str(job[2])],
+                              own_row=True)
 
 
 class QueueRestartTests(unittest.TestCase):
@@ -99,7 +100,8 @@ class QueueRestartTests(unittest.TestCase):
         # it is let through, ends as its report says.
         def child(argv, **kwargs):
             at = argv.index("--request")
-            args = argparse.Namespace(queue=Path(argv[argv.index("--queue") + 1]), request=argv[at + 1:at + 4])
+            args = argparse.Namespace(queue=Path(argv[argv.index("--queue") + 1]), request=argv[at + 1:at + 4],
+                                      own_row=True)
             try:
                 cli.claim_head(args, head)
             except ReviewError:
@@ -363,6 +365,7 @@ class RequestRowTests(unittest.TestCase):
             with patch("cursor_pr.cli.pack", side_effect=AssertionError("review repeated")):
                 self.assertEqual(cli.run_request(args), (first, code))
             self.assertEqual(publish.call_args_list[0], publish.call_args_list[1])
+        args.own_row = True  # As the entry point marks a row it has checked against the change.
         cli.settle(args, "reviewed")
         with closing(sqlite3.connect(self.queue)) as db:
             self.assertEqual(db.execute("SELECT status, prepared FROM requests").fetchone(), ("reviewed", None))
@@ -460,6 +463,35 @@ class RequestRowTests(unittest.TestCase):
                 self.assertIn("--queue and --request go together and require --change", self.refused(*options))
         self.assertIn("--request takes a project, a change number and a comment number",
                       self.refused(*change, "--queue", str(self.queue), "--request", self.KEY, "three", "81"))
+
+    def test_request_for_another_change_is_refused_and_its_row_left_alone(self):
+        # The row named is the running request of another change, or of the same number elsewhere.
+        jobs = Jobs(self.state)
+        jobs.enqueue(self.KEY, 4, 82)
+        jobs.enqueue("gitlab/gitlab.com/acme/api", 3, 83)
+        while jobs.next():
+            pass
+        for request in ((self.KEY, "4", "82"), ("gitlab/gitlab.com/acme/api", "3", "83")):
+            with self.subTest(request=request):
+                code, review, err = self.enter("--queue", str(self.queue), "--request", *request)
+                review.assert_not_called()
+                self.assertEqual((code, err), (2, "cursor-review: --request names another change than --change\n"))
+        with closing(sqlite3.connect(self.queue)) as db:
+            self.assertEqual(db.execute("SELECT number, comment, status, head FROM requests ORDER BY rowid").fetchall(),
+                             [(3, 81, "started", ""), (4, 82, "started", ""), (3, 83, "started", "")])
+
+    def test_failure_before_the_row_is_known_to_be_the_reviews_own_settles_nothing(self):
+        # Here the project the poller passes cannot be read. The poller, which is waiting, finishes the row.
+        project = dict(provider="github", url="https://github.com/acme/api", checkout=str(self.state), requester_ids=[7])
+        argv = ["cursor-review", "--change", "acme/api#3", "--expected-change-url",
+                project_from(project).change_url(3), "--max-input-tokens", "6000", *self.options]
+        with patch("sys.argv", argv), patch("cursor_pr.cli.run_request") as review, \
+                patch.dict(os.environ, {"CURSOR_REVIEW_POLLER_CHILD": "1", "REVIEW_STATE_DIR": str(self.state),
+                                        "REVIEW_FORGE_PROJECT": "not json"}), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            self.assertEqual(cli.main(), 2)
+        review.assert_not_called()
+        self.assertEqual(self.row()[0], "started")
 
     def test_failure_is_settled_before_its_diagnostic_can_fail(self):
         class Gone(io.StringIO):

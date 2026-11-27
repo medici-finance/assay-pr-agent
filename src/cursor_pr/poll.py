@@ -199,12 +199,14 @@ def supervised(argv, **options):
             # The review runs in the group the supervisor was started as the leader of. A supervisor
             # that is stuck or was killed has not ended it, so the poller does. The supervisor has
             # not been waited for yet, so its number, which is the group's, is still its own.
+            # The supervisor is stopped first, so that it cannot start anything more while its group
+            # is being ended.
+            if not ended:
+                process.kill()
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-            if not ended:
-                process.kill()
             process.wait()
             process.stdout.close()
         os.close(over)
