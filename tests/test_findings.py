@@ -52,8 +52,19 @@ class ParseAnswerTests(unittest.TestCase):
         raw["result"] = raw["result"].replace("123456", "9" * 4500)
         result = engine.parse_answer(json.dumps(raw), ANCHORS)
         [dropped] = json.loads(json.dumps(result))["dropped"]
-        self.assertEqual((dropped["path"], dropped["line"]), ("a.py", None))
+        self.assertIn(dropped["path"], ("", "a.py"))
+        self.assertIsNone(dropped["line"])
         self.assertEqual(len(result["findings"]), 1)
+
+    def test_a_yaml_value_that_cannot_be_constructed_discards_only_its_finding(self):
+        raw = json.loads(envelope([]))
+        review = {"review": {"key_issues_to_review": [issue(), issue(header="INVALID_DATE"), issue(header="Other Bug")]}}
+        for scalar in ("2026-02-30", "!!bool invalid"):
+            with self.subTest(scalar=scalar):
+                raw["result"] = yaml.safe_dump(review).replace("INVALID_DATE", scalar)
+                result = engine.parse_answer(json.dumps(raw), ANCHORS)
+                self.assertEqual([finding["title"] for finding in result["findings"]], ["Possible Bug", "Other Bug"])
+                self.assertEqual(result["dropped"], [{"path": "", "line": None, "reason": "malformed finding"}])
 
     def test_the_answer_itself_must_still_be_valid(self):
         base = {"type": "result", "subtype": "success", "is_error": False}

@@ -333,15 +333,20 @@ def tokens(prompt):
 
 
 class ReviewAnswerLoader(yaml.SafeLoader):
-    def construct_bounded_int(self, node):
-        try:
-            return self.construct_yaml_int(node)
-        except ValueError:
-            # Let per-finding validation reject an integer Python cannot convert.
-            return None
-
-
-ReviewAnswerLoader.add_constructor("tag:yaml.org,2002:int", ReviewAnswerLoader.construct_bounded_int)
+    def construct_sequence(self, node, deep=False):
+        if not isinstance(node, yaml.SequenceNode):
+            return super().construct_sequence(node, deep=deep)
+        # A conversion failure in one YAML row must leave the others readable.
+        entries = {}
+        for child in dict.fromkeys(node.value):
+            loader = yaml.SafeLoader("")
+            try:
+                entries[child] = loader.construct_document(child)
+            except (ValueError, TypeError, OverflowError, LookupError, AttributeError, yaml.YAMLError):
+                entries[child] = None
+            finally:
+                loader.dispose()
+        return [entries[child] for child in node.value]
 
 
 def parse_answer(raw, anchors, limit=MAX_FINDINGS):
