@@ -139,7 +139,7 @@ class SummaryScannerTests(unittest.TestCase):
         def invoke(prompt, model, anchors):
             calls.append(prompt)
             return {"findings": [], "model_usage": None}
-        def publish(project, number, head, body, state, **kwargs):
+        def publish(project, number, head, body, state, *args):
             posts.append(body)
         def local(root, head, tool, path, cache, **kwargs):
             self.assertNotEqual(tool, "hadolint")

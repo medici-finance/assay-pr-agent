@@ -102,7 +102,7 @@ def run_forge(verb, project, *, numbers=(), publication=None, timeout=45):
     return json.loads(run(["pr-agent-forge", verb], data=json.dumps(request).encode(), env=env, timeout=timeout))
 
 
-def post_comment(project, number, head, body, state, *, dedupe_body=None):
+def post_comment(project, number, head, body, state, dedupe_body=None):
     if project is None:
         raise ReviewError("Use a --change address from the configured review projects")
     directory = state / "publications"
