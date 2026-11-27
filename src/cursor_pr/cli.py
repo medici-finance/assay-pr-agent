@@ -21,8 +21,8 @@ import yaml
 from . import context, drift, engine, history, providers, scanners
 from .scanners import fence
 from .login import auth_mode, login_directory
-from .setup import locked, apply_saved_setup, load_provider_key, max_input_tokens, state_dir
-from .config import DEFAULT_MAX_INPUT_TOKENS, load_config, project_from
+from .setup import locked, apply_saved_setup, load_provider_key, max_findings, max_input_tokens, state_dir
+from .config import DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, FINDINGS_SETTINGS, MAX_FINDINGS_LIMIT, load_config, project_from
 from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import go_report, scan_files
@@ -35,12 +35,12 @@ from .source import ReviewError, ci_refs, forge_change, local_change, post_comme
 
 MAX_DEGRADED_ROWS = 50
 FORGE_COMMENT_BYTES = 16 * 1024
+COMPACT_FINDING_MESSAGE = 140
 # Each tier's whole budget is this multiple of the configured input-token limit.
 TIERS = {"regular": 1, "mid": 2, "max": 10}
-CAPS = {"regular": MAX_FINDINGS, "mid": 6, "max": 10}
 TIMEOUTS = {"regular": 120, "mid": 240, "max": 480}
 DEEP_FOCUS = ("Look for what only this wider view shows: a caller the change breaks, behaviour the existing "
-              "tests do not cover, and a description or earlier comment the change contradicts or leaves unanswered.")
+              "tests do not cover, and earlier discussion that points to a concrete defect in the shown patch.")
 USED = ("included", "truncated")
 
 
@@ -63,11 +63,13 @@ def add_history(files, checks, packed, estimate, limit, dropped, advisories, **o
     return packed, estimate
 
 
-def fit(files, checks, limit, cap=MAX_FINDINGS, *, title="", description="", focus="", advisories=(), rendered=None):
+def fit(files, checks, limit, cap=MAX_FINDINGS, *, title="", description="", focus="", advisories=(), rendered=None,
+        scoped=False, commit_messages=False, description_truncated=False):
     """Fill the prompt with reviewable patches first and use spare space for history."""
     if rendered is None:
         rendered = render_sections(files)
-    options = dict(max_findings=cap, focus=focus, rendered=rendered)
+    options = dict(max_findings=cap, focus=focus, rendered=rendered, scoped=scoped,
+                   commit_messages=commit_messages, description_truncated=description_truncated)
     if advisories:
         original = pack(files, checks, title=title, description=description, advisories=advisories, **options)
         original_size = tokens(original[0]) if original[3] else 0
@@ -86,12 +88,11 @@ def fit(files, checks, limit, cap=MAX_FINDINGS, *, title="", description="", foc
     return packed, estimate, original_size, dropped
 
 
-def fit_patch(files, checks, limit, title, description, *, max_findings, focus, rendered):
+def fit_patch(files, checks, limit, title, description, **options):
     """Pack the prompt, leaving out whole files until it fits the input budget.
 
     Returns the prompt, token estimates, skipped paths and whether author context was kept.
     """
-    options = dict(max_findings=max_findings, focus=focus, rendered=rendered)
     prompt, anchors, unseen, has_text = full_pack = pack(
         files, checks, title=title, description=description, **options)
     estimated = full = tokens(prompt) if has_text else 0
@@ -108,12 +109,13 @@ def fit_patch(files, checks, limit, title, description, *, max_findings, focus, 
     for check in checks:
         for finding in check["findings"]:
             findings_by_path[finding["path"]].append(finding)
-    overhead = tokens(pack([], [], title=title, description=description, **options)[0])
+    singleton = dict(options, scoped=options["scoped"] or len(files) > 1)
+    overhead = tokens(pack([], [], title=title, description=description, **singleton)[0])
     sizes = {}
     for file in files:
-        if rendered[file.path][0] is not None:
+        if options["rendered"][file.path][0] is not None:
             file_checks = [{"findings": findings_by_path.get(file.path, ())}]
-            standalone, _, _, _ = pack([file], file_checks, title=title, description=description, **options)
+            standalone, _, _, _ = pack([file], file_checks, title=title, description=description, **singleton)
             sizes[file.path] = tokens(standalone) - overhead
     queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
@@ -152,19 +154,35 @@ def fit_patch(files, checks, limit, title, description, *, max_findings, focus, 
     return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped), bool(title or description)
 
 
-def with_context(files, checks, packed, estimated, dropped, limit, cap, names, raw, *, rendered, focus=""):
+def shown_description(kind, fates):
+    state = next((row["state"] for row in fates if row["name"] == "change description"), "empty")
+    if state not in USED:
+        return ""
+    return "truncated" if kind == "author" and state == "truncated" else kind
+
+
+def with_context(files, checks, packed, estimated, dropped, limit, cap, names, raw, *, rendered, focus="",
+                 scoped=False, description_kind=""):
     """Fit tier-specific context to an already selected scope."""
     text, fates = context.assemble(names, raw, limit - estimated - (120 if focus else 80))
-    options = dict(max_findings=cap, focus=focus, rendered=rendered)
+    options = dict(max_findings=cap, focus=focus, rendered=rendered, scoped=scoped)
+    baseline = estimated
     if text:
-        wider = pack(files, checks, frozenset(dropped), context=text, **options)
+        skipped = frozenset(dropped)
+        wider = pack(files, checks, skipped, context=text, **options)
         size = tokens(wider[0])
         if size <= limit:
-            packed, estimated = wider, size
+            packed, estimated, baseline = wider, size, size
+            kind = shown_description(description_kind, fates)
+            if kind:
+                guided = pack(files, checks, skipped, context=text, context_description=kind, **options)
+                guided_size = tokens(guided[0])
+                if guided_size <= baseline:
+                    packed, estimated = guided, guided_size
         else:
             fates = [dict(row, state="dropped") if row["state"] in USED else row for row in fates]
             text = ""
-    return packed, estimated, fates, text
+    return packed, estimated, fates, text, baseline
 
 
 def run_pass(row, prompt, anchors, args, source, *, cap, timeout, originals=None):
@@ -219,15 +237,56 @@ def total_usage(passes):
     return totals or None
 
 
-def finding_line(issue, *, compact=False, shorten_path=False):
+def finding_line(issue, *, compact=False, shorten_path=False, clip=None):
     # Fence displayed text after clipping so the shortened value stays literal.
     path = issue["path"]
     if shorten_path and len(path) > 80:
         tag = hashlib.sha256(path.encode("utf-8")).hexdigest()[:12]
         path = f"…/{path[-80:]} [{tag}]"
     title = fence(issue["title"], 60 if compact else None)
-    message = fence(issue["message"], 140 if compact else None)
-    return f"- {fence(path)}:{issue['line']} — {title}. {message}"
+    message = fence(issue["message"], COMPACT_FINDING_MESSAGE if compact else clip)
+    return f"- {fence(path)}:{issue['line']} — {title}. {message}" + (" (shortened)" if clip else "")
+
+
+def size_of(text):
+    return len(text.encode("utf-8"))
+
+
+def shortened_finding(issue, allowance):
+    """The finding row with the longest message that fits, keeping at least the compact 140 characters."""
+    low, high, best = COMPACT_FINDING_MESSAGE, len(issue["message"]), None
+    while low <= high:
+        middle = (low + high) // 2
+        row = comment_text([finding_line(issue, clip=middle)])
+        if size_of(row) <= allowance:
+            best, low = row, middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def bounded_findings(issues, space):
+    """Reserve the minimum for each row before sharing space for additional detail."""
+    full = [comment_text([finding_line(issue)]) for issue in issues]
+    rows = full.copy()
+    for index, issue in enumerate(issues):
+        if len(issue["message"]) > COMPACT_FINDING_MESSAGE:
+            shortened = comment_text([finding_line(issue, clip=COMPACT_FINDING_MESSAGE)])
+            rows[index] = min((full[index], shortened), key=size_of)
+    minimum_sizes = [size_of(row) for row in rows]
+    remaining = space - sum(minimum_sizes)
+    if remaining < 0:
+        return None
+
+    order = sorted(range(len(issues)), key=lambda index: size_of(full[index]))
+    for position, index in enumerate(order):
+        allowance = minimum_sizes[index] + remaining // (len(order) - position)
+        if size_of(full[index]) <= allowance:
+            rows[index] = full[index]
+        else:
+            rows[index] = shortened_finding(issues[index], allowance) or rows[index]
+        remaining -= size_of(rows[index]) - minimum_sizes[index]
+    return rows
 
 
 def comment_text(rows):
@@ -328,7 +387,9 @@ def publish(address, head, report, *, project=None, state=None):
             body.append(f"A verification pass kept {check['after']} of {check['before']} findings.")
         if omitted_findings := report.get("omitted_findings"):
             noun = "finding" if omitted_findings == 1 else "findings"
-            body.append(f"{omitted_findings} {noun} omitted by the {CAPS[tier]}-finding tier limit.")
+            # A prepared report from an older worker recorded the omitted count and the capped list.
+            finding_cap = report.get("max_findings", len(report["findings"]))
+            body.append(f"{omitted_findings} {noun} omitted by the {finding_cap}-finding tier limit.")
     # Paths come from the PR and titles/messages from the model: quote them as code
     # so the reviewer identity never posts a Markdown link or @mention for an attacker.
     header, body = body, []
@@ -356,11 +417,27 @@ def publish(address, head, report, *, project=None, state=None):
     extra = [f"- Not reviewed (token limit): {extra_coverage} more files"] if extra_coverage else []
     footer = ["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."]
     text = comment_text(intro + coverage + extra + header + findings + body + outside + footer)
-    if tier != "regular" and len(text.encode("utf-8")) > FORGE_COMMENT_BYTES:
+    # The forge helper refuses a body over 16 KiB: shorten rather than lose the whole comment.
+    if tier == "regular" and findings and size_of(text) > FORGE_COMMENT_BYTES:
+        # Keep every other row whole and shorten the longest finding messages first.
+        before = comment_text(intro + coverage + extra + header + ["Some findings were shortened to fit the forge comment."])
+        after = comment_text(body + outside + footer)
+        rows = bounded_findings(report["findings"], FORGE_COMMENT_BYTES - size_of(before + after))
+        if rows is not None:
+            text = before + "".join(rows) + after
+    if size_of(text) > FORGE_COMMENT_BYTES:
         text = fit_tier_comment(intro + header, report["findings"], coverage, extra_coverage, outside, body, footer)
-        if len(text.encode("utf-8")) > FORGE_COMMENT_BYTES:
-            raise ReviewError("Higher-tier review exceeded the forge comment limit")
+        if size_of(text) > FORGE_COMMENT_BYTES:
+            raise ReviewError("Review exceeded the forge comment limit")
     post_comment(project, int(number), head, text, state if state is not None else state_dir())
+
+
+def findings_option(value):
+    """A findings cap as the environment accepts it: int() syntax within the bound."""
+    number = int(value)
+    if not 1 <= number <= MAX_FINDINGS_LIMIT:
+        raise ValueError(f"findings cap must be from 1 to {MAX_FINDINGS_LIMIT}")
+    return number
 
 
 class Stopped(SystemExit):
@@ -462,6 +539,9 @@ def parser():
     p.add_argument("--model", help="Explicit provider model (otherwise the CLI default)")
     p.add_argument("--max-input-tokens", type=int,
                    help=f"Preflight estimate limit (default {DEFAULT_MAX_INPUT_TOKENS}, or the saved REVIEW_MAX_INPUT_TOKENS setting)")
+    p.add_argument("--max-findings", type=findings_option,
+                   help=f"Findings cap of the requested tier, 1 to {MAX_FINDINGS_LIMIT} (default {DEFAULT_MAX_FINDINGS}, or the "
+                        "saved " + ", ".join(FINDINGS_SETTINGS.values()) + " setting for that tier)")
     p.add_argument("--tier", choices=list(TIERS), default="regular",
                    help="Review depth: mid and max add context beyond the patch at 2 and 10 times the token limit")
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling the model")
@@ -482,7 +562,7 @@ def execute(args):
         raise ReviewError("--go-analysis-producer requires --expected-change-url")
     if args.change:
         change = forge_change(args.change, args.expected_change_url, project=getattr(args, "forge_project", None),
-                              with_description=args.tier != "regular")
+                              with_description=True)
     else:
         base, head = ci_refs() if args.ci else (args.base, args.head or "HEAD")
         change = local_change(root, base, head)
@@ -500,6 +580,7 @@ def execute(args):
             report, code = json.loads(prepared)
             return report, code
 
+    caps = max_findings(state_dir().resolve(), tier=args.tier, override=args.max_findings)
     paths = {f.path for f in change.files}
     selected = set(args.path) if args.path else paths
     if not selected <= paths:
@@ -558,10 +639,20 @@ def execute(args):
     # Mid and max send the same first prompt, so a max review reuses a cached mid result.
     limit = base if tier == "regular" else 2 * base - base // 4
     first_tier = "regular" if tier == "regular" else "mid"
-    cap = CAPS[first_tier]
+    cap = caps[first_tier]
     rendered = render_sections(files)
-    regular_options = {"title": change.title, "description": change.description, "advisories": advisories} if tier == "regular" else {}
-    first_pack, estimated, full, dropped = fit(files, checks, limit, cap, rendered=rendered, **regular_options)
+    scoped = selected != paths
+    if not args.change or not (change.title or change.description):
+        description_kind = "history"
+    elif change.description_truncated:
+        description_kind = "truncated"
+    else:
+        description_kind = "author" if change.description else "title"
+    regular_options = {}
+    if tier == "regular":
+        regular_options = dict(title=change.title, description=change.description, advisories=advisories,
+                               commit_messages=not args.change, description_truncated=change.description_truncated)
+    first_pack, estimated, full, dropped = fit(files, checks, limit, cap, rendered=rendered, scoped=scoped, **regular_options)
     prompt, anchors, unseen, has_text = first_pack
     plans = []
     fates = context.assemble(context.MID, raw, 0)[1] if tier != "regular" else []
@@ -569,8 +660,9 @@ def execute(args):
     first_paths = set()
     if has_text and estimated <= limit:
         if tier != "regular":
-            first_pack, estimated, fates, first_context = with_context(
-                files, checks, first_pack, estimated, dropped, limit, cap, context.MID, raw, rendered=rendered)
+            first_pack, estimated, fates, first_context, first_baseline = with_context(
+                files, checks, first_pack, estimated, dropped, limit, cap, context.MID, raw,
+                rendered=rendered, scoped=scoped, description_kind=description_kind)
             prompt = first_pack[0]
         plans.append(({"name": "review", "estimated_input_tokens": estimated, "state": "planned"}, prompt, anchors, fates))
         first_paths = {path for path, lines in anchors.items() if lines}
@@ -578,14 +670,14 @@ def execute(args):
     deep_limit = limit
     if tier == "max" and has_text:
         # The reserve is for planning. Verification may use any tokens left after actual prompts.
-        deep_limit = budget - (estimated if plans else 0) - base // 2
+        deep_limit = budget - (first_baseline if plans else 0) - base // 2
         deep_pack, deep_size, _, deep_dropped = fit(
-            files, checks, deep_limit, cap, focus=DEEP_FOCUS, rendered=rendered)
+            files, checks, deep_limit, cap, focus=DEEP_FOCUS, rendered=rendered, scoped=scoped)
         deep_anchors = deep_pack[1]
         if deep_size <= deep_limit:
-            deep_pack, deep_size, deep_fates, deep_context = with_context(
+            deep_pack, deep_size, deep_fates, deep_context, _ = with_context(
                 files, checks, deep_pack, deep_size, deep_dropped, deep_limit, cap, context.DEEP, raw,
-                rendered=rendered, focus=DEEP_FOCUS)
+                rendered=rendered, focus=DEEP_FOCUS, scoped=scoped, description_kind=description_kind)
             new_paths = any(lines and path not in first_paths for path, lines in deep_anchors.items())
             extra_context = any(row["name"] not in context.MID and row["state"] in USED for row in deep_fates)
             if new_paths or extra_context:
@@ -609,12 +701,17 @@ def execute(args):
             wider, fates_with_history = context.assemble(
                 (*names, history_name), {**raw, history_name: history_text}, tokens(original_context))
             replacements = fates_with_history[:-1]
+            previous_kind = shown_description(description_kind, blocks)
+            replacement_kind = shown_description(description_kind, replacements)
+            if previous_kind == "author" and replacement_kind != "author":
+                continue
             if fates_with_history[-1]["state"] not in USED or any(
                     old["state"] in USED and new["state"] not in USED
                     for old, new in zip(blocks, replacements, strict=True)):
                 continue
             candidate = pack(files, checks, frozenset(skipped), context=wider, max_findings=cap,
-                             focus=DEEP_FOCUS if is_deep else "", rendered=rendered)[0]
+                             focus=DEEP_FOCUS if is_deep else "", rendered=rendered, scoped=scoped,
+                             context_description=replacement_kind)[0]
             size = tokens(candidate)
             if size <= row["estimated_input_tokens"]:
                 row["estimated_input_tokens"] = size
@@ -634,7 +731,7 @@ def execute(args):
               "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
               "findings": [], "cursor_usage": None, "full_input_tokens": full, "degraded": degraded,
               "drift": drifted, "passes": passes, "context": list(context_fates.values()),
-              "verification": {"state": "not-needed"}, "delivered": planned_tier}
+              "verification": {"state": "not-needed"}, "delivered": planned_tier, "max_findings": caps[tier]}
     if static:
         report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
@@ -680,11 +777,13 @@ def execute(args):
                     findings = verdict["findings"]
                     report["verification"] = {"state": "filtered", "before": before, "after": len(findings)}
                 break
-    cap = CAPS[tier]
+    cap = caps[tier]
     if len(findings) > cap:
         report["omitted_findings"] = len(findings) - cap
         from_deep = [issue for issue in findings if issue in deep_findings]
         from_first = [issue for issue in findings if issue not in deep_findings]
+        # A max cap below the mid cap can leave more deep findings than the cap allows.
+        from_deep = from_deep[:cap]
         findings = from_first[:cap - len(from_deep)] + from_deep
     report.update(findings=findings, cursor_usage=total_usage(passes),
                   cache_hit=bool(passes) and all(row["state"] == "cached" for row in passes),
