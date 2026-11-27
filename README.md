@@ -37,7 +37,7 @@ The CLI receives an allow-listed environment: its own provider's key or sign-in 
 
 ### Untrusted input and evidence binding
 
-The prompt contains three things: PR-Agent's review rubric, the scanner diagnostics that fall on shown lines, and the diff hunks. The change's title, description, reviews and other comments are not sent, and Hadolint, zizmor, OSV-Scanner and Qualgen output never enters it. The diagnostics and the patch follow a fixed instruction to use only that material and not to use tools, and each is labelled `untrusted data`. The file list is bracketed by two change reads and refused if the head moved in between, so the patch belongs to one head.
+The regular prompt contains PR-Agent's review rubric, scanner diagnostics that fall on shown lines, and the diff hunks. Mid and max can add bounded change details and surrounding code. Max can also include eligible conversation comments, excluding internal GitLab notes and earlier review summaries. Hadolint, zizmor, OSV-Scanner and Qualgen output stays in the report. The prompt labels the diagnostics, patch and context as `untrusted data` and instructs the model to work without tools. The reviewer checks the change before and after reading its file list and refuses it if the head moves.
 
 A finding is accepted only if it names a reviewed file and cites a contiguous range of head lines that the shown hunks contain. One failing finding rejects the whole answer: the review ends as `model-unavailable` and its scanner results are still posted. A file name containing a C0 control character (below U+0020), or a duplicate file name, stops the review before the model is called.
 
