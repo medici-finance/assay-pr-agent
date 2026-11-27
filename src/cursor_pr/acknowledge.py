@@ -91,12 +91,16 @@ def request(project, method, url, headers, deadline=None, **options):
         raise Busy()
     unanswered.pop(host, None)
     answer = queue.SimpleQueue()
+    # Counted from here, so that a thread slow to start takes its delay out of the wait, not on top.
+    cutoff = time.monotonic() + left
     # A forge that is only slow runs into httpx's own timeout, just before the wait here is over:
     # the error then names what was slow, and its thread has ended when the next call is made.
     patience = left - SHORTEST_SECONDS / 2
 
     def send():
         try:
+            if time.monotonic() >= cutoff:
+                raise OutOfTime()  # First run when the caller had stopped waiting: nothing is sent.
             with httpx.Client(timeout=patience, follow_redirects=False,
                               **(client_options() if project.provider == "gitlab" else {})) as client:
                 answer.put((client.request(method, url, headers=headers, **options), None))
@@ -106,7 +110,7 @@ def request(project, method, url, headers, deadline=None, **options):
     thread = threading.Thread(target=send, name="forge-marker-request", daemon=True)
     thread.start()
     try:
-        response, error = answer.get(timeout=left)
+        response, error = answer.get(timeout=max(cutoff - time.monotonic(), 0))
     except queue.Empty:
         unanswered[host] = thread
         raise httpx.ReadTimeout("The forge did not answer in time") from None
