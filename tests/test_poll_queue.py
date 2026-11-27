@@ -1234,6 +1234,23 @@ class ReadScheduleTests(Offline):
         self.tick(0)
         self.assertEqual([row[:3] for row in self.schedule()], [(number, 1, 120) for number in self.open])
 
+    def test_clock_set_back_does_not_make_a_change_wait_longer_than_it_was_given(self):
+        steady = [5000.0]
+        self.start(patch("cursor_pr.poll.time.monotonic", side_effect=lambda: steady[0]))
+        self.tick(0)
+        steady[0] += 120
+        self.assertEqual(self.tick(), [3])  # Quiet: it now waits 240 seconds.
+        # 200 seconds pass, and the wall clock is set back by 150 of them.
+        steady[0] += 200
+        self.assertEqual(self.tick(50), [])
+        # By the wall clock 190 seconds are still to go. By the steady one the 240 are over in 40.
+        steady[0] += 40
+        self.assertEqual(self.tick(40), [3])
+        # After a restart there is only the wall clock, as before.
+        self.jobs = Jobs(self.state)
+        steady[0] += 10_000
+        self.assertEqual(self.tick(60), [])
+
     def test_cycle_logs_how_many_changes_it_read_and_how_many_it_skipped(self):
         self.open = [3, 4, 5]
         self.threads = {number: [comment(number)] for number in self.open}

@@ -52,6 +52,9 @@ class Jobs:
 
     def __init__(self, state):
         self.path = state / "requests.sqlite3"
+        # When this process last read each change, by the steady clock. Not kept across a restart,
+        # after which the saved wall-clock times are all there is.
+        self.read = {}
         settled = []
         with closing(sqlite3.connect(self.path)) as db, db:
             # One transaction for the schema and the recovery: sqlite3 opens none for DDL by itself,
@@ -151,8 +154,12 @@ class Jobs:
                 db.executemany("DELETE FROM schedule WHERE project=? AND number=?",
                                [(project, number) for number in saved if number not in numbers])
         # A clock that moved back past the last read makes the saved times meaningless, so read now.
+        # One that moved back less would make a change wait for longer than it was given, so a read
+        # this process made is also due once that long has passed by its own steady clock.
+        steady = time.monotonic()
         return {number for number, (wait, seen) in saved.items()
-                if number in numbers and now >= seen and seen + min(wait, cap) > now}
+                if number in numbers and now >= seen and seen + min(wait, cap) > now
+                and steady - self.read.get((project, number), steady) < min(wait, cap)}
 
     def forget_schedule(self):
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -170,6 +177,7 @@ class Jobs:
                 quiet = previous is not None and not active and list(previous[:2]) == [comments, newest]
                 db.execute("INSERT OR REPLACE INTO schedule VALUES (?,?,?,?,?,?)",
                            (project, number, comments, newest, min(previous[2] * 2, cap) if quiet else interval, now))
+                self.read[project, number] = time.monotonic()
 
     # What a finished request owes the forge is two things, each with its own tries and its own time
     # of the next one: the marker's removal (cleared, tries, retry_at) and, after a failure, the
