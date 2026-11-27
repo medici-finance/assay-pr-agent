@@ -634,7 +634,12 @@ class SupervisorTests(unittest.TestCase):
         self.assertFalse((self.state / "review.ready").exists())
 
     def test_review_runs_in_the_group_the_poller_can_end_and_the_supervisor_outside_it(self):
-        report = "import os; print(os.getpgrp(), os.getppid(), os.getpgid(os.getppid()))"
+        # The supervisor steps out after it has started the review, so the review waits for that.
+        report = ("import os, time\nsupervisor = os.getppid()\n"
+                  "for attempt in range(500):\n"
+                  "    if os.getpgid(supervisor) != os.getpgrp(): break\n"
+                  "    time.sleep(0.01)\n"
+                  "print(os.getpgrp(), supervisor, os.getpgid(supervisor))")
         process, _ = self.supervise([sys.executable, "-c", report])
         out, err = process.communicate(timeout=20)
         group, supervisor, supervisors_group = map(int, out.split())
@@ -770,15 +775,38 @@ class SupervisedTests(unittest.TestCase):
                 # be waited for, so its end follows a moment later.
                 self.assertTrue(gone(self.state / name, within=5))
 
+    def test_poller_ends_the_group_while_the_supervisor_still_has_its_number(self):
+        # Once the poller has waited for the supervisor, the number may be another process's, and
+        # ending "the group" would end a stranger's. So the group is ended first, in every case.
+        cases = {"ended": "raise SystemExit(0)", "killed": "os.kill(os.getpid(), signal.SIGKILL)", "stuck": "time.sleep(120)"}
+        for name, then in cases.items():
+            with self.subTest(supervisor=name):
+                script = self.state / f"{name}.py"
+                script.write_text("import os, signal, time\n" + then + "\n")
+                seen = []
+
+                def ended_group(number, how, kill=os.killpg):
+                    try:
+                        os.kill(number, 0)  # Succeeds for a process that has ended and not been waited for.
+                        seen.append("its own")
+                    except ProcessLookupError:
+                        seen.append("given up")
+                    return kill(number, how)
+
+                with patch("cursor_pr.poll.SUPERVISOR", script), patch("cursor_pr.poll.REVIEW_SECONDS", 0.3), \
+                        patch("cursor_pr.poll.STOP_SECONDS", 0.3), \
+                        patch("cursor_pr.poll.os.killpg", side_effect=ended_group):
+                    poll.supervised(["unused"])
+                self.assertEqual(seen, ["its own"])
+
     def test_interrupted_poller_ends_the_review_before_it_goes_on(self):
         busy = [sys.executable, "-c", BUSY, str(self.state / "review")]
 
-        def interrupt(self_, *args, **kwargs):
+        def interrupt(*args):
             started(self.state / "review")
             raise KeyboardInterrupt
 
-        with patch("cursor_pr.poll.subprocess.Popen.communicate", autospec=True, side_effect=interrupt), \
-                self.assertRaises(KeyboardInterrupt):
+        with patch("cursor_pr.poll.read_all", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
             poll.supervised(busy)
         self.assertTrue(gone(self.state / "review", within=0))  # Already ended when the interrupt gets out.
 

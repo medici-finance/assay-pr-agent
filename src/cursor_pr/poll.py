@@ -7,11 +7,13 @@ import json
 import logging
 import os
 from pathlib import Path
+import selectors
 import signal
 import sqlite3
 import subprocess
 import sys
 import threading
+import time
 
 from .config import load_config
 from .credentials import SETUP_INPUTS, forge_credentials
@@ -171,37 +173,60 @@ def supervised(argv, **options):
     can write to. So a review never runs beside a later poller, however this one stops.
     """
     lifeline, hold = os.pipe()
+    # The supervisor holds the other end of this one for as long as it runs, and gives it to nobody.
+    # It says that the supervisor has ended without the poller having to wait for it, which would
+    # give up the supervisor's number while the review's group, which has the same number, is needed.
+    over, running = os.pipe()
     keep = (lock_fd,) if lock_fd is not None else ()
     process = None
     try:
         process = subprocess.Popen(
             [sys.executable, "-I", str(SUPERVISOR), str(lifeline), str(REVIEW_SECONDS),
-             ",".join(map(str, keep)), *argv], stdout=subprocess.PIPE, pass_fds=(lifeline, *keep),
+             ",".join(map(str, keep)), *argv], stdout=subprocess.PIPE, pass_fds=(lifeline, running, *keep),
             process_group=0, **options)
-        return process.communicate(timeout=REVIEW_SECONDS + STOP_SECONDS)[0]
-    except subprocess.TimeoutExpired:
-        return None
+        os.close(running)
+        running = None
+        return read_all(process.stdout.fileno(), REVIEW_SECONDS + STOP_SECONDS)
     finally:
         # Closing the poller's end is what tells the supervisor to end the review: on a timeout,
         # on an interrupt, and on any other way out of here.
         os.close(lifeline)
         os.close(hold)
+        if running is not None:
+            os.close(running)
         if process is not None:
+            ended = closed_within(over, STOP_SECONDS)
+            # The review runs in the group the supervisor was started as the leader of. A supervisor
+            # that is stuck or was killed has not ended it, so the poller does. The supervisor has
+            # not been waited for yet, so its number, which is the group's, is still its own.
             try:
-                ended = process.wait(timeout=STOP_SECONDS) >= 0
-            except subprocess.TimeoutExpired:
-                ended = False
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
             if not ended:
-                # The supervisor did not end by itself: it is stuck, or it was killed. Then nobody has
-                # ended the review, which runs in the group the supervisor was started as the leader
-                # of. A group's number is not given to another process while the group has members.
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
                 process.kill()
-                process.wait()
+            process.wait()
             process.stdout.close()
+        os.close(over)
+
+
+def read_all(descriptor, seconds):
+    """Everything written to the descriptor until it is closed, or None when that takes too long."""
+    parts = []
+    with selectors.DefaultSelector() as waiting:
+        waiting.register(descriptor, selectors.EVENT_READ)
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            if waiting.select(left):
+                part = os.read(descriptor, 65536)
+                if not part:
+                    return b"".join(parts)
+                parts.append(part)
+    return None
+
+
+def closed_within(descriptor, seconds):
+    return read_all(descriptor, seconds) is not None
 
 
 def cycle(projects, state, jobs, since, runner=None):
