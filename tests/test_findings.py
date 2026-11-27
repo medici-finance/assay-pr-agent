@@ -333,6 +333,12 @@ class QuotedEvidenceTests(unittest.TestCase):
                                                    relevant_code="...\nprepare()\nsend()")]), anchors)
         self.assertEqual(parsed["findings"][0]["evidence"], "verified")
 
+    def test_a_numbered_match_does_not_set_the_raw_indentation_margin(self):
+        anchors = shown("3 +    first()", "if enabled:", "    first()", "    second()", "    third()")
+        quote = "...\n3 +    first()\nsecond()\nthird()"
+        parsed = engine.parse_answer(envelope([dict(issue(start=1, end=5), relevant_code=quote)]), anchors)
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
     def test_raw_quotes_cannot_change_trailing_source_whitespace(self):
         anchors = shown("    Authorization: token ")
         exact = dict(issue(start=1, end=1), relevant_code="Authorization: token ")
@@ -379,6 +385,20 @@ class QuotedEvidenceTests(unittest.TestCase):
         with patch.object(engine, "evidence_matches", wraps=engine.evidence_matches) as matches:
             self.assertTrue(engine.covers(parts, cited))
         self.assertLess(matches.call_count, 5 * len(cited))
+
+    def test_expensive_alignment_retains_the_finding_as_unverified(self):
+        source_lines = ["check()"] * 220
+        quote = "...\ncheck()\ncheck()\n" * 25 + "..."
+        raw = envelope([dict(issue(start=1, end=len(source_lines)), relevant_code=quote)])
+        with patch.object(engine, "EVIDENCE_WORK_LIMIT", 1200):
+            parsed = engine.parse_answer(raw, shown(*source_lines))
+        self.assertEqual([row["evidence"] for row in parsed["findings"]], ["unverified"])
+        self.assertEqual(parsed["dropped"], [])
+
+    def test_invisible_formatting_does_not_make_a_quote_substantive(self):
+        source_line = "x\u200d\u200d"
+        raw = envelope([dict(issue(start=1, end=1), relevant_code=source_line)])
+        self.assertEqual(engine.parse_answer(raw, shown(source_line))["findings"][0]["evidence"], "unverified")
 
     def test_blank_cited_lines_need_no_quote(self):
         anchors = shown("first = 1", "", "second = 2")
@@ -427,6 +447,14 @@ class QuotedEvidenceTests(unittest.TestCase):
         body = "````js\n" + source_line + "\n````"
         [finding] = engine.parse_answer(envelope([issue(start=1, end=1, body=body)]), shown(source_line))["findings"]
         self.assertEqual(finding["evidence"], "verified")
+
+    def test_tilde_fences_and_first_block_fallback(self):
+        exact = "~~~~py\nresult = 1\n~~~~"
+        anchors = shown("result = 1")
+        first = engine.parse_answer(envelope([issue(start=1, end=1, body=exact)]), anchors)
+        self.assertEqual(first["findings"][0]["evidence"], "verified")
+        later = engine.parse_answer(envelope([issue(start=1, end=1, body="~~~\nresult = 2\n~~~\n" + exact)]), anchors)
+        self.assertEqual(later["findings"][0]["evidence"], "unverified")
 
     def test_pack_records_the_text_of_every_shown_head_line(self):
         patch = "@@ -1,2 +1,2 @@\n first()\n-old\n+  third( x )\n"

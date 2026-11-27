@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import tomllib
+import unicodedata
 
 from jinja2 import Environment
 import yaml
@@ -25,6 +26,7 @@ from .providers import KEYS, LABELS, provider
 
 VERSION = "2"
 MAX_FINDINGS = DEFAULT_MAX_FINDINGS
+EVIDENCE_WORK_LIMIT = 250_000
 DROPPED_PATH_CHARS = 32_768
 LOCKS = {"package-lock.json", "pnpm-lock.yaml", "go.sum", "npm-shrinkwrap.json"}
 
@@ -452,6 +454,7 @@ def answer_findings(answer, anchors):
         if not isinstance(issues, yaml.SequenceNode) or issues.tag != YAML_TAG + "seq":
             raise ReviewError("Invalid Cursor finding list")
         entries, scalars = {}, {}
+        evidence_budget = EvidenceBudget()
         for node in issues.value:
             if node not in entries:
                 try:
@@ -460,7 +463,7 @@ def answer_findings(answer, anchors):
                     item = None
                 else:
                     item = answer_finding(fields, loader, scalars)
-                entries[node] = finding(item, anchors, normalized=True)
+                entries[node] = finding(item, anchors, normalized=True, evidence_budget=evidence_budget)
             yield entries[node]
     except RecursionError:
         raise ReviewError("YAML nesting in the review response is too deep") from None
@@ -511,7 +514,7 @@ def parse_answer(raw, anchors, limit=MAX_FINDINGS, *, verification=False):
     return {"findings": clean, "dropped": dropped, "cursor_usage": usage if isinstance(usage, dict) else None}
 
 
-def finding(issue, anchors, *, normalized=False, verification=False):
+def finding(issue, anchors, *, normalized=False, verification=False, evidence_budget=None):
     """One validated finding, or the record of why it was dropped. A reason is fixed text, never the model's."""
     dropped = {"path": "", "line": None, "reason": "malformed finding"}
     if not isinstance(issue, dict):
@@ -546,36 +549,51 @@ def finding(issue, anchors, *, normalized=False, verification=False):
             return None, dropped
         valid["verification_status"] = status
     if not verification:
-        evidence = quoted_evidence(issue.get("relevant_code"), body, lines, start, end)
+        evidence = quoted_evidence(issue.get("relevant_code"), body, lines, start, end,
+                                   evidence_budget if evidence_budget is not None else EvidenceBudget())
         if evidence is None:
             return None, dict(dropped, reason="quoted code does not match the cited lines")
         valid["evidence"] = evidence
     return valid, None
 
 
-def quoted_evidence(code, message, lines, start, end):
+class EvidenceBudget:
+    """Bound the quote work for one model answer, including repeated rows."""
+
+    def __init__(self):
+        self.remaining = EVIDENCE_WORK_LIMIT
+
+    def spend(self, units):
+        self.remaining -= units
+        return self.remaining >= 0
+
+
+def quoted_evidence(code, message, lines, start, end, budget):
     """Return an evidence status, or None when the explicit quote contradicts the patch."""
     asked = isinstance(code, str)
+    if not budget.spend(len(code if asked else message)):
+        return "unverified"
     quote = code if asked else fenced_quote(message)
     parts = checkable(quote)
     concrete = [part for part in parts if part is not ELIDED]
-    if not concrete or not isinstance(lines, dict):
+    if not concrete or not isinstance(lines, dict) or not budget.spend(end - start + 1):
         return "unverified"
     cited = [(line, lines[line].rstrip("\r\n")) for line in range(start, end + 1)]
     raw_matches = quoted_in_order(concrete, cited)
     if raw_matches is None:
         # A fenced block in the message may be a suggested fix.
         return None if asked else "unverified"
-    if covers(parts, cited, single_line=len(concrete) == 1):
+    if covers(parts, cited, single_line=len(concrete) == 1, budget=budget):
         return "verified"
     quote_margin = common_indent(quote for quote, _ in raw_matches)
     source_margin = common_indent(line for _, line in raw_matches)
-    if quote_margin != source_margin and covers(parts, cited, quote_margin=quote_margin, source_margin=source_margin):
+    if quote_margin != source_margin and covers(parts, cited, quote_margin=quote_margin, source_margin=source_margin,
+                                                budget=budget):
         return "verified"
     return "unverified"
 
 
-FENCE_START = re.compile(r"(?m)^[ \t]*(`{3,})(?!`)[^`\r\n]*\r?\n")
+FENCE_START = re.compile(r"(?m)^[ \t]*(`{3,}(?!`)|~{3,}(?!~))([^\r\n]*)\r?\n")
 # A quoted line as the patch shows it: indented, numbered, and marked as added.
 SHOWN = re.compile(r"([1-9]\d*) (?:\+| )(.*)")
 # An explicit elision such as "..." or "# …": it stands for cited lines the quote leaves out.
@@ -586,11 +604,14 @@ ELIDED = object()
 
 
 def fenced_quote(message):
-    opening = FENCE_START.search(message)
-    if opening is None:
-        return ""
-    closing = re.compile(rf"(?m)^[ \t]*`{{{len(opening[1])},}}[ \t]*\r?$").search(message, opening.end())
-    return message[opening.end():closing.start()] if closing else ""
+    for opening in FENCE_START.finditer(message):
+        marker = opening[1][0]
+        if marker == "`" and marker in opening[2]:
+            continue
+        closer = re.compile(rf"(?m)^[ \t]*{marker}{{{len(opening[1])},}}[ \t]*\r?$")
+        closing = closer.search(message, opening.end())
+        return message[opening.end():closing.start()] if closing else ""
+    return ""
 
 
 def checkable(quote):
@@ -623,6 +644,7 @@ def numbered_match(part, index, line):
 def quoted_in_order(parts, cited):
     """Match whole lines in order and collect the raw pairs used to infer a uniform indent."""
     remaining = iter(cited)
+    numbered = {str(index): line for index, line in cited}
     raw_matches = []
     for part in parts:
         text = part[0].lstrip(" \t")
@@ -630,7 +652,8 @@ def quoted_in_order(parts, cited):
             if numbered_match(part, index, line):
                 break
             if text == line.lstrip(" \t"):
-                raw_matches.append((part[0], line))
+                if numbered.get(part[1]) != part[2]:
+                    raw_matches.append((part[0], line))
                 break
         else:
             return None
@@ -679,12 +702,14 @@ def isolated_evidence(part, cited, indexed, first, strong_from, quote_margin, si
     return {pos + 1: pos >= strong_from or substantive(cited[pos][1]) for pos in matching}
 
 
-def covers(parts, cited, *, quote_margin="", source_margin="", single_line=False):
+def covers(parts, cited, *, quote_margin="", source_margin="", single_line=False, budget=None):
     """Find coverage with consistent indentation and a substantive match on the same alignment."""
+    if budget is None:
+        budget = EvidenceBudget()
     reach = {0: False}  # next cited position -> whether any alignment here matched substantive code
     eliding, indexed = False, None
     for offset, part in enumerate(parts):
-        if not reach:
+        if not reach or not budget.spend(len(reach)):
             return False
         if part is ELIDED:
             eliding = True
@@ -695,14 +720,20 @@ def covers(parts, cited, *, quote_margin="", source_margin="", single_line=False
             strong_from = min((pos for pos, strong in reach.items() if strong), default=len(cited) + 1)
             if offset + 1 < len(parts) and parts[offset + 1] is ELIDED:
                 if indexed is None:
+                    if not budget.spend(len(cited)):
+                        return False
                     indexed = indexed_evidence(cited, source_margin, single_line)
                 reach = isolated_evidence(part, cited, indexed, first, strong_from, quote_margin, single_line)
                 continue
+            if not budget.spend(len(cited) + 1 - first):
+                return False
             reach = {pos: pos >= strong_from for pos in range(first, len(cited) + 1)}
         step = {}
         last = max(reach)
         reachable = strong = False
         for position in range(min(reach), len(cited)):
+            if not budget.spend(1):
+                return False
             if position in reach:
                 reachable = True
                 strong = strong or reach[position]
@@ -716,6 +747,8 @@ def covers(parts, cited, *, quote_margin="", source_margin="", single_line=False
         reach = step
     if eliding:
         return any(reach.values())
+    if not budget.spend(len(cited)):
+        return False
     last_nonblank = max((pos for pos, (_, line) in enumerate(cited) if line.strip(" \t")), default=-1)
     return any(strong and pos > last_nonblank for pos, strong in reach.items())
 
@@ -725,7 +758,8 @@ def substantive(content):
 
     `return x` or `x = 1` counts; `}` or `);` alone does not, since it would match almost any range.
     """
-    visible = "".join(content.split())
+    visible = [char for char in content if char.isprintable() and not char.isspace()
+               and unicodedata.category(char) not in ("Mn", "Me")]
     return len(visible) >= 3 and any(char.isalnum() for char in visible)
 
 
