@@ -142,12 +142,12 @@ def publish(address, head, report, *, project=None, state=None):
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {fence(path)}")
     tracked = report.get("outcomes")
-    if tracked and tracked["fixed"] + tracked["unaddressed"] + tracked["repeated"]:
+    if tracked and tracked["fixed"] + tracked["unaddressed"] + tracked.get("gone", 0) + tracked["repeated"]:
         # An accept rate needs a finding whose code the author either changed or left alone.
         rate = f"{tracked['accept_rate']}%" if tracked["accept_rate"] is not None else "not available"
-        body.append(f"Tracked findings for this change: {tracked['fixed']} addressed and {tracked['unaddressed']} left unchanged "
-                    f"at a later review (accept rate {rate}); {tracked['repeated']} raised again; "
-                    f"{tracked['open']} awaiting a later review.")
+        body.append(f"Tracked findings for this change: {tracked['fixed']} fixed and {tracked['unaddressed']} left unchanged "
+                    f"at a later review (accept rate {rate}); {tracked.get('gone', 0)} gone from the change with no "
+                    f"sign of a fix; {tracked['repeated']} raised again; {tracked['open']} awaiting a later review.")
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
     # A finding may quote a multiline source fragment, including forge quick actions.
     lines = [" ".join(line.splitlines()) for line in body]
