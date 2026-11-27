@@ -339,6 +339,14 @@ class QuotedEvidenceTests(unittest.TestCase):
         parsed = engine.parse_answer(envelope([dict(issue(start=1, end=5), relevant_code=quote)]), anchors)
         self.assertEqual(parsed["findings"][0]["evidence"], "verified")
 
+    def test_an_earlier_duplicate_does_not_choose_the_only_indent(self):
+        for indent in ("", "  "):
+            with self.subTest(indent=indent):
+                anchors = shown(indent + "prepare()", "    prepare()", "    send()")
+                quote = "...\nprepare()\nsend()"
+                parsed = engine.parse_answer(envelope([dict(issue(start=1, end=3), relevant_code=quote)]), anchors)
+                self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
     def test_raw_quotes_cannot_change_trailing_source_whitespace(self):
         anchors = shown("    Authorization: token ")
         exact = dict(issue(start=1, end=1), relevant_code="Authorization: token ")
@@ -396,9 +404,11 @@ class QuotedEvidenceTests(unittest.TestCase):
         self.assertEqual(parsed["dropped"], [])
 
     def test_invisible_formatting_does_not_make_a_quote_substantive(self):
-        source_line = "x\u200d\u200d"
-        raw = envelope([dict(issue(start=1, end=1), relevant_code=source_line)])
-        self.assertEqual(engine.parse_answer(raw, shown(source_line))["findings"][0]["evidence"], "unverified")
+        for invisible in ("\u200d", "\u115f", "\u1160", "\u3164", "\uffa0"):
+            with self.subTest(invisible=invisible):
+                source_line = "x" + invisible * 2
+                raw = envelope([dict(issue(start=1, end=1), relevant_code=source_line)])
+                self.assertEqual(engine.parse_answer(raw, shown(source_line))["findings"][0]["evidence"], "unverified")
 
     def test_blank_cited_lines_need_no_quote(self):
         anchors = shown("first = 1", "", "second = 2")
@@ -455,6 +465,13 @@ class QuotedEvidenceTests(unittest.TestCase):
         self.assertEqual(first["findings"][0]["evidence"], "verified")
         later = engine.parse_answer(envelope([issue(start=1, end=1, body="~~~\nresult = 2\n~~~\n" + exact)]), anchors)
         self.assertEqual(later["findings"][0]["evidence"], "unverified")
+
+    def test_fenced_quote_inside_a_blockquote_matches_source(self):
+        for body, source in (("> ```python\n> send()\n> ```", "send()"),
+                             ("> > ~~~~\n> > > result\n> > ~~~~", "> result")):
+            with self.subTest(body=body):
+                parsed = engine.parse_answer(envelope([issue(start=1, end=1, body=body)]), shown(source))
+                self.assertEqual(parsed["findings"][0]["evidence"], "verified")
 
     def test_pack_records_the_text_of_every_shown_head_line(self):
         patch = "@@ -1,2 +1,2 @@\n first()\n-old\n+  third( x )\n"

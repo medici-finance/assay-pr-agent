@@ -579,21 +579,19 @@ def quoted_evidence(code, message, lines, start, end, budget):
     if not concrete or not isinstance(lines, dict) or not budget.spend(end - start + 1):
         return "unverified"
     cited = [(line, lines[line].rstrip("\r\n")) for line in range(start, end + 1)]
-    raw_matches = quoted_in_order(concrete, cited)
-    if raw_matches is None:
+    if not quoted_in_order(concrete, cited):
         # A fenced block in the message may be a suggested fix.
         return None if asked else "unverified"
     if covers(parts, cited, single_line=len(concrete) == 1, budget=budget):
         return "verified"
-    quote_margin = common_indent(quote for quote, _ in raw_matches)
-    source_margin = common_indent(line for _, line in raw_matches)
-    if quote_margin != source_margin and covers(parts, cited, quote_margin=quote_margin, source_margin=source_margin,
-                                                budget=budget):
-        return "verified"
+    for quote_margin, source_margin in candidate_margins(concrete, cited, budget):
+        if covers(parts, cited, quote_margin=quote_margin, source_margin=source_margin, budget=budget):
+            return "verified"
     return "unverified"
 
 
-FENCE_START = re.compile(r"(?m)^[ \t]*(`{3,}(?!`)|~{3,}(?!~))([^\r\n]*)\r?\n")
+FENCE_START = re.compile(r" {0,3}(`{3,}(?!`)|~{3,}(?!~))([^\r\n]*)")
+BLOCKQUOTE_PREFIX = re.compile(r" {0,3}>[ \t]?")
 # A quoted line as the patch shows it: indented, numbered, and marked as added.
 SHOWN = re.compile(r"([1-9]\d*) (?:\+| )(.*)")
 # An explicit elision such as "..." or "# …": it stands for cited lines the quote leaves out.
@@ -601,16 +599,42 @@ ELISION = re.compile(r"(?:(?:#|//)[ \t]*)?(?:\.{3,}|…)")
 # The patch display's hunk markers stand for no code at all.
 MARKER = re.compile(r"__(?:new|old) hunk__")
 ELIDED = object()
+# These default-ignorable Hangul fillers are classified as printable letters.
+INVISIBLE_FILLERS = frozenset("\u115f\u1160\u3164\uffa0")
+
+
+def blockquote_line(line, depth=None):
+    """Remove the quote container prefixes, retaining any deeper markers as text."""
+    count, start = 0, 0
+    while depth is None or count < depth:
+        prefix = BLOCKQUOTE_PREFIX.match(line, start)
+        if prefix is None:
+            break
+        start = prefix.end()
+        count += 1
+    return line[start:], count
 
 
 def fenced_quote(message):
-    for opening in FENCE_START.finditer(message):
+    lines = iter(message.split("\n"))
+    for line in lines:
+        text, depth = blockquote_line(line.removesuffix("\r"))
+        opening = FENCE_START.fullmatch(text)
+        if opening is None:
+            continue
         marker = opening[1][0]
         if marker == "`" and marker in opening[2]:
             continue
-        closer = re.compile(rf"(?m)^[ \t]*{marker}{{{len(opening[1])},}}[ \t]*\r?$")
-        closing = closer.search(message, opening.end())
-        return message[opening.end():closing.start()] if closing else ""
+        closer = re.compile(rf" {{0,3}}{marker}{{{len(opening[1])},}}[ \t]*")
+        body = []
+        for line in lines:
+            text, count = blockquote_line(line.removesuffix("\r"), depth)
+            if count != depth:
+                break
+            if closer.fullmatch(text):
+                return "\n".join(body)
+            body.append(text)
+        break
     return ""
 
 
@@ -642,26 +666,39 @@ def numbered_match(part, index, line):
 
 
 def quoted_in_order(parts, cited):
-    """Match whole lines in order and collect the raw pairs used to infer a uniform indent."""
+    """Check for a matching ordered subset before testing complete coverage."""
     remaining = iter(cited)
-    numbered = {str(index): line for index, line in cited}
-    raw_matches = []
     for part in parts:
         text = part[0].lstrip(" \t")
-        for index, line in remaining:
-            if numbered_match(part, index, line):
-                break
-            if text == line.lstrip(" \t"):
-                if numbered.get(part[1]) != part[2]:
-                    raw_matches.append((part[0], line))
-                break
-        else:
-            return None
-    return raw_matches
+        if not any(numbered_match(part, index, line) or text == line.lstrip(" \t") for index, line in remaining):
+            return False
+    return True
 
 
-def common_indent(lines):
-    return os.path.commonprefix([line[:len(line) - len(line.lstrip(" \t"))] for line in lines])
+def candidate_margins(parts, cited, budget):
+    """Try uniform shifts from possible matches, then let coverage choose the alignment."""
+    if not budget.spend(len(cited) + len(parts)):
+        return
+    indents, numbered = defaultdict(dict), {}
+    for index, line in cited:
+        stripped = line.lstrip(" \t")
+        indents[stripped][line[:len(line) - len(stripped)]] = None
+        numbered[str(index)] = line
+    raw = [part for part in parts if numbered.get(part[1]) != part[2]]
+    # Every covering alignment must match this row as raw code. Start with the fewest possible shifts.
+    seeds = [min(raw, key=lambda part: len(indents[part[0].lstrip(" \t")]))] if raw else parts
+    seen = {("", "")}
+    for text, _, _ in seeds:
+        stripped = text.lstrip(" \t")
+        quote = text[:len(text) - len(stripped)]
+        for source in indents[stripped]:
+            if not budget.spend(1 + len(quote) + len(source)):
+                return
+            common = len(os.path.commonprefix((quote[::-1], source[::-1])))
+            margins = (quote[:len(quote) - common], source[:len(source) - common])
+            if margins not in seen:
+                seen.add(margins)
+                yield margins
 
 
 def evidence_key(text, margin, single_line):
@@ -759,7 +796,7 @@ def substantive(content):
     `return x` or `x = 1` counts; `}` or `);` alone does not, since it would match almost any range.
     """
     visible = [char for char in content if char.isprintable() and not char.isspace()
-               and unicodedata.category(char) not in ("Mn", "Me")]
+               and char not in INVISIBLE_FILLERS and unicodedata.category(char) not in ("Mn", "Me")]
     return len(visible) >= 3 and any(char.isalnum() for char in visible)
 
 
