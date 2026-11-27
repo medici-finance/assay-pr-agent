@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from cursor_pr import cli, source
+from cursor_pr import cli, engine, source
 from cursor_pr.config import project_from
 
 FILES = {"src/app.py": "def run(argument):\n    return argument\n",
@@ -110,9 +110,20 @@ class DegradeTests(unittest.TestCase):
         files = source.local_change(self.root, "HEAD~1", self.head).files
         app, guide = (next(file for file in files if file.path == path)
                       for path in ("src/app.py", "docs/guide.md"))
-        checks = [{"findings": [{"path": app.path, "line": 2, "message": "Scanner details. " * 900}]}]
+        app_finding = {"path": app.path, "line": 2, "message": "Long scanner details. " * 900}
+        guide_finding = {"path": guide.path, "line": 1, "message": "Guide finding"}
+        checks = [{"findings": [app_finding, guide_finding]}]
         limit = cli.tokens(cli.pack([guide], checks)[0])
-        (_, anchors, _, has_text), estimated, _, dropped = cli.fit([app, guide], checks, limit)
+        with patch.object(engine, "section", wraps=engine.section) as section, \
+             patch.object(cli, "pack", wraps=cli.pack) as pack:
+            (prompt, anchors, _, has_text), estimated, _, dropped = cli.fit([app, guide], checks, limit)
+        self.assertEqual([call.args[0].path for call in section.call_args_list], [app.path, guide.path])
+        single_file_checks = [(files[0].path, file_checks[0]["findings"])
+                              for files, file_checks, *_ in (call.args for call in pack.call_args_list)
+                              if len(files) == 1]
+        self.assertEqual(single_file_checks, [(app.path, [app_finding]), (guide.path, [guide_finding])])
+        self.assertIn("Guide finding", prompt)
+        self.assertNotIn("Long scanner details", prompt)
         self.assertTrue(has_text)
         self.assertLessEqual(estimated, limit)
         self.assertEqual(dropped, [app.path])
