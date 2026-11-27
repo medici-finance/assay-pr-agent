@@ -103,7 +103,7 @@ backend gitlab
 def client_options():
     if "REVIEW_GITLAB_LOCAL_CA" not in os.environ:
         return {}
-    return {"verify": context(Path(os.environ["ASSAY_CONFIG_HOME"]))}
+    return {"verify": context(Path(os.environ["REVIEW_FORGE_DIR"]))}
 
 
 def local_url(url):

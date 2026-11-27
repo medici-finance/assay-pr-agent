@@ -1,9 +1,11 @@
 import argparse
 import fcntl
-from contextlib import ExitStack
+from contextlib import ExitStack, closing, contextmanager
 import json
 import os
 from pathlib import Path
+import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -17,16 +19,16 @@ from .scanners import fence
 from .login import auth_mode, login_directory
 from .setup import locked, apply_saved_setup, load_provider_key, max_input_tokens, state_dir
 from .config import DEFAULT_MAX_INPUT_TOKENS, load_config, project_from
-from .credentials import forge_credentials, standalone_requested
+from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import go_report, scan_files, scanner
 from .sync import scan_checkout
 from .engine import CursorFailure, pack, review, tokens
-from .source import ReviewError, ci_refs, forge_change, local_change, run_desk
+from .source import ReviewError, ci_refs, forge_change, local_change, post_comment
 
 
-def publish(address, head, report):
-    repo, number = address.rsplit("#", 1)
+def publish(address, head, report, *, project=None, state=None):
+    _, number = address.rsplit("#", 1)
     label = providers.LABELS[report.get("provider", "cursor")]
     body = [f"{label} review of {head}", report["state"]]
     # Paths come from the PR and titles/messages from the model: quote them as code
@@ -53,21 +55,121 @@ def publish(address, head, report):
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {fence(path)}")
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
-    with tempfile.NamedTemporaryFile("w", encoding="utf8") as tmp:
-        # A finding may quote a multiline source fragment, including forge quick actions.
-        tmp.write("\n".join(" ".join(line.splitlines()) for line in body) + "\n")
-        tmp.flush()
-        run_desk(["deskpost", "comment", repo, number, "--kind", "mr", "--head", head,
-             "--body-file", tmp.name])
+    # A finding may quote a multiline source fragment, including forge quick actions.
+    text = "\n".join(" ".join(line.splitlines()) for line in body) + "\n"
+    post_comment(project, int(number), head, text, state if state is not None else state_dir())
+
+
+# The longest a review started from the queue may run. Its waits have timeouts of their own. This is
+# for one that hangs anyway: it holds the poller's lock, and no poller starts until it is gone.
+QUEUED_REVIEW_SECONDS = 1800
+# How long it then has to unwind before it is ended from outside.
+CLEANUP_SECONDS = 30
+
+
+# Waits outside the review's interpreter, on a pipe only the review holds. The pipe closing means the
+# review has ended, however it did. Still open at the hard limit, the review is ended from here.
+# It ends the review's whole process group: a command the review was waiting on would otherwise outlive
+# it, with no limit of its own and perhaps with the pipe the poller reads the report from.
+WATCHDOG = """import os, select, signal, sys
+if not select.select([0], [], [], float(sys.argv[1]))[0]:
+    try:
+        os.killpg(int(sys.argv[2]), signal.SIGKILL)
+    except OSError:
+        os.kill(int(sys.argv[2]), signal.SIGKILL)
+"""
+
+
+def out_of_time(signum, frame):
+    # Unwinds like any exit: the command being waited on is killed and the temporary files go. The row
+    # is not settled and stays started, for the next poller.
+    raise SystemExit(f"cursor-review: still running after {QUEUED_REVIEW_SECONDS} seconds, giving up")
+
+
+@contextmanager
+def time_limit():
+    # Two stops. The alarm asks the review to unwind. The watchdog does not ask: it also ends a review
+    # stuck where no handler runs, in a native call or in its own cleanup. It gets none of the
+    # review's descriptors, so it never holds the poller's lock.
+    guard = subprocess.Popen([sys.executable, "-I", "-c", WATCHDOG, str(QUEUED_REVIEW_SECONDS + CLEANUP_SECONDS),
+                              str(os.getpid())], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+    try:
+        # A group of the review's own from here on, which the commands it starts join. The watchdog
+        # was started before and stays outside it.
+        os.setpgrp()
+    except OSError:
+        pass  # A session leader leads its group already.
+    signal.signal(signal.SIGALRM, out_of_time)
+    signal.alarm(QUEUED_REVIEW_SECONDS)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        guard.kill()
+        guard.stdin.close()
+        guard.wait()
+
+
+def request_row(args):
+    project, number, comment = args.request
+    return project, int(number), int(comment)
+
+
+def open_queue(args):
+    # The poller's queue as it is. A wrong path is an error, not a new empty database.
+    return closing(sqlite3.connect(args.queue.resolve().as_uri() + "?mode=rw", uri=True))
+
+
+def claim_head(args, head):
+    # The row of the request under review takes the head before any other work. A repeat of the
+    # request finds the head of its interrupted start there and is refused at another. Read and
+    # written in one transaction on the row the poller reads, so the two cannot disagree.
+    try:
+        with open_queue(args) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT head FROM requests WHERE project=? AND number=? AND comment=?
+                AND status='started'""", request_row(args)).fetchone()
+            if row is None:
+                raise ReviewError("The queue has no running request for this review")
+            if row[0] and row[0] != head:
+                raise ReviewError(f"Change is at {head}, not at {row[0]}, the head of its interrupted start")
+            db.execute("UPDATE requests SET head=? WHERE project=? AND number=? AND comment=?",
+                       (head, *request_row(args)))
+    except sqlite3.Error as err:
+        raise ReviewError(f"Review queue: {err}") from err
+
+
+def settle(args, status):
+    # How the review ended, on the request's row and before the lock is released, so that a poller
+    # that has stopped reading finds it there. The first one stands: a report that only failed to
+    # print did not fail. Never raises, because it also runs while a failure is being reported.
+    if not args.queue:
+        return  # --request without --queue: that failure is the one being reported.
+    try:
+        with open_queue(args) as db, db:
+            db.execute("""UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?
+                AND status='started'""", (status, *request_row(args)))
+    except (sqlite3.Error, ValueError, OSError) as err:
+        print(f"cursor-review: could not record how the review ended: {err}", file=sys.stderr)
+
+
+def review_outcome(report):
+    # What the poller keeps for a finished review: its state once its result is on the change.
+    return report["state"] if report.get("publication") == "posted-or-already-present" else "failed"
 
 
 def parser():
     p = argparse.ArgumentParser(description="Run one bounded code review and emit a JSON report.")
     mode = p.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--change", help="Assay-configured GitHub PR or GitLab MR, e.g. 'org/repo#42'")
+    mode.add_argument("--change", help="Configured GitHub PR or GitLab MR, e.g. 'org/repo#42'")
     mode.add_argument("--base", help="Local base revision to compare against")
     mode.add_argument("--ci", action="store_true", help="Use provider CI event SHAs in the checkout")
     p.add_argument("--expected-change-url", help="Require this exact open forge change before reviewing")
+    p.add_argument("--queue", type=Path, help="The poller's request queue, with --request")
+    p.add_argument("--request", nargs=3, metavar=("PROJECT", "NUMBER", "COMMENT"),
+                   help="The queued request under review: its row takes the head and how the review ended")
     p.add_argument("--head", help="Local head revision (default HEAD with --base)")
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="Checkout for local Git and scanners")
     p.add_argument("--path", action="append", default=[], help="Limit review to an exact changed path; repeatable")
@@ -81,23 +183,28 @@ def parser():
                    help=f"Preflight estimate limit (default {DEFAULT_MAX_INPUT_TOKENS}, or the saved REVIEW_MAX_INPUT_TOKENS setting)")
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling the model")
     p.add_argument("--cache-dir", type=Path, default=Path(os.getenv("XDG_CACHE_HOME", Path.home()/".cache"))/"cursor-pr-review")
-    p.add_argument("--post", action="store_true", help="Publish a head-bound summary using deskpost with --change")
+    p.add_argument("--post", action="store_true", help="Publish a head-bound summary with --change")
     return p
 
 
 def execute(args):
     if args.max_input_tokens < 1 or (args.head and not args.base) or (args.post and (not args.change or args.estimate)):
         raise ReviewError("Invalid budget or incompatible --head/--post options")
+    if bool(args.queue) != bool(args.request) or (args.request and not args.change):
+        raise ReviewError("--queue and --request go together and require --change")
     root = args.repo.resolve()
     if args.expected_change_url and not args.change:
         raise ReviewError("--expected-change-url requires --change")
     if args.go_analysis_producer and not args.expected_change_url:
         raise ReviewError("--go-analysis-producer requires --expected-change-url")
     if args.change:
-        change = forge_change(args.change, args.expected_change_url)
+        change = forge_change(args.change, args.expected_change_url, project=getattr(args, "forge_project", None))
     else:
         base, head = ci_refs() if args.ci else (args.base, args.head or "HEAD")
         change = local_change(root, base, head)
+
+    if args.request:
+        claim_head(args, change.head)
 
     paths = {f.path for f in change.files}
     selected = set(args.path) if args.path else paths
@@ -185,9 +292,10 @@ def run_request(args):
         report.update(model_invocations=report["cursor_invocations"], model_usage=report["cursor_usage"])
     if args.post:
         try:
-            publish(args.change, report["head"], report)
-        except (ReviewError, OSError, subprocess.TimeoutExpired):
-            return dict(report, publication="failed"), 2
+            publish(args.change, report["head"], report, project=getattr(args, "forge_project", None),
+                    state=getattr(args, "forge_state", None))
+        except (ReviewError, OSError, ValueError, subprocess.TimeoutExpired) as err:
+            return dict(report, publication="failed", publication_error=str(err) or type(err).__name__), 2
         report["publication"] = "posted-or-already-present"
     return report, code
 
@@ -204,6 +312,8 @@ def main():
     old = Path.cwd()
     try:
         with ExitStack() as stack:
+            if args.request:
+                stack.enter_context(time_limit())
             state = state_dir().resolve()
             if args.change and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
                 apply_saved_setup(state)
@@ -217,35 +327,44 @@ def main():
                 args.max_input_tokens = max_input_tokens(state)
             if args.model is None:
                 args.model = os.getenv("REVIEW_MODEL")
-            if args.change and os.getenv("CURSOR_REVIEW_POLLER_CHILD") == "1" and os.getenv("REVIEW_MANAGED_PROJECT"):
-                args.managed_project = project_from(json.loads(os.environ["REVIEW_MANAGED_PROJECT"]))
-            if args.change and standalone_requested():
-                state.mkdir(mode=0o700, parents=True, exist_ok=True)
-                projects = load_config(state)
+            if args.change:
+                if os.getenv("CURSOR_REVIEW_POLLER_CHILD") == "1":
+                    project = project_from(json.loads(os.environ["REVIEW_FORGE_PROJECT"]))
+                else:
+                    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    projects = load_config(state)
+                    slug = args.change.rpartition("#")[0]
+                    project = next((p for p in projects.values() if p.slug == slug), None)
+                    if project is None:
+                        raise ReviewError("Use a --change address from the configured review projects")
+                    stack.enter_context(forge_credentials(projects))
                 slug, _, number = args.change.rpartition("#")
-                project = next((p for p in projects.values() if p.slug == slug), None)
-                if project is None or not number.isdecimal():
+                if project.slug != slug or not number.isascii() or not number.isdecimal():
                     raise ReviewError("Use a --change address from the configured review projects")
                 if args.expected_change_url and args.expected_change_url != project.change_url(number):
                     raise ReviewError("Configured project and expected change URL differ")
                 args.expected_change_url = project.change_url(number)
                 if args.scanner_ci is None:
                     args.scanner_ci = project.scanner_ci
+                args.forge_project = project
+                args.forge_state = state
                 args.managed_project = project if project.managed else None
-                stack.enter_context(forge_credentials(projects, state))
             clean = stack.enter_context(tempfile.TemporaryDirectory(prefix="pr-agent-settings-"))
-            # deskread/deskpost discover their configured forge from the caller's checkout.
-            # Compute the upstream imports here, then restore cwd before touching the forge.
             os.chdir(clean)
             from pr_agent.algo.git_patch_processing import to_hunk_only_patch  # noqa: F401
             from pr_agent.algo.token_handler import TokenEncoder  # noqa: F401
             os.chdir(args.repo)
             report, status = run_request(args)
+            if args.request:
+                # At once, before the cleanup or the report can fail.
+                settle(args, review_outcome(report))
         print(json.dumps(report, ensure_ascii=True, indent=2))
         return status
     except (ReviewError, OSError, ValueError, TypeError, KeyError, AttributeError,
             UnidiffParseError, yaml.YAMLError, subprocess.TimeoutExpired) as err:
         print(f"cursor-review: {err}", file=sys.stderr)
+        if args.request:
+            settle(args, "failed")
         return 2
     finally:
         os.chdir(old)

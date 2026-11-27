@@ -1,16 +1,15 @@
 """Mark a queued review request on the forge, and tell the requester when nothing was posted."""
 import logging
 import os
-import tempfile
 from urllib.parse import quote
 
 import httpx
 
 from .gitlab_tls import client_options
-from .source import ReviewError, reviewer_token, run_desk
+from .source import ReviewError, post_comment, reviewer_token, run_forge, valid_sha
 
 log = logging.getLogger(__name__)
-# deskpost has no reaction verb, so the marker goes straight to each forge's API.
+# The forge helper has no reaction operation, so the marker goes straight to each forge's API.
 MARK = {"github": ("eyes", "content"), "gitlab": ("hourglass", "name")}
 NOTICE = ("A `/review` request on this change did not produce a posted review: the review could not be "
           "completed or published. Post `/review` again to retry it.\n")
@@ -82,34 +81,49 @@ def add(project, number, comment):
     response.raise_for_status()  # GitHub answers 200 when this account has already reacted.
 
 
+def own_reaction(project, markers, headers):
+    """The ID of this credential's reaction on the comment. An App installation token may not read
+    GET /user, but adding a reaction it already has answers 200 with that reaction, ID included."""
+    response = request(project, "POST", markers, headers, json={"content": "eyes"})
+    response.raise_for_status()
+    row = response.json()
+    if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] < 1 or row.get("content") != "eyes":
+        raise ReviewError("The forge did not identify the reviewer's reaction")
+    return [row["id"]]
+
+
 def remove(project, number, comment):
     root, markers, headers = reviewer(project, number, comment)
-    for ident in own_markers(project, root, markers, headers):
+    found = (own_reaction(project, markers, headers) if project.provider == "github"
+             else own_markers(project, root, markers, headers))
+    for ident in found:
         response = request(project, "DELETE", f"{markers}/{ident}", headers)
         if response.status_code != 404:
             response.raise_for_status()
 
 
-def notify(project, number):
-    with tempfile.NamedTemporaryFile("w", encoding="utf8") as body:
-        body.write(NOTICE)
-        body.flush()
-        run_desk(["deskpost", "comment", project.slug, str(number), "--kind", "mr", "--body-file", body.name],
-                 cwd=project.checkout)
+def notify(project, number, state):
+    # The helper publishes only on the change's current head. The notice is about the request, not a
+    # head, so it goes on whatever head the change has now, once per head like any comment.
+    head = run_forge("change", project, numbers=[number]).get("headSha")
+    if not valid_sha(head):
+        raise ReviewError("Forge did not identify the change head")
+    post_comment(project, number, head, NOTICE, state)
 
 
 class Acknowledgement:
     """Every call fails open: one log line, and the queue and the review go on."""
 
-    def __init__(self, jobs):
+    def __init__(self, jobs, state):
         self.jobs = jobs
+        self.state = state
 
     def queued(self, project, number, comment):
         self.attempt(lambda: add(project, number, comment), "mark", project, number, comment)
 
     def finished(self, project, number, comment, status):
         if status == "failed":
-            self.attempt(lambda: notify(project, number), "report the failed review on", project, number, None)
+            self.attempt(lambda: notify(project, number, self.state), "report the failed review on", project, number, None)
 
         def clear():
             # GitLab's one marker belongs to the merge request and stays while another request waits there.
