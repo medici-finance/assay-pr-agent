@@ -115,7 +115,10 @@ def execute(args):
             number = args.change.rsplit("#", 1)[1]
             if args.expected_change_url != project.change_url(number):
                 raise ReviewError("Managed checkout and reviewed project differ")
-            checkout = stack.enter_context(scan_checkout(root, project, number, change.head))
+            resources = getattr(args, "sarif_resources", stack)
+            checkout = resources.enter_context(scan_checkout(root, project, number, change.head))
+            if resources is not stack:
+                args.sarif_checkout = checkout
         checks = scan_files(checkout, change.head, files)
         deadline = time.monotonic() + 180
         for tool, path in missing:
@@ -201,8 +204,6 @@ def main():
         args.go_report = args.go_report.resolve()
     if args.qualgen_store:
         args.qualgen_store = args.qualgen_store.resolve()
-    if args.sarif:
-        args.sarif = args.sarif.resolve()
     old = Path.cwd()
     try:
         with ExitStack() as stack:
@@ -246,11 +247,14 @@ def main():
             from pr_agent.algo.git_patch_processing import to_hunk_only_patch  # noqa: F401
             from pr_agent.algo.token_handler import TokenEncoder  # noqa: F401
             os.chdir(args.repo)
+            if args.sarif:
+                args.sarif_resources = stack
             report, status = run_request(args)
-        print(json.dumps(report, ensure_ascii=True, indent=2))
-        # The report reaches stdout even when the export cannot be written.
-        if args.sarif:
-            sarif.write(args.sarif, report, lambda path: blob(args.repo, report["head"], path))
+            print(json.dumps(report, ensure_ascii=True, indent=2))
+            # Export before releasing a managed checkout and after printing the report.
+            if args.sarif:
+                checkout = getattr(args, "sarif_checkout", args.repo)
+                sarif.write(old / args.sarif, report, lambda path: blob(checkout, report["head"], path))
         return status
     except (ReviewError, OSError, ValueError, TypeError, KeyError, AttributeError,
             UnidiffParseError, yaml.YAMLError, subprocess.TimeoutExpired) as err:

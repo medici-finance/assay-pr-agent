@@ -50,7 +50,7 @@ def describe(tool, name):
     return {"id": name, "name": name[:255], "shortDescription": {"text": f"A finding reported by {tool}."}}
 
 
-def line_hashes(blob):
+def line_hashes(blob, wanted=None):
     """Line number to primaryLocationLineHash, computed as github/codeql-action's src/fingerprints.ts
     does: a rolling hash of the 100 characters counted from the line's start, ignoring spaces and
     tabs, so the text after the line is part of the value; then that value's number of occurrences in
@@ -64,7 +64,8 @@ def line_hashes(blob):
         nonlocal value
         text = format(value, "x")
         seen[text] = seen.get(text, 0) + 1
-        prints[starts[index]] = f"{text}:{seen[text]}"
+        if wanted is None or starts[index] in wanted:
+            prints[starts[index]] = f"{text}:{seen[text]}"
         starts[index] = -1
 
     def push(current):
@@ -93,7 +94,7 @@ def line_hashes(blob):
     # The reference reads UTF-16 code units and closes the input with U+FFFF. When that marker
     # starts a line of its own, the line is not in the file and is dropped.
     units = blob.decode("utf8", "replace").encode("utf-16-le")
-    for unit in struct.unpack(f"<{len(units) // 2}H", units):
+    for (unit,) in struct.iter_unpack("<H", units):
         feed(unit)
     marker_starts_line = line_start
     feed(0xFFFF)
@@ -102,17 +103,20 @@ def line_hashes(blob):
             emit()
         push(0)
     if marker_starts_line:
-        del prints[number]
+        prints.pop(number, None)
     return prints
 
 
 def log(report, source=None):
     """source(path) is the content of a path at the reviewed head, or None when Git cannot supply it."""
-    results, rules, lines, located = [], {}, {}, []
-    for tool, name, path, line, end, text in findings(report):
-        if not (isinstance(text, str) and text.strip() and safe_path(path)
-                and isinstance(name, str) and name.strip()):
-            continue
+    rows = [row for row in findings(report) if safe_path(row[2]) and isinstance(row[1], str)
+            and row[1].strip() and isinstance(row[5], str) and row[5].strip()]
+    requested = {}
+    for _, _, path, line, _, _ in rows:
+        if type(line) is int and line > 0:
+            requested.setdefault(path, set()).add(line)
+    results, rules, lines = [], {}, {}
+    for tool, name, path, line, end, text in rows:
         # Six scanners share one driver, so the message names the tool that reported the line.
         text = (text if tool == "model" else f"{tool}: {text}")[:MESSAGE_LIMIT]
         # A URI reference: a '#' or '%' in a path must not read as a fragment or an escape.
@@ -127,24 +131,18 @@ def log(report, source=None):
             # The line's own text identifies the result, so a line added above it is not a new alert.
             if path not in lines:
                 blob = source(path) if source else None
-                lines[path] = line_hashes(blob) if blob is not None else {}
+                lines[path] = line_hashes(blob, requested[path]) if blob is not None else {}
             # Without the line's text there is no value: the upload-sarif action computes it instead.
             fingerprint = lines[path].get(line)
             if fingerprint:
-                located.append(((path, name, fingerprint), (extent, text), result))
+                # The finding keeps its own identity when other findings appear on that line.
+                span = extent - line if extent is not None else None
+                key = hashlib.sha256(json.dumps([span, text]).encode()).hexdigest()
+                fingerprint = f"{fingerprint}:{key}"
         if fingerprint:
             result["partialFingerprints"] = {"primaryLocationLineHash": fingerprint}
         rules.setdefault(name, describe(tool, name))
         results.append(result)
-    # One rule can report several findings on one line: every model finding has one rule, and ShellCheck
-    # reports SC2086 for each unquoted variable. The first keeps the reference value and each one after
-    # it that differs from the ones before adds its number. Findings the log cannot tell apart, such as
-    # two SC2086 with one message, keep one identity.
-    told_apart = {}
-    for place, finding, result in located:
-        number = told_apart.setdefault(place, {}).setdefault(finding, len(told_apart[place]) + 1)
-        if number > 1:
-            result["partialFingerprints"]["primaryLocationLineHash"] += f":{number}"
     return {"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0", "runs": [{
         "tool": {"driver": {"name": TOOL, "version": release(), "informationUri": PROJECT,
                             "rules": list(rules.values())}},

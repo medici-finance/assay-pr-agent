@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 from cursor_pr import cli, engine, sarif
 from cursor_pr.checks import blob
+from cursor_pr.config import project_from
+from cursor_pr.source import local_change
 
 
 def report(**changes):
@@ -87,6 +89,11 @@ class SarifLogTests(unittest.TestCase):
             with self.subTest(content=content[:24]):
                 self.assertEqual(sarif.line_hashes(content), expected)
 
+    def test_only_requested_line_hashes_are_returned(self):
+        content = b"same line\n" * 30
+        all_hashes = sarif.line_hashes(content)
+        self.assertEqual(sarif.line_hashes(content, {2, 7, 50}), {n: all_hashes[n] for n in (2, 7)})
+
     def test_located_results_are_identified_by_their_line_text(self):
         def export(*lines, text=SCRIPT):
             value = report(findings=[], static_checks=[], checks=[{
@@ -117,29 +124,29 @@ class SarifLogTests(unittest.TestCase):
             return report(findings=[], static_checks=[], checks=[
                 {"tool": "shellcheck", "path": "run.sh", "state": "complete", "findings": list(findings)}])
         value = sarif.line_hashes(SOURCES["src/app.py"])[3]
-        # Every model finding has one rule. Three defects on one line would be one alert.
-        self.assertEqual(prints(results(model(("first", 3), ("second", 4), ("third", 3)), head_text)), [
-            {"primaryLocationLineHash": value}, {"primaryLocationLineHash": value + ":2"},
-            {"primaryLocationLineHash": value + ":3"}])
-        # The first keeps the reference value, so a finding alone on its line keeps its identity.
-        self.assertEqual(prints(results(model(("first", 3)), head_text)), [{"primaryLocationLineHash": value}])
-        # Two that differ only in extent are two findings, and a later one that repeats an earlier one
-        # takes that finding's number.
-        self.assertEqual(prints(results(model(("same", 3), ("same", 5), ("first", 3), ("first", 3)), head_text)), [
-            {"primaryLocationLineHash": value}, {"primaryLocationLineHash": value + ":2"},
-            {"primaryLocationLineHash": value + ":3"}, {"primaryLocationLineHash": value + ":3"}])
+        # Every model finding has one rule. Distinct findings on one line keep distinct identities
+        # even when the model changes their order.
+        same_line = [("first", 3), ("same", 3), ("same", 5), ("third", 3), ("first", 3)]
+        keys = prints(results(model(*same_line), head_text))
+        self.assertEqual(keys, list(reversed(prints(results(model(*reversed(same_line)), head_text)))))
+        identities = [key["primaryLocationLineHash"] for key in keys]
+        self.assertTrue(all(key.startswith(value + ":") for key in identities))
+        self.assertEqual(len(set(identities[:4])), 4)
+        self.assertEqual(identities[0], identities[-1])
+        # The finding keeps its identity when the others are removed.
+        self.assertEqual(prints(results(model(("first", 3)), head_text)), keys[:1])
         # The log cannot tell apart two SC2086 rows with one message, so they keep one identity.
         shell = {"path": "run.sh", "rule": "SC2086", "line": 4, "message": "Double quote."}
-        one = [{"primaryLocationLineHash": sarif.line_hashes(SCRIPT)[4]}]
+        one = prints(results(scanned(shell), head_text))
         self.assertEqual(prints(results(scanned(shell, shell), head_text)), one * 2)
-        # Two rules on one line need no number: the rule is part of a result's identity.
+        # The result keeps its fingerprint regardless of a different rule on the same line.
         other = dict(shell, rule="SC2154", message="Referenced but not assigned.")
-        self.assertEqual(prints(results(scanned(shell, other), head_text)), one * 2)
-        # Neither does the same rule on the same text in another file.
+        self.assertEqual(prints(results(scanned(shell, other), head_text))[:1], one)
+        # A finding in another file does not change this result.
         alone = model(("first", 3))
         self.assertEqual(prints(results(dict(alone, findings=alone["findings"] + [
             dict(alone["findings"][0], path="copy.py", message="elsewhere")]), head_text)),
-            [{"primaryLocationLineHash": value}] * 2)
+            keys[:1] + prints(results(model(("elsewhere", 3)), head_text)))
         self.assertEqual(prints(results(model(("first", 3), ("second", 3)), None)), [None, None])
 
     def test_unreadable_lines_carry_no_fingerprint_and_lineless_ones_keep_one(self):
@@ -246,8 +253,8 @@ class SarifFlagTests(unittest.TestCase):
         self.assertEqual(exported, json.dumps(sarif.log(json.loads(out), lambda path: blob(self.root, head, path)),
                                               ensure_ascii=True, indent=2) + "\n")
         # The fingerprint is of the finding's line as committed.
-        self.assertEqual(json.loads(exported)["runs"][0]["results"][0]["partialFingerprints"],
-                         {"primaryLocationLineHash": sarif.line_hashes(EXAMPLE.encode())[2]})
+        key = json.loads(exported)["runs"][0]["results"][0]["partialFingerprints"]["primaryLocationLineHash"]
+        self.assertTrue(key.startswith(sarif.line_hashes(EXAMPLE.encode())[2] + ":"))
         self.assertEqual(json.loads(out)["state"], "estimate")
         self.assertEqual([(r["ruleId"], r["level"]) for r in json.loads(exported)["runs"][0]["results"]], [("SC2086", "note")])
         self.assertFalse((self.root / "estimate.sarif").exists())
@@ -262,6 +269,43 @@ class SarifFlagTests(unittest.TestCase):
         self.check("--base", self.base, "--estimate")
         self.assertEqual(sorted(p.name for p in self.root.iterdir() if p.suffix == ".sarif"), ["review.sarif"])
 
+    def test_export_reuses_the_temporary_managed_checkout(self):
+        candidate = self.root
+        original = self.root / "checkout-without-head"
+        original.mkdir()
+        url = "https://github.com/example/repo/pull/1"
+        project = project_from(dict(provider="github", url=url.removesuffix("/pull/1"), requester_ids=[7],
+                                    checkout=str(original), managed=True))
+        change = local_change(candidate, self.base, "HEAD")
+        change = type(change)(change.head, change.files, url)
+        active = False
+
+        @contextlib.contextmanager
+        def checkout(*_):
+            nonlocal active
+            active = True
+            try:
+                yield candidate
+            finally:
+                active = False
+
+        def read(root, head, path):
+            self.assertTrue(active)
+            self.assertEqual(root, candidate)
+            return blob(root, head, path)
+
+        target = candidate / "managed.sarif"
+        self.root = original
+        with patch.object(cli, "scan_checkout", side_effect=checkout), patch.object(cli, "blob", side_effect=read), \
+             patch.object(cli, "forge_change", return_value=change), \
+             patch.dict(os.environ, {"CURSOR_REVIEW_POLLER_CHILD": "1", "REVIEW_FORGE_PROJECT": json.dumps(dict(
+                 provider=project.provider, url=project.url, checkout=str(project.checkout),
+                 requester_ids=sorted(project.requesters), managed=True))}):
+            code, _, error = self.check("--change", "example/repo#1", "--estimate", "--sarif", str(target))
+        self.assertEqual(code, 0, error)
+        self.assertEqual(len(json.loads(target.read_text())["runs"][0]["results"]), 1)
+        self.assertFalse(active)
+
     def test_fingerprints_read_the_reviewed_head(self):
         # Edited after the commit, and absent from it: neither line is at the reviewed head.
         (self.root / "example.sh").write_text("#!/bin/sh\nprintf '%s\\n' \"$argument\"\n")
@@ -272,8 +316,9 @@ class SarifFlagTests(unittest.TestCase):
         self.assertEqual(code, 0)
         rows = json.loads((self.root / "out.sarif").read_text())["runs"][0]["results"]
         self.assertEqual([r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for r in rows], ["example.sh", "ghost.sh"])
-        self.assertEqual([r.get("partialFingerprints") for r in rows],
-                         [{"primaryLocationLineHash": sarif.line_hashes(EXAMPLE.encode())[2]}, None])
+        self.assertTrue(rows[0]["partialFingerprints"]["primaryLocationLineHash"].startswith(
+            sarif.line_hashes(EXAMPLE.encode())[2] + ":"))
+        self.assertNotIn("partialFingerprints", rows[1])
         head = self.git("rev-parse", "HEAD")
         self.assertEqual(blob(self.root, head, "example.sh"), EXAMPLE.encode())
         self.assertIsNone(blob(self.root, head, "ghost.sh"))
@@ -285,3 +330,11 @@ class SarifFlagTests(unittest.TestCase):
         self.assertIn("cursor-review:", err)
         self.assertNotIn("missing", out)
         self.assertFalse((self.root / "missing").exists())
+
+    def test_symlink_loop_does_not_prevent_printing_the_report(self):
+        loop = self.root / "loop.sarif"
+        loop.symlink_to(loop.name)
+        code, out, err = self.check("--base", self.base, "--estimate", "--sarif", str(loop))
+        self.assertEqual((code, json.loads(out)["state"]), (2, "estimate"))
+        self.assertIn("cursor-review:", err)
+        self.assertTrue(loop.is_symlink())
