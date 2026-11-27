@@ -177,7 +177,8 @@ class MarkerTests(Offline):
         with self.assertNoLogs("cursor_pr.acknowledge", level="WARNING"):
             ack.finished(self.gh, 3, 81, "failed", acknowledge.time.monotonic() - 1)
         self.assertEqual(self.calls, [])
-        self.assertEqual((ack.jobs.acknowledgement(job), ack.jobs.acknowledgement_tries(job)), ((0, 0), 0))
+        owed = ack.jobs.owed(job)
+        self.assertEqual([owed[name] for name in ("cleared", "cleared_tries", "notice_sent", "notice_sent_tries")], [0] * 4)
         self.assertIn((*job, "failed"), ack.jobs.unfinished_acknowledgements(acknowledge.time.time()))  # Still due.
 
     def test_marker_turned_away_for_now_is_asked_for_again_when_the_review_starts(self):
@@ -235,7 +236,25 @@ class MarkerTests(Offline):
         self.assertIn("may be left in place", logged.output[0])
         self.assertIsNone(ack.jobs.acknowledgement(job))  # Final: not tried again.
 
-    def test_a_call_cut_short_by_the_deadline_is_not_a_failed_try(self):
+    def test_reaction_github_wrote_when_asked_is_removed_even_when_the_time_is_up(self):
+        ack = self.ack()
+        job = self.gh.key, 3, 81
+        ack.jobs.next()
+        ack.jobs.finish(job, "reviewed")  # Never marked: the lookup below writes the reaction.
+        clock = [1000.0]
+        answer = self.respond
+
+        def slow(request):
+            clock[0] += 3 if request.method == "POST" else 0
+            return answer(request)
+        self.respond = slow
+        with patch.object(acknowledge.time, "monotonic", side_effect=lambda: clock[0]):
+            ack.finished(self.gh, 3, 81, "reviewed", 1002.0)
+        self.assertEqual([method for method, _ in self.sent()], ["POST", "DELETE"])
+        self.assertEqual([row for row in self.eyes if row["user"]["id"] == ME and row["content"] == "eyes"], [])
+        self.assertIsNone(ack.jobs.owed(job))
+
+    def test_a_call_that_started_is_a_try_however_little_time_it_had(self):
         ack = self.ack()
         job = self.gh.key, 3, 81
         ack.jobs.next()
@@ -252,10 +271,13 @@ class MarkerTests(Offline):
         with patch.object(acknowledge.time, "monotonic", return_value=1000.0), \
                 patch.object(acknowledge.httpx, "Client", side_effect=silent), \
                 patch.object(acknowledge, "run_forge", side_effect=subprocess.TimeoutExpired("change", 2)), \
-                self.assertNoLogs("cursor_pr.acknowledge", level="WARNING"):
+                self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
             ack.finished(self.gh, 3, 81, "failed", 1002.0)  # Two seconds are left of the cycle's time.
-        self.assertEqual(waits, [2.0])
-        self.assertEqual((ack.jobs.acknowledgement(job), ack.jobs.acknowledgement_tries(job)), ((0, 0), 0))
+        self.assertEqual((waits, len(logged.output)), ([2.0], 2))
+        # Counted, each for itself: a forge that never answers in time cannot keep them due for ever.
+        owed = ack.jobs.owed(job)
+        self.assertEqual([owed[name] for name in ("cleared", "cleared_tries", "notice_sent", "notice_sent_tries")], [0, 1, 0, 1])
+        self.assertEqual(ack.jobs.unfinished_acknowledgements(acknowledge.time.time()), [])  # Neither is due at once.
 
     def test_removal_refused_for_good_is_not_owed_any_longer_and_says_what_may_be_left(self):
         cases = [(self.gh, {("DELETE", GITHUB + "/101"): 403}, "HTTP 403"), (self.gh, {("DELETE", GITHUB + "/101"): 301}, "HTTP 301"),
@@ -550,7 +572,8 @@ class NoticeTests(Offline):
         self.assertEqual(len(logged.output), 1)  # The removal, and it alone, failed.
         self.assertLessEqual(read.call_args.kwargs["timeout"], acknowledge.NOTICE_SECONDS)
         post.assert_called_once()
-        self.assertEqual((jobs.acknowledgement(job), jobs.acknowledgement_tries(job)), ((1, 0), 1))
+        owed = jobs.owed(job)
+        self.assertEqual([owed[name] for name in ("cleared", "cleared_tries", "notice_sent", "notice_sent_tries")], [0, 1, 1, 0])
 
     def test_failure_notice_goes_to_the_forge_helper_as_a_head_bound_comment(self):
         # The real path below the notice, with only the helper process and the credential replaced.
@@ -668,8 +691,55 @@ class NoticeTests(Offline):
                 cycle(projects, self.state, jobs, since, ack=ack)
         self.assertEqual(tried[:8], [0, 60, 180, 420, 900, 1860, 3780, 7380])  # 1, 2, 4, 8, 16, 32 and then 60 minutes.
         self.assertEqual(len(tried), acknowledge.TRIES)
-        self.assertIn("Gave up on the queued marker or failure notice of acme/github#3 comment 81 after 12 tries", logged.output[-1])
+        self.assertIn("Gave up on the removal of the queued marker of acme/github#3 comment 81 after 12 tries", logged.output[-1])
         self.assertIsNone(jobs.acknowledgement(job))
+
+    def hours(self, jobs, ack, now, cycles=600):
+        projects, since = {self.gh.key: self.gh}, {self.gh.key: datetime(2026, 1, 1, tzinfo=timezone.utc)}
+        with patch("cursor_pr.poll.poll_project"):
+            for _ in range(cycles):
+                now[0] += 60
+                cycle(projects, self.state, jobs, since, ack=ack)
+
+    def test_removal_given_up_leaves_a_notice_that_was_never_tried_still_owed(self):
+        jobs = Jobs(self.state)
+        job = (self.gh.key, 3, 81)
+        jobs.enqueue(*job, acknowledge=True)
+        jobs.next()
+        jobs.finish(job, "failed")
+        now = [1_800_000_000.0]
+        self.start(patch.object(acknowledge.time, "time", side_effect=lambda: now[0]))
+        ack = Acknowledgement(jobs, self.state)
+        # The removal fails every time and leaves the notice no time to start in.
+        with patch.object(acknowledge, "remove", side_effect=httpx.ConnectError("down")) as remove, \
+                patch.object(acknowledge, "notify", side_effect=acknowledge.OutOfTime()), \
+                self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
+            self.hours(jobs, ack, now)
+        self.assertEqual(remove.call_count, acknowledge.TRIES)
+        self.assertIn("Gave up on the removal of the queued marker", logged.output[-1])
+        owed = jobs.owed(job)
+        self.assertEqual([owed[name] for name in ("cleared", "notice_sent", "notice_sent_tries")], [1, 0, 0])
+        with patch.object(acknowledge, "notify") as notify:
+            self.hours(jobs, ack, now, 1)
+        notify.assert_called_once()
+        self.assertIsNone(jobs.owed(job))
+
+    def test_notice_whose_change_read_never_answers_is_given_up_and_the_removal_is_not_repeated(self):
+        jobs = Jobs(self.state)
+        job = (self.gh.key, 3, 81)
+        jobs.enqueue(*job, acknowledge=True)
+        jobs.next()
+        jobs.finish(job, "failed")
+        now = [1_800_000_000.0]
+        self.start(patch.object(acknowledge.time, "time", side_effect=lambda: now[0]))
+        ack = Acknowledgement(jobs, self.state)
+        with patch.object(acknowledge, "remove") as remove, \
+                patch.object(acknowledge, "run_forge", side_effect=subprocess.TimeoutExpired("change", 5)) as read, \
+                self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
+            self.hours(jobs, ack, now)
+        self.assertEqual((remove.call_count, read.call_count), (1, acknowledge.TRIES))
+        self.assertIn("Gave up on the failure notice of acme/github#3 comment 81 after 12 tries", logged.output[-1])
+        self.assertIsNone(jobs.owed(job))
 
     def test_restart_tells_the_requester_about_a_review_it_gave_up_on(self):
         jobs = Jobs(self.state)

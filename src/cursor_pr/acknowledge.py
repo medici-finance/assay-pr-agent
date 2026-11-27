@@ -1,7 +1,6 @@
 """Mark a queued review request on the forge, and tell the requester when nothing was posted."""
 import logging
 import os
-import subprocess
 import time
 from urllib.parse import quote
 
@@ -18,8 +17,10 @@ MARK = {"github": ("eyes", "content"), "gitlab": ("hourglass", "name")}
 NOTICE = ("The `/review` request {request} was not completed: the review could not be finished or "
           "published. Post `/review` again to retry it.\n")
 NOTE = {"github": "#issuecomment-", "gitlab": "#note_"}
-# A removal or notice that failed is tried again after this long, then after twice as long each time
-# up to an hour, and given up after this many tries, about six hours in all.
+# A removal or a notice that failed is tried again after this long, then after twice as long each
+# time up to an hour, and given up after this many tries, about six hours in all. Each of the two
+# has its own count and its own time: neither can use up the other's tries. A try is one that
+# reached the forge or the helper, however it ended; a call never started for lack of time is none.
 RETRY_SECONDS = 60
 RETRY_CAP_SECONDS = 3600
 TRIES = 12
@@ -31,9 +32,8 @@ BUDGET_SECONDS = 20
 START_SECONDS = 5
 # The removal and the notice of one request, right after its review:
 FINISH_SECONDS = 20
-# What the notice may still take to start when the removal before it used that time up. The two
-# share the count of tries, so a removal that is slow every time must not keep the notice from
-# ever being tried.
+# What the notice may still take to start when the removal before it used that time up, so that a
+# removal that is slow every time does not hold the notice back for as long as it is tried.
 NOTICE_SECONDS = 5
 TIMEOUT_SECONDS = 15
 HELPER_SECONDS = 45
@@ -63,13 +63,7 @@ def request(project, method, url, headers, deadline=None, **options):
         raise OutOfTime()
     with httpx.Client(timeout=left, follow_redirects=False,
                       **(client_options() if project.provider == "gitlab" else {})) as client:
-        try:
-            return client.request(method, url, headers=headers, **options)
-        except httpx.TimeoutException:
-            if left < TIMEOUT_SECONDS:
-                # Cut short by the deadline, not by the forge: it had less than its usual time.
-                raise OutOfTime() from None
-            raise
+        return client.request(method, url, headers=headers, **options)
 
 
 def reviewer(project, number, comment):
@@ -164,6 +158,10 @@ def remove(project, number, comment, deadline=None, said=False):
             raise
         return left_in_place(project, number, comment, err.response)
     if ident is not None:
+        if project.provider == "github" and deadline is not None:
+            # Asking GitHub may just have written the reaction. Its removal is then not put off to a
+            # later cycle, where a marker would appear on a request that is finished.
+            deadline = max(deadline, time.monotonic() + START_SECONDS)
         response = request(project, "DELETE", f"{markers}/{ident}", headers, deadline)
         if not refused(response):
             response.raise_for_status()
@@ -184,12 +182,7 @@ def notify(project, number, comment, state, deadline=None):
     left = HELPER_SECONDS if deadline is None else min(HELPER_SECONDS, deadline - time.monotonic())
     if left <= 0:
         raise OutOfTime()
-    try:
-        head = run_forge("change", project, numbers=[number], timeout=left).get("headSha")
-    except subprocess.TimeoutExpired:
-        if left < HELPER_SECONDS:
-            raise OutOfTime() from None  # Stopped by the deadline before its usual time was up.
-        raise
+    head = run_forge("change", project, numbers=[number], timeout=left).get("headSha")
     if not valid_sha(head):
         raise ReviewError("Forge did not identify the change head")
     if deadline is not None and deadline <= time.monotonic():
@@ -231,15 +224,15 @@ class Acknowledgement:
             self.marked.add(job)
         self.attempt(mark, "mark", project, number, comment)
 
-    def finished(self, project, number, comment, status, deadline=None):
+    def finished(self, project, number, comment, status, deadline=None, due=None):
+        """Do what the finished request owes. With `due`, a time, only the parts whose next try has come."""
         job = project.key, number, comment
         self.marked.discard(job)
         said = job in self.refused
         self.refused.discard(job)
-        owed = self.jobs.acknowledgement(job)
+        owed = self.jobs.owed(job)
         if owed is None:
             return
-        notice_sent, marker_cleared = owed
         if deadline is None:
             deadline = time.monotonic() + FINISH_SECONDS
         in_time = time.monotonic() < deadline
@@ -251,38 +244,40 @@ class Acknowledgement:
                 self.jobs.acknowledge_pending(project.key, number)
             else:
                 remove(project, number, comment, deadline, said)
-            # Kept apart from the notice: while only the notice is owed, the marker is left alone.
-            self.jobs.record_cleared(job)
-
-        cleared = bool(marker_cleared) or self.attempt(clear, "clear the queued marker on", project, number, comment)
 
         def report_failure():
             notify(project, number, comment, self.state,
                    max(deadline, time.monotonic() + NOTICE_SECONDS) if in_time else deadline)
-            self.jobs.record_notice(job)
 
-        notice_needed = status == "failed" and not notice_sent
-        notified = not notice_needed or self.attempt(
-            report_failure, "report the failed review on", project, number, None)
-        if notified and cleared:
+        # Kept apart: each is done, tried again and given up by itself, and while only one is owed
+        # the other is left alone.
+        parts = (("cleared", clear, "clear the queued marker on", comment, "removal of the queued marker", True),
+                 ("notice_sent", report_failure, "report the failed review on", None, "failure notice", status == "failed"))
+        for part, action, verb, shown, name, wanted in parts:
+            if owed[part] or not wanted:
+                continue
+            if due is not None and owed[part + "_retry_at"] > due:
+                continue
+            done = self.attempt(action, verb, project, number, shown)
+            if done is False:
+                tries = owed[part + "_tries"] + 1
+                if tries < TRIES:
+                    self.jobs.retry_acknowledgement(job, part, time.time() + min(RETRY_SECONDS * 2 ** (tries - 1), RETRY_CAP_SECONDS))
+                    continue
+                log.warning("Gave up on the %s of %s#%d comment %d after %d tries", name, project.slug, number, comment, tries)
+            if done is not None:
+                self.jobs.record_acknowledgement(job, part)
+                owed[part] = 1
+        if owed["cleared"] and (owed["notice_sent"] or status != "failed"):
             self.jobs.clear_acknowledgement(job)
-            return
-        if False not in (notified, cleared):
-            return  # Only out of time: nothing was tried, so no try is counted and it stays due.
-        tries = self.jobs.acknowledgement_tries(job) + 1
-        if tries >= TRIES:
-            log.warning("Gave up on the queued marker or failure notice of %s#%d comment %d after %d tries",
-                        project.slug, number, comment, tries)
-            self.jobs.clear_acknowledgement(job)
-        else:
-            self.jobs.retry_acknowledgement(job, time.time() + min(RETRY_SECONDS * 2 ** (tries - 1), RETRY_CAP_SECONDS))
 
     def settle(self, projects):
         """Try again what a finished request still owes the forge and is due: its marker's removal, its notice."""
         deadline = time.monotonic() + BUDGET_SECONDS
-        for key, number, comment, status in self.jobs.unfinished_acknowledgements(time.time()):
+        now = time.time()
+        for key, number, comment, status in self.jobs.unfinished_acknowledgements(now):
             if key in projects and time.monotonic() < deadline:
-                self.finished(projects[key], number, comment, status, deadline)
+                self.finished(projects[key], number, comment, status, deadline, now)
 
     def mark(self, projects):
         """Mark the waiting requests: the new ones, and those a poller that stopped left unmarked.

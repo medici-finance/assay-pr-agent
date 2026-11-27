@@ -84,9 +84,11 @@ class Jobs:
                 project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,
                 notice_sent INTEGER NOT NULL DEFAULT 0, tries INTEGER NOT NULL DEFAULT 0,
                 retry_at REAL NOT NULL DEFAULT 0, cleared INTEGER NOT NULL DEFAULT 0,
+                notice_tries INTEGER NOT NULL DEFAULT 0, notice_retry_at REAL NOT NULL DEFAULT 0,
                 PRIMARY KEY(project, number, comment))""")
             columns = {row[1] for row in db.execute("PRAGMA table_info(acknowledgements)")}
-            for column, kind in (("tries", "INTEGER"), ("retry_at", "REAL"), ("cleared", "INTEGER")):
+            for column, kind in (("tries", "INTEGER"), ("retry_at", "REAL"), ("cleared", "INTEGER"),
+                                 ("notice_tries", "INTEGER"), ("notice_retry_at", "REAL")):
                 if column not in columns:
                     db.execute(f"ALTER TABLE acknowledgements ADD COLUMN {column} {kind} NOT NULL DEFAULT 0")
             if upgraded:
@@ -169,22 +171,38 @@ class Jobs:
                 db.execute("INSERT OR REPLACE INTO schedule VALUES (?,?,?,?,?,?)",
                            (project, number, comments, newest, min(previous[2] * 2, cap) if quiet else interval, now))
 
+    # What a finished request owes the forge is two things, each with its own tries and its own time
+    # of the next one: the marker's removal (cleared, tries, retry_at) and, after a failure, the
+    # notice (notice_sent, notice_tries, notice_retry_at).
+    PARTS = {"cleared": ("tries", "retry_at"), "notice_sent": ("notice_tries", "notice_retry_at")}
+
     def unfinished_acknowledgements(self, now=None):
-        """Finished requests that still owe the forge something; with a time, only those due a try by then."""
+        """Finished requests that still owe the forge something; with a time, only those with a part due by then."""
         with closing(sqlite3.connect(self.path)) as db:
             return db.execute("""SELECT project, number, comment, status FROM requests JOIN acknowledgements
                 USING (project, number, comment) WHERE status NOT IN ('queued','started')
-                AND (?1 IS NULL OR retry_at <= ?1)""", (now,)).fetchall()
+                AND (?1 IS NULL OR (cleared=0 AND retry_at <= ?1)
+                     OR (status='failed' AND notice_sent=0 AND notice_retry_at <= ?1))""", (now,)).fetchall()
 
-    def acknowledgement_tries(self, job):
+    def owed(self, job):
+        """The request's record as a dict of each part, its tries and its next time, or None when it has none."""
         with closing(sqlite3.connect(self.path)) as db:
-            row = db.execute("SELECT tries FROM acknowledgements WHERE project=? AND number=? AND comment=?", job).fetchone()
-            return row[0] if row else 0
+            row = db.execute("""SELECT cleared, tries, retry_at, notice_sent, notice_tries, notice_retry_at
+                FROM acknowledgements WHERE project=? AND number=? AND comment=?""", job).fetchone()
+        return row and dict(zip(("cleared", "cleared_tries", "cleared_retry_at",
+                                 "notice_sent", "notice_sent_tries", "notice_sent_retry_at"), row))
 
-    def retry_acknowledgement(self, job, at):
+    def retry_acknowledgement(self, job, part, at):
+        tries, retry_at = self.PARTS[part]
         with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("""UPDATE acknowledgements SET tries=tries+1, retry_at=?
+            db.execute(f"""UPDATE acknowledgements SET {tries}={tries}+1, {retry_at}=?
                 WHERE project=? AND number=? AND comment=?""", (at, *job))
+
+    def record_acknowledgement(self, job, part):
+        """The part is done with: carried out, or given up."""
+        assert part in self.PARTS
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(f"UPDATE acknowledgements SET {part}=1 WHERE project=? AND number=? AND comment=?", job)
 
     def waiting_acknowledgements(self):
         """Requests that are waiting for their review and are to be marked on the forge."""
@@ -197,14 +215,6 @@ class Jobs:
         with closing(sqlite3.connect(self.path)) as db:
             return db.execute("""SELECT notice_sent, cleared FROM acknowledgements
                 WHERE project=? AND number=? AND comment=?""", job).fetchone()
-
-    def record_notice(self, job):
-        with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("UPDATE acknowledgements SET notice_sent=1 WHERE project=? AND number=? AND comment=?", job)
-
-    def record_cleared(self, job):
-        with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("UPDATE acknowledgements SET cleared=1 WHERE project=? AND number=? AND comment=?", job)
 
     def acknowledge_pending(self, project, number):
         """Give every waiting request on the change a record, so that the last to finish clears its marker."""
