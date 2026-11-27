@@ -99,7 +99,9 @@ def publish(address, head, report, *, project=None, state=None):
     elif report["state"] == "model-unavailable":
         body.append(f"{label} could not complete the review.")
     elif not report["findings"]:
-        body.append("No model findings in the reviewed scope.")
+        # With every model finding dropped, saying there were none would read as a clean review.
+        body.append("No model finding passed the checks." if report.get("dropped")
+                    else "No model findings in the reviewed scope.")
     for check in report["checks"]:
         if check["state"] != "complete":
             body.append(f"- {check['tool']}: could not check {fence(check.get('path') or check.get('reason', ''))}")
