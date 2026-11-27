@@ -9,7 +9,9 @@ from .providers import KEYS
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import selectors
 import subprocess
+import time
 
 
 class ReviewError(Exception):
@@ -126,6 +128,20 @@ def valid_sha(value):
     return isinstance(value, str) and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value)
 
 
+TITLE_LIMIT = 256
+DESCRIPTION_LIMIT = 1500
+DESCRIPTION_COMMITS = 32
+TRUNCATED = " …[truncated]"
+
+
+def bounded_text(value, limit):
+    # The author's own text is optional context: absent or malformed means empty, and long means cut.
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    value = "".join(c for c in value if c.isprintable() or c in "\n\t").strip()
+    return value if len(value) <= limit else value[:limit].rstrip() + TRUNCATED
+
+
 @dataclass(frozen=True)
 class File:
     path: str
@@ -142,6 +158,8 @@ class Change:
     identity: str
     base: str = ""      # tip of the base as a commit, when the caller named one
     base_ref: str = ""  # base branch name reported by the forge
+    title: str = ""
+    description: str = ""
 
 
 def forge_change(address, expected_url=None, *, project=None):
@@ -177,7 +195,10 @@ def forge_change(address, expected_url=None, *, project=None):
         files.append(File(row["filename"], row.get("patch", ""), row.get("status", ""),
                           row["patchAbsent"], row.get("previousFilename", "")))
     base_ref = first.get("baseRef")
-    return Change(head, files, first.get("url") or address, base_ref=base_ref if isinstance(base_ref, str) else "")
+    # The description is context, not evidence, so it is read once and never bracketed like the head.
+    return Change(head, files, first.get("url") or address, base_ref=base_ref if isinstance(base_ref, str) else "",
+                  title=bounded_text(last.get("title"), TITLE_LIMIT),
+                  description=bounded_text(last.get("body"), DESCRIPTION_LIMIT))
 
 
 def git(root, *args):
@@ -203,7 +224,57 @@ def local_change(root, base, head):
         except UnicodeDecodeError:
             patch = ""
         files.append(File(path, patch, status, not bool(patch)))
-    return Change(head, files, str(root.resolve()), base=tip)
+    return Change(head, files, str(root.resolve()), base=tip, description=local_description(root, base, head))
+
+
+def local_description(root, base, head):
+    """Collect bounded optional context from the most recent commits in chronological order."""
+    byte_limit = 4 * DESCRIPTION_LIMIT
+    output = bytearray()
+    deadline = time.monotonic() + 45
+    args = ["git", "--literal-pathspecs", "-C", str(root), "log", "--no-show-signature", "--encoding=UTF-8",
+            f"-{DESCRIPTION_COMMITS + 1}", "--format=%s%n%n%b%x00", base + ".." + head, "--"]
+    try:
+        with selectors.DefaultSelector() as ready, \
+             subprocess.Popen(args, env=child_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+            try:
+                ready.register(process.stdout, selectors.EVENT_READ)
+                while len(output) <= byte_limit:
+                    remaining = max(0, deadline - time.monotonic())
+                    if not ready.select(remaining):
+                        return ""
+                    chunk = os.read(process.stdout.fileno(), byte_limit + 1 - len(output))
+                    if not chunk:
+                        if process.wait(timeout=max(0, deadline - time.monotonic())):
+                            return ""
+                        break
+                    output.extend(chunk)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return ""
+    # Spend the budget newest-first, then display the retained messages in chronological order.
+    clipped = len(output) > byte_limit
+    messages = output[:byte_limit].decode("utf8", "replace").split("\0")
+    if not clipped:
+        messages.pop()  # Trailing separator after the last complete message.
+    clipped = clipped or len(messages) > DESCRIPTION_COMMITS
+    chosen, remaining = [], DESCRIPTION_LIMIT
+    for message in messages[:DESCRIPTION_COMMITS]:
+        if remaining <= 0:
+            clipped = True
+            break
+        text = bounded_text(message, len(message))
+        if not text:
+            continue
+        if len(text) > remaining:
+            clipped = True
+            text = text[:remaining].rstrip()
+        chosen.append(text)
+        remaining -= len(text) + 2
+    description = "\n\n".join(reversed(chosen))
+    return description + TRUNCATED if clipped else description
 
 
 def ci_refs():

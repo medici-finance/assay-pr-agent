@@ -45,29 +45,35 @@ def rank(path):
     return 3
 
 
-def fit(files, checks, limit):
+def fit(files, checks, limit, *, title="", description="", rendered=None):
     """Pack the prompt, leaving out whole files until it fits the input budget.
 
     Returns the prompt parts, the estimate of what will be sent, the estimate of the full
     prompt, and the paths left out. Nothing is left out when even one file cannot fit.
     """
-    rendered = render_sections(files)
-    prompt, anchors, unseen, has_text = full_pack = pack(files, checks, rendered=rendered)
+    if rendered is None:
+        rendered = render_sections(files)
+    prompt, anchors, unseen, has_text = full_pack = pack(files, checks, title=title, description=description, rendered=rendered)
     estimated = full = tokens(prompt) if has_text else 0
     if full <= limit:
         return full_pack, full, full, []
+    if title or description:
+        plain = pack(files, checks, rendered=rendered)
+        plain_estimate = tokens(plain[0])
+        if plain_estimate <= limit:
+            return plain, plain_estimate, full, []
     # Measure each file with its scanner evidence before choosing what to leave out.
     # A file that cannot fit alone leaves first, so a smaller file can still be reviewed.
     findings_by_path = defaultdict(list)
     for check in checks:
         for finding in check["findings"]:
             findings_by_path[finding["path"]].append(finding)
-    overhead = tokens(pack([], [])[0])
+    overhead = tokens(pack([], [], title=title, description=description)[0])
     sizes = {}
     for file in files:
         if rendered[file.path][0] is not None:
             file_checks = [{"findings": findings_by_path.get(file.path, ())}]
-            standalone, _, _, _ = pack([file], file_checks, rendered=rendered)
+            standalone, _, _, _ = pack([file], file_checks, title=title, description=description, rendered=rendered)
             sizes[file.path] = tokens(standalone) - overhead
     queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
@@ -78,9 +84,14 @@ def fit(files, checks, limit):
         while len(queue) > 1 and freed < estimated - limit:
             dropped.append(queue.pop(0))
             freed += sizes[dropped[-1]]
-        prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), rendered=rendered)
+        prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), title, description, rendered=rendered)
         estimated = tokens(prompt) if has_text else 0
-    if not has_text or estimated > limit:
+    fits = has_text and estimated <= limit
+    if (title or description) and (not fits or len(dropped) > 1):
+        fitted, estimate, _, skipped = fit(files, checks, limit, rendered=rendered)
+        if fitted[3] and estimate <= limit and (not fits or len(skipped) < len(dropped)):
+            return fitted, estimate, full, skipped
+    if not fits:
         return full_pack, full, full, []
     return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped)
 
@@ -210,7 +221,8 @@ def execute(args):
         go["findings"] = [row for row in go["findings"] if row["path"] in selected]
         checks.append(go)
 
-    (prompt, anchors, unseen, has_text), estimated, full, degraded = fit(files, checks, args.max_input_tokens)
+    (prompt, anchors, unseen, has_text), estimated, full, degraded = fit(
+        files, checks, args.max_input_tokens, title=change.title, description=change.description)
     omitted = sorted(set(unseen) | (paths - selected))
     backend = providers.provider()
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",

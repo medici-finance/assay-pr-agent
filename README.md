@@ -37,7 +37,7 @@ The CLI receives an allow-listed environment: its own provider's key or sign-in 
 
 ### Untrusted input and evidence binding
 
-The prompt contains three things: PR-Agent's review rubric, the scanner diagnostics that fall on shown lines, and the diff hunks. The change's title, description, reviews and other comments are not sent, and Hadolint, zizmor, OSV-Scanner and Qualgen output never enters it. The diagnostics and the patch follow a fixed instruction to use only that material and not to use tools, and each is labelled `untrusted data`. The file list is bracketed by two change reads and refused if the head moved in between, so the patch belongs to one head.
+The prompt contains PR-Agent's review rubric, the scanner diagnostics that fall on shown lines, and the diff hunks. It can also include optional context from the change's title and description when the forge helper supplies them, or recent commit messages in a local or CI review. The reviewer keeps reviews, other comments and Hadolint, zizmor, OSV-Scanner and Qualgen output outside the prompt. The change context, scanner diagnostics and patch are each labelled `untrusted data` and follow fixed instructions that restrict the model to the supplied material and prohibit tool use. The file list is bracketed by two change reads and refused if the head moved in between, so the patch belongs to one head.
 
 A finding is accepted only if it names a reviewed file and cites a contiguous range of head lines that the shown hunks contain. One failing finding rejects the whole answer: the review ends as `model-unavailable` and its scanner results are still posted. A file name containing a C0 control character (below U+0020), or a duplicate file name, stops the review before the model is called.
 
@@ -272,6 +272,8 @@ cursor-review --repo /path/to/checkout --change 'org/repo#42' --model MODEL
 ```
 
 The local form compares the merge base to committed `HEAD`, or to an explicit `--head`. Both commits and their common ancestor must be available locally. The forge form uses an `owner/repo#number` address from the configured projects and requires `pr-agent-forge` on `PATH`. GitLab subgroup projects can use CI mode with local Git objects. It reads metadata before and after the file list, checks head and file-count consistency, and records missing patches as incomplete coverage.
+
+The prompt can include messages from up to 32 recent commits in a local or CI review, or a forge change's title and description when the forge helper reports them. The title and description are cut at 256 and 1,500 characters, labelled untrusted, and counted in the token estimate. The reviewer drops this optional context when doing so allows it to review more files within the token budget.
 
 ### Cost and coverage
 
