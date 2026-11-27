@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from cursor_pr import context, discovery, engine
 from cursor_pr.config import project_from
-from cursor_pr.source import Change, File, local_change
+from cursor_pr.source import Change, File, base_line, hunks, local_change
 
 
 class TierContextTests(unittest.TestCase):
@@ -93,9 +93,36 @@ class TierContextTests(unittest.TestCase):
         issue = dict(path="app.py", line=1, end_line=1, title="First issue", message="First defect")
         other = dict(issue, title="Other issue", message="Different defect")
         self.assertEqual(engine.merge_findings([issue], [issue, other]), [issue, other])
-        self.assertEqual(engine.kept([issue, other], {"findings": [other]}), [other])
+        self.assertEqual(engine.kept([issue, other], {"findings": [other]}),
+                         [dict(other, verification_status="unverified")])
+        uncertain = dict(issue, verification_status="unverified")
+        confirmed = dict(issue, verification_status="confirmed")
+        self.assertEqual(engine.kept([uncertain, other], {"findings": [confirmed]}), [confirmed])
+        self.assertEqual(engine.kept([confirmed], {"findings": [uncertain]}), [uncertain])
+        self.assertEqual(engine.kept([confirmed], {"findings": [issue]}), [uncertain])
+        self.assertEqual(engine.kept([confirmed], {"findings": [dict(issue, verification_status="unknown")]}),
+                         [uncertain])
         file = File("app.py", "@@ -1 +1 @@\n-foo()\n+bar()\n", "modified")
         self.assertIn("keep the finding unchanged and unverified", engine.verification([issue], [file]))
+
+    def test_verification_tries_smaller_source_excerpts_with_the_same_patch(self):
+        patch = "@@ -1,20 +1,20 @@\n-old()\n+new()\n" + "".join(f" line_{n}()\n" for n in range(2, 21))
+        file = File("app.py", patch, "modified")
+        finding = dict(path="app.py", line=1, end_line=1, title="Example", message="Example defect")
+
+        def comparison(file, start, end, radius):
+            return [f"Source excerpt radius {radius} " + "context " * (radius * 8)]
+
+        patch_only = engine.verification([finding], [file], radius=15)
+        variants = {radius: engine.verification([finding], [file], radius=15, comparison=comparison,
+                                                source_radius=radius) for radius in (15, 8, 3)}
+        self.assertIn("16  line_16()", patch_only)
+        for expected in (variants[8], variants[3], patch_only):
+            with self.subTest(expected=expected.splitlines()[-1]):
+                limit = engine.tokens(expected)
+                prompt, size = engine.fit_verification([finding], [file], limit, comparison)
+                self.assertEqual((prompt, size), (expected, limit))
+                self.assertIn("16  line_16()", prompt)
 
     def test_verification_keeps_the_old_lines_of_a_replacement_at_the_start_of_a_hunk(self):
         issue = dict(path="app.py", line=11, end_line=11, title="Changed behavior", message="Check the replacement.")
@@ -109,6 +136,22 @@ class TierContextTests(unittest.TestCase):
         wide = engine.verification([issue], [file], radius=15)
         self.assertIn("- -old_first()\n- -old_second()\n10 +new_first()\n11 +new_second()", wide)
         self.assertNotIn("distant_old()", wide)
+
+    def test_verification_aligns_base_excerpts_with_large_replacement(self):
+        old = [f"old_{number:02}()" for number in range(1, 33)]
+        new = [f"new_{number:02}()" for number in range(1, 36)]
+        diff = "@@ -1,33 +1,36 @@\n" + "".join(f"-{line}\n" for line in old) + "".join(
+            f"+{line}\n" for line in new) + " retained()\n"
+        file = File("app.py", diff, "modified")
+        patch_rows = hunks(file)
+        self.assertIsNone(base_line(patch_rows, 1))
+        self.assertEqual([base_line(patch_rows, line, nearest=True) for line in (1, 18, 35, 36)], [1, 18, 32, 33])
+        with patch.object(context, "blob", side_effect=["\n".join(old), "\n".join(new)]):
+            comparison = context.verification_comparison(Path("."), Path("."), "base", "head")
+            base, head = comparison(file, 1, 1, 3)
+        self.assertIn("1: old_01()", base)
+        self.assertNotIn("old_32()", base)
+        self.assertIn("1: new_01()", head)
 
     def test_verification_keeps_deletion_adjacent_to_the_cited_context_line(self):
         issue = dict(path="app.py", line=2, end_line=2, title="Removed step", message="Check the missing step.")

@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import logging
 import os
 import re
+import time
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -16,11 +17,13 @@ NAME = "assay-pr-agent/review"
 # GitHub accepts 50 annotations per request and 64 KB per message; GitLab descriptions are 255 characters.
 ANNOTATIONS = 50
 DESCRIPTION = 255
+CONFLICT_PAUSES = (1, 2)
 COMPLETE = ("reviewed", "empty")
 SENTENCES = {
     "reviewed": "The review completed.",
     "empty": "The review completed. The change has no files to review.",
     "partial": "The review covered only part of the change.",
+    "degraded": "The review completed with less than the requested coverage.",
     "over-budget": "The model was skipped because the estimated prompt is over the budget.",
     "model-unavailable": "The model could not complete the review.",
 }
@@ -118,7 +121,26 @@ def gitlab_source_ref(client, headers, base, slug, number, head):
         raise ReviewError("The GitLab status source project is outside the configured publication target")
     if not isinstance(ref, str) or not ref or not ref.isprintable():
         raise ReviewError("GitLab did not identify the reviewed source branch")
-    return ref
+    # A branch pipeline and a merge request pipeline can both exist for this commit, and a status
+    # sent with the branch alone can land on the one the merge request does not show. Name the
+    # merge request's own pipeline, with the ref GitLab keeps for it, when it is one of this
+    # project's and ran this commit. Otherwise the branch is all there is to go by.
+    pipeline = change.get("head_pipeline")
+    if isinstance(pipeline, dict):
+        if pipeline.get("sha") != head:
+            # A merged-results or merge-train pipeline runs a commit of its own, and one of an
+            # earlier head is out of date. A status sent with the branch could then start a new
+            # pipeline holding this check alone, which GitLab may show, and gate the merge on,
+            # in place of the real one. No status is better than that.
+            raise ReviewError("The GitLab merge request's pipeline is not for the reviewed commit")
+        number, own = pipeline.get("id"), pipeline.get("ref")
+        if not (type(number) is int and number > 0 and pipeline.get("project_id") == target
+                and isinstance(own, str) and own and own.isprintable()):
+            # It is there and cannot be named. The branch alone could put the status on another
+            # pipeline of this commit and report it as posted.
+            raise ReviewError("The GitLab merge request's pipeline cannot be addressed from the configured project")
+        return {"ref": own, "pipeline_id": number}
+    return {"ref": ref}
 
 
 def post(address, value, project):
@@ -143,8 +165,15 @@ def post(address, value, project):
     check_publication(project, number, head, "\n\n".join(checked))
     with connection(address, url, project.checkout) as (client, _, _, _, headers):
         if provider == "gitlab":
-            body["ref"] = gitlab_source_ref(client, headers, base, slug, number, head)
-        client.post(endpoint, headers=headers, json=body).raise_for_status()
+            body.update(gitlab_source_ref(client, headers, base, slug, number, head))
+        # GitLab answers 409 while another status for this commit and ref is being written, as when
+        # CI reports at the same moment. That passes: asked again after one second, then after two.
+        for pause in (*CONFLICT_PAUSES, None):
+            response = client.post(endpoint, headers=headers, json=body)
+            if provider != "gitlab" or response.status_code != 409 or pause is None:
+                break
+            time.sleep(pause)
+        response.raise_for_status()
 
 
 def outcome(args, value):

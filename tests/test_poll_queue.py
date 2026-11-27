@@ -1,6 +1,7 @@
 import argparse
 from contextlib import closing, contextmanager, nullcontext
 import errno
+from datetime import datetime, timezone
 import io
 import json
 import os
@@ -25,6 +26,48 @@ from cursor_pr.poll import instance_lock
 with instance_lock(Path(sys.argv[1]), wait=float(sys.argv[2]) if sys.argv[2:] else 0):
     pass
 """
+START = 1_800_000_000.0
+
+
+class Offline(unittest.TestCase):
+    """Nothing here may reach a forge or the forge helper: an unmocked call fails instead of being made."""
+
+    def setUp(self):
+        def refuse(*args, **kwargs):
+            raise AssertionError("This test tried to use the network or the forge helper")
+        for name in ("socket.socket.connect", "cursor_pr.source.run"):
+            self.start(patch(name, side_effect=refuse))
+
+    def start(self, patcher):
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+
+def poller(state, *, cycle=None, env=()):
+    """Run main() through one poll cycle with everything external replaced. Returns the stand-in for cycle."""
+    (state / "projects.json").write_text("{}")
+    watch = Mock(enabled=False)
+    watch.changed.side_effect = [False, True]
+    with patch("sys.argv", ["cursor-review-poll", "--state-dir", str(state)]), patch.dict(os.environ, dict(env)), \
+         patch("cursor_pr.poll.ConfigurationWatch", return_value=watch), \
+         patch("cursor_pr.poll.setup.apply_saved_setup"), \
+         patch("cursor_pr.poll.providers.provider", return_value="cursor"), \
+         patch("cursor_pr.poll.auth_mode", return_value="api-key"), \
+         patch("cursor_pr.poll.setup.max_input_tokens", return_value=6000), \
+         patch("cursor_pr.poll.history.interval", return_value=0), \
+         patch("cursor_pr.poll.load_config", return_value={}), \
+         patch("cursor_pr.poll.providers.cursor_account", side_effect=lambda: nullcontext()), \
+         patch("cursor_pr.poll.forge_credentials", side_effect=lambda *args: nullcontext()), \
+         patch("cursor_pr.poll.logging.basicConfig"), patch("cursor_pr.poll.cycle", side_effect=cycle) as run:
+        main()
+    return run
+
+
+def comment(number, body="looks good to me"):
+    created = f"2026-06-01T{number // 60:02d}:{number % 60:02d}:00Z"  # Later comments carry a later time.
+    return dict(authorId=7, databaseId=number, authorType="User", body=body, createdAt=created, updatedAt=created)
+
+
 # A process that holds a lock on the file it is given and then waits. Whether it has ended is read
 # from the lock, which a process that was killed has released even before anyone has waited for it.
 BUSY = """import fcntl, os, sys, time
@@ -216,6 +259,26 @@ class QueueRestartTests(unittest.TestCase):
                          ["project", "number", "comment", "status"])  # Nothing of it was kept.
         _, logged = self.restart()
         self.assertEqual(logged, [f"Review of {self.gl.key} #4 comment 82 was interrupted by a restart; {self.UNRECORDED}"])
+
+    def test_upgrade_that_stops_before_its_records_are_written_is_done_again(self):
+        self.old_queue((self.gl.key, 4, 82, "queued"))
+
+        class Stopped(Exception):
+            pass
+
+        real = sqlite3.connect
+
+        class Halfway(sqlite3.Connection):
+            def execute(self, statement, *args):
+                if statement.startswith("INSERT INTO acknowledgements"):
+                    raise Stopped
+                return super().execute(statement, *args)
+        # The poller stops after the table is created and before the waiting requests get a record.
+        with patch("cursor_pr.poll.sqlite3.connect", side_effect=lambda path: real(path, factory=Halfway)), \
+                self.assertRaises(Stopped):
+            Jobs(self.state)
+        self.assertEqual(self.sql("SELECT name FROM sqlite_master WHERE name='acknowledgements'"), [])
+        self.assertEqual(Jobs(self.state).waiting_acknowledgements(), [(self.gl.key, 4, 82)])
 
     def test_review_child_is_given_the_queue_and_its_request(self):
         jobs = Jobs(self.state)
@@ -965,8 +1028,9 @@ class SupervisedTests(unittest.TestCase):
         self.assertIn("Review acme/api#3 did not end within", logged.output[0])
 
 
-class InstanceLockTests(unittest.TestCase):
+class InstanceLockTests(Offline):
     def setUp(self):
+        super().setUp()
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.state = Path(tmp.name)
@@ -1029,26 +1093,228 @@ class InstanceLockTests(unittest.TestCase):
     def test_lock_is_held_while_polling_and_released_on_exit(self):
         opened = []
 
-        def cycle(projects, state, jobs, since, *args):
+        def cycle(projects, state, jobs, since, *args, **kwargs):
             self.assertIn("BlockingIOError", self.holder().stderr)
             opened.append(jobs.path)
 
-        watch = Mock(enabled=False)
-        watch.changed.side_effect = [False, True]
-        with patch("cursor_pr.poll.ConfigurationWatch", return_value=watch), \
-             patch("cursor_pr.poll.setup.apply_saved_setup"), \
-             patch("cursor_pr.poll.providers.provider", return_value="cursor"), \
-             patch("cursor_pr.poll.auth_mode", return_value="api-key"), \
-             patch("cursor_pr.poll.setup.max_input_tokens", return_value=6000), \
-             patch("cursor_pr.poll.history.interval", return_value=0), \
-             patch("cursor_pr.poll.load_config", return_value={}), \
-             patch("cursor_pr.poll.providers.cursor_account", side_effect=lambda: nullcontext()), \
-             patch("cursor_pr.poll.forge_credentials", side_effect=lambda *args: nullcontext()), \
-             patch("cursor_pr.poll.cycle", side_effect=cycle), patch("cursor_pr.poll.logging.basicConfig"):
-            main()
+        poller(self.state, cycle=cycle)
         self.assertEqual(opened, [self.state.resolve() / "requests.sqlite3"])
         self.assertEqual(self.holder().returncode, 0)
         self.assertEqual((self.state / ".poller.lock").stat().st_mode & 0o777, 0o600)
+
+
+class ReadScheduleTests(Offline):
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = Path(tmp.name)
+        self.gh = project_from(dict(provider="github", url="https://github.com/acme/github", requester_ids=[7],
+                                    checkout=tmp.name))
+        self.open, self.threads, self.partial, self.reads, self.reviews = [3], {3: [comment(81)]}, set(), [], []
+        self.now = [START]
+        self.capped = False
+        self.start(patch("cursor_pr.discovery.time")).time.side_effect = lambda: self.now[0]
+        self.start(patch("cursor_pr.discovery.run_forge", side_effect=self.forge))
+        self.jobs = Jobs(self.state)
+        self.since = {self.gh.key: datetime(2026, 1, 1, tzinfo=timezone.utc)}
+
+    def forge(self, verb, project, *, numbers=(), timeout=45):
+        if verb == "open":
+            return dict(numbers=list(self.open), capped=self.capped)
+        self.assertEqual(verb, "comments")
+        wanted = list(numbers)
+        self.reads.append(wanted)
+        return dict(partial=[number for number in wanted if number in self.partial], items=[
+            dict(number=number, comments=self.threads[number]) for number in wanted if number not in self.partial])
+
+    def tick(self, seconds=120):
+        """Run one cycle `seconds` after the previous one; return the changes it asked to read."""
+        self.now[0] += seconds
+        self.reads.clear()
+        cycle({self.gh.key: self.gh}, self.state, self.jobs, self.since,
+              lambda project, number, state: self.reviews.append((self.now[0] - START, number)) or "reviewed",
+              idle=(120, 900))
+        return [number for wanted in self.reads for number in wanted]
+
+    def schedule(self):
+        with closing(sqlite3.connect(self.state / "requests.sqlite3")) as db:
+            return db.execute("SELECT number, comments, wait, seen - ? FROM schedule ORDER BY number", (START,)).fetchall()
+
+    def test_quiet_change_is_read_less_often_and_never_waits_more_than_the_cap(self):
+        self.assertEqual(self.tick(0), [3])  # A change seen for the first time is read at once.
+        read_at = [0]
+        for _ in range(30):
+            if self.tick():
+                read_at.append(self.now[0] - START)
+        self.assertEqual(read_at, [0, 120, 360, 840, 1800, 2760])  # 120, 240, 480, then 900 seconds.
+        self.assertLessEqual(max(b - a for a, b in zip(read_at, read_at[1:])), 900 + 120)
+        self.assertEqual(self.schedule(), [(3, 1, 900, 2760)])
+
+    def test_new_comments_return_the_change_to_the_poll_interval(self):
+        self.tick(0)
+        for _ in range(3):
+            self.tick()  # Read at 0, 120 and 360; the wait is now 480.
+        self.assertEqual(self.tick(), [])
+        self.threads[3].append(comment(82))
+        self.assertEqual(self.tick(), [])  # 600: nothing says this change changed, so it waits until 840.
+        self.assertEqual(self.tick(), [])
+        self.assertEqual(self.tick(), [3])
+        self.assertEqual(self.schedule(), [(3, 2, 120, 840)])
+        self.assertEqual(self.tick(), [3])
+        self.assertEqual(self.tick(), [])
+        self.assertEqual(self.tick(), [3])
+
+    def test_request_on_a_quiet_change_is_found_at_its_next_due_read(self):
+        self.tick(0)
+        for _ in range(7):
+            self.tick()  # Read at 0, 120, 360 and 840; the next is due at 1740.
+        self.threads[3].append(comment(90, "/review") | dict(url=self.gh.change_url(3) + "#issuecomment-90"))
+        posted = self.now[0] - START
+        for _ in range(9):
+            self.tick()
+        self.assertEqual(self.reviews, [(1800, 3)])
+        self.assertLessEqual(self.reviews[0][0] - posted, 900 + 120)
+
+    def test_restart_keeps_the_schedule(self):
+        self.tick(0)
+        self.tick()  # Read at 0 and 120; the next read is due at 360.
+        self.jobs = Jobs(self.state)  # A new poller process on the same state volume.
+        self.assertEqual(self.tick(), [])
+        self.assertEqual(self.tick(), [3])
+
+    def test_request_found_in_a_partial_read_returns_its_change_to_the_poll_interval(self):
+        self.open, self.threads = [3, 4], {3: [comment(81), comment(82)], 4: [comment(83)]}
+        self.tick(0)
+        self.tick()  # Read at 0 and 120; the wait is now 240 and the next read is due at 360.
+        self.tick()
+        # A request takes the place of the older comment: as many comments as before, and the same newest one.
+        self.threads[3][0] = comment(60, "/review") | dict(url=self.gh.change_url(3) + "#issuecomment-60")
+        self.partial = {4}
+        with self.assertLogs("cursor_pr.discovery", level="WARNING"):
+            self.assertEqual(self.tick(), [3, 4])  # 360: only 3 comes back, with the request.
+        self.assertEqual(self.reviews, [(360, 3)])
+        self.assertEqual(self.schedule()[0], (3, 2, 120, 360))
+        self.partial = set()
+        self.assertEqual(self.tick(), [3, 4])  # 480: the request is known by now and the conversation looks unchanged.
+        self.assertEqual(self.schedule()[0], (3, 2, 240, 480))  # Twice the poll interval, not twice the old wait.
+
+    def test_partial_read_does_not_advance_the_schedule(self):
+        self.open, self.threads = [3, 4], {3: [comment(81)], 4: [comment(82)]}
+        self.assertEqual(self.tick(0), [3, 4])
+        self.partial = {4}
+        with self.assertLogs("cursor_pr.discovery", level="WARNING"):
+            self.assertEqual(self.tick(), [3, 4])  # Asked for again at 120; only 3 comes back.
+        self.threads[4].append(comment(90, "/review") | dict(url=self.gh.change_url(4) + "#issuecomment-90"))
+        self.partial = set()
+        self.assertEqual(self.tick(), [3, 4])  # Both are due at 240, so the partial read advanced nothing.
+        self.assertEqual(self.reviews, [(240, 4)])
+        self.open.append(5)
+        self.threads[5] = []
+        self.partial = {5}
+        with self.assertLogs("cursor_pr.discovery", level="WARNING"):
+            self.assertEqual(self.tick(), [4, 5])  # 360: 4 is back at the poll interval since it had a request;
+            #                                      5 was never read completely, so it is asked for every cycle.
+        with self.assertLogs("cursor_pr.discovery", level="WARNING"):
+            self.assertEqual(self.tick(), [3, 4, 5])  # 480
+        self.assertEqual(self.tick(), [3, 4, 5])  # 600: an incomplete batch holds back each change in it.
+        self.assertEqual([row[0] for row in self.schedule()], [3, 4])
+        self.partial, self.open = set(), [4, 5]
+        self.assertEqual(self.tick(), [4, 5])  # 720
+        self.assertEqual([row[0] for row in self.schedule()], [4, 5])  # A closed change is forgotten.
+        self.assertEqual(sorted(number for _, number in self.jobs.read), [4, 5])  # Also in memory.
+
+    def test_one_batch_of_reads_is_kept_in_one_transaction(self):
+        self.open = list(range(3, 23))
+        self.threads = {number: [comment(100 + number)] for number in self.open}
+        batches = []
+        with patch.object(Jobs, "observed", autospec=True,
+                          side_effect=lambda jobs, project, changes, *rest: batches.append(len(changes))):
+            self.tick(0)
+        self.assertEqual((sum(batches), len(batches)), (20, len(self.reads)))  # One write per read, not per change.
+        self.tick(0)
+        self.assertEqual([row[:3] for row in self.schedule()], [(number, 1, 120) for number in self.open])
+
+    def test_clock_set_back_does_not_make_a_change_wait_longer_than_it_was_given(self):
+        steady = [5000.0]
+        self.start(patch("cursor_pr.poll.time.monotonic", side_effect=lambda: steady[0]))
+        self.tick(0)
+        steady[0] += 120
+        self.assertEqual(self.tick(), [3])  # Quiet: it now waits 240 seconds.
+        # 200 seconds pass, and the wall clock is set back by 150 of them.
+        steady[0] += 200
+        self.assertEqual(self.tick(50), [])
+        # By the wall clock 190 seconds are still to go. By the steady one the 240 are over in 40.
+        steady[0] += 40
+        self.assertEqual(self.tick(40), [3])
+        # After a restart there is only the wall clock, as before.
+        self.jobs = Jobs(self.state)
+        steady[0] += 10_000
+        self.assertEqual(self.tick(60), [])
+
+    def test_cycle_logs_how_many_changes_it_read_and_how_many_it_skipped(self):
+        self.open = [3, 4, 5]
+        self.threads = {number: [comment(number)] for number in self.open}
+        self.assertEqual(self.tick(0), [3, 4, 5])
+        with self.assertLogs("cursor_pr.poll", level="INFO") as logged:
+            self.tick()
+        self.assertEqual(logged.output, ["INFO:cursor_pr.poll:Read the comments of 3 open changes; "
+                                         "0 quiet ones are due in a later cycle"])
+        with self.assertLogs("cursor_pr.poll", level="INFO") as logged:
+            self.assertEqual(self.tick(), [])
+        self.assertEqual(logged.output, ["INFO:cursor_pr.poll:Read the comments of 0 open changes; "
+                                         "3 quiet ones are due in a later cycle"])
+        self.assertEqual(self.schedule()[-1][2:], (240, 120))
+
+    def test_cycle_counts_only_returned_threads_and_open_waiting_changes(self):
+        self.open = [3, 4, 5]
+        self.threads = {number: [comment(number)] for number in self.open}
+        self.tick(0)
+        self.tick()  # All three changes now wait until 360.
+        self.open = [4, 5, 6, 7]
+        self.threads[6] = []
+        self.partial = {7}
+        with self.assertLogs("cursor_pr.poll", level="INFO") as logged:
+            with self.assertLogs("cursor_pr.discovery", level="WARNING"):
+                self.assertEqual(self.tick(), [6, 7])
+        self.assertEqual(logged.output, ["INFO:cursor_pr.poll:Read the comments of 1 open changes; "
+                                         "2 quiet ones are due in a later cycle"])
+
+    def test_capped_open_change_list_does_not_discard_backoff(self):
+        self.assertEqual(self.tick(0), [3])
+        self.assertEqual(self.tick(), [3])  # Due next at 360.
+        self.open, self.capped = [], True
+        with self.assertLogs("cursor_pr.discovery", level="WARNING"):
+            self.assertEqual(self.tick(60), [])
+        self.assertEqual(self.schedule(), [(3, 1, 240, 120)])
+        self.open, self.capped = [3], False
+        self.assertEqual(self.tick(60), [])
+        self.assertEqual(self.tick(), [3])
+
+    def test_setting_disables_itself_at_the_poll_interval(self):
+        for value, idle in (("900", (120, 900)), ("120", None), ("60", None)):
+            with self.subTest(value=value):
+                self.assertEqual(poller(self.state, env={"REVIEW_POLL_SECONDS": "120", "REVIEW_POLL_IDLE_MAX_SECONDS": value})
+                                 .call_args.kwargs["idle"], idle)
+
+    def test_schedule_saved_before_the_setting_was_turned_off_is_not_found_when_it_is_back_on(self):
+        self.tick(0)
+        self.tick()
+        self.assertEqual(self.schedule(), [(3, 1, 240, 120)])
+        poller(self.state, env={"REVIEW_POLL_SECONDS": "120", "REVIEW_POLL_IDLE_MAX_SECONDS": "900"})
+        self.assertEqual(self.schedule(), [(3, 1, 240, 120)])  # Kept across a restart with it on.
+        poller(self.state, env={"REVIEW_POLL_SECONDS": "120", "REVIEW_POLL_IDLE_MAX_SECONDS": "120"})
+        self.assertEqual(self.schedule(), [])
+        # A request made while every change was read each cycle is not behind an old wait afterwards.
+        self.assertEqual(self.tick(60), [3])
+
+    def test_setting_that_is_no_time_is_refused_at_startup(self):
+        for value in ("0", "-5", "soon"):
+            with self.subTest(value=value), patch.dict(os.environ, {"REVIEW_POLL_IDLE_MAX_SECONDS": value}), \
+                 patch("sys.stderr", new_callable=io.StringIO) as err, self.assertRaises(SystemExit) as stopped:
+                poller(self.state, env={"REVIEW_POLL_SECONDS": "120"})
+            self.assertEqual(stopped.exception.code, 2)
+            self.assertTrue(err.getvalue().startswith("Polling configuration: "))
 
 
 if __name__ == "__main__":
