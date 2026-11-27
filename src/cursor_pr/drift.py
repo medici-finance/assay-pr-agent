@@ -4,9 +4,8 @@ import re
 import subprocess
 import threading
 
-from .engine import hunks
 from .scanners import fence
-from .source import ReviewError, child_env, run
+from .source import ReviewError, hunks, child_env, run, valid_sha
 
 DOCS = (".md", ".rst", ".txt", ".adoc")
 SPAN = re.compile(r"`+([^`\n]+)`+")
@@ -15,15 +14,28 @@ MAX_NAMES = 60   # names looked up per review
 MAX_ROWS = 10    # rows of each kind in the posted summary
 
 
-def git(repo, *args, alternates=None):
+def git(repo, *args, alternates=None, strip=True):
     env = dict(os.environ)
     if alternates:
         env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = alternates
-    return run(["git", "--literal-pathspecs", "-C", str(repo), *args], env=env, timeout=20).decode().strip()
+    output = run(["git", "--literal-pathspecs", "-C", str(repo), *args], env=env, timeout=20).decode()
+    return output.strip() if strip else output
 
 
 def commit(repo, ref):
     return git(repo, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}")
+
+
+def patch_base(root, checkout, change):
+    """Resolve the comparison preimage from immutable change metadata, never a branch name."""
+    if change.patch_base or not change.base:
+        return change.patch_base
+    try:
+        objects = None if root == checkout else git(root, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+        bases = git(checkout, "merge-base", "--all", change.base, change.head, alternates=objects).split()
+    except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    return bases[0] if len(bases) == 1 and valid_sha(bases[0]) else ""
 
 
 def names(files):
@@ -86,10 +98,10 @@ def check(root, head, base, files, *, head_repo=None):
             fork = git(head_repo, "merge-base", tip, head, alternates=objects)
         # The merge base is an ancestor of the tip, so everything below reads root alone.
         behind = int(git(root, "rev-list", "--count", f"{fork}..{tip}"))
-        result.update(base=tip, behind=behind)
+        result.update(base=tip, fork=fork, behind=behind)
         if behind:
             moved = set(git(root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z",
-                            fork, tip, "--").split("\0"))
+                            fork, tip, "--", strip=False).split("\0"))
             # A renamed file's old path counts too: the base may have edited it there.
             result["both"] = sorted(moved & {p for f in files for p in (f.path, f.previous) if p})
             wanted = names(files)
