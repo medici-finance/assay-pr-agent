@@ -52,6 +52,9 @@ class Jobs:
 
     def __init__(self, state):
         self.path = state / "requests.sqlite3"
+        # When this process last read each change, by the steady clock. Not kept across a restart,
+        # after which the saved wall-clock times are all there is.
+        self.read = {}
         settled = []
         with closing(sqlite3.connect(self.path)) as db, db:
             # One transaction for the schema and the recovery: sqlite3 opens none for DDL by itself,
@@ -76,6 +79,9 @@ class Jobs:
                 db.execute("ALTER TABLE requests ADD COLUMN prepared TEXT")
             db.execute("""CREATE TABLE IF NOT EXISTS activations (
                 project TEXT PRIMARY KEY, since TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS schedule (
+                project TEXT NOT NULL, number INTEGER NOT NULL, comments INTEGER NOT NULL, newest TEXT NOT NULL,
+                wait INTEGER NOT NULL, seen REAL NOT NULL, PRIMARY KEY(project, number))""")
             upgraded = db.execute("SELECT 1 FROM sqlite_master WHERE name='acknowledgements'").fetchone() is None
             db.execute("""CREATE TABLE IF NOT EXISTS acknowledgements (
                 project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,
@@ -137,6 +143,44 @@ class Jobs:
         with closing(sqlite3.connect(self.path)) as db:
             return db.execute("SELECT 1 FROM requests WHERE project=? AND number=? AND status IN ('queued','started')",
                               (project, number)).fetchone() is not None
+
+    def waiting(self, project, numbers, now, cap, listing_complete):
+        """Open changes whose saved read is not due yet. A change no longer open is forgotten."""
+        numbers = set(numbers)
+        with closing(sqlite3.connect(self.path)) as db, db:
+            saved = {number: (wait, seen) for number, wait, seen in db.execute(
+                "SELECT number, wait, seen FROM schedule WHERE project=?", (project,))}
+            if listing_complete:
+                db.executemany("DELETE FROM schedule WHERE project=? AND number=?",
+                               [(project, number) for number in saved if number not in numbers])
+                for key in [key for key in self.read if key[0] == project and key[1] not in numbers]:
+                    del self.read[key]  # Forgotten with its row, or it would be kept for every change ever read.
+        # A clock that moved back past the last read makes the saved times meaningless, so read now.
+        # One that moved back less would make a change wait for longer than it was given, so a read
+        # this process made is also due once that long has passed by its own steady clock.
+        steady = time.monotonic()
+        return {number for number, (wait, seen) in saved.items()
+                if number in numbers and now >= seen and seen + min(wait, cap) > now
+                and steady - self.read.get((project, number), steady) < min(wait, cap)}
+
+    def forget_schedule(self):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("DELETE FROM schedule")
+        self.read.clear()
+
+    def observed(self, project, changes, now, interval, cap):
+        """Keep one complete read of each change, given as (number, comments, newest, active). A first look,
+        new comments or a request read again after one interval; an unchanged conversation waits twice as
+        long as before, never longer than the cap. One transaction for the batch: a first poll of a large
+        project reads hundreds of changes, and a commit for each would hold the queued reviews back."""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            for number, comments, newest, active in changes:
+                previous = db.execute("SELECT comments, newest, wait FROM schedule WHERE project=? AND number=?",
+                                      (project, number)).fetchone()
+                quiet = previous is not None and not active and list(previous[:2]) == [comments, newest]
+                db.execute("INSERT OR REPLACE INTO schedule VALUES (?,?,?,?,?,?)",
+                           (project, number, comments, newest, min(previous[2] * 2, cap) if quiet else interval, now))
+                self.read[project, number] = time.monotonic()
 
     # What a finished request owes the forge is two things, each with its own tries and its own time
     # of the next one: the marker's removal (cleared, tries, retry_at) and, after a failure, the
@@ -369,14 +413,19 @@ def read_all(descriptor, seconds):
     return None
 
 
-def cycle(projects, state, jobs, since, runner=None, ack=None):
+def cycle(projects, state, jobs, since, runner=None, ack=None, idle=None):
     if ack is not None:
         ack.settle(projects)
+    polled = [0, 0]
     for project in projects.values():
         try:
-            poll_project(project, jobs, since[project.key], ack)
+            counts = poll_project(project, jobs, since[project.key], ack, idle)
+            if idle is not None:
+                polled = [total + count for total, count in zip(polled, counts)]
         except Exception:
             log.exception("Poll failed for %s; will retry next cycle", project.key)
+    if idle is not None:
+        log.info("Read the comments of %d open changes; %d quiet ones are due in a later cycle", *polled)
     if ack is not None:
         ack.mark(projects)
     while job := jobs.next():
@@ -471,6 +520,9 @@ def main():
                 args.interval = int(os.getenv("REVIEW_POLL_SECONDS", "120"))
             if args.interval < 1:
                 raise ValueError("poll interval must be positive")
+            idle_max = int(os.getenv("REVIEW_POLL_IDLE_MAX_SECONDS", "900"))
+            if idle_max < 1:
+                raise ValueError("REVIEW_POLL_IDLE_MAX_SECONDS must be positive")
             setup.max_input_tokens(state)
             setup.max_findings(state)
             mine_seconds = history.interval()
@@ -484,6 +536,14 @@ def main():
         ack = acknowledge.Acknowledgement(jobs, state)
         since = {key: jobs.activated(key) for key in projects}
         log.info("Polling %s with %d seconds between cycles", ", ".join(projects), args.interval)
+        # A cap no longer than the poll interval reads every change on every cycle, as before the schedule.
+        idle = (args.interval, idle_max) if idle_max > args.interval else None
+        if idle:
+            log.info("A quiet change can wait up to %d seconds before it is due for another read", idle_max)
+        else:
+            # Nothing keeps the schedule up to date while it is off, so none of it may be found
+            # again when it is turned back on: a wait saved before would hide a request made since.
+            jobs.forget_schedule()
         if mine_seconds:
             threading.Thread(target=history.mine_periodically, args=(projects, state, mine_seconds),
                              name="qualgen-miner", daemon=True).start()
@@ -491,7 +551,7 @@ def main():
             if watch.enabled and any(p.managed and not p.checkout.is_dir() for p in projects.values()):
                 watch.wait(2)
                 continue
-            cycle(projects, state, jobs, since, ack=ack)
+            cycle(projects, state, jobs, since, ack=ack, idle=idle)
             watch.wait(args.interval)
 
 
