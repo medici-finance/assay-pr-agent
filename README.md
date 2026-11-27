@@ -293,11 +293,11 @@ The standalone poller supports `/review`. For additional upstream PR-Agent chat 
 
 Add `--sarif review.sarif` to any review or estimate to write the same findings as a [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html) log after the JSON report is printed. The log has one run whose driver is `assay-pr-agent` and one result per model finding and per ShellCheck, actionlint, Go analysis, hadolint, zizmor or OSV-Scanner finding. `ruleId` is the scanner rule or `model-finding`. The report keeps no scanner severity, so `level` is a fixed mapping: `warning` for model findings and OSV-Scanner vulnerabilities, `note` for every other scanner finding. Each result names a repository-relative, percent-encoded `artifactLocation.uri` and, when the finding has a line, `region.startLine`, plus `region.endLine` for a model finding. OSV-Scanner findings carry no line, so they name the lockfile without a region. Messages are cut at 1,000 characters and a finding without a safe relative path is left out. `partialFingerprints.primaryLocationLineHash` is the value the `upload-sarif` action computes for a result that has none: a hash of the 100 characters from the start of the finding's line, ignoring spaces and tabs, so the text that follows the line is part of the value, with a number that keeps identical lines apart. When one rule reports several findings on one line, the first keeps that value and each later one that differs from the ones before adds its number, so two model findings on one line are two results. Findings the log cannot tell apart, such as two ShellCheck SC2086 on one line with one message, keep one identity. A line added above a finding does not change its identity, and the same reviewed head always gives the same values. The text is read from the reviewed head in `--repo`. A result whose file is not there is written without a fingerprint, and the action computes it from its checkout. A finding without a line is identified by its path, rule and message. `invocations[0].executionSuccessful` is `true` only for the `reviewed`, `empty` and `estimate` states. The path is resolved against the directory you run the command from, not `--repo`. If the file cannot be written, the JSON report is still printed, the reason goes to stderr and the exit code is 2. The poller does not request the export.
 
-GitHub code scanning accepts SARIF 2.1.0 files from third-party tools. It is available for public repositories on GitHub.com and for organization-owned repositories with GitHub Code Security enabled. Upload it from a GitHub Actions job with the `upload-sarif` action, which needs `security-events: write` and, for private repositories, `actions: read`. Actions skips the steps after a failed one, and `cursor-review` exits 2 for partial coverage, an over-budget prompt or a failed model, so the upload states that it also runs after a failure when the file exists:
+GitHub code scanning accepts SARIF 2.1.0 files from third-party tools. It is available for public repositories on GitHub.com and for organization-owned repositories with GitHub Code Security enabled. Upload it from a GitHub Actions job with the `upload-sarif` action, which needs `security-events: write` and, for private repositories, `actions: read`. Actions skips the steps after a failed one, and `cursor-review` exits 2 for partial coverage, an over-budget prompt or a failed model, so the upload states that it also runs after a failure when the file exists. Both examples remove the file before the review: a runner that keeps its working directory could otherwise upload the previous run's log when a review fails before writing its own.
 
 ```yaml
     steps:
-      - run: cursor-review --ci --max-input-tokens 4000 --sarif review.sarif > review.json
+      - run: rm -f review.sarif && cursor-review --ci --max-input-tokens 4000 --sarif review.sarif > review.json
       - uses: github/codeql-action/upload-sarif@v4
         if: always() && hashFiles('review.sarif') != ''
         with:
@@ -309,6 +309,7 @@ GitLab ingests SARIF 2.1.0 from an `artifacts:reports:sarif` artifact on GitLab 
 ```yaml
 review:
   script:
+    - rm -f review.sarif
     - cursor-review --ci --max-input-tokens 4000 --sarif review.sarif > review.json || review_exit=$?
     - test -s review.sarif
   artifacts:
