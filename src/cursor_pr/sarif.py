@@ -118,17 +118,15 @@ def log(report, source=None):
     results, rules, lines = [], {}, {}
     for tool, name, path, line, end, text in rows:
         # Six scanners share one driver, so the message names the tool that reported the line.
-        text = (text if tool == "model" else f"{tool}: {text}")[:MESSAGE_LIMIT]
+        text = text if tool == "model" else f"{tool}: {text}"
         # A URI reference: a '#' or '%' in a path must not read as a fragment or an escape.
         location = {"artifactLocation": {"uri": quote(path, safe="/")}}
-        result = {"ruleId": name, "level": "warning" if tool in WARNINGS else "note", "message": {"text": text},
-                  "locations": [{"physicalLocation": location}]}
-        # A finding without a line, such as an OSV-Scanner vulnerability, has only these to identify it.
-        fingerprint = hashlib.sha256(json.dumps([path, name, text]).encode()).hexdigest()
+        result = {"ruleId": name, "level": "warning" if tool in WARNINGS else "note",
+                  "message": {"text": text[:MESSAGE_LIMIT]}, "locations": [{"physicalLocation": location}]}
         if type(line) is int and line > 0:
             extent = end if type(end) is int and end >= line else None
             location["region"] = {"startLine": line, **({"endLine": extent} if extent is not None else {})}
-            # The line's own text identifies the result, so a line added above it is not a new alert.
+            # Use source context and its occurrence count so absolute line offsets do not enter the hash.
             if path not in lines:
                 blob = source(path) if source else None
                 lines[path] = line_hashes(blob, requested[path]) if blob is not None else {}
@@ -139,6 +137,9 @@ def log(report, source=None):
                 span = extent - line if extent is not None else None
                 key = hashlib.sha256(json.dumps([span, text]).encode()).hexdigest()
                 fingerprint = f"{fingerprint}:{key}"
+        else:
+            # An OSV-Scanner vulnerability has only the path, rule and message to identify it.
+            fingerprint = hashlib.sha256(json.dumps([path, name, text]).encode()).hexdigest()
         if fingerprint:
             result["partialFingerprints"] = {"primaryLocationLineHash": fingerprint}
         rules.setdefault(name, describe(tool, name))

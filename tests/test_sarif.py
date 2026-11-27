@@ -167,6 +167,18 @@ class SarifLogTests(unittest.TestCase):
         self.assertEqual(prints(results(value)), [{"primaryLocationLineHash": hashlib.sha256(
             json.dumps(["uv.lock", rule, "osv-scanner: " + message]).encode()).hexdigest()} for rule, message in advisories])
 
+    def test_fingerprints_include_text_beyond_the_display_limit(self):
+        prefix = "x" * sarif.MESSAGE_LIMIT
+        finding = {"path": "src/app.py", "line": 3, "end_line": 3, "title": "Issue"}
+        for line in (3, None):
+            with self.subTest(line=line):
+                value = report(findings=[dict(finding, line=line, message=prefix + suffix)
+                                         for suffix in ("first defect", "second defect")],
+                               checks=[], static_checks=[])
+                first, second = results(value, head_text)
+                self.assertEqual(first["message"], second["message"])
+                self.assertNotEqual(first["partialFingerprints"], second["partialFingerprints"])
+
     def test_paths_are_percent_encoded_uri_references(self):
         paths = ["src/a#b.py", "sp ace/ü.py", "50%.yml", "q?x.yml", "plain/dir/file.sh"]
         asked = []
@@ -271,12 +283,17 @@ class SarifFlagTests(unittest.TestCase):
 
     def test_export_reuses_the_temporary_managed_checkout(self):
         candidate = self.root
+        base = self.git("rev-parse", "HEAD")
+        path = "example.py"
+        (candidate / path).write_text("value = 1\n")
+        self.git("add", path)
+        self.git("commit", "-qm", "Add a Python change")
         original = self.root / "checkout-without-head"
         original.mkdir()
         url = "https://github.com/example/repo/pull/1"
         project = project_from(dict(provider="github", url=url.removesuffix("/pull/1"), requester_ids=[7],
                                     checkout=str(original), managed=True))
-        change = local_change(candidate, self.base, "HEAD")
+        change = local_change(candidate, base, "HEAD")
         change = type(change)(change.head, change.files, url)
         active = False
 
@@ -296,14 +313,18 @@ class SarifFlagTests(unittest.TestCase):
 
         target = candidate / "managed.sarif"
         self.root = original
+        answer = {"findings": [{"path": path, "line": 1, "end_line": 1, "title": "Example",
+                                "message": "A finding on a path without a scanner."}], "cursor_usage": None}
         with patch.object(cli, "scan_checkout", side_effect=checkout), patch.object(cli, "blob", side_effect=read), \
              patch.object(cli, "forge_change", return_value=change), \
+             patch.object(cli, "scan_files", return_value=[]), patch.object(engine, "invoke", return_value=answer), \
              patch.dict(os.environ, {"CURSOR_REVIEW_POLLER_CHILD": "1", "REVIEW_FORGE_PROJECT": json.dumps(dict(
                  provider=project.provider, url=project.url, checkout=str(project.checkout),
                  requester_ids=sorted(project.requesters), managed=True))}):
-            code, _, error = self.check("--change", "example/repo#1", "--estimate", "--sarif", str(target))
+            code, _, error = self.check("--change", "example/repo#1", "--sarif", str(target))
         self.assertEqual(code, 0, error)
-        self.assertEqual(len(json.loads(target.read_text())["runs"][0]["results"]), 1)
+        row, = json.loads(target.read_text())["runs"][0]["results"]
+        self.assertIn("partialFingerprints", row)
         self.assertFalse(active)
 
     def test_fingerprints_read_the_reviewed_head(self):
