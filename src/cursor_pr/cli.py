@@ -46,6 +46,8 @@ def publish(address, head, report, *, project=None, state=None):
     _, number = address.rsplit("#", 1)
     if "map" in report:
         text = "\n".join(visual.comment(report, evidence(report))) + "\n"
+        if len(text.encode("utf-8")) > visual.MAX_COMMENT_BYTES:
+            raise ReviewError("Visual review exceeded the forge comment limit")
     else:
         label = providers.LABELS[report.get("provider", "cursor")]
         body = [f"{label} review of {head}", report["state"]]

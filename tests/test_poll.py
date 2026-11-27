@@ -60,6 +60,40 @@ class PollTests(unittest.TestCase):
         self.assertEqual(restarted.next(), (self.gh.key, 2, 11, "visual-review"))
         self.assertIsNone(restarted.next())
 
+    def test_rollback_can_queue_and_claim_regular_reviews(self):
+        jobs = Jobs(self.state)
+        jobs.enqueue(self.gh.key, 1, 10, command="visual-review")
+        with sqlite3.connect(jobs.path) as old:
+            # The previous image inserts without a column list and claims only queued rows.
+            old.execute("INSERT OR IGNORE INTO requests VALUES (?,?,?,?)", (self.gh.key, 2, 20, "queued"))
+            claimed = old.execute("""UPDATE requests SET status='started' WHERE rowid=(
+                SELECT rowid FROM requests WHERE status='queued' ORDER BY rowid LIMIT 1)
+                RETURNING project, number, comment""").fetchone()
+            self.assertEqual(claimed, (self.gh.key, 2, 20))
+        restarted = Jobs(self.state)
+        visual = restarted.next()
+        self.assertEqual(visual, (self.gh.key, 1, 10, "visual-review"))
+        restarted.finish(visual, "reviewed")
+        self.assertIsNone(restarted.next())
+
+    def test_queue_migrates_the_initial_visual_schema_without_losing_commands(self):
+        jobs = Jobs(self.state)
+        with sqlite3.connect(jobs.path) as db:
+            db.execute("ALTER TABLE requests ADD COLUMN command TEXT NOT NULL DEFAULT 'review'")
+            db.executemany("INSERT INTO requests VALUES (?,?,?,?,?)", [
+                (self.gh.key, 1, 10, "queued", "review"),
+                (self.gh.key, 2, 20, "queued", "visual-review"),
+                (self.gh.key, 3, 30, "started", "visual-review"),
+            ])
+        migrated = Jobs(self.state)
+        with sqlite3.connect(jobs.path) as db:
+            self.assertEqual([row[1] for row in db.execute("PRAGMA table_info(requests)")],
+                             ["project", "number", "comment", "status"])
+        self.assertEqual(migrated.next(), (self.gh.key, 1, 10, "review"))
+        self.assertEqual(migrated.next(), (self.gh.key, 2, 20, "visual-review"))
+        self.assertTrue(migrated.recorded(self.gh.key, 3, 30))
+        self.assertIsNone(migrated.next())
+
     def test_wizard_env_and_legacy_config(self):
         row = dict(provider="github", url=self.gh.url, checkout=str(self.state), requester_ids=[7])
         with patch.dict(os.environ, {}, clear=True), patch("sys.stdin.isatty", return_value=True), \
