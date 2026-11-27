@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -45,7 +46,7 @@ class CapturePromptTest(unittest.TestCase):
         bin_dir.mkdir()
         for name in ("cursor-agent", "codex", "claude"):
             shim = bin_dir / name
-            shim.write_text(f"#!/bin/sh\necho {name} >> {self.started}\nexit 1\n")
+            shim.write_text(f"#!/bin/sh\necho {name} >> {shlex.quote(str(self.started))}\nexit 1\n")
             shim.chmod(0o700)
         self.env = dict(self.clean, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"], CURSOR_API_KEY="fixture",
                         REVIEW_STATE_DIR=str(self.root / "state"))
@@ -234,6 +235,23 @@ class CapturePromptTest(unittest.TestCase):
         prompt = (self.root / "out" / "branch.prompt.txt").read_text()
         self.assertNotIn("return 1", prompt)  # Only what is committed is in the prompt.
         self.assertNotIn("new.py", prompt)
+
+    def test_capture_written_into_the_checkout_is_not_counted_as_work_not_committed(self):
+        inside = self.repo / "scratch" / "branch"
+        result = subprocess.run([sys.executable, str(SCRIPT), str(inside), "--repo", str(self.repo), "--base", self.base,
+                                 "--cache-dir", str(self.root / "cache")], env=self.env, capture_output=True, text=True,
+                                timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("warning", result.stderr)
+        (self.repo / "scratch" / "other.txt").write_text("not this run's\n")
+        result = subprocess.run([sys.executable, str(SCRIPT), str(inside), "--repo", str(self.repo), "--base", self.base,
+                                 "--cache-dir", str(self.root / "cache")], env=self.env, capture_output=True, text=True,
+                                timeout=120)
+        self.assertIn("capture-prompt: warning: 1 uncommitted or untracked path(s)", result.stderr)
+
+    def test_stand_in_clis_record_a_start_whatever_the_path_looks_like(self):
+        self.assertEqual(subprocess.run(["codex"], env=self.env).returncode, 1)
+        self.assertEqual(self.started.read_text(), "codex\n")
 
     def test_another_commit_than_the_checkouts_is_named_and_not_warned_about(self):
         first = self.git("rev-parse", "HEAD")

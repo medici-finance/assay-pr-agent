@@ -41,7 +41,7 @@ def git(repo, *args):
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def committed(repo, reported, asked):
+def committed(repo, reported, asked, ours=()):
     """The commit that was captured, and how many paths of the checkout are in no commit.
 
     The count is None when it does not apply (another commit than the checkout's was captured) or
@@ -52,7 +52,15 @@ def committed(repo, reported, asked):
         return reported or asked or "HEAD", None
     if head != git(repo, "rev-parse", "--verify", "HEAD^{commit}"):
         return head[:12], None
-    status = git(repo, "status", "--porcelain")
+    # Without this run's own files, which are in the checkout when the output prefix is.
+    top = git(repo, "rev-parse", "--show-toplevel")
+    inside = []
+    for path in ours:
+        try:
+            inside.append(":(top,exclude,literal)" + path.resolve().relative_to(Path(top).resolve()).as_posix())
+        except (TypeError, ValueError):
+            pass
+    status = git(repo, "status", "--porcelain", "--", ":(top)", *inside)
     return head[:12], None if status is None else len(status.splitlines())
 
 
@@ -144,7 +152,7 @@ def main(argv):
         if not isinstance(err, (OSError, ValueError)):
             raise
         return fail(f"could not write the capture ({err}); nothing was left behind")
-    head, dirty = committed(args.repo, report.get("head"), args.head)
+    head, dirty = committed(args.repo, report.get("head"), args.head, (prompt_file, anchors_file))
     print(f"prompt: {prompt_file}")
     print(f"anchors: {anchors_file}")
     print(f"captured: {args.base}..{head}")
