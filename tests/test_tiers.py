@@ -228,9 +228,11 @@ class TierTests(unittest.TestCase):
         self.assertEqual(report["model_invocations"], 1)
 
     def test_tier_falls_back_to_the_one_below_and_says_so(self):
-        plain = self.check("--estimate")[1]["estimated_input_tokens"]
-        # Twice the budget less the verification reserve leaves no room for context.
-        tight = (plain + 60) * 4 // 7
+        change = cli.local_change(self.root, "main", self.head)
+        files = sorted(change.files, key=lambda f: f.path)
+        patch_size = engine.tokens(engine.pack(files, [], max_findings=cli.CAPS["mid"])[0])
+        # The first-pass allowance leaves room for the patch, with too little left for context.
+        tight = (patch_size + 60) * 4 // 7
         code, report = self.check("--tier", "mid", "--max-input-tokens", str(tight))
         self.assertEqual((code, report["state"], report["delivered"]), (2, "degraded", "regular"))
         self.assertTrue(all(row["state"] in ("dropped", "empty") for row in report["context"]), report["context"])
