@@ -1,2 +1,2 @@
 # tiktoken encoding files: one long line of data each. Never diff them or count them as code.
-src/cursor_pr/vendor/tiktoken/* -diff linguist-generated
+src/cursor_pr/vendor/tiktoken/* -diff -text linguist-generated
