@@ -225,7 +225,7 @@ print(json.dumps(dict(type='result',subtype='success',is_error=False,
                     jobs = Jobs(self.state)
                     jobs.enqueue(project.key, 3, 81)
                     self.assertEqual(jobs.next(), (project.key, 3, 81))
-                    self.assertEqual(run_review(project,3,self.state,81),"reviewed")
+                    self.assertEqual(run_review(project,3,self.state,comment=81),"reviewed")
                     with closing(sqlite3.connect(jobs.path)) as db:
                         self.assertEqual(db.execute("SELECT status, attempts, head FROM requests WHERE project=?",
                                                     (project.key,)).fetchall(), [("reviewed", 1, "a"*40)])

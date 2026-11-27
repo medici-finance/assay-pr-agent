@@ -25,10 +25,13 @@ import selectors
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 # How long a review asked to stop has to remove its temporary files before it is ended outright.
 GRACE_SECONDS = 5
+# How long a diagnostic may take to write before the supervisor goes on without it.
+SAY_SECONDS = 1
 STOPPED = 124
 
 
@@ -55,14 +58,13 @@ def supervise(lifeline, seconds, keep, command):
         os.close(alive)
         reason = watch(lifeline, ended, woken, seconds)
         if reason:
-            # Said first: this process ends with its group.
-            print(f"cursor-review: the review was stopped: {reason}", file=sys.stderr, flush=True)
+            say(f"cursor-review: the review was stopped: {reason}")
             # Asked first, so that it removes its temporary files and ends the command it waits on.
             os.killpg(group, signal.SIGTERM)
             wait_for(ended, GRACE_SECONDS)
     except BaseException as failure:
         # Whatever goes wrong with the waiting, the review is not left running without it.
-        print(f"cursor-review: the review was stopped: its supervisor failed: {failure!r}", file=sys.stderr, flush=True)
+        say(f"cursor-review: the review was stopped: its supervisor failed: {failure!r}")
     finally:
         try:
             # The review itself first, and waited for, so that it is not left for another to wait for.
@@ -72,6 +74,19 @@ def supervise(lifeline, seconds, keep, command):
             # Then the group: whatever the review started, and this process with it.
             os.killpg(group, signal.SIGKILL)
     return STOPPED
+
+
+def say(message):
+    # Said before the group is ended, because this process ends with it, but never waited on:
+    # with nobody reading the diagnostics, a write can block, and ending the review must not.
+    def write():
+        try:
+            print(message, file=sys.stderr, flush=True)
+        except OSError:
+            pass
+    writer = threading.Thread(target=write, daemon=True)
+    writer.start()
+    writer.join(SAY_SECONDS)
 
 
 def watch(lifeline, ended, woken, seconds):

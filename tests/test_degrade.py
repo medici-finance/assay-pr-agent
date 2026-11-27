@@ -37,7 +37,7 @@ class DegradeTests(unittest.TestCase):
                     "result": json.dumps({"review": {"key_issues_to_review": [issue]}})}
         shim = self.root / "cursor-agent"
         shim.write_text("#!/usr/bin/env python3\nimport sys\n"
-                        f"open({str(self.prompts)!r}, 'a').write(sys.argv[-1] + '\\0')\n"
+                        f"open({str(self.prompts)!r}, 'a').write(sys.stdin.read() + '\\0')\n"
                         f"print({json.dumps(envelope)!r})\n")
         shim.chmod(0o700)
         env = patch.dict(os.environ, {"PATH": str(self.root) + os.pathsep + os.environ["PATH"],
@@ -69,7 +69,9 @@ class DegradeTests(unittest.TestCase):
 
     def test_oversized_review_drops_low_value_files_and_says_so(self):
         full = self.estimate()["estimated_input_tokens"]
-        code, lock_only = self.check("--base", "HEAD~1", "--estimate", "--max-input-tokens", str(full - 1))
+        files = sorted(source.local_change(self.root, "HEAD~1", self.head).files, key=lambda file: file.path)
+        limit = engine.tokens(engine.pack(files, [])[0]) - 1
+        code, lock_only = self.check("--base", "HEAD~1", "--estimate", "--max-input-tokens", str(limit))
         self.assertEqual((code, lock_only["state"], lock_only["degraded"]), (2, "estimate", ["uv.lock"]))
         self.assertFalse(self.prompts.exists())
 

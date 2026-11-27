@@ -1,7 +1,8 @@
 import argparse
 from collections import defaultdict
 import fcntl
-from contextlib import ExitStack, closing, contextmanager
+import hashlib
+from contextlib import ExitStack, closing
 import json
 import os
 from pathlib import Path
@@ -13,10 +14,11 @@ import sys
 import tempfile
 import time
 
+import httpx
 from unidiff.errors import UnidiffParseError
 import yaml
 
-from . import drift, history, providers, scanners
+from . import context, drift, engine, history, providers, scanners
 from .scanners import fence
 from .login import auth_mode, login_directory
 from .setup import locked, apply_saved_setup, load_provider_key, max_input_tokens, state_dir
@@ -25,51 +27,53 @@ from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
-from .engine import CursorFailure, pack, render_sections, review, tokens
+from .discovery import context_comments
+from .engine import MAX_FINDINGS, CursorFailure, merge_findings, pack, rank, render_sections, review, tokens, verification
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
 
 
-LOCKS = {"package-lock.json", "pnpm-lock.yaml", "go.sum", "npm-shrinkwrap.json"}
 MAX_DEGRADED_ROWS = 50
+FORGE_COMMENT_BYTES = 16 * 1024
+# Each tier's whole budget is this multiple of the configured input-token limit.
+TIERS = {"regular": 1, "mid": 2, "max": 10}
+CAPS = {"regular": MAX_FINDINGS, "mid": 6, "max": 10}
+TIMEOUTS = {"regular": 120, "mid": 240, "max": 480}
+DEEP_FOCUS = ("Look for what only this wider view shows: a caller the change breaks, behaviour the existing "
+              "tests do not cover, and a description or earlier comment the change contradicts or leaves unanswered.")
+USED = ("included", "truncated")
 
 
-def rank(path):
-    """Order in which whole files leave an oversized prompt: the least reviewable first."""
-    parts = path.lower().split("/")
-    name = parts[-1]
-    if name in LOCKS or name.endswith((".lock", ".min.js", ".min.css")):
-        return 0
-    if (set(parts[:-1]) & {"test", "tests", "__tests__", "testdata", "spec"} or name.startswith("test_")
-            or re.search(r"(_test|\.test|\.spec)\.[a-z0-9]+$", name)):
-        return 1
-    if "docs" in parts[:-1] or name.endswith((".md", ".rst", ".txt", ".adoc")):
-        return 2
-    return 3
-
-
-def fit(files, checks, limit):
+def fit(files, checks, limit, cap=MAX_FINDINGS, *, title="", description="", focus="", rendered=None):
     """Pack the prompt, leaving out whole files until it fits the input budget.
 
     Returns the prompt parts, the estimate of what will be sent, the estimate of the full
     prompt, and the paths left out. Nothing is left out when even one file cannot fit.
     """
-    rendered = render_sections(files)
-    prompt, anchors, unseen, has_text = full_pack = pack(files, checks, rendered=rendered)
+    if rendered is None:
+        rendered = render_sections(files)
+    prompt, anchors, unseen, has_text = full_pack = pack(
+        files, checks, title=title, description=description, max_findings=cap, focus=focus, rendered=rendered)
     estimated = full = tokens(prompt) if has_text else 0
     if full <= limit:
         return full_pack, full, full, []
+    if title or description:
+        plain = pack(files, checks, max_findings=cap, focus=focus, rendered=rendered)
+        plain_estimate = tokens(plain[0])
+        if plain_estimate <= limit:
+            return plain, plain_estimate, full, []
     # Measure each file with its scanner evidence before choosing what to leave out.
     # A file that cannot fit alone leaves first, so a smaller file can still be reviewed.
     findings_by_path = defaultdict(list)
     for check in checks:
         for finding in check["findings"]:
             findings_by_path[finding["path"]].append(finding)
-    overhead = tokens(pack([], [])[0])
+    overhead = tokens(pack([], [], title=title, description=description, max_findings=cap, focus=focus)[0])
     sizes = {}
     for file in files:
         if rendered[file.path][0] is not None:
             file_checks = [{"findings": findings_by_path.get(file.path, ())}]
-            standalone, _, _, _ = pack([file], file_checks, rendered=rendered)
+            standalone, _, _, _ = pack(
+                [file], file_checks, title=title, description=description, max_findings=cap, focus=focus, rendered=rendered)
             sizes[file.path] = tokens(standalone) - overhead
     queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
@@ -80,11 +84,151 @@ def fit(files, checks, limit):
         while len(queue) > 1 and freed < estimated - limit:
             dropped.append(queue.pop(0))
             freed += sizes[dropped[-1]]
-        prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), rendered=rendered)
+        prompt, anchors, unseen, has_text = pack(
+            files, checks, frozenset(dropped), title, description, max_findings=cap, focus=focus, rendered=rendered)
         estimated = tokens(prompt) if has_text else 0
-    if not has_text or estimated > limit:
+    fits = has_text and estimated <= limit
+    if (title or description) and (not fits or len(dropped) > 1):
+        fitted, estimate, _, skipped = fit(files, checks, limit, cap, focus=focus, rendered=rendered)
+        if fitted[3] and estimate <= limit and (not fits or len(skipped) < len(dropped)):
+            return fitted, estimate, full, skipped
+    if not fits:
         return full_pack, full, full, []
     return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped)
+
+
+def with_context(files, checks, packed, estimated, dropped, limit, cap, names, raw, *, rendered, focus=""):
+    """Add optional context without exceeding the patch pass's allowance."""
+    text, fates = context.assemble(names, raw, limit - estimated - (120 if focus else 80))
+    if text:
+        wider = pack(files, checks, frozenset(dropped), context=text, max_findings=cap, focus=focus,
+                     rendered=rendered)[0]
+        size = tokens(wider)
+        if size <= limit:
+            return wider, size, fates
+        fates = [dict(row, state="dropped") if row["state"] in USED else row for row in fates]
+    return packed, estimated, fates
+
+
+def run_pass(row, prompt, anchors, args, source, *, cap, timeout, originals=None):
+    """Run one pass and record billing data only for fresh provider calls."""
+    before = engine.started
+    try:
+        answer, cached = review(prompt, args.model, anchors, args.cache_dir, source,
+                                limit=cap, timeout=timeout, originals=originals)
+    except CursorFailure as err:
+        row.update(state="failed", model_invocations=engine.started - before)
+        if row["model_invocations"] and err.usage is not None:
+            row["model_usage"] = err.usage
+        return None, str(err)
+    except (ReviewError, OSError, ValueError, KeyError, TypeError, AttributeError,
+            subprocess.TimeoutExpired, yaml.YAMLError) as err:
+        row.update(state="failed", model_invocations=engine.started - before)
+        return None, str(err) if isinstance(err, ReviewError) else type(err).__name__
+    row.update(state="cached" if cached else "called", model_invocations=engine.started - before)
+    if not cached and answer.get("cursor_usage") is not None:
+        row["model_usage"] = answer["cursor_usage"]
+    return answer, None
+
+
+def merged_fates(groups):
+    """One row per context block, from a prompt that used it when any did."""
+    rows = {}
+    for fates in groups:
+        for row in fates:
+            if row["name"] not in rows or (row["state"] in USED and rows[row["name"]]["state"] not in USED):
+                rows[row["name"]] = row
+    return rows
+
+
+def reached(prompts):
+    """The tier whose context the (pass name, block fates) prompts contained, each tier holding the one below."""
+    used = [(name, row["name"]) for name, fates in prompts for row in fates if row["state"] in USED]
+    if not any(block in context.MID for _, block in used):
+        return "regular"
+    return "max" if any(name == "deep" and block not in context.MID for name, block in used) else "mid"
+
+
+def total_usage(passes):
+    """Preserve a single usage record and sum additive counters across fresh passes."""
+    samples = [row["model_usage"] for row in passes if "model_usage" in row]
+    if len(samples) <= 1:
+        return next(iter(samples), None)
+    totals = {}
+    for sample in samples:
+        for key, value in sample.items():
+            if type(value) in (int, float):
+                totals[key] = totals.get(key, 0) + value
+    return totals or None
+
+
+def finding_line(issue, *, compact=False, shorten_path=False):
+    # Fence displayed text after clipping so the shortened value stays literal.
+    path = issue["path"]
+    if shorten_path and len(path) > 80:
+        tag = hashlib.sha256(path.encode("utf-8")).hexdigest()[:12]
+        path = f"…/{path[-80:]} [{tag}]"
+    title = fence(issue["title"], 60 if compact else None)
+    message = fence(issue["message"], 140 if compact else None)
+    return f"- {fence(path)}:{issue['line']} — {title}. {message}"
+
+
+def comment_text(rows):
+    # A finding may quote multiline source, including forge quick actions.
+    return "\n".join(" ".join(line.splitlines()) for line in rows) + "\n"
+
+
+def omission_notice(count, label):
+    return f"{count} {label} omitted from this comment.\n" if count else ""
+
+
+def fit_comment_rows(rows, allowance, label, *, already_omitted=0):
+    """Fit whole rows and count entries that could not be shown."""
+    rendered = [comment_text([row]) for row in rows]
+    sizes = [len(row.encode("utf-8")) for row in rendered]
+    notice = omission_notice(already_omitted, label)
+    if sum(sizes) + len(notice.encode("utf-8")) <= allowance:
+        return "".join(rendered) + notice
+    omitted = already_omitted + len(rows)
+    remaining = allowance - len(omission_notice(omitted, label).encode("utf-8"))
+    included = []
+    for row, size in zip(rendered, sizes, strict=True):
+        if size <= remaining:
+            included.append(row)
+            remaining -= size
+            omitted -= 1
+    return "".join(included) + omission_notice(omitted, label)
+
+
+def fit_tier_comment(header, findings, coverage, extra_coverage, outside, details, footer):
+    """Keep finding summaries and coverage before spending space on optional evidence."""
+    body = comment_text(header + ["Some review details were shortened to fit the forge comment."])
+    end = comment_text(footer)
+    space = FORGE_COMMENT_BYTES - len((body + end).encode("utf-8"))
+
+    exact = [comment_text([finding_line(issue, compact=True)]) for issue in findings]
+    abbreviated = [comment_text([finding_line(issue, compact=True, shorten_path=True)]) for issue in findings]
+    model = [min((full, short), key=lambda row: len(row.encode("utf-8")))
+             for full, short in zip(exact, abbreviated, strict=True)]
+    space -= sum(len(row.encode("utf-8")) for row in model)
+
+    evidence_label = "check and history rows"
+    outside_label = "files outside review coverage"
+    evidence_notice = len(omission_notice(len(details), evidence_label).encode("utf-8"))
+    outside_notice = len(omission_notice(len(outside), outside_label).encode("utf-8"))
+    skipped = fit_comment_rows(coverage, space - evidence_notice - outside_notice,
+                               "files skipped by the token limit", already_omitted=extra_coverage)
+    space -= len(skipped.encode("utf-8"))
+    outside_text = fit_comment_rows(outside, space - evidence_notice, outside_label)
+    space -= len(outside_text.encode("utf-8"))
+
+    for index, full in enumerate(exact):
+        cost = len(full.encode("utf-8")) - len(model[index].encode("utf-8"))
+        if cost <= space - evidence_notice:
+            model[index] = full
+            space -= cost
+    evidence = fit_comment_rows(details, space, evidence_label)
+    return body + "".join(model) + skipped + outside_text + evidence + end
 
 
 def publish(address, head, report, *, project=None, state=None):
@@ -92,19 +236,49 @@ def publish(address, head, report, *, project=None, state=None):
     label = providers.LABELS[report.get("provider", "cursor")]
     body = [f"{label} review of {head}", report["state"]]
     degraded = report.get("degraded") or []
+    coverage = []
+    extra_coverage = max(0, len(degraded) - MAX_DEGRADED_ROWS)
     if degraded:
         body.append(f"Degraded review: the full prompt is an estimated {report['full_input_tokens']} tokens, "
-                    f"over the limit of {report['max_input_tokens']}. {label} did not review these files:")
-        body.extend(f"- Not reviewed (token limit): {fence(path)}" for path in degraded[:MAX_DEGRADED_ROWS])
-        if len(degraded) > MAX_DEGRADED_ROWS:
-            body.append(f"- Not reviewed (token limit): {len(degraded) - MAX_DEGRADED_ROWS} more files")
+                    f"over the limit of {report.get('prompt_limit', report['max_input_tokens'])}. "
+                    f"{label} did not review these files:")
+        coverage.extend(f"- Not reviewed (token limit): {fence(path)}" for path in degraded[:MAX_DEGRADED_ROWS])
+
+    intro, body = body, []
+    tier = report.get("tier", "regular")
+    if tier != "regular" and report.get("delivered") is None:
+        # Nothing reached the model: the state line below says why, and no tier or context was delivered.
+        body.append(f"Tier {tier}: budget {report['max_input_tokens']} tokens ({TIERS[tier]}× the configured "
+                    f"{report['base_input_tokens']}).")
+    elif tier != "regular":
+        body.append(f"Tier {tier}: budget {report['max_input_tokens']} tokens ({TIERS[tier]}× the configured "
+                    f"{report['base_input_tokens']}), estimated use {report['estimated_input_tokens']}.")
+        if report["delivered"] is not None and report["delivered"] != tier:
+            body.append(f"Degraded review: {tier} was requested and {report['delivered']} was delivered.")
+        blocks = {row["name"]: row["state"] for row in report["context"]}
+        used = [name + (" (truncated)" if state == "truncated" else "") for name, state in blocks.items() if state in USED]
+        body.append("Context beyond the patch: " + (", ".join(used) or "none") + ".")
+        missing = [f"{name} ({state})" for name, state in blocks.items() if state not in USED and state != "empty"]
+        if missing:
+            body.append("Not included: " + ", ".join(missing) + ".")
+        for row in report["passes"]:
+            if row["state"] == "failed":
+                body.append(f"The {row['name']} pass did not complete.")
+        check = report["verification"]
+        if check["state"] == "unavailable":
+            body.append("The findings could not be verified by a second pass.")
+        elif check["state"] == "filtered":
+            body.append(f"A verification pass kept {check['after']} of {check['before']} findings.")
+        if omitted_findings := report.get("omitted_findings"):
+            noun = "finding" if omitted_findings == 1 else "findings"
+            body.append(f"{omitted_findings} {noun} omitted by the {CAPS[tier]}-finding tier limit.")
     # Paths come from the PR and titles/messages from the model: quote them as code
     # so the reviewer identity never posts a Markdown link or @mention for an attacker.
-    for issue in report["findings"]:
-        body.append(f"- {fence(issue['path'])}:{issue['line']} — {fence(issue['title'])}. {fence(issue['message'])}")
+    header, body = body, []
+    findings = [finding_line(issue) for issue in report["findings"]]
     if report["state"] == "over-budget":
         body.append(f"Skipped {label}. Estimated prompt {report['estimated_input_tokens']} tokens "
-                    f"exceeds the limit of {report['max_input_tokens']}.")
+                    f"exceeds the limit of {report.get('prompt_limit', report['max_input_tokens'])}.")
     elif report["state"] == "model-unavailable":
         body.append(f"{label} could not complete the review.")
     elif not report["findings"]:
@@ -121,11 +295,14 @@ def publish(address, head, report, *, project=None, state=None):
         body.extend(["", *history.summary(report["qualgen"]), ""])
     if "drift" in report:
         body.extend(["", *drift.summary(report["drift"]), ""])
-    for path in report["omitted"]:
-        body.append(f"- Outside review coverage: {fence(path)}")
-    body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
-    # A finding may quote a multiline source fragment, including forge quick actions.
-    text = "\n".join(" ".join(line.splitlines()) for line in body) + "\n"
+    outside = [f"- Outside review coverage: {fence(path)}" for path in report["omitted"]]
+    extra = [f"- Not reviewed (token limit): {extra_coverage} more files"] if extra_coverage else []
+    footer = ["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."]
+    text = comment_text(intro + coverage + extra + header + findings + body + outside + footer)
+    if tier != "regular" and len(text.encode("utf-8")) > FORGE_COMMENT_BYTES:
+        text = fit_tier_comment(intro + header, report["findings"], coverage, extra_coverage, outside, body, footer)
+        if len(text.encode("utf-8")) > FORGE_COMMENT_BYTES:
+            raise ReviewError("Higher-tier review exceeded the forge comment limit")
     post_comment(project, int(number), head, text, state if state is not None else state_dir())
 
 
@@ -228,6 +405,8 @@ def parser():
     p.add_argument("--model", help="Explicit provider model (otherwise the CLI default)")
     p.add_argument("--max-input-tokens", type=int,
                    help=f"Preflight estimate limit (default {DEFAULT_MAX_INPUT_TOKENS}, or the saved REVIEW_MAX_INPUT_TOKENS setting)")
+    p.add_argument("--tier", choices=list(TIERS), default="regular",
+                   help="Review depth: mid and max add context beyond the patch at 2 and 10 times the token limit")
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling the model")
     p.add_argument("--cache-dir", type=Path, default=Path(os.getenv("XDG_CACHE_HOME", Path.home()/".cache"))/"cursor-pr-review")
     p.add_argument("--post", action="store_true", help="Publish a head-bound summary with --change")
@@ -245,7 +424,8 @@ def execute(args):
     if args.go_analysis_producer and not args.expected_change_url:
         raise ReviewError("--go-analysis-producer requires --expected-change-url")
     if args.change:
-        change = forge_change(args.change, args.expected_change_url, project=getattr(args, "forge_project", None))
+        change = forge_change(args.change, args.expected_change_url, project=getattr(args, "forge_project", None),
+                              with_description=args.tier != "regular")
     else:
         base, head = ci_refs() if args.ci else (args.base, args.head or "HEAD")
         change = local_change(root, base, head)
@@ -294,6 +474,15 @@ def execute(args):
             drifted = drift.forge(root, checkout, change, bool(project), files)
         else:
             drifted = drift.check(root, change.head, drift_base, files)
+        notes = None
+        if args.tier == "max" and args.change:
+            number = int(args.change.rsplit("#", 1)[1])
+            try:
+                notes = context_comments(args.forge_project, number)
+            except (ReviewError, OSError, ValueError, KeyError, TypeError, AttributeError,
+                    subprocess.TimeoutExpired, httpx.HTTPError):
+                notes = None
+        raw = context.gather(args.tier, root, checkout, change, files, drifted, notes)
     go = None
     if args.go_report:
         go = go_report(args.go_report, change.head)
@@ -303,45 +492,128 @@ def execute(args):
         go["findings"] = [row for row in go["findings"] if row["path"] in selected]
         checks.append(go)
 
-    (prompt, anchors, unseen, has_text), estimated, full, degraded = fit(files, checks, args.max_input_tokens)
-    omitted = sorted(set(unseen) | (paths - selected))
+    tier, base = args.tier, args.max_input_tokens
+    budget = base * TIERS[tier]
     backend = providers.provider()
+    # Mid and max send the same first prompt, so a max review reuses a cached mid result.
+    limit = base if tier == "regular" else 2 * base - base // 4
+    first_tier = "regular" if tier == "regular" else "mid"
+    cap = CAPS[first_tier]
+    rendered = render_sections(files)
+    metadata = {"title": change.title, "description": change.description} if tier == "regular" else {}
+    (prompt, anchors, unseen, has_text), estimated, full, dropped = fit(
+        files, checks, limit, cap, rendered=rendered, **metadata)
+    plans = []
+    fates = context.assemble(context.MID, raw, 0)[1] if tier != "regular" else []
+    deep_fates = context.assemble(context.DEEP, raw, 0)[1] if tier == "max" else []
+    first_paths = set()
+    if has_text and estimated <= limit:
+        if tier != "regular":
+            prompt, estimated, fates = with_context(
+                files, checks, prompt, estimated, dropped, limit, cap, context.MID, raw, rendered=rendered)
+        plans.append(({"name": "review", "estimated_input_tokens": estimated, "state": "planned"}, prompt, anchors, fates))
+        first_paths = {path for path, lines in anchors.items() if lines}
+
+    deep_limit = limit
+    if tier == "max" and has_text:
+        # The reserve is for planning. Verification may use any tokens left after actual prompts.
+        deep_limit = budget - (estimated if plans else 0) - base // 2
+        (deep, deep_anchors, _, _), deep_size, _, deep_dropped = fit(
+            files, checks, deep_limit, cap, focus=DEEP_FOCUS, rendered=rendered)
+        if deep_size <= deep_limit:
+            deep, deep_size, deep_fates = with_context(
+                files, checks, deep, deep_size, deep_dropped, deep_limit, cap, context.DEEP, raw,
+                rendered=rendered, focus=DEEP_FOCUS)
+            new_paths = any(lines and path not in first_paths for path, lines in deep_anchors.items())
+            extra_context = any(row["name"] not in context.MID and row["state"] in USED for row in deep_fates)
+            if new_paths or extra_context:
+                plans.append(({"name": "deep", "estimated_input_tokens": deep_size, "state": "planned"},
+                              deep, deep_anchors, deep_fates))
+            else:
+                deep_fates = [dict(row, state="dropped") if row["state"] in USED else row for row in deep_fates]
+
+    passes = [row for row, _, _, _ in plans]
+    context_fates = merged_fates([fates, deep_fates])
+    planned_tier = reached([(row["name"], blocks) for row, _, _, blocks in plans]) if plans else None
+    reviewable = selected - set(unseen)
+    planned_paths = {path for _, _, locations, _ in plans for path, lines in locations.items() if lines}
+    degraded = sorted(reviewable - planned_paths) if plans else []
+    omitted = sorted(set(unseen) | (paths - selected))
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
-              "estimated_input_tokens": estimated, "max_input_tokens": args.max_input_tokens,
+              "estimated_input_tokens": sum(row["estimated_input_tokens"] for row in passes),
+              "max_input_tokens": budget, "base_input_tokens": base, "prompt_limit": limit, "tier": tier,
               "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
               "findings": [], "cursor_usage": None, "full_input_tokens": full, "degraded": degraded,
-              "drift": drifted}
+              "drift": drifted, "passes": passes, "context": list(context_fates.values()),
+              "verification": {"state": "not-needed"}, "delivered": planned_tier}
     if static:
         report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
         report["cursor_team_id"] = os.environ["REVIEW_CURSOR_TEAM_ID"]
     if args.qualgen_store:
         report["qualgen"] = history.screen(root, args.qualgen_store, selected, change.head)
-    if estimated > args.max_input_tokens:
-        return dict(report, state="over-budget"), 2
+    if has_text and not passes:
+        return dict(report, state="over-budget", estimated_input_tokens=full, prompt_limit=deep_limit, delivered=None), 2
     if args.estimate:
-        return dict(report, state="estimate"), 2 if degraded else 0
-    if has_text:
-        try:
-            answer, cached = review(prompt, args.model, anchors, args.cache_dir,
-                                    change.identity)
-        except CursorFailure as err:
-            return dict(report, state="model-unavailable", error=str(err),
-                        cursor_invocations=err.invocations, cursor_usage=err.usage), 2
-        except (ReviewError, OSError, ValueError, KeyError, TypeError, AttributeError,
-                subprocess.TimeoutExpired, yaml.YAMLError) as err:
-            # Preserve deterministic diagnostics even if the model failed.
-            return dict(report, state="model-unavailable", error=str(err) if isinstance(err, ReviewError)
-                        else type(err).__name__, cursor_invocations=None), 2
-        report.update(answer, cache_hit=cached, cursor_invocations=int(not cached))
-        if cached:
-            report["cursor_usage"] = None
+        return dict(report, state="estimate"), 2 if degraded or (has_text and planned_tier != tier) else 0
+
+    completed, coverage, findings, deep_findings, last_error = [], {}, [], [], None
+    for row, pass_prompt, locations, blocks in plans:
+        depth = "max" if row["name"] == "deep" else first_tier
+        answer, error = run_pass(row, pass_prompt, locations, args, change.identity, cap=cap, timeout=TIMEOUTS[depth])
+        if answer is None:
+            last_error = error
+            continue
+        completed.append((row["name"], blocks))
+        coverage.update({path: lines for path, lines in locations.items() if lines})
+        if depth == "max":
+            deep_findings = answer["findings"]
+        findings = merge_findings(findings, answer["findings"]) if findings else answer["findings"]
+    # Report only what reached the model: a block of a pass that failed was not sent.
+    sent = merged_fates(blocks for _, blocks in completed)
+    report["context"] = [sent.get(name) or (dict(row, state="not sent") if row["state"] in USED else row)
+                         for name, row in context_fates.items()]
+    report["delivered"] = reached(completed) if completed else None
+    if tier != "regular" and findings:
+        before = len(findings)
+        left = budget - report["estimated_input_tokens"]
+        report["verification"] = {"state": "unavailable", "before": before}
+        for radius in (15, 8, 3, 0):
+            check = verification(findings, files, radius)
+            size = tokens(check)
+            if size <= left:
+                row = {"name": "verification", "estimated_input_tokens": size, "state": "planned"}
+                passes.append(row)
+                report["estimated_input_tokens"] += size
+                verdict, _ = run_pass(row, check, coverage, args, change.identity,
+                                      cap=before, timeout=120, originals=findings)
+                if verdict is not None:
+                    findings = verdict["findings"]
+                    report["verification"] = {"state": "filtered", "before": before, "after": len(findings)}
+                break
+    cap = CAPS[tier]
+    if len(findings) > cap:
+        report["omitted_findings"] = len(findings) - cap
+        from_deep = [issue for issue in findings if issue in deep_findings]
+        from_first = [issue for issue in findings if issue not in deep_findings]
+        findings = from_first[:cap - len(from_deep)] + from_deep
+    report.update(findings=findings, cursor_usage=total_usage(passes),
+                  cache_hit=bool(passes) and all(row["state"] == "cached" for row in passes),
+                  cursor_invocations=sum(row["model_invocations"] for row in passes))
+    if has_text and not completed:
+        return dict(report, state="model-unavailable", error=last_error), 2
+    degraded = sorted(reviewable - coverage.keys())
+    report["degraded"] = degraded
+    if report["delivered"] == "max":
+        report["prompt_limit"] = deep_limit
+    lowered = ((has_text and report["delivered"] != tier) or report["verification"]["state"] == "unavailable"
+               or any(row["state"] == "failed" for row in passes))
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
-    if degraded:
+    if degraded or lowered:
         report["state"] = "degraded"
     else:
         report["state"] = "partial" if incomplete else ("reviewed" if has_text else "empty")
-    return report, 2 if incomplete or degraded else 0
+    return report, 2 if incomplete or degraded or lowered else 0
 
 
 def run_request(args):

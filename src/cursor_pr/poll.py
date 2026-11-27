@@ -122,8 +122,23 @@ class Jobs:
             # The head may have moved on since the first start, or the retry failed like the first did.
             log.warning("Review of %s #%d comment %d was not completed by its retry; a new /review retries it", *job)
 
+    # Tiers live in their own table: a request without a row is a plain /review.
+    TIERS = "CREATE TABLE IF NOT EXISTS tiers (project TEXT, number INTEGER, comment INTEGER, tier TEXT NOT NULL, " \
+            "PRIMARY KEY(project, number, comment))"
 
-def run_review(project, number, state, comment=None):
+    def set_tier(self, project, number, comment, tier):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(self.TIERS)
+            db.execute("INSERT OR IGNORE INTO tiers VALUES (?,?,?,?)", (project, number, comment, tier))
+
+    def tier(self, job):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(self.TIERS)
+            row = db.execute("SELECT tier FROM tiers WHERE project=? AND number=? AND comment=?", job).fetchone()
+            return row[0] if row else "regular"
+
+
+def run_review(project, number, state, tier="regular", comment=None):
     address = f"{project.slug}#{number}"
     argv = [sys.executable, "-I", "-m", "cursor_pr.cli", "--repo", str(project.checkout),
             "--change", address, "--expected-change-url", project.change_url(number),
@@ -138,6 +153,8 @@ def run_review(project, number, state, comment=None):
         argv.extend(["--max-input-tokens", os.environ["REVIEW_MAX_INPUT_TOKENS"]])
     if os.getenv("REVIEW_MODEL"):
         argv.extend(["--model", os.environ["REVIEW_MODEL"]])
+    if tier != "regular":
+        argv.extend(["--tier", tier])
     if comment is not None:
         # The child keeps the request's row itself: the head it resolves, which a repeat of the
         # request is held to, and how it ended, for a poller that stops before it can read the report.
@@ -233,15 +250,16 @@ def read_report(report, over, seconds):
         deadline = time.monotonic() + seconds
         while (left := deadline - time.monotonic()) > 0:
             readable = {key.fd for key, _ in waiting.select(left)}
+            if over in readable:
+                # The supervisor has ended. What is still in the pipe is taken, for a short time
+                # only, whether or not something goes on writing to it.
+                waiting.unregister(over)
+                deadline = min(deadline, time.monotonic() + DRAIN_SECONDS)
             if report in readable:
                 part = os.read(report, 65536)
                 if not part:
                     return b"".join(parts)
                 parts.append(part)
-            elif over in readable:
-                # The supervisor has ended, and its group with it. Take what is still in the pipe.
-                waiting.unregister(over)
-                deadline = min(deadline, time.monotonic() + DRAIN_SECONDS)
         return b"".join(parts) if over not in waiting.get_map() else None
 
 
@@ -271,8 +289,10 @@ def cycle(projects, state, jobs, since, runner=None):
         status = "failed"
         if key in projects:
             try:
-                status = (runner(projects[key], number, state) if runner
-                          else run_review(projects[key], number, state, comment))
+                tier = jobs.tier(job)
+                extra = () if tier == "regular" else (tier,)
+                status = (runner(projects[key], number, state, *extra) if runner
+                          else run_review(projects[key], number, state, tier, comment))
             except Exception:
                 log.exception("Review failed for %s #%d comment %d", key, number, comment)
         jobs.finish(job, status)

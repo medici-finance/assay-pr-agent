@@ -763,6 +763,31 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual(process.returncode, self.ENDED)
                 self.assertTrue(gone(self.state / name))
 
+    def test_review_is_ended_even_when_nobody_reads_the_diagnostics(self):
+        # The supervisor's stderr is a pipe that is full and whose reader does not read.
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, reader)
+        os.set_blocking(writer, False)
+        try:
+            while True:
+                os.write(writer, b"x" * 65536)
+        except BlockingIOError:
+            pass
+        os.set_blocking(writer, True)
+        lifeline, hold = os.pipe()
+        process = subprocess.Popen([sys.executable, "-I", str(poll.SUPERVISOR), str(lifeline), "60", "",
+                                    *self.busy("review")], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=writer, pass_fds=(lifeline,), process_group=0)
+        os.close(lifeline)
+        os.close(writer)
+        self.addCleanup(lambda: [self.end(process.pid, how) for how in (os.kill, os.killpg)] and process.wait())
+        started(self.state / "review")
+        began = time.monotonic()
+        os.close(hold)
+        self.assertEqual(process.wait(timeout=20), self.ENDED)
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertTrue(gone(self.state / "review"))
+
     def test_review_that_ignores_the_request_to_stop_is_ended_anyway(self):
         stubborn = "import signal, sys\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n" + BUSY
         process, hold = self.supervise([sys.executable, "-c", stubborn, str(self.state / "review")], grace=0.3)
@@ -861,6 +886,19 @@ class SupervisedTests(unittest.TestCase):
         # waited for, so its end follows a moment later.
         self.assertTrue(gone(self.state / "review", within=5))
 
+    def test_command_that_keeps_writing_after_the_supervisor_is_killed_does_not_hold_the_queue(self):
+        # It is in the group, so the poller ends it. Until then its output must not put that off.
+        chatty = "import sys\nwhile True: sys.stdout.write('x' * 4096); sys.stdout.flush()\n"
+        script = self.state / "killed.py"
+        script.write_text("import os, signal, subprocess, sys, time\n"
+                          f"subprocess.Popen([sys.executable, '-c', {chatty!r}])\n"
+                          "time.sleep(0.5)\nos.kill(os.getpid(), signal.SIGKILL)\n")
+        with patch("cursor_pr.poll.SUPERVISOR", script), patch("cursor_pr.poll.DRAIN_SECONDS", 0.3):
+            began = time.monotonic()
+            printed = poll.supervised(["unused"])
+        self.assertLess(time.monotonic() - began, 10)  # Against the half hour the review is allowed.
+        self.assertTrue(printed.startswith(b"x"))
+
     def test_command_that_left_the_group_with_the_report_pipe_does_not_hold_the_queue(self):
         review = ("import subprocess, sys\n"
                   f"subprocess.Popen([sys.executable, '-c', {BUSY!r}, sys.argv[1]], start_new_session=True)\n"
@@ -913,7 +951,7 @@ class SupervisedTests(unittest.TestCase):
                                     checkout=str(self.state)))
         with patch("cursor_pr.poll.supervised", return_value=None), \
                 self.assertLogs("cursor_pr.poll", level="WARNING") as logged:
-            self.assertEqual(run_review(project, 3, self.state, 81), "failed")
+            self.assertEqual(run_review(project, 3, self.state, comment=81), "failed")
         self.assertIn("Review acme/api#3 did not end within", logged.output[0])
 
 
