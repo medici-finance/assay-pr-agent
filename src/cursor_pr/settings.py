@@ -9,7 +9,7 @@ import ssl
 import tempfile
 
 from . import accounts, gitlab_tls, providers, setup
-from .config import DEFAULT_MAX_INPUT_TOKENS, parse_projects
+from .config import DEFAULT_MAX_INPUT_TOKENS, gitlab_base, parse_projects
 from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secret, validate_operator, validate_pem, validate_token
 from .login import login_directory, login_env
 
@@ -94,6 +94,14 @@ def gitlab_access(config, old):
     instances = setup.gitlab_instances(setup.effective_projects(config))
     if not instances:
         return None, None, True
+    if len(instances) != 1:
+        raise ValueError("Configure one GitLab instance per container")
+    base, = instances
+    api_base = os.getenv("GITLAB_API_BASE", "").rstrip("/")
+    if api_base and api_base != base + "/api/v4":
+        raise ValueError("GITLAB_API_BASE must match the selected projects")
+    if os.getenv("REVIEW_GITLAB_BASE_URL") and gitlab_base(os.environ["REVIEW_GITLAB_BASE_URL"]) != base:
+        raise ValueError("REVIEW_GITLAB_BASE_URL must match the selected projects")
     same_instances = instances == setup.gitlab_instances(config["projects"])
     try:
         token = accounts.saved_token()
@@ -101,20 +109,19 @@ def gitlab_access(config, old):
             token = stored(config, old, TOKEN)
     except ValueError:
         token = None
-    tls_environment = {name for name in gitlab_tls.NAMES if name in os.environ or name + "_FILE" in os.environ}
-    if not tls_environment:
-        verify = gitlab_tls.context(old) if same_instances else True
-    else:
+    trust = [name for name in gitlab_tls.NAMES
+             if name in os.environ or name + "_FILE" in os.environ or (same_instances and name in config["secrets"])]
+    verify = True
+    if trust:
         with tempfile.TemporaryDirectory(prefix="review-gitlab-settings-") as temp:
             bundle = Path(temp)
-            for name, filename in gitlab_tls.NAMES.items():
-                if name in tls_environment or (same_instances and name in config["secrets"]):
-                    private_file(bundle / filename, gitlab_tls.validate(name, stored(config, old, name)))
+            for name in trust:
+                private_file(bundle / gitlab_tls.NAMES[name], gitlab_tls.validate(name, stored(config, old, name)))
             try:
                 verify = gitlab_tls.context(bundle)
             except ssl.SSLError:
                 raise ValueError("The GitLab certificate files could not be loaded for TLS") from None
-    return sorted(instances)[0], token, verify
+    return base, token, verify
 
 
 def model(value, config, state, old):

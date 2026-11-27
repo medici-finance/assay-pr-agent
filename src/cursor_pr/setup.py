@@ -321,14 +321,15 @@ def installer_lock(state):
 def commit(state, old, bundle):
     """Activate a finished bundle unless another save finished first."""
     link = state / (".setup-link-" + uuid.uuid4().hex)
-    try:
-        with locked(state, fcntl.LOCK_EX):
-            if active_bundle(state) != old:
-                raise ValueError("Another setup finished first; run setup again to edit its settings")
-            link.symlink_to(bundle.name)
+    with locked(state, fcntl.LOCK_EX):
+        if active_bundle(state) != old:
+            raise ValueError("Another setup finished first; run setup again to edit its settings")
+        link.symlink_to(bundle.name)
+        try:
             os.replace(link, state / "setup")
-    finally:
-        link.unlink(missing_ok=True)
+        except BaseException:
+            link.unlink(missing_ok=True)
+            raise
 
 
 def configure(state, *, force_login=False):

@@ -1,4 +1,5 @@
 """One-shot local browser transport for the standard installer and its settings page."""
+import fcntl
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -118,19 +119,23 @@ class Session:
         return self.show({"sections": [], "projects": [], "unread": True}, *notices)
 
     def reread(self, state):
-        """Read the settings again for a page that could not be read back after a save."""
+        """Refresh the settings view after an external save or a failed readback."""
         with self.cv:
-            if not self.view.get("unread"):
+            if self.view["status"] != "settings":
                 return
         with self.editing:
             with self.cv:
-                if not self.view.get("unread"):
+                if self.view["status"] != "settings":
                     return
+                revision = self.view.get("revision")
             try:
+                with setup.locked(state, fcntl.LOCK_SH):
+                    bundle = setup.active_bundle(state)
+                if bundle is not None and bundle.name == revision:
+                    return
                 page = settings.view(state)
             except Exception:
-                with self.cv:
-                    self.view["messages"] = [UNREADABLE]
+                self.unread(UNREADABLE)
                 return
             self.show(page)
 
@@ -156,12 +161,15 @@ class Session:
             dialog.browser.reset(token)
         if resume and result["status"] != "quit":
             # The settings page shows what the wizard saved, or why it failed.
+            completed = result["status"] == "complete"
+            notice = "The setup wizard saved the configuration." if completed else result["label"]
             try:
-                self.show(settings.view(state), "The setup wizard saved the configuration."
-                          if result["status"] == "complete" else result["label"])
+                self.show(settings.view(state), notice)
                 return
-            except (ValueError, OSError, KeyError, TypeError):
-                pass
+            except Exception:
+                if completed:
+                    self.unread(notice, UNREADABLE)
+                    return
         with self.cv:
             self.view = {"id": self.view["id"] + 1, **result}
             self.cv.notify_all()

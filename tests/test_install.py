@@ -205,7 +205,7 @@ else:
         harness = """
 <script>
 const requests = [];
-let finishSave;
+let finishSave, finishNavigation;
 const view = {id: 1, status: "settings", messages: [], projects: [], sections: [
   {title: "Settings", settings: [
     {name: "model", kind: "text", label: "Model", value: "auto", help: ""},
@@ -216,6 +216,10 @@ window.fetch = async (path, options) => {
   if (path === "/setting") {
     requests.push(JSON.parse(options.body));
     await new Promise(resolve => { finishSave = resolve; });
+  }
+  if (path === "/step" && options.method === "POST") {
+    requests.push(JSON.parse(options.body));
+    await new Promise(resolve => { finishNavigation = resolve; });
   }
   return new Response(JSON.stringify(view));
 };
@@ -245,12 +249,17 @@ document.addEventListener("DOMContentLoaded", async () => {
     await tick();
     check(lookup("key", ".input").value === "", "the failed import left the old value submittable");
     check(lookup("key", ".error").textContent === "This file could not be read.", "the import error was hidden");
+    File.prototype.text = () => Promise.resolve(["one", "two"].join(String.fromCharCode(10)));
+    select(disk, new File(["ignored"], "multiline.txt"));
+    await tick();
+    check(lookup("key", ".input").value === "", "the token input silently removed an embedded line break");
+    check(lookup("key", ".error").textContent.includes("line break"), "the malformed token had no error");
     let finish;
     File.prototype.text = () => new Promise(resolve => { finish = resolve; });
     select(disk, new File(["ignored"], "key.txt"));
     save.click();
     check(save.disabled && requests.length === 0, "save submitted while the import was pending");
-    finish("replacement");
+    finish("replacement" + String.fromCharCode(10));
     await tick();
     check(!save.disabled, "save stayed disabled after the import");
     const refreshed = new Promise(resolve => {
@@ -266,6 +275,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     check(!lookup("model", ".change").disabled, "the next editor stayed disabled");
     check(!document.querySelector("#quit").disabled && !document.querySelector("#wizard").disabled,
           "a navigation control stayed disabled after saving");
+    lookup("model", ".change").click();
+    document.querySelector("#wizard").click();
+    lookup("model", ".save").click();
+    check(document.querySelector("#groups").inert && document.querySelector("#quit").disabled,
+          "editing or closing stayed available after starting the wizard");
+    check(requests.length === 2 && requests[1].action === "wizard", "save submitted while navigation was pending");
+    finishNavigation();
     document.body.dataset.result = "passed";
   } catch (error) {
     document.body.dataset.result = error.message;

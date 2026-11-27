@@ -259,6 +259,31 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(rows["gitlab"]["requester_ids"], [15])
         self.assertEqual(self.document()["settings"]["REVIEW_OPERATOR"], "alice:16")
 
+    def test_gitlab_lookup_loads_mounted_ca_and_crl(self):
+        project = dict(provider="gitlab", url="https://gitlab.com/org/repo", requester_ids=[13])
+        certificate, revocations = self.root / "mounted-ca.pem", self.root / "mounted-crl.pem"
+        certificate.write_text(CERTIFICATE)
+        revocations.write_text(REVOCATIONS)
+        self.seed(projects=[project], secrets={setup.TOKEN: "fixture-token", setup.gitlab_tls.CA: str(certificate),
+                                              setup.gitlab_tls.CRL: str(revocations)})
+        _, _, verify = settings.gitlab_access(self.document(), setup.active_bundle(self.state))
+        self.assertIn(ssl.PEM_cert_to_DER_cert(CERTIFICATE), verify.get_ca_certs(binary_form=True))
+        self.assertTrue(verify.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)
+
+    def test_gitlab_lookup_requires_an_unambiguous_instance_matching_environment(self):
+        gitlab = dict(provider="gitlab", url="https://gitlab.com/org/repo", requester_ids=[13],
+                      gitlab_base="https://gitlab.com")
+        other = dict(gitlab, url="https://gitlab.example.org/org/repo", gitlab_base="https://gitlab.example.org")
+        self.seed(projects=[gitlab], secrets={setup.TOKEN: "fixture-token"})
+        for overrides in ({"REVIEW_PROJECTS": json.dumps([gitlab, other])},
+                          {"REVIEW_PROJECTS": json.dumps([other]), "GITLAB_API_BASE": "https://gitlab.com/api/v4"},
+                          {"REVIEW_PROJECTS": json.dumps([other]), "REVIEW_GITLAB_BASE_URL": "https://gitlab.com"}):
+            with self.subTest(overrides=overrides), patch.dict(os.environ, {setup.TOKEN: "fixture-env", **overrides}), \
+                    patch.object(accounts, "gitlab_id", return_value=13) as lookup:
+                with self.assertRaisesRegex(ValueError, "GitLab instance|must match"):
+                    settings.save(self.state, {"name": "REVIEW_OPERATOR", "value": "alice"})
+                lookup.assert_not_called()
+
     def test_github_ids_are_saved_in_runtime_format(self):
         self.seed()
         for name in (setup.APP_ID, setup.INSTALL_ID):
@@ -519,6 +544,17 @@ class SettingsSessionTests(unittest.TestCase):
         thread.join(timeout=2)
         self.assertEqual(session.view["status"], "quit")
 
+    def test_wizard_save_recovers_from_failed_readback(self):
+        session = Session()
+        session.show(settings.view(self.state))
+        with patch.object(setup, "configure"), patch.object(settings, "view", side_effect=OSError("unreadable")):
+            session.launch(self.state, resume=True)
+            self.settled(session, "settings")
+        self.assertTrue(session.view["unread"])
+        self.assertEqual(session.view["messages"], ["The setup wizard saved the configuration.", web_setup.UNREADABLE])
+        session.reread(self.state)
+        self.assertNotIn("unread", session.view)
+
     def test_a_save_that_commits_is_reported_saved_even_if_the_page_cannot_be_read_back(self):
         session = Session()
         session.show(settings.view(self.state))
@@ -563,6 +599,33 @@ class SettingsSessionTests(unittest.TestCase):
         code, refreshed = change_setting(session, self.state, {**stale, "id": session.view["id"]})
         self.assertEqual(code, 200)
         self.assertEqual(item(refreshed, "REVIEW_MAX_INPUT_TOKENS")["value"], "8000")
+
+    def test_reloading_settings_reads_the_latest_bundle(self):
+        session = Session()
+        first = session.show(settings.view(self.state))
+        session.reread(self.state)
+        self.assertEqual(session.view["id"], first["id"])
+        settings.save(self.state, {"name": "REVIEW_MAX_INPUT_TOKENS", "value": "9000"})
+        session.reread(self.state)
+        self.assertNotEqual(session.view["id"], first["id"])
+        self.assertEqual(item(session.view, "REVIEW_MAX_INPUT_TOKENS")["value"], "9000")
+
+    def test_activation_does_not_unlink_the_consumed_temporary_link(self):
+        session = Session()
+        session.show(settings.view(self.state))
+        unlink = Path.unlink
+
+        def failure_after_replace(path, *args, **kwargs):
+            if path.name.startswith(".setup-link-"):
+                raise PermissionError("cleanup failed")
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", failure_after_replace):
+            code, reply = change_setting(session, self.state, {"id": session.view["id"],
+                                         "name": "REVIEW_MAX_INPUT_TOKENS", "value": "9000"})
+        self.assertEqual(code, 200)
+        self.assertTrue(setup.active_bundle(self.state).is_dir())
+        self.assertEqual(item(reply, "REVIEW_MAX_INPUT_TOKENS")["value"], "9000")
 
     def test_a_save_that_fails_is_reported_unsaved(self):
         session = Session()

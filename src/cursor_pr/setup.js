@@ -15,7 +15,7 @@ const quit = document.querySelector("#quit");
 let quitting = false;
 quit.onclick = async () => {
   quitting = true;
-  quit.disabled = true;
+  settingsNavigation(true);
   try {
     await api("POST", {id: step.id, action: "quit"});
     document.querySelector("#registration").hidden = true;
@@ -25,8 +25,9 @@ quit.onclick = async () => {
     message.textContent = "Setup closed. You can close this tab.";
   } catch (error) {
     quitting = false;
-    quit.disabled = false;
     await load().catch(fail);
+  } finally {
+    settingsNavigation(false);
   }
 };
 // The installer console prints a random setup key; it is kept in a session cookie.
@@ -66,6 +67,9 @@ document.querySelector("#reprint").onclick = async () => {
 // A saved setup opens on a list where each setting is saved on its own.
 const list = document.querySelector("#settings"), groups = document.querySelector("#groups");
 const row = document.querySelector("#setting").content, wizard = document.querySelector("#wizard");
+function settingsNavigation(active) {
+  quit.disabled = wizard.disabled = groups.inert = active;
+}
 function heading(tag, text) {
   const node = document.createElement(tag); node.textContent = text; return node;
 }
@@ -127,7 +131,13 @@ function field(item, project) {
         return;
       }
       const value = await chosen.text();
-      if (version === importVersion) control.value = value;
+      if (version !== importVersion) return;
+      const imported = item.multiline ? value : value.trim();
+      if (!item.multiline && /[\r\n]/.test(imported)) {
+        problem.textContent = "This token file contains a line break.";
+        return;
+      }
+      control.value = imported;
     } catch {
       if (version === importVersion) problem.textContent = "This file could not be read.";
     } finally {
@@ -138,7 +148,7 @@ function field(item, project) {
     }
   };
   const keep = async data => {
-    if (importing || saving) return;
+    if (importing || saving || groups.inert || quitting) return;
     saving = true;
     updateControls();
     quit.disabled = wizard.disabled = true;
@@ -180,9 +190,9 @@ function render(view) {
       [heading("h3", project.url), ...project.settings.map(item => field(item, project))]));
 }
 wizard.onclick = async () => {
-  wizard.disabled = true;
+  settingsNavigation(true);
   try { await api("POST", {id: step.id, action: "wizard"}); await load(); } catch (error) { fail(error); }
-  finally { wizard.disabled = false; }
+  finally { settingsNavigation(false); }
 };
 async function load() {
   if (quitting) return;
