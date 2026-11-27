@@ -1273,11 +1273,24 @@ class ReadScheduleTests(Offline):
         self.assertEqual(self.tick(60), [])
         self.assertEqual(self.tick(), [3])
 
-    def test_setting_is_validated_at_startup_and_disables_itself_at_the_poll_interval(self):
+    def test_setting_disables_itself_at_the_poll_interval(self):
         for value, idle in (("900", (120, 900)), ("120", None), ("60", None)):
             with self.subTest(value=value):
                 self.assertEqual(poller(self.state, env={"REVIEW_POLL_SECONDS": "120", "REVIEW_POLL_IDLE_MAX_SECONDS": value})
                                  .call_args.kwargs["idle"], idle)
+
+    def test_schedule_saved_before_the_setting_was_turned_off_is_not_found_when_it_is_back_on(self):
+        self.tick(0)
+        self.tick()
+        self.assertEqual(self.schedule(), [(3, 1, 240, 120)])
+        poller(self.state, env={"REVIEW_POLL_SECONDS": "120", "REVIEW_POLL_IDLE_MAX_SECONDS": "900"})
+        self.assertEqual(self.schedule(), [(3, 1, 240, 120)])  # Kept across a restart with it on.
+        poller(self.state, env={"REVIEW_POLL_SECONDS": "120", "REVIEW_POLL_IDLE_MAX_SECONDS": "120"})
+        self.assertEqual(self.schedule(), [])
+        # A request made while every change was read each cycle is not behind an old wait afterwards.
+        self.assertEqual(self.tick(60), [3])
+
+    def test_setting_that_is_no_time_is_refused_at_startup(self):
         for value in ("0", "-5", "soon"):
             with self.subTest(value=value), patch.dict(os.environ, {"REVIEW_POLL_IDLE_MAX_SECONDS": value}), \
                  patch("sys.stderr", new_callable=io.StringIO) as err, self.assertRaises(SystemExit) as stopped:

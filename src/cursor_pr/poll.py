@@ -152,6 +152,10 @@ class Jobs:
         return {number for number, (wait, seen) in saved.items()
                 if number in numbers and now >= seen and seen + min(wait, cap) > now}
 
+    def forget_schedule(self):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("DELETE FROM schedule")
+
     def observed(self, project, changes, now, interval, cap):
         """Keep one complete read of each change, given as (number, comments, newest, active). A first look,
         new comments or a request read again after one interval; an unchanged conversation waits twice as
@@ -511,6 +515,10 @@ def main():
         idle = (args.interval, idle_max) if idle_max > args.interval else None
         if idle:
             log.info("A quiet change can wait up to %d seconds before it is due for another read", idle_max)
+        else:
+            # Nothing keeps the schedule up to date while it is off, so none of it may be found
+            # again when it is turned back on: a wait saved before would hide a request made since.
+            jobs.forget_schedule()
         if mine_seconds:
             threading.Thread(target=history.mine_periodically, args=(projects, state, mine_seconds),
                              name="qualgen-miner", daemon=True).start()
