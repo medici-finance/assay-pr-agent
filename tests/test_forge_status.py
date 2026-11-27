@@ -107,6 +107,7 @@ class ForgeStatusRequestTests(unittest.TestCase):
         self.lookup = self.start(patch.object(forge_status, "reviewer_token", return_value="fixture"))
         self.requests, self.clients = [], []
         self.status, self.location, self.error = 201, None, None
+        self.gitlab_source = dict(sha=HEAD, source_project_id=123, target_project_id=123, source_branch="topic/ref")
         client = httpx.Client
         transport = httpx.MockTransport(self.respond)
         def build(**options):
@@ -122,7 +123,11 @@ class ForgeStatusRequestTests(unittest.TestCase):
         self.requests.append(request)
         if self.error:
             raise self.error
-        return httpx.Response(302, headers={"Location": self.location}) if self.location else httpx.Response(self.status, json={"id": 1})
+        if self.location:
+            return httpx.Response(302, headers={"Location": self.location})
+        if request.method == "GET" and request.url.path.endswith("/merge_requests/7"):
+            return httpx.Response(200, json=self.gitlab_source)
+        return httpx.Response(self.status, json={"id": 1})
 
     def exercise(self, provider, *options, url=None, post=True, model=None, address=None, desk_error=None):
         change = source.Change(HEAD, [source.File("demo.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")], url or SITES[provider])
@@ -146,7 +151,7 @@ class ForgeStatusRequestTests(unittest.TestCase):
                 self.requests.clear()
                 report, code, posts, desk = self.exercise(provider, "--forge-status")
                 self.assertEqual((code, report["forge_status"], report["publication"]), (0, "posted", "posted-or-already-present"))
-                [request] = self.requests
+                [request] = [request for request in self.requests if request.method == "POST"]
                 self.assertEqual((request.method, str(request.url)), ("POST", APIS[provider]))
                 body = json.loads(request.content)
                 self.lookup.assert_called_with(provider, SLUG, self.root)
@@ -159,6 +164,7 @@ class ForgeStatusRequestTests(unittest.TestCase):
                     self.assertEqual(request.headers["PRIVATE-TOKEN"], "fixture")
                     self.assertEqual((body["name"], body["state"], body["target_url"]),
                                  (NAME, "success", SITES[provider]))
+                    self.assertEqual(body["ref"], "topic/ref")
                 self.assertEqual(desk.call_count, 1)
                 self.assertEqual(desk.call_args.args[1:3], (7, HEAD))
                 self.assertEqual(self.policy.call_args.args[1:3], (7, HEAD))
@@ -174,7 +180,7 @@ class ForgeStatusRequestTests(unittest.TestCase):
         [options] = self.clients
         self.assertEqual(list(options["mounts"]), ["https://gitlab.example"])
         self.assertEqual(transports, [{"verify": False}])
-        self.assertEqual(len(self.requests), 1)
+        self.assertEqual([r.method for r in self.requests], ["GET", "POST"])
 
     def test_flag_or_environment_variable_enable_it_and_otherwise_it_is_skipped(self):
         with patch.dict(os.environ, {"REVIEW_FORGE_STATUS": "1"}):
@@ -233,7 +239,7 @@ class ForgeStatusRequestTests(unittest.TestCase):
         with self.assertNoLogs("cursor_pr.forge_status", level="WARNING"):
             self.assertEqual(self.exercise("github", "--forge-status", url="https://github.com/Org/Project/pull/7", address="Org/Project#7")[0]["forge_status"], "posted")
         self.assertEqual(self.lookup.call_args.args, ("github", "Org/Project", self.root))
-        self.assertEqual([str(r.url) for r in self.requests],
+        self.assertEqual([str(r.url) for r in self.requests if r.method == "POST"],
                          ["https://gitlab.example/api/v4/projects/org%2Fproject/statuses/" + HEAD, "https://api.github.com/repos/Org/Project/check-runs"])
 
     def test_status_only_never_writes_when_the_publication_policy_refuses(self):
@@ -250,7 +256,7 @@ class ForgeStatusRequestTests(unittest.TestCase):
             url = "https://git.example:8443/gitlab/org/project/-/merge_requests/7"
             report, *_ = self.exercise("gitlab", "--forge-status", url=url)
             self.assertEqual(report["forge_status"], "posted")
-            self.assertEqual(str(self.requests[0].url),
+            self.assertEqual(str(self.requests[-1].url),
                              f"https://git.example:8443/gitlab/api/v4/projects/org%2Fproject/statuses/{HEAD}")
 
     def test_a_gitlab_instance_under_a_path_is_reached_at_its_api(self):
@@ -262,9 +268,18 @@ class ForgeStatusRequestTests(unittest.TestCase):
                         "https://gitlab.example/gitlab/" + SLUG + "/-/merge_requests/8"):
                 with self.subTest(url=url), self.assertLogs("cursor_pr.forge_status", level="WARNING"):
                     self.assertEqual(self.exercise("gitlab", "--forge-status", url=url)[0]["forge_status"], "failed")
-        self.assertEqual([str(r.url) for r in self.requests],
+        self.assertEqual([str(r.url) for r in self.requests if r.method == "POST"],
                          ["https://gitlab.example/gitlab/api/v4/projects/org%2Fproject/statuses/" + HEAD])
-        self.assertEqual(json.loads(self.requests[0].content)["target_url"], site)
+        self.assertEqual(json.loads(self.requests[-1].content)["target_url"], site)
+
+    def test_gitlab_status_refuses_a_fork_or_moved_head(self):
+        for update in (dict(source_project_id=124), dict(sha="b" * 40)):
+            with self.subTest(update=update), self.assertLogs("cursor_pr.forge_status", level="WARNING"):
+                self.requests.clear()
+                self.gitlab_source = dict(sha=HEAD, source_project_id=123, target_project_id=123, source_branch="topic/ref") | update
+                report, *_ = self.exercise("gitlab", "--forge-status")
+                self.assertEqual(report["forge_status"], "failed")
+                self.assertEqual([request.method for request in self.requests], ["GET"])
 
     def test_a_failed_summary_publication_leaves_the_status_unattempted(self):
         report, code, *_ = self.exercise("github", "--forge-status", desk_error=source.ReviewError("pr-agent-forge comment exited 1"))
