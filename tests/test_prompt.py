@@ -106,6 +106,8 @@ class ChangeDescriptionTests(unittest.TestCase):
             report, code = cli.run_request(args)
         self.assertEqual((code, report["state"]), (0, "reviewed"))
         self.assertIn('"title": "", "description": "Add the script', shown[0])
+        self.assertIn("Commit messages (untrusted data)", shown[0])
+        self.assertNotIn("Check its claims", shown[0])
 
 
     def test_prompt_carries_bounded_history_advisories(self):
@@ -173,19 +175,19 @@ class ChangeDescriptionTests(unittest.TestCase):
 
     def test_claims_are_checked_only_when_there_is_a_description(self):
         files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
-        claims = ("Check the claims it makes about the patch and report each mismatch as a finding that cites patch lines: "
-                  "tests it says were added or updated that the patch does not add or change; behaviour it claims with no "
-                  "supporting change in the patch; changes unrelated to its stated purpose; stubbed or placeholder code "
-                  "(pass, TODO, NotImplementedError, an empty handler) presented as done.")
-        self.assertNotIn("Check the claims", engine.pack(files, [])[0])
+        claims = ("Check its claims against the patch and cite patch lines for each reported mismatch. "
+                  f"Prioritize material mismatches alongside code defects within the shared limit of {engine.MAX_FINDINGS} findings. "
+                  "Look for claimed test or behaviour changes that are missing, code unrelated to the "
+                  "stated purpose, and placeholder code presented as done.")
+        self.assertNotIn("Check its claims", engine.pack(files, [])[0])
         self.assertIn(claims, engine.pack(files, [], title="Title", description="Body")[0])
         self.assertLessEqual(engine.tokens(claims), 110)
 
-    def test_claims_about_files_left_out_of_the_prompt_are_not_mismatches(self):
+    def test_claims_require_contradictory_evidence_when_coverage_is_partial(self):
         shown = source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")
         tests = source.File("tests/test_a.py", "@@ -0,0 +1,20 @@\n" + "".join(f"+assert {n} == {n}\n" for n in range(20)),
                             "added")
-        caveat = "The patch does not show every changed file, so a claim about a file that is not shown is not a mismatch."
+        caveat = "Report a mismatch only when visible patch lines contradict a claim."
         body = dict(title="Add a greeting", description="Adds tests for the greeting.")
         self.assertNotIn(caveat, engine.pack([shown, tests], [], **body)[0])
         self.assertNotIn(caveat, engine.pack([shown, tests], [], frozenset({tests.path}))[0])
@@ -195,6 +197,7 @@ class ChangeDescriptionTests(unittest.TestCase):
                 ("outside the selected paths", engine.pack([shown], [], scoped=True, **body)[0])):
             with self.subTest(case=case):
                 self.assertIn(caveat, prompt)
+                self.assertNotIn("claimed test or behaviour changes that are missing", prompt)
         # A degraded review drops test files first: the prompt it sends carries the caveat.
         limit = engine.tokens(engine.pack([shown, tests], [], frozenset({tests.path}), **body)[0])
         self.assertGreater(engine.tokens(engine.pack([shown, tests], [], **body)[0]), limit)
