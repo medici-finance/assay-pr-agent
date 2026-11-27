@@ -42,6 +42,7 @@ FIELDS = (
      "help": "The installation of that App which covers the repositories."},
 )
 VISIBILITIES = (("private", "Private"), ("internal", "Internal"), ("public", "Public"))
+GITLAB_CREDENTIALS = (TOKEN, *gitlab_tls.NAMES)
 PROJECT_FIELDS = ("requester_ids", "visibility", "go_analysis", "scanner_ci")
 PROJECT_ROW_FIELDS = (
     ("requester_ids", "Who can request reviews", "text", "GitHub or GitLab usernames or numeric account IDs, separated by commas."),
@@ -80,14 +81,17 @@ def stored(config, old, name):
 
 def gitlab_access(config, old):
     """The instance, reviewer token and TLS context that GitLab username lookups need."""
-    if "gitlab" not in {row["provider"] for row in config["projects"]}:
+    instances = setup.gitlab_instances(setup.effective_projects(config))
+    if not instances:
         return None, None, True
+    same_instances = instances == setup.gitlab_instances(config["projects"])
     try:
-        token = accounts.saved_token() or stored(config, old, TOKEN)
+        token = accounts.saved_token()
+        if token is None and same_instances:
+            token = stored(config, old, TOKEN)
     except ValueError:
         token = None
-    bases = sorted(setup.gitlab_instances(config["projects"]))
-    return bases[0] if bases else None, token, gitlab_tls.context(old)
+    return sorted(instances)[0], token, gitlab_tls.context(old) if same_instances else True
 
 
 def model(value, config, state, old):
@@ -96,18 +100,20 @@ def model(value, config, state, old):
 
 def cursor_team(value, config, state, old):
     saved = config["settings"]
-    if saved.get("REVIEW_AUTH_MODE", "api-key") == "api-key":
+    backend, mode = setup.effective_backend(saved)
+    if mode == "api-key":
         with tempfile.TemporaryDirectory(prefix="review-team-check-") as temp:
             # Like the poller, check against a throwaway configuration.
             return providers.eligible_team(stored(config, old, setup.CURSOR), value, Path(temp))
     # Never switch the live sign-in profile here: a review may be using it.
-    home = login_env("cursor", login_directory(state, saved.get("REVIEW_LOGIN_PROFILE", "")))["HOME"]
+    profile = saved.get("REVIEW_LOGIN_PROFILE", "") if backend == saved.get("REVIEW_PROVIDER", "cursor") else ""
+    home = login_env("cursor", login_directory(state, os.getenv("REVIEW_LOGIN_PROFILE", profile)))["HOME"]
     return providers.eligible_team(None, value, Path(home))
 
 
 def operator(value, config, state, old):
     base, token, verify = gitlab_access(config, old)
-    forges = {row["provider"] for row in config["projects"]}
+    forges = {row["provider"] for row in setup.effective_projects(config)}
     return validate_operator(accounts.resolve_operator(value, forges, base=base, token=token, verify=verify))
 
 
@@ -116,22 +122,23 @@ VALIDATORS = {
     "REVIEW_SYNC_SECONDS": plain(setup.number), "REVIEW_QUALGEN_INTERVAL_SECONDS": plain(setup.nonnegative),
     "REVIEW_OSV_DOWNLOAD_DATABASES": plain(choice(("1", "0"))), "REVIEW_MODEL": model,
     "REVIEW_CURSOR_TEAM_ID": cursor_team, "REVIEW_OPERATOR": operator,
-    APP_ID: plain(setup.number), INSTALL_ID: plain(setup.number)}
+    APP_ID: plain(lambda value: setup.number(value).lstrip("0")),
+    INSTALL_ID: plain(lambda value: setup.number(value).lstrip("0"))}
 
 
 def global_rows(config):
     saved = config["settings"]
-    backend = providers.provider(saved.get("REVIEW_PROVIDER", "cursor"))
-    forges = {row["provider"] for row in config["projects"]}
+    backend, mode = setup.effective_backend(saved)
+    forges = {row["provider"] for row in setup.effective_projects(config)}
     rows = []
     for field in FIELDS:
         if field.get("when") == "cursor" and backend != "cursor" or field.get("when") == "github" and "github" not in forges:
             continue
         row = {key: field[key] for key in ("name", "section", "label", "help") if key in field}
         if field.get("wizard"):
-            row.update(kind="text", wizard=True, value={"REVIEW_PROVIDER": providers.LABELS[backend],
-                "REVIEW_AUTH_MODE": {"login": "Sign in with the CLI", "api-key": "API key"}.get(
-                    saved.get("REVIEW_AUTH_MODE", "api-key"), "")}[field["name"]])
+            row.update(kind="text", wizard=True, locked=field["name"] in os.environ,
+                       value=providers.LABELS[backend] if field["name"] == "REVIEW_PROVIDER" else
+                       {"login": "Sign in with the CLI", "api-key": "API key"}[mode])
         else:
             env = field["name"] in os.environ
             row.update(kind=field.get("kind", "number"), locked=env,
@@ -146,10 +153,10 @@ def global_rows(config):
 def credentials(config):
     """The credentials the page offers: name, label and whether each one is optional."""
     saved = config["settings"]
-    backend = providers.provider(saved.get("REVIEW_PROVIDER", "cursor"))
-    forges = {row["provider"] for row in config["projects"]}
+    backend, mode = setup.effective_backend(saved)
+    forges = {row["provider"] for row in setup.effective_projects(config)}
     rows = []
-    if saved.get("REVIEW_AUTH_MODE", "api-key") == "api-key":
+    if mode == "api-key":
         rows.append((providers.KEYS[backend], providers.LABELS[backend] + " API key", False))
     if "github" in forges:
         rows.append((KEY, "GitHub App private key", False))
@@ -163,19 +170,24 @@ def credential_rows(config):
     """One row per credential, with where it lives but never its value."""
     rows = []
     for name, label, optional in credentials(config):
-        location = config["secrets"].get(name)
+        different_instance = name in GITLAB_CREDENTIALS and (
+            setup.gitlab_instances(setup.effective_projects(config)) != setup.gitlab_instances(config["projects"]))
+        location = None if different_instance else config["secrets"].get(name)
         where = ("env" if name in os.environ or name + "_FILE" in os.environ
                  else "mounted" if location and Path(location).is_absolute() else "stored" if location else "none")
         rows.append({"name": name, "section": "Credentials", "label": label, "kind": "secret", "optional": optional,
-                     "multiline": name not in (TOKEN, *providers.KEYS.values()), "state": where, "locked": where == "env",
-                     "value": location if where == "mounted" else "", "help": LOCATION_HELP[where]})
+                     "multiline": name not in (TOKEN, *providers.KEYS.values()), "state": where,
+                     "locked": where == "env" or different_instance,
+                     "value": location if where == "mounted" else "",
+                     "help": "Use the setup wizard or container environment for a different GitLab instance."
+                     if different_instance and where != "env" else LOCATION_HELP[where]})
     return rows
 
 
 def project_rows(config):
     locked = "REVIEW_PROJECTS" in os.environ
     projects = []
-    for row in config["projects"]:
+    for row in setup.effective_projects(config):
         values = {"requester_ids": ", ".join(map(str, row["requester_ids"])), "visibility": row.get("visibility", "private"),
                   "go_analysis": row.get("go_analysis", ""), "scanner_ci": json.dumps(row.get("scanner_ci", {}), indent=2)}
         fields = []
@@ -252,6 +264,9 @@ def replace_credential(config, name, value, remove, written):
         raise ValueError("Unknown credential")
     if name in os.environ or name + "_FILE" in os.environ:
         raise ValueError(f"{name} is supplied by the container environment")
+    if name in GITLAB_CREDENTIALS and (
+            setup.gitlab_instances(setup.effective_projects(config)) != setup.gitlab_instances(config["projects"])):
+        raise ValueError("Use the setup wizard or container environment for a different GitLab instance")
     if remove:
         if name not in gitlab_tls.NAMES or name not in config["secrets"]:
             raise ValueError("This credential cannot be removed")
@@ -259,6 +274,13 @@ def replace_credential(config, name, value, remove, written):
         return
     written[name] = (validate_pem(value) if name == KEY
                      else gitlab_tls.validate(name, value) if name in gitlab_tls.NAMES else validate_token(value))
+    if name == setup.CURSOR:
+        team = os.getenv("REVIEW_CURSOR_TEAM_ID", config["settings"].get("REVIEW_CURSOR_TEAM_ID", ""))
+        with tempfile.TemporaryDirectory(prefix="review-team-check-") as temp:
+            try:
+                providers.select_team(written[name], team, Path(temp))
+            except ValueError as err:
+                raise ValueError(f"{err} Use the setup wizard if the key and team need to change together.") from None
     config["secrets"][name] = setup.SECRETS[name]
 
 

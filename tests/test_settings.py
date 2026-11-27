@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -141,12 +142,53 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "container environment"):
                 settings.save(self.state, {"name": "CODEX_API_KEY", "value": "rotated"})
             self.assertEqual(item(settings.view(self.state), "CODEX_API_KEY")["state"], "env")
-        with patch.dict(os.environ, {"REVIEW_PROJECTS": "[]"}):
-            rows = [row for project in settings.view(self.state)["projects"] for row in project["settings"]]
+        replacement = dict(provider="github", url="https://github.com/org/replacement", checkout=str(self.checkout),
+                           requester_ids=[84], visibility="private")
+        with patch.dict(os.environ, {"REVIEW_PROJECTS": json.dumps([replacement])}):
+            project, = settings.view(self.state)["projects"]
+            self.assertEqual(project["url"], replacement["url"])
+            rows = project["settings"]
+            self.assertEqual(next(row["value"] for row in rows if row["name"] == "requester_ids"), "84")
             self.assertEqual({row["name"] for row in rows}, set(settings.PROJECT_FIELDS))
             self.assertEqual({row["locked"] for row in rows}, {True})
             with self.assertRaisesRegex(ValueError, "container environment"):
                 settings.save(self.state, {"project": "https://github.com/org/repo", "name": "visibility", "value": "internal"})
+
+    def test_provider_and_sign_in_overrides_control_available_credentials(self):
+        self.seed(values={**SAVED, "REVIEW_AUTH_MODE": "login"})
+        with patch.dict(os.environ, {"REVIEW_PROVIDER": "claude"}):
+            view = settings.view(self.state)
+            self.assertEqual(item(view, "REVIEW_PROVIDER")["value"], "Claude")
+            self.assertEqual(item(view, "REVIEW_AUTH_MODE")["value"], "API key")
+            self.assertEqual(item(view, "ANTHROPIC_API_KEY")["state"], "none")
+            with self.assertRaisesRegex(ValueError, "Unknown credential"):
+                settings.save(self.state, {"name": "CODEX_API_KEY", "value": "inactive-key"})
+            settings.save(self.state, {"name": "ANTHROPIC_API_KEY", "value": "replacement"})
+        self.assertEqual(self.document()["settings"]["REVIEW_PROVIDER"], "codex")
+        with patch.dict(os.environ, {"REVIEW_PROVIDER": "claude", "REVIEW_AUTH_MODE": "login"}):
+            view = settings.view(self.state)
+            self.assertEqual(item(view, "REVIEW_AUTH_MODE")["value"], "Sign in with the CLI")
+            with self.assertRaises(StopIteration):
+                item(view, "ANTHROPIC_API_KEY")
+
+    def test_gitlab_override_does_not_reuse_credentials_from_another_instance(self):
+        original = dict(provider="gitlab", url="https://gitlab.com/org/repo", requester_ids=[13])
+        self.seed(projects=[original], secrets={setup.TOKEN: "original-token"})
+        overriding = dict(original, url="https://gitlab.example.org/org/repo")
+        with patch.dict(os.environ, {"REVIEW_PROJECTS": json.dumps([overriding])}):
+            token = item(settings.view(self.state), setup.TOKEN)
+            self.assertTrue(token["locked"])
+            self.assertEqual(token["state"], "none")
+            self.assertEqual(settings.gitlab_access(self.document(), setup.active_bundle(self.state)),
+                             ("https://gitlab.example.org", None, True))
+            with self.assertRaisesRegex(ValueError, "different GitLab instance"):
+                settings.save(self.state, {"name": setup.TOKEN, "value": "replacement"})
+
+    def test_github_ids_are_saved_in_runtime_format(self):
+        self.seed()
+        for name in (setup.APP_ID, setup.INSTALL_ID):
+            settings.save(self.state, {"name": name, "value": "0043"})
+            self.assertEqual(self.document()["settings"][name], "43")
 
     def test_values_show_where_they_come_from(self):
         self.seed(values={k: v for k, v in SAVED.items() if k != "REVIEW_MODEL"})
@@ -242,6 +284,22 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "printable token"):
             settings.save(self.state, {"name": "CODEX_API_KEY", "value": "has a space"})
         self.assertEqual((setup.active_bundle(self.state) / "settings.json").read_bytes(), before)
+
+    def test_cursor_key_must_pass_team_selection_before_activating(self):
+        self.seed(values={**SAVED, "REVIEW_PROVIDER": "cursor", "REVIEW_CURSOR_TEAM_ID": "7"},
+                  secrets={setup.CURSOR: "working-key"})
+        before = (self.state / "setup").readlink()
+        with patch.object(providers, "select_team", side_effect=ValueError("Team unavailable")) as select:
+            with self.assertRaisesRegex(ValueError, "setup wizard"):
+                settings.save(self.state, {"name": setup.CURSOR, "value": "invalid-key"})
+        self.assertEqual(select.call_args.args[:2], ("invalid-key", "7"))
+        self.assertEqual((self.state / "setup").readlink(), before)
+        self.assertEqual((setup.active_bundle(self.state) / "cursor.key").read_text().strip(), "working-key")
+        with patch.object(providers, "select_team", return_value="8") as select, \
+             patch.dict(os.environ, {"REVIEW_CURSOR_TEAM_ID": "8"}):
+            settings.save(self.state, {"name": setup.CURSOR, "value": "replacement"})
+        self.assertEqual(select.call_args.args[:2], ("replacement", "8"))
+        self.assertEqual((setup.active_bundle(self.state) / "cursor.key").read_text().strip(), "replacement")
 
     def test_optional_gitlab_tls_files_can_be_replaced_and_removed(self):
         gitlab = dict(provider="gitlab", url="https://gitlab.com/org/repo", checkout=str(self.checkout), requester_ids=[13])
@@ -348,6 +406,27 @@ class SettingsSessionTests(unittest.TestCase):
             configure.side_effect = None
             session.launch(self.state)
             self.settled(session, "complete")
+
+    def test_terminal_quit_waits_for_settings_save_to_complete(self):
+        session = Session()
+        page = settings.view(self.state)
+        session.show(page)
+        started, finished = threading.Event(), threading.Event()
+
+        def close():
+            started.set()
+            session.terminal_quit()
+            finished.set()
+
+        with session.editing:
+            thread = threading.Thread(target=close)
+            thread.start()
+            self.assertTrue(started.wait(timeout=2))
+            self.assertFalse(finished.is_set())
+            session.show(page, "Saved.")
+        self.assertTrue(finished.wait(timeout=2))
+        thread.join(timeout=2)
+        self.assertEqual(session.view["status"], "quit")
 
     def test_closing_the_settings_page_ends_the_session(self):
         session = Session()

@@ -86,6 +86,17 @@ def load_provider_key(selected):
         del os.environ[name + "_FILE"]
 
 
+def effective_backend(saved):
+    configured = saved.get("REVIEW_PROVIDER", "cursor")
+    selected = providers.provider(os.getenv("REVIEW_PROVIDER", configured))
+    default_mode = saved.get("REVIEW_AUTH_MODE", "api-key") if selected == configured else "api-key"
+    return selected, auth_mode(selected, os.getenv("REVIEW_AUTH_MODE", default_mode))
+
+
+def effective_projects(config):
+    return json.loads(os.environ["REVIEW_PROJECTS"]) if "REVIEW_PROJECTS" in os.environ else config["projects"]
+
+
 def apply_saved_setup(state, *, sync_only=False):
     """Snapshot one complete setup; explicitly supplied container settings win."""
     if not (state / "setup").is_symlink():
@@ -97,13 +108,12 @@ def apply_saved_setup(state, *, sync_only=False):
         config = json.loads((bundle / "settings.json").read_text())
         values = {k: config["settings"][k] for k in SETTINGS if k in config["settings"]}
         values["REVIEW_PROJECTS"] = json.dumps(config["projects"])
-        effective = json.loads(os.getenv("REVIEW_PROJECTS", values["REVIEW_PROJECTS"]))
+        effective = effective_projects(config)
         forges = {row["provider"] for row in effective}
-        selected = providers.provider(os.environ.get("REVIEW_PROVIDER", values.get("REVIEW_PROVIDER", "cursor")))
+        selected, mode = effective_backend(values)
         if selected != values.get("REVIEW_PROVIDER", "cursor"):
             values.pop("REVIEW_AUTH_MODE", None)
             values.pop("REVIEW_LOGIN_PROFILE", None)
-        mode = auth_mode(selected, os.getenv("REVIEW_AUTH_MODE", values.get("REVIEW_AUTH_MODE", "api-key")))
         if not sync_only and mode == "api-key":
             load_provider_key(selected)
         for name, location in config["secrets"].items():

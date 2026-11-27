@@ -94,12 +94,19 @@ function field(item, project) {
     if (!masked) control.value = item.value;
     control.focus();
   };
-  find(".cancel").onclick = () => { box.hidden = true; toggle.hidden = false; toggle.focus(); };
+  let importVersion = 0;
+  find(".cancel").onclick = () => {
+    importVersion++;
+    if (masked) { control.value = ""; disk.value = ""; }
+    box.hidden = true; toggle.hidden = false; toggle.focus();
+  };
   disk.onchange = async () => {
-    const chosen = disk.files[0];
-    if (chosen && chosen.size <= (item.multiline ? 900000 : 24000)) control.value = await chosen.text();
-    else problem.textContent = "This file is too large to import.";
+    const version = ++importVersion, chosen = disk.files[0];
     disk.value = "";
+    if (chosen && chosen.size <= (item.multiline ? 900000 : 24000)) {
+      const value = await chosen.text();
+      if (version === importVersion) control.value = value;
+    } else problem.textContent = "This file is too large to import.";
   };
   const keep = async data => {
     submit.disabled = drop.disabled = true;

@@ -62,6 +62,11 @@ class Session:
             self.cv.notify_all()
             return True
 
+    def terminal_quit(self):
+        # Use the same lock as the browser to let a save finish before closing.
+        with self.editing, self.cv:
+            return self.quit(self.view["id"])
+
     def callback(self, query):
         state, code = query.get("state", []), query.get("code", [])
         with self.cv:
@@ -98,7 +103,7 @@ class Session:
     def show(self, page, *notices):
         with self.cv:
             if self.view["status"] == "quit":
-                return None  # a quit from the terminal during a save still ends the session
+                return None
             self.view = {"id": self.view["id"] + 1, "status": "settings", "messages": list(notices), **page}
             self.cv.notify_all()
             return self.view.copy()
@@ -279,13 +284,13 @@ def serve(state, *, force_login=False):
         def service_actions(self):
             with session.cv:
                 status = session.view["status"]
-                if status == "quit":
-                    threading.Thread(target=self.shutdown, daemon=True).start()
-                elif status in ("register", "question", "settings") and sys.stdin.isatty():
-                    # Provider login owns the terminal during a working step.
-                    if select.select([sys.stdin], [], [], 0)[0]:
-                        if sys.stdin.readline().strip().lower() in ("q", "quit", "/quit"):
-                            session.quit(session.view["id"])
+            if status == "quit":
+                threading.Thread(target=self.shutdown, daemon=True).start()
+            elif status in ("register", "question", "settings") and sys.stdin.isatty():
+                # Provider login owns the terminal during a working step.
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    if sys.stdin.readline().strip().lower() in ("q", "quit", "/quit"):
+                        threading.Thread(target=session.terminal_quit, daemon=True).start()
 
     bind = os.getenv("REVIEW_SETUP_BIND", "127.0.0.1")
     with Server((bind, port), Handler) as server:
