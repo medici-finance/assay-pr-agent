@@ -28,8 +28,8 @@ from .artifacts import forge_go_report
 from .checks import blob, go_report, scan_files
 from .sync import scan_checkout
 from .discovery import context_comments
-from .engine import (MAX_FINDINGS, CursorFailure, merge_findings, pack, prompt_advisories, rank, render_sections,
-                     review, tokens, verification, visible_advisories)
+from .engine import (MAX_FINDINGS, CursorFailure, fit_verification, merge_findings, pack, prompt_advisories, rank,
+                     render_sections, review, tokens, visible_advisories)
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
 
 
@@ -243,7 +243,10 @@ def finding_line(issue, *, compact=False, shorten_path=False, clip=None):
     if shorten_path and len(path) > 80:
         tag = hashlib.sha256(path.encode("utf-8")).hexdigest()[:12]
         path = f"…/{path[-80:]} [{tag}]"
-    title = fence(issue["title"], 60 if compact else None)
+    status = issue.get("verification_status")
+    prefix = {"confirmed": "Confirmed ", "unverified": "Unverified "}.get(status, "")
+    title_text = prefix + issue["title"]
+    title = fence(title_text, 60 if compact else None)
     message = fence(issue["message"], COMPACT_FINDING_MESSAGE if compact else clip)
     return f"- {fence(path)}:{issue['line']} — {title}. {message}" + (" (shortened)" if clip else "")
 
@@ -385,6 +388,8 @@ def publish(address, head, report, *, project=None, state=None):
             body.append("The findings could not be verified by a second pass.")
         elif check["state"] == "filtered":
             body.append(f"A verification pass kept {check['after']} of {check['before']} findings.")
+            if any(finding.get("verification_status") == "unverified" for finding in report["findings"]):
+                body.append("Some retained findings are unverified.")
         if omitted_findings := report.get("omitted_findings"):
             noun = "finding" if omitted_findings == 1 else "findings"
             # A prepared report from an older worker recorded the omitted count and the capped list.
@@ -401,12 +406,19 @@ def publish(address, head, report, *, project=None, state=None):
         body.append(f"{label} could not complete the review.")
     elif not report["findings"]:
         body.append("No model findings in the reviewed scope.")
+    summarize_matches = report["state"] == "reviewed"
+    summarized = 0
     for check in report["checks"]:
         if check["state"] != "complete":
             body.append(f"- {check['tool']}: could not check {fence(check.get('path') or check.get('reason', ''))}")
         for item in check["findings"]:
+            if summarize_matches and item.get("baseline_match") and item.get("shown_to_model"):
+                summarized += 1
+                continue
             detail = " ".join(part for part in (fence(item["rule"]), fence(item.get("message", ""))) if part)
             body.append(f"- {fence(item['path'])}:{item['line']} — {detail}")
+    if summarized:
+        body.append(f"Scanner diagnostics also reported on the base: {summarized}.")
     if report.get("static_checks"):
         body.extend(["", *scanners.summary(report["static_checks"]), ""])
     if "qualgen" in report:
@@ -552,6 +564,11 @@ def parser():
 
 
 def execute(args):
+    with ExitStack() as verification_resources:
+        return execute_review(args, verification_resources)
+
+
+def execute_review(args, verification_resources):
     if args.max_input_tokens < 1 or (args.head and not args.base) or (args.post and (not args.change or args.estimate)):
         raise ReviewError("Invalid budget or incompatible --head/--post options")
     if bool(args.queue) != bool(args.request) or (args.request and not args.change):
@@ -598,11 +615,12 @@ def execute(args):
             number = args.change.rsplit("#", 1)[1]
             if args.expected_change_url != project.change_url(number):
                 raise ReviewError("Managed checkout and reviewed project differ")
-            resources = getattr(args, "sarif_resources", stack)
+            resources = getattr(args, "sarif_resources", verification_resources if args.tier != "regular" else stack)
             checkout = resources.enter_context(scan_checkout(root, project, number, change.head))
-            if resources is not stack:
+            if hasattr(args, "sarif_resources"):
                 args.sarif_checkout = checkout
-        checks = scan_files(checkout, change.head, files)
+        patch_base = drift.patch_base(root, checkout, change)
+        checks = scan_files(checkout, change.head, files, base_root=root, base=patch_base)
         deadline = time.monotonic() + 180
         for tool, path in missing:
             remaining = deadline - time.monotonic()
@@ -755,10 +773,16 @@ def execute(args):
             last_error = error
             continue
         completed.append((row["name"], blocks))
-        coverage.update({path: lines for path, lines in locations.items() if lines})
+        for path, lines in locations.items():
+            if lines:
+                coverage.setdefault(path, set()).update(lines)
         if depth == "max":
             deep_findings = answer["findings"]
-        findings = merge_findings(findings, answer["findings"]) if findings else answer["findings"]
+        findings = merge_findings(findings, answer["findings"])
+    for check in checks:
+        for item in check["findings"]:
+            if item.get("baseline_match") and item["line"] in coverage.get(item["path"], ()):
+                item["shown_to_model"] = True
     # Report only what reached the model: a block of a pass that failed was not sent.
     sent = merged_fates(blocks for _, blocks in completed)
     report["context"] = [sent.get(name) or (dict(row, state="not sent") if row["state"] in USED else row)
@@ -768,24 +792,25 @@ def execute(args):
         before = len(findings)
         left = budget - report["estimated_input_tokens"]
         report["verification"] = {"state": "unavailable", "before": before}
-        for radius in (15, 8, 3, 0):
-            check = verification(findings, files, radius)
-            size = tokens(check)
-            if size <= left:
-                row = {"name": "verification", "estimated_input_tokens": size, "state": "planned"}
-                passes.append(row)
-                report["estimated_input_tokens"] += size
-                verdict, _ = run_pass(row, check, coverage, args, change.identity,
-                                      cap=before, timeout=120, originals=findings)
-                if verdict is not None:
-                    findings = verdict["findings"]
-                    report["verification"] = {"state": "filtered", "before": before, "after": len(findings)}
-                break
+        comparison = context.verification_comparison(root, checkout, patch_base, change.head)
+        check, size = fit_verification(findings, files, left, comparison)
+        if check is not None:
+            row = {"name": "verification", "estimated_input_tokens": size, "state": "planned"}
+            passes.append(row)
+            report["estimated_input_tokens"] += size
+            verdict, _ = run_pass(row, check, coverage, args, change.identity,
+                                  cap=before, timeout=120, originals=findings)
+            if verdict is not None:
+                findings = verdict["findings"]
+                report["verification"] = {"state": "filtered", "before": before, "after": len(findings)}
+        if report["verification"]["state"] == "unavailable":
+            findings = [dict(finding, verification_status="unverified") for finding in findings]
     cap = caps[tier]
     if len(findings) > cap:
         report["omitted_findings"] = len(findings) - cap
-        from_deep = [issue for issue in findings if issue in deep_findings]
-        from_first = [issue for issue in findings if issue not in deep_findings]
+        deep_keys = {engine.finding_key(issue) for issue in deep_findings}
+        from_deep = [issue for issue in findings if engine.finding_key(issue) in deep_keys]
+        from_first = [issue for issue in findings if engine.finding_key(issue) not in deep_keys]
         # A max cap below the mid cap can leave more deep findings than the cap allows.
         from_deep = from_deep[:cap]
         findings = from_first[:cap - len(from_deep)] + from_deep
@@ -798,7 +823,8 @@ def execute(args):
     report["degraded"] = degraded
     if report["delivered"] == "max":
         report["prompt_limit"] = deep_limit
-    lowered = ((has_text and report["delivered"] != tier) or report["verification"]["state"] == "unavailable"
+    unverified = tier != "regular" and any(f.get("verification_status") == "unverified" for f in findings)
+    lowered = ((has_text and report["delivered"] != tier) or report["verification"]["state"] == "unavailable" or unverified
                or any(row["state"] == "failed" for row in passes))
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
     if degraded or lowered:
