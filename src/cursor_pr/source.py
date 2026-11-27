@@ -145,6 +145,11 @@ class File:
     status: str
     absent: bool = False
     previous: str = ""
+    known_no_text: bool = False
+
+    @property
+    def patch_unavailable(self):
+        return self.absent and not self.known_no_text and self.status not in ("removed", "deleted", "D")
 
 
 @dataclass(frozen=True)
@@ -215,11 +220,14 @@ def local_change(root, base, head):
     files = []
     for status, path in zip(names[0:-1:2], names[1::2], strict=True):
         raw = git(root, *flags, "--unified=3", base, head, "--", path)
+        known_no_text = False
         try:
             patch = to_hunk_only_patch(raw.decode("utf8"))
+            known_no_text = not patch
         except UnicodeDecodeError:
+            # Git can emit a textual hunk in another encoding. Count it as unavailable.
             patch = ""
-        files.append(File(path, patch, status, not bool(patch)))
+        files.append(File(path, patch, status, not bool(patch), known_no_text=known_no_text))
     # Without a forge description, the commit messages are the author's account of the change.
     messages = git(root, "log", "--reverse", "--format=%s%n%n%b%x00", base + ".." + head, "--").decode("utf8", "replace")
     return Change(head, files, str(root.resolve()), tip, "", "",
