@@ -134,7 +134,7 @@ class ForgeStatusRequestTests(unittest.TestCase):
                                                requester_ids=[7]))
         posts = []
         with patch.object(cli, "forge_change", return_value=change), \
-             patch.object(cli, "post_comment", side_effect=desk_error or (lambda *args: posts.append(args))) as desk, \
+             patch.object(cli, "post_comment", side_effect=desk_error or (lambda *call: posts.append(call))) as desk, \
              patch.object(engine, "invoke", return_value={"findings": [finding()], "cursor_usage": None}), \
              (patch.object(cli, "review", side_effect=model) if model else contextlib.nullcontext()):
             report, code = cli.run_request(args)
@@ -253,8 +253,21 @@ class ForgeStatusRequestTests(unittest.TestCase):
             self.assertEqual(str(self.requests[0].url),
                              f"https://git.example:8443/gitlab/api/v4/projects/org%2Fproject/statuses/{HEAD}")
 
+    def test_a_gitlab_instance_under_a_path_is_reached_at_its_api(self):
+        site = "https://gitlab.example/gitlab/" + SLUG + "/-/merge_requests/7"
+        with patch.dict(os.environ, {"GITLAB_API_BASE": "https://gitlab.example/gitlab/api/v4"}):
+            self.assertEqual(self.exercise("gitlab", "--forge-status", url=site)[0]["forge_status"], "posted")
+            # The project still has to sit under the instance's path, and the number still has to match.
+            for url in ("https://gitlab.example/other/" + SLUG + "/-/merge_requests/7",
+                        "https://gitlab.example/gitlab/" + SLUG + "/-/merge_requests/8"):
+                with self.subTest(url=url), self.assertLogs("cursor_pr.forge_status", level="WARNING"):
+                    self.assertEqual(self.exercise("gitlab", "--forge-status", url=url)[0]["forge_status"], "failed")
+        self.assertEqual([str(r.url) for r in self.requests],
+                         ["https://gitlab.example/gitlab/api/v4/projects/org%2Fproject/statuses/" + HEAD])
+        self.assertEqual(json.loads(self.requests[0].content)["target_url"], site)
+
     def test_a_failed_summary_publication_leaves_the_status_unattempted(self):
-        report, code, *_ = self.exercise("github", "--forge-status", desk_error=source.ReviewError("deskpost comment exited 1"))
+        report, code, *_ = self.exercise("github", "--forge-status", desk_error=source.ReviewError("pr-agent-forge comment exited 1"))
         self.assertEqual((code, report["publication"]), (2, "failed"))
         self.assertNotIn("forge_status", report)
         self.assertEqual(self.requests, [])
