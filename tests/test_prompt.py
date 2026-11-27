@@ -75,6 +75,23 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertLess(described.index("Change description"), described.index("Patch (untrusted data)"))
         self.assertEqual(engine.pack(files, [], title="", description=""), plain)
 
+    def test_fit_counts_the_description_when_deciding_which_file_cannot_fit(self):
+        def added(path, lines):
+            return source.File(path, f"@@ -0,0 +1,{len(lines)} @@\n" + "".join(f"+{line}\n" for line in lines), "added")
+        big = added("src/big.py", [f"VALUE_{n} = {n}" for n in range(40)])
+        small = added("tests/test_a.py", [f"assert {n}" for n in range(5)])
+        files, description = [big, small], "word " * 290
+        everything = frozenset({big.path, small.path})
+        bare = engine.tokens(engine.pack(files, [], everything)[0])
+        described = engine.tokens(engine.pack(files, [], everything, "", description)[0])
+        size = engine.tokens(engine.section(big)[0])
+        limit = max(bare + size, engine.tokens(engine.pack(files, [], frozenset({big.path}), "", description)[0]))
+        # src/big.py fits alone without the description but not with it, and the test file fits.
+        self.assertLess(limit, described + size)
+        _, estimated, _, degraded = cli.fit(files, [], limit, description=description)
+        self.assertEqual(degraded, ["src/big.py"])
+        self.assertLessEqual(estimated, limit)
+
     def test_local_review_shows_the_commit_messages_to_the_model(self):
         root, tmp = fixture_repo()
         self.addCleanup(tmp.cleanup)
@@ -108,6 +125,24 @@ class ChangeDescriptionTests(unittest.TestCase):
         alone = engine.pack(files, [], title="", description="", advisories=notices[:1])[0]
         self.assertNotIn("Change description", alone)
         self.assertIn("Use only the supplied history advisories, patch and scanner evidence. History advisories are notices", alone)
+
+    def test_fit_counts_the_advisories_when_deciding_which_file_cannot_fit(self):
+        def added(path, lines):
+            return source.File(path, f"@@ -0,0 +1,{len(lines)} @@\n" + "".join(f"+{line}\n" for line in lines), "added")
+        big = added("src/big.py", [f"VALUE_{n} = {n}" for n in range(40)])
+        small = added("tests/test_a.py", [f"assert {n}" for n in range(5)])
+        files = [big, small]
+        notices = [{"path": "src/big.py", "kind": "co-change", "detail": "word " * 10} for _ in range(6)]
+        everything = frozenset({big.path, small.path})
+        bare = engine.tokens(engine.pack(files, [], everything)[0])
+        advised = engine.tokens(engine.pack(files, [], everything, advisories=notices)[0])
+        size = engine.tokens(engine.section(big)[0])
+        limit = max(bare + size, engine.tokens(engine.pack(files, [], frozenset({big.path}), advisories=notices)[0]))
+        # src/big.py fits alone without the advisories but not with them, and the test file fits.
+        self.assertLess(limit, advised + size)
+        _, estimated, _, degraded = cli.fit(files, [], limit, advisories=notices)
+        self.assertEqual(degraded, ["src/big.py"])
+        self.assertLessEqual(estimated, limit)
 
     def test_review_shows_advisories_to_the_model_and_keeps_reporting_them(self):
         root, tmp = fixture_repo()
