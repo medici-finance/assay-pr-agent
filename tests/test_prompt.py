@@ -1,3 +1,6 @@
+import fcntl
+import os
+import resource
 import subprocess
 import json
 import tempfile
@@ -80,6 +83,49 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertTrue(description.endswith(source.TRUNCATED))
         self.assertEqual(len(description), source.DESCRIPTION_LIMIT + len(source.TRUNCATED))
 
+    def test_local_description_preserves_recent_messages_when_an_older_one_is_large(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        def git(*args):
+            return subprocess.check_output(["git", "-c", "user.name=Test",
+                                            "-c", "user.email=test@example.org", *args], cwd=root)
+        git("init", "-q")
+        git("commit", "--allow-empty", "-qm", "base")
+        base = source.commit(root, "HEAD")
+        git("commit", "--allow-empty", "-qm", "Old subject\n\n" + "large message " * 1000)
+        git("commit", "--allow-empty", "-qm", "Recent subject")
+        description = source.local_description(root, base, source.commit(root, "HEAD"))
+        self.assertTrue(description.startswith("Old subject"))
+        self.assertTrue(description.endswith("Recent subject" + source.TRUNCATED))
+        self.assertLessEqual(len(description), source.DESCRIPTION_LIMIT + len(source.TRUNCATED))
+
+    def test_local_description_ignores_the_configured_log_output_encoding(self):
+        root, tmp = fixture_repo()
+        self.addCleanup(tmp.cleanup)
+        subprocess.run(["git", "config", "i18n.logOutputEncoding", "UTF-16LE"], cwd=root, check=True)
+        base, head = (source.commit(root, ref) for ref in ("HEAD~2", "HEAD"))
+        self.assertEqual(source.local_description(root, base, head),
+                         "Add the script\n\nExplains why the script exists.\n\nQuote the argument")
+
+    def test_local_description_reads_high_numbered_pipes(self):
+        minimum = 1024
+        limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if limit != resource.RLIM_INFINITY and limit <= minimum:
+            self.skipTest("open file limit is too low to allocate a high-numbered pipe")
+        root, tmp = fixture_repo()
+        self.addCleanup(tmp.cleanup)
+        base, head = (source.commit(root, ref) for ref in ("HEAD~1", "HEAD"))
+        popen = subprocess.Popen
+
+        def high_stdout(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            with process.stdout:
+                high = fcntl.fcntl(process.stdout, fcntl.F_DUPFD, minimum)
+            process.stdout = os.fdopen(high, "rb")
+            return process
+
+        with patch.object(source.subprocess, "Popen", side_effect=high_stdout):
+            self.assertEqual(source.local_description(root, base, head), "Quote the argument")
+
     def test_prompt_carries_the_description_only_when_there_is_one(self):
         files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
         plain = engine.pack(files, [])
@@ -105,9 +151,41 @@ class ChangeDescriptionTests(unittest.TestCase):
         limit = max(bare + size, engine.tokens(engine.pack(files, [], frozenset({big.path}), "", description)[0]))
         # src/big.py fits alone without the description but not with it, and the test file fits.
         self.assertLess(limit, described + size)
-        _, estimated, _, degraded = cli.fit(files, [], limit, description=description)
+        (prompt, _, _, _), estimated, _, degraded = cli.fit(files, [], limit, description=description)
         self.assertEqual(degraded, ["src/big.py"])
+        self.assertIn("Change description (untrusted data)", prompt)
         self.assertLessEqual(estimated, limit)
+
+    def test_fit_omits_metadata_before_dropping_files_that_fit(self):
+        body = "".join(f"+VALUE_{n} = {n}\n" for n in range(30))
+        files = [source.File(path, "@@ -0,0 +1,30 @@\n" + body, "added")
+                 for path in ("src/a.py", "tests/test_a.py")]
+        checks = [{"findings": [{"path": files[1].path, "line": 1, "title": "Scanner finding"}]}]
+        metadata = {"title": "Add values", "description": "word " * 80}
+        plain = engine.pack(files, checks)
+        limit = engine.tokens(plain[0])
+        full = engine.tokens(engine.pack(files, checks, **metadata)[0])
+        self.assertGreater(full, limit)
+        self.assertLess(engine.tokens(engine.pack(files[:1], checks, **metadata)[0]), limit)
+
+        self.assertEqual(cli.fit(files, checks, limit, **metadata), (plain, limit, full, []))
+
+    def test_fit_omits_metadata_to_review_more_files_during_degradation(self):
+        def added(path, count):
+            body = "".join(f"+VALUE_{n} = {n}\n" for n in range(count))
+            return source.File(path, f"@@ -0,0 +1,{count} @@\n" + body, "added")
+
+        files = [added("src/a.py", 30), added("src/b.py", 30), added("uv.lock", 300)]
+        metadata = {"description": "word " * 210}
+        wanted = engine.pack(files, [], frozenset({"uv.lock"}))
+        estimated = engine.tokens(wanted[0])
+        limit = estimated + 5  # Allow for per-file estimates around section boundaries.
+        full = engine.tokens(engine.pack(files, [], **metadata)[0])
+        self.assertGreater(engine.tokens(engine.pack(files, [])[0]), limit)
+        self.assertLessEqual(engine.tokens(engine.pack(files[:1], [], **metadata)[0]), limit)
+        self.assertGreater(engine.tokens(engine.pack(files[:2], [], **metadata)[0]), limit)
+
+        self.assertEqual(cli.fit(files, [], limit, **metadata), (wanted, estimated, full, ["uv.lock"]))
 
     def test_fit_retries_without_metadata_before_refusing_the_review(self):
         files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
@@ -170,6 +248,52 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertEqual(degraded, [big.path])
         self.assertEqual(estimated, bare_small)
         self.assertNotIn("History advisories", prompt)
+
+    def test_fit_does_not_charge_files_for_advisories_hidden_by_the_cap(self):
+        def added(path, count):
+            body = "".join(f"+VALUE_{n} = {n}\n" for n in range(count))
+            return source.File(path, f"@@ -0,0 +1,{count} @@\n" + body, "added")
+
+        first = added("src/first.py", 5)
+        hidden = added("tests/test_hidden.py", 8)
+        oversized = added("src/oversized.py", 100)
+        notices = [
+            {"path": file.path, "kind": "co-change", "detail": detail}
+            for file, detail in ((first, "coupled"), (hidden, "coupled to another file " * 12))
+            for _ in range(12)
+        ]
+        wanted = engine.pack([first, hidden], [], advisories=notices)
+        wanted_size = engine.tokens(wanted[0])
+        limit = wanted_size + 5  # Allow for per-file estimates around section boundaries.
+        self.assertGreater(engine.tokens(engine.pack([hidden], [], advisories=notices)[0]), limit)
+        self.assertGreater(engine.tokens(engine.pack([oversized], [])[0]), limit)
+
+        packed, estimate, _, degraded = cli.fit([first, hidden, oversized], [], limit, advisories=notices)
+        self.assertEqual((estimate, degraded), (wanted_size, [oversized.path]))
+        self.assertEqual(packed[0], wanted[0])
+        self.assertTrue(packed[1][hidden.path])
+
+    def test_fit_recounts_when_dropping_a_file_exposes_other_advisories(self):
+        def added(path, count):
+            body = "".join(f"+VALUE_{n} = {n}\n" for n in range(count))
+            return source.File(path, f"@@ -0,0 +1,{count} @@\n" + body, "added")
+
+        lock = added("uv.lock", 5)
+        hidden = added("src/history.py", 8)
+        kept = added("tests/test_keep.py", 80)
+        notices = [
+            {"path": file.path, "kind": "co-change", "detail": detail}
+            for file, detail in ((lock, "coupled"), (hidden, "coupled to another file " * 12))
+            for _ in range(12)
+        ]
+        wanted = engine.pack([kept], [])
+        limit = engine.tokens(wanted[0])
+        self.assertLess(engine.tokens(engine.pack([lock], [], advisories=notices)[0]), limit)
+        self.assertGreater(engine.tokens(engine.pack([hidden], [], advisories=notices)[0]), limit)
+
+        packed, estimate, _, degraded = cli.fit([lock, hidden, kept], [], limit, advisories=notices)
+        self.assertEqual((estimate, degraded), (limit, [hidden.path, lock.path]))
+        self.assertEqual(packed[0], wanted[0])
 
     def test_advisories_are_kept_only_for_files_with_shown_lines(self):
         shown = source.File("shown.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")

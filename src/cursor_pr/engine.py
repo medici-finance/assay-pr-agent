@@ -54,7 +54,21 @@ def section(f):
     return f"Change {f.status} {f.previous}\n{rendered}", anchors
 
 
-def pack(files, checks, skip=frozenset(), title="", description="", advisories=()):
+def render_sections(files):
+    """Validate paths and render each patch once for full and reduced prompts."""
+    rendered = {}
+    for file in files:
+        if not file.path or any(ord(char) < 32 for char in file.path) or file.path in rendered:
+            raise ReviewError("Invalid or duplicate forge filename")
+        rendered[file.path] = section(file)
+    return rendered
+
+
+def visible_advisories(advisories, anchors):
+    return list(islice((advisory for advisory in advisories if anchors.get(advisory["path"])), 12))
+
+
+def pack(files, checks, skip=frozenset(), title="", description="", *, advisories=(), rendered=None):
     """Build the prompt. Paths in skip are left out to fit the budget and get no anchors."""
     template = distribution("pr-agent").locate_file("pr_agent/settings/pr_reviewer_prompts.toml")
     with template.open("rb") as stream:
@@ -63,25 +77,21 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
         num_max_findings=MAX_FINDINGS,
         diff_hunk_format="New hunks are numbered at the head; old hunks show the former code.",
     )
+    patches = render_sections(files).items() if rendered is None else ((f.path, rendered[f.path]) for f in files)
     sections, anchors, omitted = [], {}, []
-    for f in files:
-        if not f.path or any(ord(c) < 32 for c in f.path) or f.path in anchors:
-            raise ReviewError("Invalid or duplicate forge filename")
-        text, anchors[f.path] = section(f)
+    for path, (text, lines) in patches:
+        anchors[path] = set() if path in skip else lines
         if text is None:
-            omitted.append(f.path)
-        elif f.path in skip:
-            anchors[f.path] = set()
-        else:
+            omitted.append(path)
+        elif path not in skip:
             sections.append(text)
     evidence = [finding for check in checks for finding in check["findings"]
                 if finding["line"] in anchors.get(finding["path"], set())]
     # The author's title and description give intent. They are as untrusted as the patch itself.
     change = {"title": title, "description": description} if title or description else None
     # Repository-history notices are hints about the changed files, never findings of their own.
-    shown_advisories = (a for a in advisories if anchors.get(a["path"]))
     notices = [{"path": a["path"], "kind": a["kind"], "detail": a["detail"][:300] + "…" * (len(a["detail"]) > 300)}
-               for a in islice(shown_advisories, 12)]
+               for a in visible_advisories(advisories, anchors)]
     context = [name for name, present in (("change description", change), ("history advisories", notices)) if present]
     sources = ", ".join(context + ["patch"]) + " and scanner evidence" if context else "patch and scanner evidence"
     about = " The change description is the author's own account: use it for intent, not as evidence." if change else ""

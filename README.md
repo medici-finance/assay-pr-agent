@@ -2,6 +2,77 @@
 
 A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It builds on [PR-Agent](https://github.com/the-pr-agent/pr-agent). The PR-Agent contributors provide the review prompt, line-numbered diff formatter and token estimator used here. We ship their [MIT-licensed](https://github.com/the-pr-agent/pr-agent/blob/main/LICENSE) Python package in the container, with its original license notice. Choose Cursor Agent, Claude Code, or Codex CLI for inference. The `pr-agent-forge` helper uses Assay’s Go library for authenticated forge access when you use a change number. Local and CI runs require only the Git objects.
 
+## Security model
+
+The reviewer reads changes written by people who need no access to your deployment, and it posts under your reviewer identity. What sets it apart, at a glance:
+
+- Deterministic checks run first at zero model tokens: ShellCheck, actionlint, Hadolint, zizmor, OSV-Scanner and, when configured, Assay's Go analysis report.
+- One bounded model call per review, under a token budget of 6,000 estimated input tokens by default, with at most three findings.
+- Bounded Qualgen history advisories for files shown in the prompt, with additional advisories in the review report.
+- Hardened for hostile pull requests: a requester allowlist for comment triggers, model tools disabled, untrusted input labelled, and a posted comment that is flattened and quoted as code.
+
+The rest of this section states what the code enforces, in the order a request meets it. The sections after it cover installation and operation.
+
+### Who can start a comment-triggered review
+
+The poller queues a review only when a new comment on an open change meets all of these requirements:
+
+- The body is `/review` and nothing else apart from surrounding whitespace. A quoted or decorated command such as `> /review` or `/review please` is an ordinary comment.
+- The author's numeric account ID is in the project's `requester_ids`. Setup resolves usernames to IDs once. The list is the control on who can spend model budget; nothing limits a listed account beyond one review per comment.
+- The comment is unedited, with equal created and updated timestamps, and is not older than the project's activation.
+- On GitHub, the author type is `User`, which refuses bots, organizations and mannequins, and the comment URL is that change's `#issuecomment-<id>`.
+- On GitLab, the conversation list that the forge helper reads omits note visibility and rounds timestamps to seconds, so the one otherwise eligible note is looked up once through the API with the reviewer token. It must be a non-internal, non-system note on that merge request, by the same author, with the same body and unedited according to the API's timestamps. The lookup rejects authors marked as bots. Allowlist human accounts because the API can omit the bot flag.
+
+A failed GitLab lookup is retried on the next poll, and a note that fails the lookup's checks, or that the lookup no longer finds, is recorded as ignored. Each comment starts at most one review, and when the review starts the change must still be open at its configured URL. A poll never calls the model. Operators can also run `cursor-review --change ... --post` directly. This uses the configured project and reviewer credentials and does not require a request comment or check its author allowlist.
+
+### What the model can and cannot do
+
+Each review can make one inference invocation of the selected provider CLI, with a 120-second timeout and no retry or fallback. If the prompt exceeds the token limit, inference is skipped and the review returns `over-budget` (see [Cost and coverage](#cost-and-coverage)). Direct Cursor runs can perform a separate account check before estimating the prompt. The answer must be one successful result of at most 32,768 characters with at most three findings. Tools are disabled per provider:
+
+- **Cursor** — `cursor-agent -p --mode=ask` in a temporary workspace holding a written `.cursor/cli.json` with an empty allow list and a deny list for shell, file read, file write, web fetch and MCP tools.
+- **Claude Code** — `claude -p --tools "" --strict-mcp-config --max-turns 1 --no-session-persistence`.
+- **Codex** — `codex exec --ephemeral --sandbox read-only`, with the shell tool, unified exec, multi-agent, apps and web search disabled and user configuration and rules ignored.
+
+The CLI receives an allow-listed environment: its own provider's key or sign-in profile and the path, locale, configuration, temporary, proxy and TLS settings. Forge credentials, CI secrets and other providers' keys are not in that environment, and no repository is present in its workspace.
+
+### Untrusted input and evidence binding
+
+The prompt contains PR-Agent's review rubric, the scanner diagnostics that fall on shown lines, and the diff hunks. It can also include optional context from the change's title and description when the forge helper supplies them, or recent commit messages in a local or CI review. The prompt may also include Qualgen advisories for the files it shows. Other comments, prior reviews and Hadolint, zizmor and OSV-Scanner output stay outside the prompt. The change context, Qualgen advisories, scanner diagnostics and patch are each labelled `untrusted data` and follow fixed instructions that restrict the model to the supplied material and prohibit tool use. The file list is bracketed by two change reads and refused if the head moved in between, so the patch belongs to one head.
+
+A finding is accepted only if it names a reviewed file and cites a contiguous range of head lines that the shown hunks contain. One failing finding rejects the whole answer: the review ends as `model-unavailable` and its scanner results are still posted. A file name containing a C0 control character (below U+0020), or a duplicate file name, stops the review before the model is called.
+
+### The posted comment
+
+The reviewer's only forge write is one ordinary conversation comment, which the `pr-agent-forge` helper posts through Assay's forge library under the reviewer credential ([Publish a summary](#publish-a-summary)). It never submits a review verdict, approves, merges or edits a change. Before writing, the library checks that the repository's live visibility is within the project's configured `visibility`, that the change is still open and that its head is still the reviewed SHA. It also scans the body for an impersonated ruling by the configured operator, personal-data shapes and, on internal and public projects, references to private repositories and `REVIEW_WITHHELD_IDENTIFIERS`, and it refuses a body over 16 KiB. Once the agent writes a receipt to the state volume, it suppresses an identical retry for the same change and head, including after a restart. An interruption between forge acceptance and saving the receipt can result in a duplicate.
+
+Every pull request path, model title and message, scanner rule and message, and Qualgen notice is quoted as a code span. Its delimiters are one backtick longer than any run inside the text, and an inner space at each end keeps backticks in the text from joining the delimiters. That keeps Markdown, links and `@mentions` in those strings literal. Line breaks are collapsed in every line of the comment, so none of those strings can add a line, start a forge quick action or open a multi-line construct. The Hadolint, zizmor and OSV-Scanner summary shows at most 30 rows of 450 characters, and the Qualgen list at most 20 entries of 500 characters. A few long model findings, up to the limit of three, or many ShellCheck, actionlint or Go analysis rows can exceed the 16 KiB byte limit and prevent publication.
+
+### Local scanners
+
+ShellCheck, actionlint, Hadolint, zizmor and OSV-Scanner never read the checkout's working tree or follow a link. Each receives one immutable Git blob from the reviewed head: ShellCheck and actionlint on standard input in an empty temporary directory, the other three as a file in a temporary directory with an environment of only `PATH` and `HOME` (plus the advisory database cache for OSV-Scanner). Each run has a timeout and a size cap, and Hadolint, zizmor and OSV-Scanner refuse anything that is not a regular file, such as a symlink or a submodule. For a managed checkout whose reviewed commit is missing locally, the reviewer fetches only that change's ref into a temporary checkout, uses it only if its SHA matches, and discards it. Nothing from the change is built or executed.
+
+### CI artifacts
+
+Hadolint, zizmor, OSV-Scanner and the Go analysis report can come from CI instead. A report is accepted only from the producer named for the project (`go_analysis` only when you set it) and from a finished run for the reviewed source commit. Downloads are capped at 8 MiB, follow redirects by hand over HTTPS, and the forge token is dropped before any redirect target is requested. The Go report must carry the `go-analysis/v1` schema, the repository, the reviewed source SHA, complete coverage and agreeing totals, exit code and gate. For Hadolint, zizmor and OSV-Scanner, an unusable or missing CI report triggers a local scan when the source and scanner are available. If coverage still cannot be obtained, the summary says `could not check`. The reviewer continues without unusable Go analysis evidence. Use producers whose pipeline definitions and outputs your team controls, including when relying on default scanner producer names. A name and matching SHA alone do not establish producer trust. [Use the Go report in a comment-triggered review](#use-the-go-report-in-a-comment-triggered-review) describes the Go analysis setup.
+
+### Credential custody
+
+Forge access always uses the reviewer credential from setup or the container environment. Before it polls, syncs or reviews, the agent copies that credential into a private runtime directory (in `/dev/shm` under Docker) and removes the credential variables from its own environment. On GitHub, the forge helper exchanges the App private key for an installation token restricted to the one repository, which the agent reuses until five minutes before it expires; on GitLab the configured reviewer token is used as it is, and nothing is rotated. The helper receives the credential on standard input for each call, and the GitLab note lookup, CI artifact downloads and git-sync read the same runtime copies. Every forge and provider credential file the agent writes, including those runtime copies, is plaintext, mode 0600 and replaced by an atomic rename. The agent removes recognized provider API keys, `REVIEW_FORGE_*` variables and recognized forge secret and TLS inputs from the environments of its forge helper, Git commands and ShellCheck and actionlint scanners. Keep unrelated credentials such as `GH_TOKEN` out of the service environment because those child processes can inherit them.
+
+The state volume holds the setup's credentials, the request queue, the cache, the publication receipts and Qualgen's history. Follow the existing advice to [protect the volume and its backups](#interactive-setup), to [treat the sign-in volume as a credential](#review-provider) and to [keep the state volume private](#qualgen-history-advisories).
+
+### Deployment hardening
+
+Discovery is polling only: there is no webhook, the reviewer and sync services publish no port, and the GitHub App is created with an inactive webhook and no events. The reviewer mounts the checkout volume read-only; only the sync service writes to it.
+
+`compose.yaml` and the Kubernetes manifests run every container with a read-only root filesystem, all capabilities dropped and no privilege escalation, with a 1 GiB temporary mount on `/tmp`. The manifests also set a non-root user, the runtime's default seccomp profile, no service account token and a `restricted` pod-security namespace, and define the `pr-agent-egress` NetworkPolicy: egress only, to DNS on port 53 and otherwise to the public internet, with RFC1918, CGNAT and link-local ranges (which include cloud metadata addresses) and IPv6 unique-local and link-local ranges blocked. [`k8s/README.md`](k8s/README.md) covers a forge or proxy on a private network and the policy's node-traffic limit.
+
+The image runs as UID 10001 and installs the Cursor Agent CLI from a release tarball pinned by version and SHA-256 digest, as it already does for Qualgen, Hadolint, zizmor and OSV-Scanner, instead of the `cursor.com/install` script that always fetches the current release. The forge helper is compiled from an Assay source commit pinned in the Dockerfile. The plain `docker run` commands in this README do not pass the equivalent runtime flags.
+
+### Limits
+
+A finding is still model output written after reading attacker-supplied code, so findings are advisory: prompt injection can change what the one comment says inside its code spans, or talk the model out of reporting, and a person decides what to do with a change. The tool restrictions are flags and configuration that each provider CLI enforces, not a sandbox this agent applies to the CLI process, which controls its own system context and requests. The scanners run as the service user without a filesystem sandbox, and ShellCheck and actionlint also inherit the filtered service environment, so a compromise of any scanner could read the credential files the service holds. Only line breaks are removed from posted text; other control and formatting characters, such as bidirectional overrides, pass through. The state volume holds credentials and repository history. The forge data behind the trigger checks, the GitHub token exchange and the visibility, head and body checks on a post are the behaviour of Assay's forge library, built into the helper from the pinned commit.
+
 ## Install with Docker Compose
 
 Start the containers from this checkout, then attach to the installer:
@@ -202,7 +273,7 @@ cursor-review --repo /path/to/checkout --change 'org/repo#42' --model MODEL
 
 The local form compares the merge base to committed `HEAD`, or to an explicit `--head`. Both commits and their common ancestor must be available locally. The forge form uses an `owner/repo#number` address from the configured projects and requires `pr-agent-forge` on `PATH`. GitLab subgroup projects can use CI mode with local Git objects. It reads metadata before and after the file list, checks head and file-count consistency, and records missing patches as incomplete coverage.
 
-The prompt can include messages from up to 32 recent commits in a local or CI review, or a forge change's title and description when the forge helper reports them. The title and description are cut at 256 and 1,500 characters, labelled untrusted, and counted in the token estimate. If the extra context would prevent every file from fitting, the reviewer tries the patch and scanner evidence alone.
+The prompt can include messages from up to 32 recent commits in a local or CI review, or a forge change's title and description when the forge helper reports them. The title and description are cut at 256 and 1,500 characters, labelled untrusted, and counted in the token estimate. The reviewer drops this optional context when doing so allows it to review more files within the token budget.
 
 ### Cost and coverage
 
@@ -273,7 +344,7 @@ Set `REVIEW_QUALGEN_INTERVAL_SECONDS` in Docker or enter the refresh interval du
 
 An authorized GitHub or GitLab `/review` runs `qualgen check` for the changed paths and adds its notices to the posted summary. A notice can identify a frequently co-changed file that is missing from the change. The summary identifies the mined commit and marks paths with insufficient history. Live reference notices are included only when the checkout is at the reviewed head. While the first snapshot is being built, the review reports that history is unavailable. The comment shows up to 20 entries; the JSON includes the full advisory list.
 
-Qualgen uses local CPU, disk and Git history. Its advisories go into the review prompt as untrusted data, at most 12 entries with each detail cut at 300 characters, so they count toward the token estimate and are part of the model cache key. The model is told they are hints to check against the patch, not findings. The advisories are also added to the posted summary, and an estimate, an over-budget review or a model failure still reports them.
+Qualgen uses local CPU, disk and Git history. Its advisories go into the review prompt as untrusted data, at most 12 entries for files with reviewable hunks in the prompt, with each detail cut at 300 characters, so they count toward the token estimate and are part of the model cache key. The model is told they are hints to check against the patch, not findings. The advisories are also added to the posted summary, and an estimate, an over-budget review or a model failure still reports them.
 
 ### Base drift
 
