@@ -63,13 +63,19 @@ class MarkerTests(Offline):
         status = self.refuse.get((request.method, url.split("?")[0]))
         if status:
             return httpx.Response(status, json=dict(message="details the log must not quote"), request=request)
-        if url.endswith("/user"):
-            return httpx.Response(200, json=self.account, request=request)
         github = "api.github.com" in url
+        if url.endswith("/user"):
+            # A GitHub App installation token cannot read the account it acts as.
+            return httpx.Response(403 if github else 200, json=self.account, request=request)
         rows, field = (self.eyes, "content") if github else (self.awards, "name")
         if request.method == "GET":
             wanted = request.url.params.get(field)
             return httpx.Response(200, json=[row for row in rows if not wanted or row[field] == wanted], request=request)
+        if request.method == "POST" and github:
+            # GitHub answers a reaction this account already has with 200 and that reaction.
+            mine = [row for row in rows if row["user"]["id"] == ME and row["content"] == "eyes"]
+            if mine:
+                return httpx.Response(200, json=mine[0], request=request)
         if request.method == "POST":
             rows.append(dict(id=100 + len(self.calls), user=dict(id=ME), **{field: "eyes" if github else "hourglass"}))
             return httpx.Response(200 if github else 201, json=rows[-1], request=request)
@@ -94,8 +100,7 @@ class MarkerTests(Offline):
         ack.finished(self.gh, 3, 81, "reviewed")
         self.assertEqual(self.sent(), [
             ("POST", GITHUB),
-            ("GET", "https://api.github.com/user"),
-            ("GET", GITHUB + "?per_page=100&page=1&content=eyes"),
+            ("POST", GITHUB),  # Answered with the reaction already there, whose ID is then deleted.
             ("DELETE", GITHUB + "/101")])  # Not the other account's reaction, nor our own different one.
         self.check_headers("github")
         self.assertEqual([row["id"] for row in self.eyes], [11, 13])
@@ -152,7 +157,7 @@ class MarkerTests(Offline):
         cases = [({("POST", GITHUB): 403}, (self.gh, 3, 81), ack.queued, "Could not mark acme/github#3 comment 81: HTTP 403"),
                  ({("GET", GITLAB): 403}, (self.gl, 3, 81), ack.queued, "Could not mark acme/gitlab#3 comment 81: HTTP 403"),
                  ({("POST", GITLAB): 404}, (self.gl, 3, 81), ack.queued, "Could not mark acme/gitlab#3 comment 81: HTTP 404"),
-                 ({("GET", "https://api.github.com/user"): 401}, (self.gh, 3, 81), finished, CLEAR + " 401"),
+                 ({("POST", GITHUB): 401}, (self.gh, 3, 81), finished, CLEAR + " 401"),
                  ({("GET", "https://gitlab.com/api/v4/user"): 403}, (self.gl, 3, 81), finished, "Could not clear the queued marker on acme/gitlab#3 comment 81: HTTP 403")]
         for refuse, (project, number, comment), call, line in cases:
             with self.subTest(line=line):

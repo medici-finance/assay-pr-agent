@@ -81,9 +81,22 @@ def add(project, number, comment):
     response.raise_for_status()  # GitHub answers 200 when this account has already reacted.
 
 
+def own_reaction(project, markers, headers):
+    """The ID of this credential's reaction on the comment. An App installation token may not read
+    GET /user, but adding a reaction it already has answers 200 with that reaction, ID included."""
+    response = request(project, "POST", markers, headers, json={"content": "eyes"})
+    response.raise_for_status()
+    row = response.json()
+    if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] < 1 or row.get("content") != "eyes":
+        raise ReviewError("The forge did not identify the reviewer's reaction")
+    return [row["id"]]
+
+
 def remove(project, number, comment):
     root, markers, headers = reviewer(project, number, comment)
-    for ident in own_markers(project, root, markers, headers):
+    found = (own_reaction(project, markers, headers) if project.provider == "github"
+             else own_markers(project, root, markers, headers))
+    for ident in found:
         response = request(project, "DELETE", f"{markers}/{ident}", headers)
         if response.status_code != 404:
             response.raise_for_status()
