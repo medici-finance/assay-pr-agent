@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cursor_pr import cli, engine, history, source
+from cursor_pr import cli, context, engine, history, source
 
 
 def fixture_repo():
@@ -328,7 +328,8 @@ class ChangeDescriptionTests(unittest.TestCase):
         def invoke(prompt, model, anchors):
             shown.append(prompt)
             return {"findings": [], "cursor_usage": None}
-        change = source.Change("a" * 40, [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")], "org/repo#1", "T", "D")
+        change = source.Change("a" * 40, [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")],
+                               "org/repo#1", title="T", description="D")
         args = cli.parser().parse_args(["--change", "org/repo#1", "--repo", str(root), "--cache-dir", str(root / "cache"),
                                         "--qualgen-store", str(root / "store"), "--max-input-tokens", "6000"])
         with patch.object(cli, "forge_change", return_value=change), patch.object(cli, "scan_files", return_value=[]), \
@@ -343,6 +344,7 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertEqual((report["qualgen"], bounded["qualgen"]), (advisory, advisory))
         self.assertEqual(len(shown), 1)
         self.assertIn('"detail": "coupled"', shown[0])
+        self.assertIn("Check its claims", shown[0])
 
 
     def test_claims_are_checked_only_when_there_is_a_description(self):
@@ -375,16 +377,81 @@ class ChangeDescriptionTests(unittest.TestCase):
                 ("author", "Describe the updated tests.\n" + "word " * 900, estimate + 200, False),
                 ("history", "An intermediate commit description.", 6000, False)):
             with self.subTest(kind=kind, allowance=allowance):
-                parts, _, fates, _ = cli.with_context(
+                parts, _, fates, _, _ = cli.with_context(
                     files, [], packed, estimate, [], allowance, 6, ("change description",),
                     {"change description": text}, rendered=rendered, scoped=True, description_kind=kind)
-                self.assertEqual("Check its claims" in parts[0], claims)
+                self.assertEqual("Flag description claims" in parts[0], claims)
                 if claims:
-                    self.assertIn("shared limit of 6 findings", parts[0])
-                    self.assertIn("visible patch lines contradict a claim", parts[0])
+                    self.assertIn("0-6 issues", parts[0])
+                    self.assertIn("visible patch lines contradict them", parts[0])
                 if allowance < 6000:
                     self.assertEqual(fates[0]["state"], "truncated")
                     self.assertIn("The change description is truncated.", parts[0])
+
+    def test_tight_claim_guidance_keeps_available_tier_context(self):
+        files = [source.File("src/app.py", "@@ -0,0 +1 @@\n+value = 1\n", "added")]
+        rendered = engine.render_sections(files)
+        packed = engine.pack(files, [], max_findings=6, rendered=rendered)
+        estimate = engine.tokens(packed[0])
+        raw = {"change description": "The patch adds the value.",
+               "surrounding code": "\n".join(f"## src/app.py line {i}\n{i}: value = {i}" for i in range(80))}
+
+        _, used, fates, _, _ = cli.with_context(
+            files, [], packed, estimate, [], estimate + 150, 6, context.MID, raw,
+            rendered=rendered, scoped=True, description_kind="author")
+
+        present = {row["name"] for row in fates if row["state"] in cli.USED}
+        self.assertEqual(present, {"change description", "surrounding code"})
+        self.assertLessEqual(used, estimate + 150)
+
+    def test_claim_checking_preserves_the_patch_in_the_max_deep_pass(self):
+        root, tmp = fixture_repo()
+        self.addCleanup(tmp.cleanup)
+
+        def added(name, count):
+            lines = "".join(f"+VALUE_{i} = {i}\n" for i in range(count))
+            return source.File(name, f"@@ -0,0 +1,{count} @@\n" + lines, "added")
+
+        small, large = added("tests/test_small.py", 5), added("src/large.py", 806)
+        body = "Check the updated defaults."
+        change = source.Change(source.commit(root, "HEAD"), [small, large], "org/repo#1", description=body)
+        raw = {"change description": body, "whole changed files": "Inspect the values."}
+        args = cli.parser().parse_args(["--change", "org/repo#1", "--repo", str(root),
+                                        "--cache-dir", str(root / "cache"), "--tier", "max",
+                                        "--max-input-tokens", "1000", "--estimate"])
+        with patch.object(cli, "forge_change", return_value=change), patch.object(cli, "scan_files", return_value=[]), \
+             patch.object(context, "gather", return_value=raw):
+            report, _ = cli.run_request(args)
+
+        self.assertEqual([row["name"] for row in report["passes"]], ["review", "deep"])
+        self.assertEqual(report["degraded"], [])
+
+    def test_history_sharing_preserves_a_complete_author_description(self):
+        root, tmp = fixture_repo()
+        self.addCleanup(tmp.cleanup)
+        file = source.File("src/app.py", "@@ -0,0 +1 @@\n+value = 1\n", "added")
+        body = "\n".join(f"Case {i} covers defaults, input and output." for i in range(29))
+        changed = source.Change(source.commit(root, "HEAD"), [file], "org/repo#1", title="New defaults",
+                                description=body)
+        advice = {"state": "complete", "advisories": [
+            {"path": file.path, "kind": "co-change", "detail": "Look at caller."}], "unscreened": []}
+        args = cli.parser().parse_args(["--change", "org/repo#1", "--repo", str(root),
+                                        "--cache-dir", str(root / "cache"), "--tier", "mid",
+                                        "--max-input-tokens", "815", "--qualgen-store", str(root / "history")])
+        prompts = []
+
+        def invoke(prompt, *args, **kwargs):
+            prompts.append(prompt)
+            return {"findings": [], "cursor_usage": None}
+
+        with patch.object(cli, "forge_change", return_value=changed), patch.object(cli, "scan_files", return_value=[]), \
+             patch.object(context, "gather", return_value={"change description": body}), \
+             patch.object(history, "screen", return_value=advice), patch.object(engine, "invoke", side_effect=invoke):
+            report, code = cli.run_request(args)
+        self.assertEqual((report["delivered"], code), ("mid", 0))
+        self.assertIn("Check description claims", prompts[0])
+        self.assertEqual(next(row["state"] for row in report["context"] if row["name"] == "change description"),
+                         "included")
 
     def test_claims_require_contradictory_evidence_when_coverage_is_partial(self):
         shown = source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")

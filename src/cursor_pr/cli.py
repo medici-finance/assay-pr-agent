@@ -163,17 +163,24 @@ def with_context(files, checks, packed, estimated, dropped, limit, cap, names, r
                  scoped=False, description_kind=""):
     """Fit tier-specific context to an already selected scope."""
     text, fates = context.assemble(names, raw, limit - estimated - (120 if focus else 80))
-    options = dict(max_findings=cap, focus=focus, rendered=rendered)
+    options = dict(max_findings=cap, focus=focus, rendered=rendered, scoped=scoped)
+    baseline = estimated
     if text:
-        wider = pack(files, checks, frozenset(dropped), context=text, scoped=scoped,
-                     context_description=shown_description(description_kind, fates), **options)
+        skipped = frozenset(dropped)
+        wider = pack(files, checks, skipped, context=text, **options)
         size = tokens(wider[0])
         if size <= limit:
-            packed, estimated = wider, size
+            packed, estimated, baseline = wider, size, size
+            kind = shown_description(description_kind, fates)
+            if kind:
+                guided = pack(files, checks, skipped, context=text, context_description=kind, **options)
+                guided_size = tokens(guided[0])
+                if guided_size <= baseline:
+                    packed, estimated = guided, guided_size
         else:
             fates = [dict(row, state="dropped") if row["state"] in USED else row for row in fates]
             text = ""
-    return packed, estimated, fates, text
+    return packed, estimated, fates, text, baseline
 
 
 def run_pass(row, prompt, anchors, args, source, *, cap, timeout, originals=None):
@@ -497,7 +504,7 @@ def execute(args):
     first_paths = set()
     if has_text and estimated <= limit:
         if tier != "regular":
-            first_pack, estimated, fates, first_context = with_context(
+            first_pack, estimated, fates, first_context, first_baseline = with_context(
                 files, checks, first_pack, estimated, dropped, limit, cap, context.MID, raw,
                 rendered=rendered, scoped=scoped, description_kind=description_kind)
             prompt = first_pack[0]
@@ -507,12 +514,12 @@ def execute(args):
     deep_limit = limit
     if tier == "max" and has_text:
         # The reserve is for planning. Verification may use any tokens left after actual prompts.
-        deep_limit = budget - (estimated if plans else 0) - base // 2
+        deep_limit = budget - (first_baseline if plans else 0) - base // 2
         deep_pack, deep_size, _, deep_dropped = fit(
             files, checks, deep_limit, cap, focus=DEEP_FOCUS, rendered=rendered, scoped=scoped)
         deep_anchors = deep_pack[1]
         if deep_size <= deep_limit:
-            deep_pack, deep_size, deep_fates, deep_context = with_context(
+            deep_pack, deep_size, deep_fates, deep_context, _ = with_context(
                 files, checks, deep_pack, deep_size, deep_dropped, deep_limit, cap, context.DEEP, raw,
                 rendered=rendered, focus=DEEP_FOCUS, scoped=scoped, description_kind=description_kind)
             new_paths = any(lines and path not in first_paths for path, lines in deep_anchors.items())
@@ -538,13 +545,17 @@ def execute(args):
             wider, fates_with_history = context.assemble(
                 (*names, history_name), {**raw, history_name: history_text}, tokens(original_context))
             replacements = fates_with_history[:-1]
+            previous_kind = shown_description(description_kind, blocks)
+            replacement_kind = shown_description(description_kind, replacements)
+            if previous_kind == "author" and replacement_kind != "author":
+                continue
             if fates_with_history[-1]["state"] not in USED or any(
                     old["state"] in USED and new["state"] not in USED
                     for old, new in zip(blocks, replacements, strict=True)):
                 continue
             candidate = pack(files, checks, frozenset(skipped), context=wider, max_findings=cap,
                              focus=DEEP_FOCUS if is_deep else "", rendered=rendered, scoped=scoped,
-                             context_description=shown_description(description_kind, replacements))[0]
+                             context_description=replacement_kind)[0]
             size = tokens(candidate)
             if size <= row["estimated_input_tokens"]:
                 row["estimated_input_tokens"] = size
