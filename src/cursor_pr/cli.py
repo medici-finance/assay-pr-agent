@@ -56,7 +56,7 @@ def fit(files, checks, limit, *, title="", description=""):
         return full_pack, full, full, []
     sizes = {f.path: tokens(text) for f in files if (text := section(f)[0])}
     # A file that cannot fit even alone leaves first, so it never takes a file that fits with it.
-    overhead = tokens(pack(files, checks, frozenset(sizes))[0])
+    overhead = tokens(pack(files, checks, frozenset(sizes), title, description)[0])
     queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
     while estimated > limit and queue:
