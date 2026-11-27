@@ -1,4 +1,4 @@
-"""Post model findings as inline comments on the reviewed head, outside deskpost and its trust gate."""
+"""Post model findings as inline comments on the reviewed head, outside the forge helper's publication checks."""
 import hashlib
 import json
 import logging
@@ -10,7 +10,7 @@ import httpx
 
 from . import forge_status, providers
 from .scanners import fence, safe_path
-from .source import ReviewError, desk, run_desk
+from .source import ReviewError, run_forge
 
 log = logging.getLogger(__name__)
 PREFIX = "<!-- assay-pr-agent:inline:%s:"
@@ -55,24 +55,40 @@ def carried(head, text):
     return {lines[2]}
 
 
-def read(kind, address):
-    """One per-change deskread kind, checked the way `source.desk` checks the change kinds."""
-    repo, number = address.rsplit("#", 1)
-    data = json.loads(run_desk(["deskread", kind, "--change", address]))
+def thread(project, number):
+    """The change's comments through the forge helper, complete or not at all."""
+    data = run_forge("comments", project, numbers=[int(number)])
     items = data.get("items") or []
-    if (data.get("schema") != 1 or data.get("kind") != kind or data.get("partial")
-            or len(items) != 1 or items[0].get("repo") != repo or items[0].get("number") != int(number)
-            or not isinstance(items[0].get(kind), list)):
-        raise ReviewError("Incomplete or mismatched deskread " + kind + " envelope")
-    return items[0][kind]
+    if (data.get("partial") or len(items) != 1 or items[0].get("number") != int(number)
+            or not isinstance(items[0].get("comments"), list)):
+        raise ReviewError("Incomplete or mismatched change comment read")
+    return items[0]["comments"]
 
 
-def reviewer(address, value):
+def review_comments(client, headers, slug, number):
+    """Every review comment on the pull request, read to the end; an unread page could hide an earlier post."""
+    found, page = [], 1
+    while True:
+        response = client.get(f"https://api.github.com/repos/{slug}/pulls/{number}/comments",
+                              params={"page": page, "per_page": 100}, headers=headers)
+        response.raise_for_status()
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise ReviewError("Invalid pull request review comment list")
+        found += [r for r in rows if isinstance(r, dict)]
+        if len(rows) < 100:
+            return found
+        if page >= PAGES:
+            raise ReviewError("Too many review comments to check for earlier inline comments")
+        page += 1
+
+
+def reviewer(project, number, value):
     """The account that posts this tool's summaries on GitHub: a bot, the author of the newest one."""
-    # An installation token cannot read its own identity, so the summary deskpost just wrote stands
-    # in for it. Only a bot can match, and deskpost's audit lines may sit around the summary's first line.
+    # An installation token cannot read its own identity, so the summary just posted stands in for it.
+    # Only a bot can match, and lines the publication adds may sit around the summary's first line.
     first = f"{providers.LABELS[value.get('provider', 'cursor')]} review of {value['head']}"
-    ours = [c for c in read("comments", address) if isinstance(c, dict) and c.get("authorType") == "Bot"
+    ours = [c for c in thread(project, number) if isinstance(c, dict) and c.get("authorType") == "Bot"
             and isinstance(c.get("body"), str) and first in c["body"].split("\n")]
     if not ours or any(type(c.get(k)) is not int for c in ours for k in ("authorId", "databaseId")):
         raise ReviewError("Could not identify the reviewer identity on the change")
@@ -89,25 +105,30 @@ def account(client, headers, base):
     return me
 
 
-def unmoved(address, head):
+def unmoved(project, number, head):
     # Read last, right before the first write: a comment on a moved head lands on the wrong line.
-    if desk("change", address).get("headSha") != head:
+    if run_forge("change", project, numbers=[int(number)]).get("headSha") != head:
         raise Stale("the change moved on since the review")
 
 
-def github(client, headers, address, slug, number, rows, me, head):
+def github(client, headers, project, slug, number, rows, me, head):
     """(posted, refused, already present) as one review on the reviewed head."""
-    mark = marker(head, rows)
-    if any(r.get("authorId") == me and r.get("commitId") == head and str(r.get("body") or "").strip() == mark
-           for r in read("reviews", address) if isinstance(r, dict)):
+    # Each comment closes with its own marker, as on GitLab, so a later run with a different set of
+    # findings, or one after a run that stopped partway, posts only what is not there yet.
+    found = set().union(*(carried(head, c.get("body")) for c in review_comments(client, headers, slug, number)
+                          if (c.get("user") or {}).get("id") == me))
+    rows = [row for row in rows if marker(head, row) not in found]
+    if not rows:
         return 0, 0, True
-    unmoved(address, head)
+    unmoved(project, number, head)
     endpoint = f"https://api.github.com/repos/{slug}/pulls/{number}/reviews"
+    mark = marker(head, rows)
 
     def submit(part):
         client.post(endpoint, headers=headers, json={
             "commit_id": head, "event": "COMMENT", "body": mark,
-            "comments": [dict(path=path, line=line, side="RIGHT", body=body) for path, line, body in part]}).raise_for_status()
+            "comments": [dict(path=path, line=line, side="RIGHT", body=f"{body}\n\n{marker(head, [path, line, body])}")
+                         for path, line, body in part]}).raise_for_status()
 
     try:
         submit(rows)
@@ -128,7 +149,7 @@ def github(client, headers, address, slug, number, rows, me, head):
     return posted, refused, False
 
 
-def gitlab(client, headers, address, base, slug, number, rows, me, head):
+def gitlab(client, headers, project, base, slug, number, rows, me, head):
     """(posted, refused, already present) as one discussion per finding on the reviewed head."""
     root = f"{base}/projects/{quote(slug, safe='')}/merge_requests/{number}"
     response = client.get(root, headers=headers)
@@ -156,7 +177,7 @@ def gitlab(client, headers, address, base, slug, number, rows, me, head):
     pending = [row for row in rows if marker(head, row) not in found]
     if not pending:
         return 0, 0, True
-    unmoved(address, head)
+    unmoved(project, number, head)
     posted = refused = 0
     for path, line, body in pending:
         try:
@@ -174,7 +195,7 @@ def gitlab(client, headers, address, base, slug, number, rows, me, head):
     return posted, refused, False
 
 
-def post(address, value, checkout):
+def post(address, value, project, checkout):
     """(outcome, posted, refused, left out). Raises on any read or transport failure."""
     rows, left = comments(value)
     head = value["head"]
@@ -185,9 +206,9 @@ def post(address, value, checkout):
     number = address.rsplit("#", 1)[1]
     with forge_status.connection(address, value["source"], checkout) as (client, provider, slug, base, headers):
         if provider == "github":
-            sent = github(client, headers, address, slug, number, rows, reviewer(address, value), head)
+            sent = github(client, headers, project, slug, number, rows, reviewer(project, number, value), head)
         else:
-            sent = gitlab(client, headers, address, base, slug, number, rows, account(client, headers, base), head)
+            sent = gitlab(client, headers, project, base, slug, number, rows, account(client, headers, base), head)
     posted, refused, present = sent
     return "already-present" if present else "posted" if posted else "failed", posted, refused, left
 
@@ -198,11 +219,11 @@ def outcome(args, value):
             and (getattr(args, "inline_comments", False) or os.getenv("REVIEW_INLINE_COMMENTS") == "1")):
         return {"inline_publication": "skipped"}
     try:
-        result, posted, refused, left = post(args.change, value, args.repo)
+        result, posted, refused, left = post(args.change, value, getattr(args, "forge_project", None), args.repo)
     except Stale as error:
         log.warning("Inline comments for %s were not posted (%s)", args.change, error)
         return {"inline_publication": "stale"}
-    # This path bypasses deskpost, so it must not be able to fail the review itself.
+    # This path bypasses the helper's publication checks, so it must not be able to fail the review itself.
     except Exception as error:
         reason = str(error) if isinstance(error, ReviewError) else (
             f"HTTP {error.response.status_code}" if isinstance(error, httpx.HTTPStatusError) else type(error).__name__)
