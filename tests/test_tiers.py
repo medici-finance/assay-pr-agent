@@ -327,8 +327,26 @@ class TierTests(unittest.TestCase):
         for n in range(1, 11):
             self.assertIn(f"Finding {n} ", comment)
         self.assertIn("fixture: could not check", comment)
-        self.assertIn("JSON report retains", comment)
+        self.assertIn("shortened to fit the forge comment", comment)
         self.assertTrue(all(item["message"] == message for item in report["findings"]))
+
+    def test_compact_comment_keeps_exact_paths_and_reports_skipped_path_counts(self):
+        report = self.check("--tier", "max", "--estimate")[1]
+        directory = "dir/" * 40
+        finding_paths = [directory + filename for filename in ("first.py", "second.py")]
+        findings = [dict(path=path, line=1, end_line=1, title="Issue", message="多" * 5000)
+                    for path in finding_paths]
+        skipped = ["src/skipped.py"] + [f"src/{'long/' * 640}{n}.py" for n in range(52)]
+        outside = ["src/outside.py"]
+        report.update(state="degraded", provider="cursor", findings=findings, degraded=skipped, omitted=outside)
+        with patch.object(cli, "post_comment") as post:
+            cli.publish("org/repo#1", self.head, report)
+        comment = post.call_args.args[3]
+        self.assertLessEqual(len(comment.encode("utf-8")), cli.FORGE_COMMENT_BYTES)
+        for path in [*finding_paths, *outside, skipped[0]]:
+            self.assertIn(path, comment)
+        disclosed = comment.count("- Not reviewed (token limit):")
+        self.assertIn(f"{len(skipped) - disclosed} files skipped by the token limit omitted", comment)
 
     def test_one_oversized_changed_file_does_not_remove_the_others_context(self):
         self.write("src/generated.py", "".join(f"TABLE_{n} = {n}\n" for n in range(context.MAX_BLOB // 10)))

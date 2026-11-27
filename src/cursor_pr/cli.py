@@ -148,7 +148,7 @@ def total_usage(passes):
 
 def finding_line(issue, *, compact=False):
     # Fence displayed text after clipping so the shortened value stays literal.
-    path = fence(issue["path"], 120 if compact else None)
+    path = fence(issue["path"])
     title = fence(issue["title"], 60 if compact else None)
     message = fence(issue["message"], 140 if compact else None)
     return f"- {path}:{issue['line']} — {title}. {message}"
@@ -159,23 +159,42 @@ def comment_text(rows):
     return "\n".join(" ".join(line.splitlines()) for line in rows) + "\n"
 
 
-def fit_tier_comment(header, findings, details, footer):
-    """Keep the tier summary and shortened findings before optional evidence rows."""
-    body = comment_text(header + [finding_line(issue, compact=True) for issue in findings]
-                        + ["Some details were shortened to fit the forge comment. The JSON report retains them."])
-    end = comment_text(footer)
-    omitted = f"{len(details)} additional rows omitted."
-    remaining = FORGE_COMMENT_BYTES - len((body + end + omitted + "\n").encode("utf-8"))
+def fit_comment_rows(rows, allowance, label, *, already_omitted=0):
+    """Fit whole rows and count entries that could not be shown."""
+    omitted = already_omitted + len(rows)
+    notice = f"{omitted} {label} omitted from this comment.\n"
+    remaining = allowance - len(notice.encode("utf-8"))
     included = []
-    for row in details:
+    for row in rows:
         rendered = comment_text([row])
         size = len(rendered.encode("utf-8"))
         if size <= remaining:
             included.append(rendered)
             remaining -= size
-    if len(included) < len(details):
-        included.append(f"{len(details) - len(included)} additional rows omitted.\n")
-    return body + "".join(included) + end
+            omitted -= 1
+    if omitted:
+        included.append(f"{omitted} {label} omitted from this comment.\n")
+    return "".join(included)
+
+
+def fit_tier_comment(header, findings, coverage, extra_coverage, outside, details, footer):
+    """Reserve room for coverage and use remaining space for findings and evidence."""
+    body = comment_text(header + ["Some review details were shortened to fit the forge comment."])
+    end = comment_text(footer)
+    space = FORGE_COMMENT_BYTES - len((body + end).encode("utf-8"))
+
+    skipped = fit_comment_rows(coverage, space // 4, "files skipped by the token limit",
+                               already_omitted=extra_coverage)
+    space -= len(skipped.encode("utf-8"))
+    outside_text = fit_comment_rows(outside, space // 6, "files outside review coverage")
+    space -= len(outside_text.encode("utf-8"))
+
+    evidence_reserve = min(space, 512) if details else 0
+    model = fit_comment_rows([finding_line(issue, compact=True) for issue in findings],
+                             space - evidence_reserve, "model findings")
+    space -= len(model.encode("utf-8"))
+    evidence = fit_comment_rows(details, space, "check and history rows")
+    return body + model + skipped + outside_text + evidence + end
 
 
 def publish(address, head, report, *, project=None, state=None):
@@ -184,13 +203,13 @@ def publish(address, head, report, *, project=None, state=None):
     body = [f"{label} review of {head}", report["state"]]
     degraded = report.get("degraded") or []
     coverage = []
+    extra_coverage = max(0, len(degraded) - MAX_DEGRADED_ROWS)
     if degraded:
         body.append(f"Degraded review: the full prompt is an estimated {report['full_input_tokens']} tokens, "
                     f"over the limit of {report.get('prompt_limit', report['max_input_tokens'])}. "
                     f"{label} did not review these files:")
         coverage.extend(f"- Not reviewed (token limit): {fence(path)}" for path in degraded[:MAX_DEGRADED_ROWS])
-        if len(degraded) > MAX_DEGRADED_ROWS:
-            coverage.append(f"- Not reviewed (token limit): {len(degraded) - MAX_DEGRADED_ROWS} more files")
+
     intro, body = body, []
     tier = report.get("tier", "regular")
     if tier != "regular" and report.get("delivered") is None:
@@ -239,12 +258,12 @@ def publish(address, head, report, *, project=None, state=None):
         body.extend(["", *history.summary(report["qualgen"]), ""])
     if "drift" in report:
         body.extend(["", *drift.summary(report["drift"]), ""])
-    for path in report["omitted"]:
-        body.append(f"- Outside review coverage: {fence(path)}")
+    outside = [f"- Outside review coverage: {fence(path)}" for path in report["omitted"]]
+    extra = [f"- Not reviewed (token limit): {extra_coverage} more files"] if extra_coverage else []
     footer = ["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."]
-    text = comment_text(intro + coverage + header + findings + body + footer)
+    text = comment_text(intro + coverage + extra + header + findings + body + outside + footer)
     if tier != "regular" and len(text.encode("utf-8")) > FORGE_COMMENT_BYTES:
-        text = fit_tier_comment(intro + header, report["findings"], body + coverage, footer)
+        text = fit_tier_comment(intro + header, report["findings"], coverage, extra_coverage, outside, body, footer)
         if len(text.encode("utf-8")) > FORGE_COMMENT_BYTES:
             raise ReviewError("Higher-tier review exceeded the forge comment limit")
     post_comment(project, int(number), head, text, state if state is not None else state_dir())
