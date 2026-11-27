@@ -104,6 +104,24 @@ def run_pass(row, prompt, anchors, args, source, *, cap, timeout):
     return answer, None
 
 
+def merged_fates(groups):
+    """One row per context block, from a prompt that used it when any did."""
+    rows = {}
+    for fates in groups:
+        for row in fates:
+            if row["name"] not in rows or (row["state"] in USED and rows[row["name"]]["state"] not in USED):
+                rows[row["name"]] = row
+    return rows
+
+
+def reached(prompts):
+    """The tier whose context the (pass name, block fates) prompts contained, each tier holding the one below."""
+    used = [(name, row["name"]) for name, fates in prompts for row in fates if row["state"] in USED]
+    if not any(block in context.MID for _, block in used):
+        return "regular"
+    return "max" if any(name == "deep" and block not in context.MID for name, block in used) else "mid"
+
+
 def total_usage(passes):
     """Preserve a single usage record and sum additive counters across fresh passes."""
     samples = [row["model_usage"] for row in passes if "model_usage" in row]
@@ -130,7 +148,11 @@ def publish(address, head, report, *, project=None, state=None):
         if len(degraded) > MAX_DEGRADED_ROWS:
             body.append(f"- Not reviewed (token limit): {len(degraded) - MAX_DEGRADED_ROWS} more files")
     tier = report.get("tier", "regular")
-    if tier != "regular":
+    if tier != "regular" and report.get("delivered") is None:
+        # Nothing reached the model: the state line below says why, and no tier or context was delivered.
+        body.append(f"Tier {tier}: budget {report['max_input_tokens']} tokens ({TIERS[tier]}× the configured "
+                    f"{report['base_input_tokens']}).")
+    elif tier != "regular":
         body.append(f"Tier {tier}: budget {report['max_input_tokens']} tokens ({TIERS[tier]}× the configured "
                     f"{report['base_input_tokens']}), estimated use {report['estimated_input_tokens']}.")
         if report["delivered"] != tier:
@@ -288,7 +310,7 @@ def execute(args):
         if tier != "regular":
             prompt, estimated, fates = with_context(
                 files, checks, prompt, estimated, dropped, limit, cap, context.MID, raw)
-        plans.append(({"name": "review", "estimated_input_tokens": estimated, "state": "planned"}, prompt, anchors))
+        plans.append(({"name": "review", "estimated_input_tokens": estimated, "state": "planned"}, prompt, anchors, fates))
         first_paths = {path for path, lines in anchors.items() if lines}
 
     deep_limit = limit
@@ -303,19 +325,15 @@ def execute(args):
             extra_context = any(row["name"] not in context.MID and row["state"] in USED for row in deep_fates)
             if new_paths or extra_context:
                 plans.append(({"name": "deep", "estimated_input_tokens": deep_size, "state": "planned"},
-                              deep, deep_anchors))
+                              deep, deep_anchors, deep_fates))
             else:
                 deep_fates = [dict(row, state="dropped") if row["state"] in USED else row for row in deep_fates]
 
-    passes = [row for row, _, _ in plans]
-    context_fates = {row["name"]: row for row in fates}
-    for row in deep_fates:
-        if row["name"] not in context_fates or (row["state"] in USED and context_fates[row["name"]]["state"] not in USED):
-            context_fates[row["name"]] = row
-    mid_delivered = "mid" if any(row["state"] in USED for row in fates) else "regular"
-    planned_tier = "max" if any(row["name"] == "deep" for row in passes) else mid_delivered
+    passes = [row for row, _, _, _ in plans]
+    context_fates = merged_fates([fates, deep_fates])
+    planned_tier = reached([(row["name"], blocks) for row, _, _, blocks in plans])
     reviewable = selected - set(unseen)
-    planned_paths = {path for _, _, locations in plans for path, lines in locations.items() if lines}
+    planned_paths = {path for _, _, locations, _ in plans for path, lines in locations.items() if lines}
     degraded = sorted(reviewable - planned_paths) if plans else []
     omitted = sorted(set(unseen) | (paths - selected))
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
@@ -332,22 +350,25 @@ def execute(args):
     if args.qualgen_store:
         report["qualgen"] = history.screen(root, args.qualgen_store, selected, change.head)
     if has_text and not passes:
-        return dict(report, state="over-budget", estimated_input_tokens=full, prompt_limit=deep_limit), 2
+        return dict(report, state="over-budget", estimated_input_tokens=full, prompt_limit=deep_limit, delivered=None), 2
     if args.estimate:
         return dict(report, state="estimate"), 2 if degraded or planned_tier != tier else 0
 
-    completed, coverage, findings, last_error = False, {}, [], None
-    report["delivered"] = "regular"
-    for row, pass_prompt, locations in plans:
+    completed, coverage, findings, last_error = [], {}, [], None
+    for row, pass_prompt, locations, blocks in plans:
         depth = "max" if row["name"] == "deep" else first_tier
         answer, error = run_pass(row, pass_prompt, locations, args, change.identity, cap=cap, timeout=TIMEOUTS[depth])
         if answer is None:
             last_error = error
             continue
-        completed = True
+        completed.append((row["name"], blocks))
         coverage.update({path: lines for path, lines in locations.items() if lines})
         findings = merge_findings(findings, answer["findings"]) if findings else answer["findings"]
-        report["delivered"] = "max" if depth == "max" else mid_delivered
+    # Report only what reached the model: a block of a pass that failed was not sent.
+    sent = merged_fates(blocks for _, blocks in completed)
+    report["context"] = [sent.get(name) or (dict(row, state="not sent") if row["state"] in USED else row)
+                         for name, row in context_fates.items()]
+    report["delivered"] = reached(completed) if completed else None
     if tier != "regular" and findings:
         before = len(findings)
         left = budget - report["estimated_input_tokens"]

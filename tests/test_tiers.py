@@ -210,6 +210,44 @@ class TierTests(unittest.TestCase):
         self.assertEqual((code, report["state"], report["verification"]), (2, "degraded", {"state": "unavailable", "before": 2}))
         self.assertEqual(len(report["findings"]), 2)  # Unverified findings are kept and labelled.
 
+    def test_delivered_tier_is_what_the_completed_prompts_contained(self):
+        # A deep pass with max-only context, but no mid-tier block in any prompt, is not a max review.
+        with patch.object(context, "gather", return_value={"whole changed files": "## src/app.py at the head\nx = 1"}):
+            code, report = self.check("--tier", "max")
+        self.assertEqual([kind for kind, _ in self.prompts()], ["review", "deep", "verification"])
+        self.assertEqual((code, report["state"], report["delivered"]), (2, "degraded", "regular"))
+        # A deep pass that only reviews another file adds no max context either.
+        self.write("src/data.py", "".join(f"VALUE_{n} = {n}  # generated row\n" for n in range(250)))
+        self.commit("add data rows")
+        with patch.object(context, "gather", return_value={"change description": "Describes this change."}):
+            code, report = self.check("--tier", "max", "--max-input-tokens", "1000")
+        self.assertEqual([row["name"] for row in report["passes"]], ["review", "deep", "verification"])
+        self.assertEqual((code, report["state"], report["delivered"]), (2, "degraded", "mid"))
+
+    def test_comment_and_report_claim_no_tier_or_context_that_did_not_reach_the_model(self):
+        def comment(report):
+            with patch.object(cli, "post_comment") as post:
+                cli.publish("org/repo#1", self.head, dict(report, provider="cursor"))
+            return post.call_args.args[3]
+        self.answers(review="fail")
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"], report["delivered"]), (2, "model-unavailable", None))
+        self.assertEqual({row["state"] for row in report["context"]} - {"empty"}, {"not sent"})
+        text = comment(report)
+        self.assertIn("Tier mid: budget 12000 tokens (2× the configured 6000).\n", text)
+        self.assertNotIn("delivered", text)
+        self.assertNotIn("Context beyond the patch", text)
+        code, report = self.check("--tier", "mid", "--max-input-tokens", "10")
+        self.assertEqual((code, report["state"], report["delivered"]), (2, "over-budget", None))
+        self.assertNotIn("delivered", comment(report))
+        # A failed deep pass sent none of its own context.
+        self.answers(review=answer(finding(42, "Real")), deep="fail", verification=answer(finding(42, "Real")))
+        code, report = self.check("--tier", "max", "--model", "other")
+        states = {row["name"]: row["state"] for row in report["context"]}
+        self.assertEqual((report["delivered"], states["whole changed files"], states["surrounding code"]),
+                         ("mid", "not sent", "included"))
+        self.assertIn("Context beyond the patch: change description, surrounding code, call sites.", comment(report))
+
     def test_model_invocations_are_counted_not_inferred_from_the_error(self):
         real = os.replace
 
