@@ -42,7 +42,8 @@ class ForgeHelperTests(unittest.TestCase):
             project = Project(provider="gitlab", url="https://gitlab.example/prefix/org/repo",
                               slug="org/repo", checkout=root, requesters=frozenset({7}))
             original = "a" * 40
-            change = dict(iid=9, state="opened", sha=original, changes_count="1", web_url=project.change_url(9))
+            change = dict(iid=9, state="opened", sha=original, changes_count="1", web_url=project.change_url(9),
+                          title="Align acceptance criteria", description="Verify the expected state.")
             posts = []
             prefix = "/prefix/api/v4/projects/org%2Frepo"
             mr = prefix + "/merge_requests/9"
@@ -95,6 +96,11 @@ class ForgeHelperTests(unittest.TestCase):
                         self.assertEqual(threads[9][0]["databaseId"], 14)
                         reviewed = source.forge_change("org/repo#9", project=project)
                         self.assertEqual((reviewed.head, reviewed.files[0].path), (original, "app.py"))
+                        self.assertEqual(reviewed.description, "")
+                        described = source.forge_change("org/repo#9", project=project, with_description=True)
+                        self.assertEqual((described.title, described.description),
+                                         ("Align acceptance criteria", "Verify the expected state."))
+                        self.assertEqual(described.head, original)
                         source.post_comment(project, 9, original, "Review finished.", root)
                         source.post_comment(project, 9, original, "Review finished.", root)
                         change["sha"] = "b" * 40

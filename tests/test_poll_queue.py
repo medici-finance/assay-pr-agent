@@ -1,5 +1,5 @@
 import argparse
-from contextlib import closing, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 import errno
 from datetime import datetime, timezone
 import io
@@ -15,15 +15,15 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from cursor_pr import cli
+from cursor_pr import cli, poll
 from cursor_pr.config import project_from
-from cursor_pr.poll import Jobs, cycle, instance_lock, main, run_review
+from cursor_pr.poll import Jobs, cycle, instance_lock, main, run_review, supervised
 from cursor_pr.source import Change, ReviewError
 
 HOLDER = """from pathlib import Path
 import sys
 from cursor_pr.poll import instance_lock
-with instance_lock(Path(sys.argv[1])):
+with instance_lock(Path(sys.argv[1]), wait=float(sys.argv[2]) if sys.argv[2:] else 0):
     pass
 """
 START = 1_800_000_000.0
@@ -68,32 +68,52 @@ def comment(number, body="looks good to me"):
     return dict(authorId=7, databaseId=number, authorType="User", body=body, createdAt=created, updatedAt=created)
 
 
-# Stands in for a review that outlives its poller. It ends when it is released, and also when the test's
-# directory is gone, so a test that fails before releasing it leaves no process behind.
-ORPHAN = ("import sys, time\nfrom pathlib import Path\nrelease = Path(sys.argv[1])\n"
-          "while not release.exists() and release.parent.exists(): time.sleep(0.05)")
-# A poller that is killed while its review runs. The review is started the way run_review starts one.
-KILLED = f"""from pathlib import Path
-import os, subprocess, sys
-from unittest.mock import patch
-from cursor_pr import poll
-from cursor_pr.config import project_from
-
-state, release = Path(sys.argv[1]), Path(sys.argv[2])
-with poll.instance_lock(state):
-    def review(argv, timeout, **kwargs):
-        subprocess.Popen([sys.executable, "-c", {ORPHAN!r}, str(release)], stderr=subprocess.DEVNULL, **kwargs)
-        return subprocess.CompletedProcess(argv, 0, stdout=b'{{"state":"reviewed", "publication":"posted-or-already-present"}}')
-    with patch("cursor_pr.poll.subprocess.run", side_effect=review):
-        poll.run_review(project_from(dict(provider="github", url="https://github.com/acme/api", requester_ids=[7],
-                                           checkout=str(state))), 3, state)
-os._exit(0)
+# A process that holds a lock on the file it is given and then waits. Whether it has ended is read
+# from the lock, which a process that was killed has released even before anyone has waited for it.
+BUSY = """import fcntl, sys, time
+held = open(sys.argv[1], "w")
+fcntl.flock(held, fcntl.LOCK_EX)
+open(sys.argv[1] + ".ready", "w").close()
+time.sleep(120)
 """
+# A poller that holds the instance lock and is waiting for a review when it is killed.
+POLLER = f"""from pathlib import Path
+import sys
+from cursor_pr import poll
+state = Path(sys.argv[1])
+with poll.instance_lock(state):
+    poll.supervised([sys.executable, "-c", {BUSY!r}, str(state / "review")])
+"""
+
+
+def gone(path, within=15):
+    # Whether the process that locked this file has ended, however it ended.
+    import fcntl
+    deadline = time.monotonic() + within
+    while True:
+        with open(path, "a") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                pass
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+
+
+def started(path, within=15):
+    deadline = time.monotonic() + within
+    while not Path(str(path) + ".ready").exists():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"{path} was never started")
+        time.sleep(0.02)
 
 
 def child_of(state, job):
     # The options the poller gives the review child for a request, as the child's parser reads them.
-    return argparse.Namespace(queue=state / "requests.sqlite3", request=[job[0], str(job[1]), str(job[2])])
+    return argparse.Namespace(queue=state / "requests.sqlite3", request=[job[0], str(job[1]), str(job[2])],
+                              own_row=True)
 
 
 class QueueRestartTests(unittest.TestCase):
@@ -123,15 +143,16 @@ class QueueRestartTests(unittest.TestCase):
         # it is let through, ends as its report says.
         def child(argv, **kwargs):
             at = argv.index("--request")
-            args = argparse.Namespace(queue=Path(argv[argv.index("--queue") + 1]), request=argv[at + 1:at + 4])
+            args = argparse.Namespace(queue=Path(argv[argv.index("--queue") + 1]), request=argv[at + 1:at + 4],
+                                      own_row=True)
             try:
                 cli.claim_head(args, head)
             except ReviewError:
                 cli.settle(args, "failed")
-                return Mock(stdout=b"")
+                return b""
             cli.settle(args, cli.review_outcome(json.loads(answered)))
-            return Mock(stdout=answered)
-        with patch("cursor_pr.poll.poll_project"), patch("cursor_pr.poll.subprocess.run", side_effect=child) as run:
+            return answered
+        with patch("cursor_pr.poll.poll_project"), patch("cursor_pr.poll.supervised", side_effect=child) as run:
             cycle({self.gh.key: self.gh}, self.state, jobs, {self.gh.key: None})
             return run.call_args.args[0]
 
@@ -245,7 +266,7 @@ class QueueRestartTests(unittest.TestCase):
         self.assertEqual(self.sql("SELECT status, attempts, head FROM requests"), [("reviewed", 1, "a" * 40)])
 
     def test_review_started_outside_the_queue_is_given_neither(self):
-        with patch("cursor_pr.poll.subprocess.run", return_value=Mock(stdout=self.REVIEWED)) as run:
+        with patch("cursor_pr.poll.supervised", return_value=self.REVIEWED) as run:
             self.assertEqual(run_review(self.gh, 3, self.state), "reviewed")
         self.assertNotIn("--queue", run.call_args.args[0])
         self.assertNotIn("--request", run.call_args.args[0])
@@ -333,8 +354,8 @@ class QueueRestartTests(unittest.TestCase):
         for report in ({"state": "reviewed", "publication": "posted-or-already-present"}, {"state": "reviewed"},
                        {"state": "model-unavailable", "publication": "posted-or-already-present"},
                        {"state": "partial", "publication": "failed"}):
-            with self.subTest(report=report), patch("cursor_pr.poll.subprocess.run") as run:
-                run.return_value.stdout = json.dumps(report).encode()
+            with self.subTest(report=report), patch("cursor_pr.poll.supervised") as run:
+                run.return_value = json.dumps(report).encode()
                 self.assertEqual(run_review(self.gh, 3, self.state), cli.review_outcome(report))
 
 
@@ -362,6 +383,7 @@ class RequestRowTests(unittest.TestCase):
         args = cli.parser().parse_args(["--change", "acme/api#3", "--expected-change-url", change.identity,
                                         "--estimate", "--cache-dir", str(self.state / "cache"), *options])
         args.max_input_tokens = 6000
+        args.own_row = True  # As the entry point marks a row it has checked against the change.
         with patch("cursor_pr.cli.forge_change", return_value=change):
             return cli.execute(args)
 
@@ -376,6 +398,7 @@ class RequestRowTests(unittest.TestCase):
         url = "https://github.com/acme/api/pull/3"
         args = cli.parser().parse_args(["--change", address, "--expected-change-url", url, "--post", *self.options])
         args.max_input_tokens = 6000
+        args.own_row = True  # As the entry point marks a row it has checked against the change.
         with patch("cursor_pr.cli.forge_change", return_value=Change(head, [], url)), \
                 patch("cursor_pr.cli.publish") as publish:
             first, code = cli.run_request(args)
@@ -421,7 +444,6 @@ class RequestRowTests(unittest.TestCase):
         with patch("sys.argv", argv), patch("cursor_pr.cli.run_request", side_effect=failing, return_value=(
                 {"state": "reviewed", "publication": "posted-or-already-present"}, 0)) as request, \
                 patch("cursor_pr.cli.tempfile.TemporaryDirectory", side_effect=leaving or tempfile.TemporaryDirectory), \
-                patch("cursor_pr.cli.os.setpgrp"), \
                 patch.dict(os.environ, {"CURSOR_REVIEW_POLLER_CHILD": "1", "REVIEW_STATE_DIR": str(self.state),
                                         "REVIEW_FORGE_PROJECT": json.dumps(project)}), \
                 patch("sys.stderr", new_callable=io.StringIO) as err:
@@ -465,22 +487,77 @@ class RequestRowTests(unittest.TestCase):
         self.assertEqual((code, "Forge is down" in err), (2, True))
         self.assertEqual(self.row()[0], "failed")
 
-    def test_request_without_a_queue_is_refused_cleanly(self):
-        # The review is replaced here. The real one refuses these options before any work, like this.
-        code, _, err = self.enter("--request", self.KEY, "3", "81",
-                                  failing=ReviewError("--queue and --request go together and require --change"))
-        self.assertEqual((code, err), (2, "cursor-review: --queue and --request go together and require --change\n"))
+    def refused(self, *options):
+        # A mistaken call, which the parser must refuse before the review may settle anything.
+        with patch("sys.argv", ["cursor-review", *options]), patch("cursor_pr.cli.run_request") as request, \
+                patch("cursor_pr.cli.settle") as settle, patch("sys.stderr", new_callable=io.StringIO) as err, \
+                self.assertRaises(SystemExit) as stopped:
+            cli.main()
+        self.assertEqual(stopped.exception.code, 2)
+        request.assert_not_called()
+        settle.assert_not_called()
+        self.assertEqual(self.row(), ("started", ""))  # The row may be another review's, still running.
+        return err.getvalue()
+
+    def test_mistaken_queue_options_are_refused_before_any_row_is_settled(self):
+        change = ("--change", "acme/api#3", "--max-input-tokens", "6000")
+        for options in ((*change, "--request", self.KEY, "3", "81"), (*change, "--queue", str(self.queue)),
+                        ("--base", "HEAD~1", *self.options)):
+            with self.subTest(options=options):
+                self.assertIn("--queue and --request go together and require --change", self.refused(*options))
+        self.assertIn("--request takes a project, a change number and a comment number",
+                      self.refused(*change, "--queue", str(self.queue), "--request", self.KEY, "three", "81"))
+
+    def test_request_for_another_change_is_refused_and_its_row_left_alone(self):
+        # The row named is the running request of another change, or of the same number elsewhere.
+        jobs = Jobs(self.state)
+        jobs.enqueue(self.KEY, 4, 82)
+        jobs.enqueue("gitlab/gitlab.com/acme/api", 3, 83)
+        while jobs.next():
+            pass
+        for request in ((self.KEY, "4", "82"), ("gitlab/gitlab.com/acme/api", "3", "83")):
+            with self.subTest(request=request):
+                code, review, err = self.enter("--queue", str(self.queue), "--request", *request)
+                review.assert_not_called()
+                self.assertEqual((code, err), (2, "cursor-review: --request names another change than --change\n"))
+        with closing(sqlite3.connect(self.queue)) as db:
+            self.assertEqual(db.execute("SELECT number, comment, status, head FROM requests ORDER BY rowid").fetchall(),
+                             [(3, 81, "started", ""), (4, 82, "started", ""), (3, 83, "started", "")])
+
+    def test_failure_before_the_row_is_known_to_be_the_reviews_own_settles_nothing(self):
+        # Here the project the poller passes cannot be read. The poller, which is waiting, finishes the row.
+        project = dict(provider="github", url="https://github.com/acme/api", checkout=str(self.state), requester_ids=[7])
+        argv = ["cursor-review", "--change", "acme/api#3", "--expected-change-url",
+                project_from(project).change_url(3), "--max-input-tokens", "6000", *self.options]
+        with patch("sys.argv", argv), patch("cursor_pr.cli.run_request") as review, \
+                patch.dict(os.environ, {"CURSOR_REVIEW_POLLER_CHILD": "1", "REVIEW_STATE_DIR": str(self.state),
+                                        "REVIEW_FORGE_PROJECT": "not json"}), \
+                patch("sys.stderr", new_callable=io.StringIO):
+            self.assertEqual(cli.main(), 2)
+        review.assert_not_called()
         self.assertEqual(self.row()[0], "started")
 
-    WAITING = """
-    subprocess.run([sys.executable, "-c", "import sys, time; open(sys.argv[1], 'w').close(); time.sleep(60)",
-                    str(state / "waiting")])"""
+    def test_failure_is_settled_before_its_diagnostic_can_fail(self):
+        class Gone(io.StringIO):
+            # Nobody reads the review's diagnostics any more.
+            def write(self, text):
+                raise BrokenPipeError(32, "Broken pipe")
 
-    def hang(self, review, cleanup_seconds=30, waiting=None):
-        # The review child as the poller starts it, with a time limit of one second and a review that
-        # waits on a command for a minute. The command says when it is running and the review says
-        # when its cleanup ran.
-        hung = f"""import subprocess, sys, time
+        project = dict(provider="github", url="https://github.com/acme/api", checkout=str(self.state),
+                       requester_ids=[7])
+        argv = ["cursor-review", "--change", "acme/api#3", "--expected-change-url",
+                project_from(project).change_url(3), "--max-input-tokens", "6000", *self.options]
+        with patch("sys.argv", argv), patch("cursor_pr.cli.run_request", side_effect=ReviewError("Forge is down")), \
+                patch.dict(os.environ, {"CURSOR_REVIEW_POLLER_CHILD": "1", "REVIEW_STATE_DIR": str(self.state),
+                                        "REVIEW_FORGE_PROJECT": json.dumps(project)}), \
+                patch("sys.stderr", Gone()), self.assertRaises(BrokenPipeError):
+            cli.main()
+        self.assertEqual(self.row()[0], "failed")  # Not left running for a restart to repeat.
+
+    def stop(self, cleanup="pass", again=False):
+        # The review child as the poller starts it, waiting on a command, when its supervisor asks it
+        # to stop. The command holds a lock while it runs and the review says when its cleanup ran.
+        waiting = f"""import subprocess, sys
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -492,112 +569,433 @@ def settings(**kwargs):
         yield str(state)
     finally:
         (state / "cleaned").touch()
-        {review}
-def wait(args):{waiting or self.WAITING}
+        {cleanup}
+def wait(args):
+    subprocess.run([sys.executable, "-c", {BUSY!r}, str(state / "command")])
 sys.argv[0] = "cursor-review"
-with patch("cursor_pr.cli.QUEUED_REVIEW_SECONDS", 1), patch("cursor_pr.cli.CLEANUP_SECONDS", {cleanup_seconds}), \\
-        patch("cursor_pr.cli.tempfile.TemporaryDirectory", side_effect=settings), \\
+with patch("cursor_pr.cli.tempfile.TemporaryDirectory", side_effect=settings), \\
         patch("cursor_pr.cli.run_request", side_effect=wait):
     sys.exit(cli.main())
 """
         project = dict(provider="github", url="https://github.com/acme/api", checkout=str(self.state),
                        requester_ids=[7])
-        started = time.monotonic()
-        ended = subprocess.run([sys.executable, "-c", hung, "--change", "acme/api#3", "--expected-change-url",
-                                "https://github.com/acme/api/pull/3", "--max-input-tokens", "6000", *self.options],
-                               capture_output=True, text=True, timeout=30,
-                               env=dict(os.environ, CURSOR_REVIEW_POLLER_CHILD="1", REVIEW_STATE_DIR=str(self.state),
-                                        REVIEW_FORGE_PROJECT=json.dumps(project)))
-        return ended, time.monotonic() - started
-
-    def test_queued_review_that_hangs_gives_up_cleans_up_and_leaves_its_row_running(self):
-        ended, took = self.hang("pass")
-        self.assertEqual(ended.returncode, -signal.SIGKILL, ended.stderr)
-        self.assertIn("cursor-review: still running after 1 seconds, giving up", ended.stderr)
-        self.assertLess(took, 20)  # The command it waited on for a minute was killed, not waited for.
-        self.assertTrue((self.state / "waiting").exists())
+        review = subprocess.Popen(
+            [sys.executable, "-c", waiting, "--change", "acme/api#3", "--expected-change-url",
+             project_from(project).change_url(3), "--max-input-tokens", "6000", *self.options],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=dict(os.environ, CURSOR_REVIEW_POLLER_CHILD="1", REVIEW_STATE_DIR=str(self.state),
+                     REVIEW_FORGE_PROJECT=json.dumps(project)))
+        self.addCleanup(review.kill)
+        started(self.state / "command")
+        review.send_signal(signal.SIGTERM)
+        if again:  # As when a service manager and the supervisor both ask.
+            deadline = time.monotonic() + 15
+            while not (self.state / "cleaning").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            review.send_signal(signal.SIGTERM)
+        out, err = review.communicate(timeout=20)
+        self.assertEqual((review.returncode, out), (1, ""), err)
         self.assertTrue((self.state / "cleaned").exists())
-        self.assertEqual(self.row()[0], "started")  # For the next poller to queue again or give up on.
+        self.assertTrue(gone(self.state / "command"))  # The command it waited on was ended with it.
+        self.assertEqual(self.row()[0], "started")  # For the poller to finish, or the next one to queue again.
+        return err
 
-    def test_queued_review_whose_cleanup_hangs_too_is_ended_outright(self):
-        ended, took = self.hang("time.sleep(60)", cleanup_seconds=1)
-        self.assertEqual(ended.returncode, -signal.SIGKILL, ended.stderr)
-        self.assertLess(took, 20)
-        self.assertEqual(self.row()[0], "started")
+    def test_review_asked_to_stop_cleans_up_and_leaves_its_row_running(self):
+        self.assertIn("cursor-review: stopped by its supervisor\n", self.stop())
 
-    def test_queued_review_stuck_where_no_handler_runs_is_ended_from_outside(self):
-        # As in a native call that never returns to the interpreter: the alarm is never delivered.
-        ended, took = self.hang("pass", cleanup_seconds=1, waiting="""
-    import signal
-    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
-    time.sleep(60)""")
-        self.assertEqual(ended.returncode, -signal.SIGKILL, ended.stderr)
-        self.assertNotIn("giving up", ended.stderr)  # It never got to unwind.
-        self.assertLess(took, 20)
-        self.assertEqual(self.row()[0], "started")
+    def test_review_asked_to_stop_twice_still_finishes_its_cleanup(self):
+        slow = '(state / "cleaning").touch(); import time; time.sleep(0.5); (state / "finished").touch()'
+        self.assertIn("cursor-review: stopped by its supervisor\n", self.stop(slow, again=True))
+        self.assertTrue((self.state / "finished").exists())
 
-    def test_watchdog_ends_the_commands_the_review_was_waiting_on(self):
-        # The review is stuck where no handler runs while a command of its own is running.
-        ended, took = self.hang("pass", cleanup_seconds=1, waiting="""
-    import os, signal
-    helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-    (state / "helper").write_text(f"{helper.pid} {os.getpgid(helper.pid)} {os.getpid()}")
-    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
-    time.sleep(60)""")
-        self.assertEqual(ended.returncode, -signal.SIGKILL, ended.stderr)
-        self.assertLess(took, 20)
-        helper, group, review = map(int, (self.state / "helper").read_text().split())
-        self.assertEqual(group, review)  # The command ran in the review's own group,
-        self.assertNotEqual(group, os.getpgrp())  # which is not the one of whoever started the review.
-        # The helper inherited the captured report pipe. Its EOF let the wait above finish
-        # before the helper's sleep ended, even on hosts that have not yet reaped the helper.
-
-    def test_watchdog_ends_commands_after_the_review_dies(self):
-        ended, took = self.hang("pass", waiting="""
-    import os, signal
-    subprocess.Popen([sys.executable, "-c", "import time; time.sleep(25)"])
-    os.kill(os.getpid(), signal.SIGKILL)""")
-        self.assertEqual(ended.returncode, -signal.SIGKILL, ended.stderr)
-        self.assertLess(took, 20)  # The command's inherited report pipe has closed.
-        self.assertEqual(self.row()[0], "started")
-
-    def test_poller_does_not_wait_for_a_review_past_its_limits(self):
-        from cursor_pr import poll
-        self.assertGreater(poll.REVIEW_WAIT_SECONDS, cli.QUEUED_REVIEW_SECONDS + cli.CLEANUP_SECONDS)
-        project = project_from(dict(provider="github", url="https://github.com/acme/api", requester_ids=[7],
-                                    checkout=str(self.state)))
-        with patch("cursor_pr.poll.subprocess.run", side_effect=subprocess.TimeoutExpired("review", 1)) as run, \
-                self.assertLogs("cursor_pr.poll", level="WARNING") as logged:
-            self.assertEqual(run_review(project, 3, self.state, 81), "failed")
-        self.assertEqual(run.call_args.kwargs["timeout"], poll.REVIEW_WAIT_SECONDS)
-        self.assertIn("Review acme/api#3 did not end within", logged.output[0])
-
-    def test_watchdog_inherits_only_the_poller_lock(self):
-        with (self.state / "lock").open("wb") as lock, \
-                patch.dict(os.environ, {"CURSOR_REVIEW_LOCK_FD": str(lock.fileno())}), \
-                patch("cursor_pr.cli.subprocess.Popen", wraps=subprocess.Popen) as started, \
-                patch("sys.stdout", new_callable=io.StringIO):
-            lock_fd = lock.fileno()
-            self.enter(*self.options)
-        self.assertEqual(started.call_count, 1)
-        self.assertEqual(started.call_args.kwargs["pass_fds"], (lock_fd,))
-        self.assertTrue(started.call_args.kwargs["start_new_session"])
+    def test_queue_may_be_named_relative_to_where_the_review_was_started(self):
+        elsewhere = self.state / "checkout"
+        elsewhere.mkdir()
+        here = Path.cwd()
+        self.addCleanup(os.chdir, here)
+        os.chdir(self.state)
+        with patch("sys.stdout", new_callable=io.StringIO):
+            code, _, err = self.enter("--queue", "requests.sqlite3", "--request", self.KEY, "3", "81",
+                                      "--repo", str(elsewhere))
+        self.assertEqual((code, err), (0, ""))
         self.assertEqual(self.row()[0], "reviewed")
 
-    def test_review_outside_the_queue_has_no_limit_of_its_own(self):
-        with patch("cursor_pr.cli.signal.alarm") as alarm, patch("cursor_pr.cli.subprocess.Popen") as watchdog, \
-                patch("sys.stdout", new_callable=io.StringIO):
-            self.enter()
-        alarm.assert_not_called()
-        watchdog.assert_not_called()
+    def test_review_does_not_touch_a_row_that_was_not_checked_against_its_change(self):
+        change = Change("b" * 40, [], "https://github.com/acme/api/pull/3")
+        args = cli.parser().parse_args(["--change", "acme/api#3", "--expected-change-url", change.identity,
+                                        "--estimate", "--cache-dir", str(self.state / "cache"), *self.options])
+        args.max_input_tokens = 6000
+        with patch("cursor_pr.cli.forge_change", return_value=change), self.assertRaises(ReviewError):
+            cli.execute(args)
+        self.assertEqual(self.row(), ("started", ""))
+
+    def test_review_whose_cleanup_fails_while_it_stops_is_still_an_interrupted_one(self):
+        # Not a review that ran and failed: its row must stay for the retry.
+        err = self.stop('raise OSError("Directory not empty")')
+        self.assertIn("cursor-review: stopped by its supervisor (Directory not empty)\n", err)
+
+    def test_review_keeps_the_stop_request_to_itself(self):
+        before = signal.getsignal(signal.SIGTERM)
+        for options in ((), self.options):
+            with self.subTest(options=options), patch("sys.stdout", new_callable=io.StringIO):
+                self.enter(*options)
+            self.assertIs(signal.getsignal(signal.SIGTERM), before)
 
     def test_review_that_cannot_reach_its_row_still_reports_its_failure(self):
-        code, _, err = self.enter("--queue", str(self.queue), "--request", self.KEY, "three", "81",
+        code, _, err = self.enter("--queue", str(self.state / "absent.sqlite3"), "--request", self.KEY, "3", "81",
                                   failing=ReviewError("Forge is down"))
         self.assertEqual(code, 2)
         self.assertIn("Forge is down", err)
         self.assertIn("could not record how the review ended", err)
         self.assertEqual(self.row()[0], "started")
+
+
+class SupervisorTests(unittest.TestCase):
+    """The process between the poller and a review, run as the poller runs it, with real processes."""
+    ENDED = -signal.SIGKILL  # The supervisor ends with its group, whatever the review did.
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = Path(tmp.name)
+        self.open = set()
+
+    def supervise(self, command, seconds=60, keep=(), grace=None, number=None):
+        # Returns the supervisor and the end of the lifeline that the poller holds.
+        lifeline, hold = os.pipe()
+        if number is not None:  # The lifeline under the number it would have in a poller with many files open.
+            os.dup2(lifeline, number)
+            os.close(lifeline)
+            lifeline = number
+        self.open.add(hold)
+        self.addCleanup(self.let_go, hold)
+        argv = [str(lifeline), str(seconds), ",".join(map(str, keep)), *command]
+        if grace is None:
+            start = [sys.executable, "-I", str(poll.SUPERVISOR), *argv]
+        else:  # The same code with a shorter wait between asking a review to stop and ending it.
+            start = [sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv.pop(1)); import supervise\n"
+                     f"supervise.GRACE_SECONDS = {grace}; sys.exit(supervise.main(sys.argv[1:]))",
+                     str(poll.SUPERVISOR.parent), *argv]
+        process = subprocess.Popen(start, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, pass_fds=(lifeline, *keep), process_group=0)
+        os.close(lifeline)
+        # Its group as well: a test that fails must leave nothing of it behind.
+        self.addCleanup(lambda: [self.end(process.pid, how) for how in (os.kill, os.killpg)] and process.wait())
+        return process, hold
+
+    @staticmethod
+    def end(number, how):
+        try:
+            how(number, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def let_go(self, hold):
+        # Once only: a later lifeline may have been given the same number.
+        if hold in self.open:
+            self.open.discard(hold)
+            os.close(hold)
+
+    def busy(self, name):
+        return [sys.executable, "-c", BUSY, str(self.state / name)]
+
+    def stopped(self, process, reason):
+        out, err = process.communicate(timeout=20)
+        self.assertEqual((process.returncode, out, err),
+                         (self.ENDED, "", f"cursor-review: the review was stopped: {reason}\n"))
+
+    def test_review_that_ends_has_its_output_passed_on(self):
+        for code in (0, 2):
+            with self.subTest(code=code):
+                process, _ = self.supervise([sys.executable, "-c", f"import sys; print('report'); sys.exit({code})"])
+                self.assertEqual((process.communicate(timeout=20), process.returncode), (("report\n", ""), self.ENDED))
+
+    def test_review_is_ended_when_its_poller_is_gone(self):
+        process, hold = self.supervise(self.busy("review"))
+        started(self.state / "review")
+        self.let_go(hold)  # All a poller that was killed does.
+        self.stopped(process, "the poller that started it is gone")
+        self.assertTrue(gone(self.state / "review"))
+
+    def test_lifeline_may_have_any_descriptor_number(self):
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard < 2048:
+            self.skipTest("cannot open a descriptor numbered above 1024 here")
+        resource.setrlimit(resource.RLIMIT_NOFILE, (2048, hard))
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        process, hold = self.supervise(self.busy("review"), number=1500)
+        started(self.state / "review")
+        self.assertIsNone(process.poll())  # Still watching, not ended by a wait that refuses the number.
+        self.let_go(hold)
+        self.stopped(process, "the poller that started it is gone")
+        self.assertTrue(gone(self.state / "review"))
+
+    def test_review_is_ended_when_the_supervisor_cannot_watch(self):
+        # As when it is given a lifeline it cannot wait on: here one that is not open.
+        process = subprocess.Popen([sys.executable, "-I", str(poll.SUPERVISOR), "987", "60", "", *self.busy("review")],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, process_group=0)
+        self.addCleanup(process.kill)
+        _, err = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, self.ENDED)
+        self.assertIn("cursor-review: the review was stopped: its supervisor failed:", err)
+        self.assertTrue(gone(self.state / "review"))
+
+    def test_supervisor_started_inside_another_group_starts_nothing(self):
+        # Ending its group would then end whoever started it.
+        lifeline, hold = os.pipe()
+        self.addCleanup(os.close, hold)
+        process = subprocess.Popen([sys.executable, "-I", str(poll.SUPERVISOR), str(lifeline), "60", "",
+                                    *self.busy("review")], stderr=subprocess.PIPE, text=True, pass_fds=(lifeline,))
+        os.close(lifeline)
+        _, err = process.communicate(timeout=20)
+        self.assertEqual((process.returncode, err), (
+            124, "cursor-review: the supervisor must be started as the leader of its own process group\n"))
+        self.assertFalse((self.state / "review.ready").exists())
+
+    def test_supervisor_and_review_are_one_group_apart_from_the_pollers(self):
+        report = "import os; print(os.getpgrp(), os.getppid(), os.getpgid(os.getppid()))"
+        process, _ = self.supervise([sys.executable, "-c", report])
+        out, err = process.communicate(timeout=20)
+        self.assertEqual(([int(number) for number in out.split()], err), ([process.pid] * 3, ""))
+        self.assertNotEqual(process.pid, os.getpgrp())  # A signal to the poller's group reaches neither.
+
+    def test_review_is_ended_when_its_time_is_up(self):
+        process, _ = self.supervise(self.busy("review"), seconds=0.5)
+        self.stopped(process, "it was still running after 0.5 seconds")
+        self.assertTrue(gone(self.state / "review"))
+
+    def test_review_is_ended_when_its_supervisor_is_told_to_stop(self):
+        for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+            with self.subTest(signal=number.name):
+                process, _ = self.supervise(self.busy(number.name))
+                started(self.state / number.name)
+                process.send_signal(number)
+                self.stopped(process, "its supervisor was told to stop")
+                self.assertTrue(gone(self.state / number.name))
+
+    def test_signal_the_poller_was_started_to_ignore_does_not_end_the_review(self):
+        # As under nohup: the poller ignores the hangup and goes on, and so must its review.
+        for number in (signal.SIGHUP, signal.SIGINT):
+            with self.subTest(signal=number.name):
+                before = signal.signal(number, signal.SIG_IGN)
+                try:
+                    process, hold = self.supervise(self.busy(number.name))
+                finally:
+                    signal.signal(number, before)
+                started(self.state / number.name)
+                process.send_signal(number)
+                time.sleep(0.3)
+                self.assertIsNone(process.poll())
+                self.assertFalse(gone(self.state / number.name, within=0))
+                self.let_go(hold)
+                self.stopped(process, "the poller that started it is gone")
+
+    def test_commands_a_review_started_are_ended_with_it(self):
+        # The review starts a command and then: waits on it, ends without it, or is killed.
+        review = ("import os, signal, subprocess, sys, time\n"
+                  f"subprocess.Popen([sys.executable, '-c', {BUSY!r}, sys.argv[1]])\n"
+                  "while not os.path.exists(sys.argv[1] + '.ready'): time.sleep(0.02)\n")
+        for name, then in (("waits", "time.sleep(120)"), ("ends", ""), ("killed", "os.kill(os.getpid(), signal.SIGKILL)")):
+            with self.subTest(review=name):
+                process, hold = self.supervise([sys.executable, "-c", review + then, str(self.state / name)])
+                started(self.state / name)
+                if name == "waits":
+                    self.let_go(hold)
+                process.communicate(timeout=20)
+                self.assertEqual(process.returncode, self.ENDED)
+                self.assertTrue(gone(self.state / name))
+
+    def test_review_is_ended_even_when_nobody_reads_the_diagnostics(self):
+        # The supervisor's stderr is a pipe that is full and whose reader does not read.
+        reader, writer = os.pipe()
+        self.addCleanup(os.close, reader)
+        os.set_blocking(writer, False)
+        try:
+            while True:
+                os.write(writer, b"x" * 65536)
+        except BlockingIOError:
+            pass
+        os.set_blocking(writer, True)
+        lifeline, hold = os.pipe()
+        process = subprocess.Popen([sys.executable, "-I", str(poll.SUPERVISOR), str(lifeline), "60", "",
+                                    *self.busy("review")], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=writer, pass_fds=(lifeline,), process_group=0)
+        os.close(lifeline)
+        os.close(writer)
+        self.addCleanup(lambda: [self.end(process.pid, how) for how in (os.kill, os.killpg)] and process.wait())
+        started(self.state / "review")
+        began = time.monotonic()
+        os.close(hold)
+        self.assertEqual(process.wait(timeout=20), self.ENDED)
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertTrue(gone(self.state / "review"))
+
+    def test_review_that_ignores_the_request_to_stop_is_ended_anyway(self):
+        stubborn = "import signal, sys\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n" + BUSY
+        process, hold = self.supervise([sys.executable, "-c", stubborn, str(self.state / "review")], grace=0.3)
+        started(self.state / "review")
+        self.let_go(hold)
+        process.communicate(timeout=20)
+        self.assertEqual(process.returncode, self.ENDED)
+        self.assertTrue(gone(self.state / "review"))
+
+    def test_review_asked_to_stop_is_given_time_to_leave(self):
+        polite = ("import signal, sys, time\nfrom pathlib import Path\n"
+                  "def leave(*received):\n    Path(sys.argv[1] + '.left').touch(); sys.exit(1)\n"
+                  "signal.signal(signal.SIGTERM, leave)\nPath(sys.argv[1] + '.ready').touch()\ntime.sleep(120)\n")
+        process, hold = self.supervise([sys.executable, "-c", polite, str(self.state / "review")])
+        started(self.state / "review")
+        began = time.monotonic()
+        self.let_go(hold)
+        process.communicate(timeout=20)
+        self.assertTrue((self.state / "review.left").exists())
+        self.assertLess(time.monotonic() - began, 4)  # It left at once, so the wait for it ended at once.
+
+    def test_lock_is_held_by_the_review_too(self):
+        # So that a review whose supervisor was killed still keeps another poller out while it runs.
+        import fcntl
+        with open(self.state / "lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            process, _ = self.supervise(self.busy("review"), keep=(lock.fileno(),))
+        started(self.state / "review")
+        os.kill(process.pid, signal.SIGKILL)  # Only the supervisor.
+        process.wait()
+        self.assertFalse(gone(self.state / "lock", within=0.5))
+        self.assertFalse(gone(self.state / "review", within=0))
+
+    def test_lock_is_free_once_the_supervisor_has_ended_the_review(self):
+        import fcntl
+        with open(self.state / "lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            process, hold = self.supervise(self.busy("review"), keep=(lock.fileno(),))
+        started(self.state / "review")
+        self.let_go(hold)
+        process.communicate(timeout=20)
+        self.assertTrue(gone(self.state / "lock", within=2))
+        self.assertTrue(gone(self.state / "review", within=0))  # Not before the review was gone.
+
+
+class SupervisedTests(unittest.TestCase):
+    """How the poller runs a review under the supervisor."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = Path(tmp.name)
+
+    def busy(self, name="review"):
+        return [sys.executable, "-c", BUSY, str(self.state / name)]
+
+    def test_poller_reads_what_the_review_printed(self):
+        self.assertEqual(poll.supervised([sys.executable, "-c", "print('report')"], cwd=self.state), b"report\n")
+
+    def test_review_is_started_without_the_pollers_input(self):
+        probe = "import os, sys; print(os.fstat(0).st_rdev == os.stat(os.devnull).st_rdev, sys.stdin.read() == '')"
+        self.assertEqual(poll.supervised([sys.executable, "-c", probe]), b"True True\n")
+
+    def test_review_past_its_time_is_ended_and_reported_as_failed(self):
+        project = project_from(dict(provider="github", url="https://github.com/acme/api", requester_ids=[7],
+                                    checkout=str(self.state)))
+        with patch("cursor_pr.poll.REVIEW_SECONDS", 0.5), \
+                patch("cursor_pr.poll.supervised", side_effect=lambda argv, **options: supervised(self.busy())):
+            self.assertEqual(run_review(project, 3, self.state), "failed")
+        self.assertTrue(gone(self.state / "review"))
+
+    def supervisor_that(self, name, then):
+        # In place of the supervisor: one that starts the review and then does this.
+        script = self.state / f"{name}.py"
+        script.write_text("import os, signal, subprocess, sys, time\n"
+                          f"subprocess.Popen([sys.executable, '-c', {BUSY!r}, sys.argv[-1]])\n"
+                          "while not os.path.exists(sys.argv[-1] + '.ready'): time.sleep(0.02)\n" + then + "\n")
+        return patch("cursor_pr.poll.SUPERVISOR", script)
+
+    def test_poller_ends_the_review_itself_when_the_supervisor_is_stuck(self):
+        with self.supervisor_that("stuck", "time.sleep(120)"), patch("cursor_pr.poll.REVIEW_SECONDS", 0.5), \
+                patch("cursor_pr.poll.STOP_SECONDS", 0.5):
+            began = time.monotonic()
+            self.assertIsNone(poll.supervised([str(self.state / "review")]))
+        self.assertLess(time.monotonic() - began, 10)
+        self.assertTrue(gone(self.state / "review", within=5))
+
+    def test_poller_notices_at_once_when_the_supervisor_alone_is_killed(self):
+        # Not only when the review's time is up: until then the review would run with nobody to end it.
+        with self.supervisor_that("killed", "os.kill(os.getpid(), signal.SIGKILL)"), \
+                patch("cursor_pr.poll.DRAIN_SECONDS", 0.3):
+            began = time.monotonic()
+            self.assertEqual(poll.supervised([str(self.state / "review")]), b"")
+        self.assertLess(time.monotonic() - began, 10)  # Against the half hour the review is allowed.
+        # Signalled before the poller goes on. A process that is not the poller's own cannot be
+        # waited for, so its end follows a moment later.
+        self.assertTrue(gone(self.state / "review", within=5))
+
+    def test_command_that_keeps_writing_after_the_supervisor_is_killed_does_not_hold_the_queue(self):
+        # It is in the group, so the poller ends it. Until then its output must not put that off.
+        chatty = "import sys\nwhile True: sys.stdout.write('x' * 4096); sys.stdout.flush()\n"
+        script = self.state / "killed.py"
+        script.write_text("import os, signal, subprocess, sys, time\n"
+                          f"subprocess.Popen([sys.executable, '-c', {chatty!r}])\n"
+                          "time.sleep(0.5)\nos.kill(os.getpid(), signal.SIGKILL)\n")
+        with patch("cursor_pr.poll.SUPERVISOR", script), patch("cursor_pr.poll.DRAIN_SECONDS", 0.3):
+            began = time.monotonic()
+            printed = poll.supervised(["unused"])
+        self.assertLess(time.monotonic() - began, 10)  # Against the half hour the review is allowed.
+        self.assertTrue(printed.startswith(b"x"))
+
+    def test_command_that_left_the_group_with_the_report_pipe_does_not_hold_the_queue(self):
+        review = ("import subprocess, sys\n"
+                  f"subprocess.Popen([sys.executable, '-c', {BUSY!r}, sys.argv[1]], start_new_session=True)\n"
+                  "import os, time\nwhile not os.path.exists(sys.argv[1] + '.ready'): time.sleep(0.02)\n"
+                  "print('report')\n")
+
+        def end_daemon():  # It left the group on purpose, so the test ends it.
+            subprocess.run(["pkill", "-KILL", "-f", str(self.state / "daemon")], check=False)
+        self.addCleanup(end_daemon)
+        with patch("cursor_pr.poll.DRAIN_SECONDS", 0.3):
+            began = time.monotonic()
+            self.assertEqual(poll.supervised([sys.executable, "-c", review, str(self.state / "daemon")]), b"report\n")
+        self.assertLess(time.monotonic() - began, 10)
+
+    def test_poller_ends_the_group_while_the_supervisor_still_has_its_number(self):
+        # Once the poller has waited for the supervisor, the number may be another process's, and
+        # ending "the group" would end a stranger's. So the group is ended first, in every case.
+        cases = {"ended": "raise SystemExit(0)", "killed": "os.kill(os.getpid(), signal.SIGKILL)", "stuck": "time.sleep(120)"}
+        for name, then in cases.items():
+            with self.subTest(supervisor=name):
+                script = self.state / f"{name}.py"
+                script.write_text("import os, signal, time\n" + then + "\n")
+                seen = []
+
+                def ended_group(number, how, kill=os.killpg):
+                    try:
+                        os.kill(number, 0)  # Succeeds for a process that has ended and not been waited for.
+                        seen.append("its own")
+                    except ProcessLookupError:
+                        seen.append("given up")
+                    return kill(number, how)
+
+                with patch("cursor_pr.poll.SUPERVISOR", script), patch("cursor_pr.poll.REVIEW_SECONDS", 0.3), \
+                        patch("cursor_pr.poll.STOP_SECONDS", 0.3), patch("cursor_pr.poll.DRAIN_SECONDS", 0.1), \
+                        patch("cursor_pr.poll.os.killpg", side_effect=ended_group):
+                    poll.supervised(["unused"])
+                self.assertEqual(seen, ["its own"])
+
+    def test_interrupted_poller_ends_the_review_before_it_goes_on(self):
+        def interrupt(*args):
+            started(self.state / "review")
+            raise KeyboardInterrupt
+
+        with patch("cursor_pr.poll.read_report", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+            poll.supervised(self.busy())
+        self.assertTrue(gone(self.state / "review", within=0))  # Already ended when the interrupt gets out.
+
+    def test_timed_out_review_is_logged(self):
+        project = project_from(dict(provider="github", url="https://github.com/acme/api", requester_ids=[7],
+                                    checkout=str(self.state)))
+        with patch("cursor_pr.poll.supervised", return_value=None), \
+                self.assertLogs("cursor_pr.poll", level="WARNING") as logged:
+            self.assertEqual(run_review(project, 3, self.state, comment=81), "failed")
+        self.assertIn("Review acme/api#3 did not end within", logged.output[0])
 
 
 class InstanceLockTests(Offline):
@@ -614,7 +1012,19 @@ class InstanceLockTests(Offline):
     def holder(self):
         return subprocess.run([sys.executable, "-c", HOLDER, str(self.state)], capture_output=True, text=True)
 
+    def test_poller_started_while_the_last_review_is_still_being_ended_waits_for_the_lock(self):
+        with instance_lock(self.state, wait=0):
+            waiting = subprocess.Popen([sys.executable, "-c", HOLDER, str(self.state), "15"], stderr=subprocess.PIPE, text=True)
+            self.addCleanup(waiting.kill)
+            time.sleep(0.5)
+            self.assertIsNone(waiting.poll())  # Not refused at once.
+        _, err = waiting.communicate(timeout=20)
+        self.assertEqual((waiting.returncode, err), (0, ""))
+
     def test_second_poller_on_the_same_state_directory_is_refused(self):
+        patcher = patch("cursor_pr.poll.LOCK_WAIT_SECONDS", 0.3)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         with instance_lock(self.state):
             other = self.holder()  # Another process gets the same answer.
             self.assertNotEqual(other.returncode, 0)
@@ -637,18 +1047,18 @@ class InstanceLockTests(Offline):
             self.assertEqual(err.getvalue(), f"Polling lock: {reason}\n")
             watch.assert_not_called()
 
-    def test_review_child_holds_the_lock_until_it_exits(self):
-        release = self.state / "release"
-        self.addCleanup(release.touch)  # Before the review is started, so a failed assertion releases it too.
-        killed = subprocess.run([sys.executable, "-c", KILLED, str(self.state), str(release)],
-                                capture_output=True, text=True)
-        self.assertEqual(killed.returncode, 0, killed.stderr)
-        self.assertIn("BlockingIOError", self.holder().stderr)  # Only the poller was killed. Its review still runs.
-        release.touch()
-        deadline = time.monotonic() + 20
+    def test_review_does_not_outlive_a_poller_that_is_killed(self):
+        poller = subprocess.Popen([sys.executable, "-c", POLLER, str(self.state)], stderr=subprocess.PIPE, text=True)
+        self.addCleanup(poller.kill)
+        started(self.state / "review")
+        self.assertIn("BlockingIOError", self.holder().stderr)
+        poller.kill()  # Only the poller. Nothing tells the review or its supervisor.
+        poller.wait()
+        self.assertTrue(gone(self.state / "review"))  # The review was ended,
+        deadline = time.monotonic() + 15
         while "BlockingIOError" in (other := self.holder()).stderr and time.monotonic() < deadline:
             time.sleep(0.1)
-        self.assertEqual(other.returncode, 0, other.stderr)  # The review has exited.
+        self.assertEqual(other.returncode, 0, other.stderr)  # and only then was the lock free again.
 
     def test_lock_is_held_while_polling_and_released_on_exit(self):
         opened = []
