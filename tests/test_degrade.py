@@ -92,6 +92,20 @@ class DegradeTests(unittest.TestCase):
         code, report = self.check("--base", "HEAD~1", "--max-input-tokens", "1000000")
         self.assertEqual((code, report["state"], report["degraded"]), (0, "reviewed", []))
 
+    def test_file_too_large_to_fit_alone_leaves_before_files_that_fit(self):
+        (self.root / "src/big.py").write_text("".join(f"VALUE_{n} = {n}  # a long generated constant\n" for n in range(400)))
+        self.git("add", ".")
+        self.git("commit", "-qm", "large source file")
+        rest = [arg for path in ("tests/test_app.py", "docs/guide.md", "uv.lock") for arg in ("--path", path)]
+        # src/big.py is the only source file in scope and is over the limit alone; the rest fit.
+        limit = self.check("--base", "HEAD~2", "--estimate", "--max-input-tokens", "1000000",
+                           *rest)[1]["estimated_input_tokens"]
+        code, report = self.check("--base", "HEAD~2", "--estimate", "--max-input-tokens", str(limit),
+                                  "--path", "src/big.py", *rest)
+        self.assertEqual((code, report["state"]), (2, "estimate"))
+        self.assertIn("src/big.py", report["degraded"])
+        self.assertLessEqual(report["estimated_input_tokens"], limit)
+
     def test_posted_comment_is_marked_degraded_and_lists_the_unreviewed_files(self):
         project = project_from(dict(provider="github", url="https://github.com/org/repo",
                                     checkout=str(self.root), requester_ids=[1]))
@@ -116,6 +130,22 @@ class DegradeTests(unittest.TestCase):
                                       "- Not reviewed (token limit): ` tests/test_app.py `",
                                       "- Not reviewed (token limit): ` uv.lock `"])
         self.assertIn("- ` src/app.py `:2 — ` Identity `. ` Returns its argument. `", lines)
+
+    def test_forge_review_checks_drift_for_the_selected_files_only(self):
+        project = project_from(dict(provider="github", url="https://github.com/org/repo",
+                                    checkout=str(self.root), requester_ids=[1]))
+        rows = [{"filename": path, "patchAbsent": False, "status": "added",
+                 "patch": f"@@ -0,0 +1,{text.count(chr(10))} @@\n" + "".join("+" + line for line in text.splitlines(True))}
+                for path, text in FILES.items()]
+        files = {"headSha": self.head, "complete": True, "changedFiles": len(rows), "files": rows}
+        detail = {"url": project.change_url(1), "headSha": self.head, "state": "open", "baseRef": "main",
+                  "changedFiles": len(rows)}
+        with patch.object(cli, "load_config", return_value={project.key: project}), \
+             patch.object(cli, "forge_credentials"), \
+             patch.object(source, "run_forge", side_effect=[detail, files, detail]), \
+             patch.object(cli.drift, "forge", wraps=cli.drift.forge) as forge:
+            self.check("--change", "org/repo#1", "--estimate", "--path", "src/app.py")
+        self.assertEqual([f.path for f in forge.call_args.args[4]], ["src/app.py"])
 
     def test_long_list_of_unreviewed_files_is_capped_with_a_count(self):
         report = {"provider": "cursor", "state": "degraded", "findings": [], "checks": [], "omitted": [],
