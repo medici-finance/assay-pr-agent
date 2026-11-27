@@ -1,6 +1,6 @@
 """Run one queued review for the poller, and end it when the poller is gone or its time is up.
 
-The poller starts this, and this starts the review in a process group of its own. A review must
+The poller starts this as the leader of a new process group, and this starts the review in it. A review must
 never run beside a later poller, which would start the same request again, and a review that hangs
 must not keep the poller's lock for good. Both are decided here, outside the review, by a process
 that only waits:
@@ -35,22 +35,33 @@ def supervise(lifeline, seconds, keep, command):
     signal.set_wakeup_fd(wake, warn_on_full_buffer=False)
     for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(number, lambda *received: None)
+    # The poller started this process as the leader of a new group. The review and all it starts
+    # stay in that group, whose number the poller knows, so the poller can end it if this process
+    # cannot. This process then steps out of it, so that ending the group does not end this too.
+    group = os.getpgrp()
+    if group != os.getpid():
+        print("cursor-review: the supervisor must be started as the leader of its own process group", file=sys.stderr)
+        return STOPPED
     # The review holds one end of this pipe and nothing it starts does. It closes when the review ends.
     ended, alive = os.pipe()
-    review = subprocess.Popen(command, pass_fds=(*keep, alive), start_new_session=True)
+    review = subprocess.Popen(command, pass_fds=(*keep, alive))
     try:
         os.close(alive)
+        try:
+            os.setpgid(0, os.getpgid(os.getppid()))
+        except OSError:
+            pass  # The poller is gone already. The group is about to be ended, and this with it.
         reason = watch(lifeline, ended, woken, seconds)
         if reason:
             # Asked first, so that it removes its temporary files and ends the command it waits on.
-            signal_group(review.pid, signal.SIGTERM)
+            signal_group(group, signal.SIGTERM)
             wait_for(ended, GRACE_SECONDS)
     except BaseException as failure:
         # Whatever goes wrong with the waiting, the review is not left running without it.
         reason = f"its supervisor failed: {failure!r}"
     finally:
-        # The review has not been waited for yet, so its group cannot have become another's.
-        signal_group(review.pid, signal.SIGKILL)
+        # The group's number is this process's own, so it cannot have become another group's.
+        signal_group(group, signal.SIGKILL)
     status = review.wait()
     if reason:
         print(f"cursor-review: the review was stopped: {reason}", file=sys.stderr, flush=True)

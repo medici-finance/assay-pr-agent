@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -175,7 +176,8 @@ def supervised(argv, **options):
     try:
         process = subprocess.Popen(
             [sys.executable, "-I", str(SUPERVISOR), str(lifeline), str(REVIEW_SECONDS),
-             ",".join(map(str, keep)), *argv], stdout=subprocess.PIPE, pass_fds=(lifeline, *keep), **options)
+             ",".join(map(str, keep)), *argv], stdout=subprocess.PIPE, pass_fds=(lifeline, *keep),
+            process_group=0, **options)
         return process.communicate(timeout=REVIEW_SECONDS + STOP_SECONDS)[0]
     except subprocess.TimeoutExpired:
         return None
@@ -186,8 +188,17 @@ def supervised(argv, **options):
         os.close(hold)
         if process is not None:
             try:
-                process.wait(timeout=STOP_SECONDS)
+                ended = process.wait(timeout=STOP_SECONDS) >= 0
             except subprocess.TimeoutExpired:
+                ended = False
+            if not ended:
+                # The supervisor did not end by itself: it is stuck, or it was killed. Then nobody has
+                # ended the review, which runs in the group the supervisor was started as the leader
+                # of. A group's number is not given to another process while the group has members.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
                 process.kill()
                 process.wait()
             process.stdout.close()

@@ -362,7 +362,17 @@ def run_request(args):
 
 
 def main():
-    args = parser().parse_args()
+    options = parser()
+    args = options.parse_args()
+    # Refused here, before this process may settle a row: a mistaken call must not end a request
+    # that another review is running.
+    if bool(args.queue) != bool(args.request) or (args.request and not args.change):
+        options.error("--queue and --request go together and require --change")
+    if args.request:
+        try:
+            request_row(args)
+        except ValueError:
+            options.error("--request takes a project, a change number and a comment number")
     # Load PR-Agent settings only from an empty directory, independent of the target repo.
     args.repo = args.repo.resolve()
     args.cache_dir = args.cache_dir.resolve()
