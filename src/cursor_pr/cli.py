@@ -69,6 +69,10 @@ def fit(files, checks, limit, *, title="", description=""):
         prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), title, description)
         estimated = tokens(prompt) if has_text else 0
     if not has_text or estimated > limit:
+        if title or description:
+            fitted, estimate, _, skipped = fit(files, checks, limit)
+            if fitted[3] and estimate <= limit:
+                return fitted, estimate, full, skipped
         return full_pack, full, full, []
     return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped)
 

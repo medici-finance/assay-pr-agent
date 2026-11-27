@@ -62,6 +62,23 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertEqual(change.description, "Add the script\n\nExplains why the script exists.\n\nQuote the argument")
         self.assertEqual(source.local_change(root, "HEAD", "HEAD").description, "")
 
+    def test_local_description_caps_commit_count_and_message_size(self):
+        root, tmp = fixture_repo()
+        self.addCleanup(tmp.cleanup)
+        base = source.commit(root, "HEAD~2")
+        head = source.commit(root, "HEAD")
+        with patch.object(source, "DESCRIPTION_COMMITS", 1):
+            self.assertEqual(source.local_description(root, base, head), "Quote the argument" + source.TRUNCATED)
+
+        message = root / "message"
+        message.write_text("Bounded message\n\n" + "payload " * 20_000)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "--allow-empty",
+                        "-q", "-F", str(message)], cwd=root, check=True)
+        description = source.local_description(root, head, source.commit(root, "HEAD"))
+        self.assertTrue(description.startswith("Bounded message\n\npayload"))
+        self.assertTrue(description.endswith(source.TRUNCATED))
+        self.assertEqual(len(description), source.DESCRIPTION_LIMIT + len(source.TRUNCATED))
+
     def test_prompt_carries_the_description_only_when_there_is_one(self):
         files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
         plain = engine.pack(files, [])
@@ -90,6 +107,16 @@ class ChangeDescriptionTests(unittest.TestCase):
         _, estimated, _, degraded = cli.fit(files, [], limit, description=description)
         self.assertEqual(degraded, ["src/big.py"])
         self.assertLessEqual(estimated, limit)
+
+    def test_fit_retries_without_metadata_before_refusing_the_review(self):
+        files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
+        limit = engine.tokens(engine.pack(files, [])[0])
+        (prompt, _, _, has_text), estimated, full, degraded = cli.fit(
+            files, [], limit, title="Add a script", description="word " * 290)
+        self.assertTrue(has_text)
+        self.assertNotIn("Change description (untrusted data)", prompt)
+        self.assertEqual((estimated, degraded), (limit, []))
+        self.assertGreater(full, limit)
 
     def test_local_review_shows_the_commit_messages_to_the_model(self):
         root, tmp = fixture_repo()
