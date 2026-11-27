@@ -9,7 +9,7 @@ from .providers import KEYS
 from dataclasses import dataclass
 from pathlib import Path
 import re
-import select
+import selectors
 import subprocess
 import time
 
@@ -160,9 +160,10 @@ class Change:
     base_ref: str = ""  # base branch name reported by the forge
     title: str = ""
     description: str = ""
+    description_truncated: bool = False
 
 
-def forge_change(address, expected_url=None, *, project=None):
+def forge_change(address, expected_url=None, *, project=None, with_description=False):
     if not re.fullmatch(r"[\w.\-]+/[\w.\-]+#[1-9][0-9]*", address):
         raise ReviewError("Use an owner/repo#number address from the configured projects")
     repo, number = address.rsplit("#", 1)
@@ -178,7 +179,15 @@ def forge_change(address, expected_url=None, *, project=None):
     result = run_forge("change-files", project, numbers=numbers)
     if result.get("headSha") != head:
         raise ReviewError("Forge files do not match the reviewed head")
-    last = run_forge("change", project, numbers=numbers)
+    last = None
+    if with_description:
+        try:
+            last = run_forge("change-with-description", project, numbers=numbers)
+        except (OSError, ReviewError, ValueError, subprocess.TimeoutExpired):
+            # A helper without optional metadata support can still confirm the change.
+            pass
+    if last is None:
+        last = run_forge("change", project, numbers=numbers)
     if any(first.get(k) != last.get(k) for k in ("headSha", "baseRef", "changedFiles", "url", "state")):
         raise ReviewError("Change moved during the forge read")
     rows = result.get("files")
@@ -196,9 +205,11 @@ def forge_change(address, expected_url=None, *, project=None):
                           row["patchAbsent"], row.get("previousFilename", "")))
     base_ref = first.get("baseRef")
     # The description is context, not evidence, so it is read once and never bracketed like the head.
+    title = bounded_text(last.get("title"), TITLE_LIMIT)
+    description = bounded_text(last.get("body"), DESCRIPTION_LIMIT)
+    truncated = last.get("descriptionTruncated") is True or any(text.endswith(TRUNCATED) for text in (title, description))
     return Change(head, files, first.get("url") or address, base_ref=base_ref if isinstance(base_ref, str) else "",
-                  title=bounded_text(last.get("title"), TITLE_LIMIT),
-                  description=bounded_text(last.get("body"), DESCRIPTION_LIMIT))
+                  title=title, description=description, description_truncated=truncated)
 
 
 def git(root, *args):
@@ -232,14 +243,16 @@ def local_description(root, base, head):
     byte_limit = 4 * DESCRIPTION_LIMIT
     output = bytearray()
     deadline = time.monotonic() + 45
-    args = ["git", "--literal-pathspecs", "-C", str(root), "log", "--no-show-signature", "--reverse", f"-{DESCRIPTION_COMMITS + 1}",
-            "--format=%s%n%n%b%x00", base + ".." + head, "--"]
+    args = ["git", "--literal-pathspecs", "-C", str(root), "log", "--no-show-signature", "--encoding=UTF-8",
+            f"-{DESCRIPTION_COMMITS + 1}", "--format=%s%n%n%b%x00", base + ".." + head, "--"]
     try:
-        with subprocess.Popen(args, env=child_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+        with selectors.DefaultSelector() as ready, \
+             subprocess.Popen(args, env=child_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
             try:
+                ready.register(process.stdout, selectors.EVENT_READ)
                 while len(output) <= byte_limit:
                     remaining = max(0, deadline - time.monotonic())
-                    if not select.select([process.stdout], [], [], remaining)[0]:
+                    if not ready.select(remaining):
                         return ""
                     chunk = os.read(process.stdout.fileno(), byte_limit + 1 - len(output))
                     if not chunk:
@@ -250,19 +263,29 @@ def local_description(root, base, head):
             finally:
                 if process.poll() is None:
                     process.kill()
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         return ""
-    # Preserve the newest commits when the count is capped. A final incomplete message
-    # from reaching the byte limit is useful as a prefix, with the truncation signalled.
+    # Spend the budget newest-first, then display the retained messages in chronological order.
     clipped = len(output) > byte_limit
     messages = output[:byte_limit].decode("utf8", "replace").split("\0")
-    if clipped:
-        chosen = messages[:DESCRIPTION_COMMITS]
-    else:
-        chosen = messages[:-1][-DESCRIPTION_COMMITS:]
-        clipped = len(messages) - 1 > DESCRIPTION_COMMITS
-    description = bounded_text("\n\n".join(m.strip() for m in chosen if m.strip()), DESCRIPTION_LIMIT)
-    return description + TRUNCATED if clipped and not description.endswith(TRUNCATED) else description
+    if not clipped:
+        messages.pop()  # Trailing separator after the last complete message.
+    clipped = clipped or len(messages) > DESCRIPTION_COMMITS
+    chosen, remaining = [], DESCRIPTION_LIMIT
+    for message in messages[:DESCRIPTION_COMMITS]:
+        if remaining <= 0:
+            clipped = True
+            break
+        text = bounded_text(message, len(message))
+        if not text:
+            continue
+        if len(text) > remaining:
+            clipped = True
+            text = text[:remaining].rstrip()
+        chosen.append(text)
+        remaining -= len(text) + 2
+    description = "\n\n".join(reversed(chosen))
+    return description + TRUNCATED if clipped else description
 
 
 def ci_refs():
