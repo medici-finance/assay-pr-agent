@@ -104,7 +104,7 @@ def run_forge(verb, project, *, numbers=(), publication=None, timeout=45):
     return json.loads(run(["pr-agent-forge", verb], data=json.dumps(request).encode(), env=env, timeout=timeout))
 
 
-def post_comment(project, number, head, body, state):
+def post_comment(project, number, head, body, state, timeout=45):
     if project is None:
         raise ReviewError("Use a --change address from the configured review projects")
     directory = state / "publications"
@@ -119,7 +119,8 @@ def post_comment(project, number, head, body, state):
             HumanLogins=[os.environ["REVIEW_FORGE_OPERATOR"]] if os.getenv("REVIEW_FORGE_OPERATOR") else [],
             PrivateRepositories=os.getenv("REVIEW_PRIVATE_REPOSITORIES", "").split(","),
             WithheldIdentifiers=[item.strip().lower() for item in
-                                 os.getenv("REVIEW_WITHHELD_IDENTIFIERS", "").split(",") if item.strip()]))
+                                 os.getenv("REVIEW_WITHHELD_IDENTIFIERS", "").split(",") if item.strip()]),
+                  timeout=timeout)
         if not posted:
             private_file(receipt, "posted")
 

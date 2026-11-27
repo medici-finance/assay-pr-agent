@@ -22,20 +22,17 @@ NOTE = {"github": "#issuecomment-", "gitlab": "#note_"}
 RETRY_SECONDS = 60
 RETRY_CAP_SECONDS = 3600
 TRIES = 12
-# How long one cycle spends on markers and notices before it goes on to the reviews. What is left
-# waits for the next cycle: a forge that answers slowly must not hold the queue back.
+# A forge that answers slowly must not hold the queue back, so every forge call made here runs
+# under a deadline: none starts after it and none waits past it. What is left then is done later.
+# One cycle's pass over the markers to write, and its pass over the removals and notices due:
 BUDGET_SECONDS = 20
-# How long the marker of one request may take when it is written just before that request's review.
+# The marker of one request, written just before its review if the pass did not get to it:
 START_SECONDS = 5
+# The removal and the notice of one request, right after its review:
+FINISH_SECONDS = 20
 TIMEOUT_SECONDS = 15
+HELPER_SECONDS = 45
 PAGES = 5
-# Stored in place of a GitHub reaction's ID from just before the reaction is asked for until the
-# answer is recorded. A poller that stopped in between, or an answer that never arrived, leaves it:
-# a reaction may then exist whose ID nobody kept.
-UNKNOWN = 0
-# Stored from the moment a request is queued until its marker has been asked for once. A poller that
-# stopped in between finds it at its next start and marks the request then.
-PENDING = -1
 
 
 def refused(response):
@@ -113,108 +110,130 @@ def reaction_id(response):
     return row["id"]
 
 
-def add(project, number, comment, sending=lambda: None, deadline=None):
-    """Mark the request. sending is called just before GitHub is asked to create the reaction."""
+def add(project, number, comment, deadline=None):
+    """Mark the request. Marking twice is the same as marking once, on either forge."""
     root, markers, headers = reviewer(project, number, comment)
     if project.provider == "gitlab":
         if own_award(project, root, markers, headers, deadline):
             return  # An account can award an emoji once, so this one already says a request is waiting.
         request(project, "POST", markers, headers, deadline, params={"name": MARK["gitlab"][0]}).raise_for_status()
-        return
-    if deadline is not None and deadline <= time.monotonic():
-        raise ReviewError("no time left for it in this cycle")  # Before the note that a reaction may exist.
-    sending()
-    return reaction_id(react(project, markers, headers, deadline))
+    else:
+        reaction_id(react(project, markers, headers, deadline))
 
 
-def recover(project, number, comment):
-    """The ID of a GitHub reaction that may exist without its ID having been kept, or None if there is none."""
-    # Asking again is how GitHub tells an account the ID of the reaction it already has. Refused for
-    # good, as it is without the permission or once the comment is gone, there is none of ours to
-    # remove. Turned away for now, as by a rate limit, the removal stays owed.
-    root, markers, headers = reviewer(project, number, comment)
-    response = react(project, markers, headers)
-    return None if refused(response) else reaction_id(response)
+def remove(project, number, comment, deadline=None):
+    """Remove the reviewer's marker, wherever it came from. Nothing about it is kept here: the forge is asked.
 
-
-def remove(project, number, comment, marker_id):
-    if project.provider == "github" and marker_id in (None, PENDING):
-        return
+    GitLab lists the awards with their owners. GitHub tells an account the ID of its reaction only
+    in the answer to creating it, which returns the existing one, so the reaction is asked for and
+    then deleted. An answer that is final ends it: there is nothing of ours left, or nothing this
+    credential may remove any longer, which gets a log line.
+    """
     root, markers, headers = reviewer(project, number, comment)
     try:
-        ident = marker_id if project.provider == "github" else own_award(project, root, markers, headers)
+        if project.provider == "gitlab":
+            ident = own_award(project, root, markers, headers, deadline)
+        else:
+            response = react(project, markers, headers, deadline)
+            ident = None if refused(response) else reaction_id(response)
+            if ident is None:
+                left_in_place(project, number, comment, response)
     except httpx.HTTPStatusError as err:
-        if refused(err.response):
-            return  # The merge request is gone or closed to this credential, and the award with it.
-        raise
+        if not refused(err.response):
+            raise
+        return left_in_place(project, number, comment, err.response)
     if ident is not None:
-        response = request(project, "DELETE", f"{markers}/{ident}", headers)
-        if not refused(response):  # Gone already, or no longer this credential's to remove.
+        response = request(project, "DELETE", f"{markers}/{ident}", headers, deadline)
+        if not refused(response):
             response.raise_for_status()
+        else:
+            left_in_place(project, number, comment, response)
 
 
-def notify(project, number, comment, state):
+def left_in_place(project, number, comment, response):
+    # Gone with its comment or merge request: nothing to say. Anything else final may leave a marker behind.
+    if response.status_code not in (404, 410):
+        log.warning("The queued marker on %s#%d comment %d may be left in place: HTTP %d",
+                    project.slug, number, comment, response.status_code)
+
+
+def notify(project, number, comment, state, deadline=None):
     # The helper publishes only on the change's current head. The notice is about the request, not a
     # head, so it goes on whatever head the change has now, once per head like any comment.
-    head = run_forge("change", project, numbers=[number]).get("headSha")
+    def left():
+        seconds = HELPER_SECONDS if deadline is None else min(HELPER_SECONDS, deadline - time.monotonic())
+        if seconds <= 0:
+            raise ReviewError("no time left for it in this cycle")
+        return seconds
+    head = run_forge("change", project, numbers=[number], timeout=left()).get("headSha")
     if not valid_sha(head):
         raise ReviewError("Forge did not identify the change head")
     request = f"{project.change_url(number)}{NOTE[project.provider]}{comment}"
-    post_comment(project, number, head, NOTICE.format(request=request), state)
+    post_comment(project, number, head, NOTICE.format(request=request), state, timeout=left())
 
 
 class Acknowledgement:
-    """Every call fails open: one log line, and the queue and the review go on."""
+    """Every call fails open: one log line, and the queue and the review go on.
+
+    Nothing is kept about a marker. Whether a request is marked, and under which ID, is the forge's
+    to say, and writing a marker twice or removing one that is not there does no harm. A request's
+    record holds only what it still owes once its review has finished: the marker's removal and,
+    after a failure, the notice.
+    """
 
     def __init__(self, jobs, state):
         self.jobs = jobs
         self.state = state
+        # Requests whose marker this process has settled: written, or refused for good.
+        self.marked = set()
+        # Those of them it was refused for: there is no marker of theirs to remove.
+        self.unmarked = set()
 
     def queued(self, project, number, comment, deadline=None):
         job = project.key, number, comment
 
         def mark():
             try:
-                marker = add(project, number, comment, lambda: self.jobs.record_marker(job, UNKNOWN), deadline)
+                add(project, number, comment, deadline)
             except httpx.HTTPStatusError as err:
-                if err.response.status_code < 500:
-                    self.jobs.record_marker(job, None)  # Answered and turned down: nothing was created.
+                if refused(err.response):
+                    self.marked.add(job)  # Not to be asked for again. An answer for now only is.
+                    self.unmarked.add(job)
                 raise
-            self.jobs.record_marker(job, marker)  # Asked for. GitLab's award has no ID to keep.
+            self.marked.add(job)
         self.attempt(mark, "mark", project, number, comment)
 
-    def finished(self, project, number, comment, status):
+    def finished(self, project, number, comment, status, deadline=None):
         job = project.key, number, comment
-        acknowledgement = self.jobs.acknowledgement(job)
-        if acknowledgement is None:
+        self.marked.discard(job)
+        never_marked = job in self.unmarked and project.provider == "github"  # GitLab's is shared: look.
+        self.unmarked.discard(job)
+        owed = self.jobs.acknowledgement(job)
+        if owed is None:
             return
-        marker, notice_sent, marker_cleared = acknowledgement
-
-        def report_failure():
-            notify(project, number, comment, self.state)
-            self.jobs.record_notice(job)
-
-        notice_needed = status == "failed" and not notice_sent
-        notified = not notice_needed or self.attempt(
-            report_failure, "report the failed review on", project, number, None)
+        notice_sent, marker_cleared = owed
+        if deadline is None:
+            deadline = time.monotonic() + FINISH_SECONDS
 
         def clear():
             if project.provider == "gitlab" and self.jobs.pending(project.key, number):
                 # GitLab's marker stays while another request is waiting; its last request clears it.
                 # Each of them gets a record for that, also one queued by a version that kept none.
                 self.jobs.acknowledge_pending(project.key, number)
-            else:
-                found = marker
-                if project.provider == "github" and marker == UNKNOWN:
-                    # Kept before it is removed: if the removal fails, the next try must not ask
-                    # for the reaction again, which would put one on a request that has finished.
-                    found = recover(project, number, comment)
-                    self.jobs.record_marker(job, found)
-                remove(project, number, comment, found)
+            elif not never_marked:
+                remove(project, number, comment, deadline)
             # Kept apart from the notice: while only the notice is owed, the marker is left alone.
             self.jobs.record_cleared(job)
 
         cleared = bool(marker_cleared) or self.attempt(clear, "clear the queued marker on", project, number, comment)
+
+        def report_failure():
+            notify(project, number, comment, self.state, deadline)
+            self.jobs.record_notice(job)
+
+        notice_needed = status == "failed" and not notice_sent
+        notified = not notice_needed or self.attempt(
+            report_failure, "report the failed review on", project, number, None)
         if notified and cleared:
             self.jobs.clear_acknowledgement(job)
             return
@@ -228,26 +247,25 @@ class Acknowledgement:
 
     def settle(self, projects):
         """Try again what a finished request still owes the forge and is due: its marker's removal, its notice."""
-        started = time.monotonic()
+        deadline = time.monotonic() + BUDGET_SECONDS
         for key, number, comment, status in self.jobs.unfinished_acknowledgements(time.time()):
-            if key in projects and time.monotonic() - started < BUDGET_SECONDS:
-                self.finished(projects[key], number, comment, status)
+            if key in projects and time.monotonic() < deadline:
+                self.finished(projects[key], number, comment, status, deadline)
 
     def mark(self, projects):
-        """Mark the waiting requests that have not been marked: the new ones, and those a stopped poller left.
+        """Mark the waiting requests: the new ones, and those a poller that stopped left unmarked.
 
-        All of it ends within the budget: no forge call waits past it. A request left unmarked is
-        marked when its review starts.
+        All of it ends within the budget. A request left unmarked is marked when its review starts.
         """
         deadline = time.monotonic() + BUDGET_SECONDS
-        for key, number, comment in self.jobs.unmarked():
-            if key in projects and time.monotonic() < deadline:
+        for key, number, comment in self.jobs.waiting_acknowledgements():
+            if key in projects and (key, number, comment) not in self.marked and time.monotonic() < deadline:
                 self.queued(projects[key], number, comment, deadline)
 
     def starting(self, project, number, comment):
         """Mark a request whose review is about to start, if nothing has marked it yet. It is given a short time."""
-        acknowledgement = self.jobs.acknowledgement((project.key, number, comment))
-        if acknowledgement is not None and acknowledgement[0] == PENDING:
+        job = project.key, number, comment
+        if job not in self.marked and self.jobs.acknowledgement(job) is not None:
             self.queued(project, number, comment, time.monotonic() + START_SECONDS)
 
     @staticmethod
