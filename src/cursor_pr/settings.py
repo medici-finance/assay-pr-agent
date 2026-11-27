@@ -132,37 +132,41 @@ def cursor_login_home(state, profile):
     return Path(login_env("cursor", login_directory(state, profile))["HOME"])
 
 
+def check_cursor_team(account, value):
+    key, home = account
+    if home is not None:
+        return providers.eligible_team(key, value, home)
+    with tempfile.TemporaryDirectory(prefix="review-team-check-") as temp:
+        return providers.eligible_team(key, value, Path(temp))
+
+
 def cursor_team(value, config, state, old):
     saved = config["settings"]
     saved_backend = saved.get("REVIEW_PROVIDER", "cursor")
     saved_profile = saved.get("REVIEW_LOGIN_PROFILE", "")
     backend, mode = setup.effective_backend(saved)
     profile = os.getenv("REVIEW_LOGIN_PROFILE", saved_profile if backend == saved_backend else "")
-    with tempfile.TemporaryDirectory(prefix="review-team-check-") as temp:
-        scratch = Path(temp)
-        # Inspect team membership without switching the live sign-in profile.
-        effective = ((stored(config, old, setup.CURSOR), scratch) if mode == "api-key"
-                     else (None, cursor_login_home(state, profile)))
-        chosen = providers.eligible_team(effective[0], value, effective[1])
-        if saved_backend != "cursor" or chosen == saved.get("REVIEW_CURSOR_TEAM_ID", ""):
-            return chosen
-        if saved.get("REVIEW_AUTH_MODE") == "login":
-            fallback = (None, cursor_login_home(state, saved_profile))
-        elif location := config["secrets"].get(setup.CURSOR):
-            try:
-                fallback = ((old / location).read_text().strip(), scratch)
-            except OSError:
-                raise ValueError("The saved Cursor key is unavailable here. Make it readable before changing the shared team.") from None
-        else:
-            return chosen  # The saved API-key setup requires an environment-supplied key.
-        if fallback != effective:
-            key, home = fallback
-            with tempfile.TemporaryDirectory(prefix="review-saved-team-check-") as saved_temp:
-                try:
-                    providers.eligible_team(key, chosen, Path(saved_temp) if key is not None else home)
-                except ValueError as err:
-                    raise ValueError(f"The saved Cursor account cannot use that team. {err}") from None
+    # Inspect team membership without switching the live sign-in profile.
+    effective = ((stored(config, old, setup.CURSOR), None) if mode == "api-key"
+                 else (None, cursor_login_home(state, profile)))
+    chosen = check_cursor_team(effective, value)
+    if saved_backend != "cursor" or chosen == saved.get("REVIEW_CURSOR_TEAM_ID", ""):
         return chosen
+    if saved.get("REVIEW_AUTH_MODE") == "login":
+        fallback = (None, cursor_login_home(state, saved_profile))
+    elif location := config["secrets"].get(setup.CURSOR):
+        try:
+            fallback = ((old / location).read_text().strip(), None)
+        except OSError:
+            raise ValueError("The saved Cursor key is unavailable here. Make it readable before changing the shared team.") from None
+    else:
+        return chosen  # The saved API-key setup requires an environment-supplied key.
+    if fallback != effective:
+        try:
+            check_cursor_team(fallback, chosen)
+        except ValueError as err:
+            raise ValueError(f"The saved Cursor account cannot use that team. {err}") from None
+    return chosen
 
 
 def operator(value, config, state, old):
@@ -434,8 +438,11 @@ def save(state, change, *, revision=None):
                 elif not Path(location).is_absolute() or references_bundle(Path(location), old, bundle):
                     # Copy credentials whose configured paths would break when the old bundle is removed.
                     destination = bundle / setup.SECRETS[secret]
-                    shutil.copyfile(old / location, destination)
-                    destination.chmod(0o600)
+                    try:
+                        shutil.copyfile(old / location, destination)
+                        destination.chmod(0o600)
+                    except OSError:
+                        raise ValueError(f"Could not preserve the configured {secret} in a new setup bundle.") from None
                     config["secrets"][secret] = setup.SECRETS[secret]
             if written.keys() & gitlab_tls.NAMES.keys():
                 try:

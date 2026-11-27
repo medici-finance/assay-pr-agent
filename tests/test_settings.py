@@ -175,6 +175,25 @@ class SettingsTests(unittest.TestCase):
         setup.apply_saved_setup(self.state)
         self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-rotated")
 
+    def test_an_unreadable_bundle_credential_leaves_the_active_setup_intact(self):
+        self.seed()
+        old = setup.active_bundle(self.state)
+        credential = old / "codex.key"
+        credential.unlink()
+        mount = self.root / "reviewer-only-mount"
+        credential.symlink_to(mount)
+        document = self.document()
+        document["secrets"]["CODEX_API_KEY"] = str(credential)
+        (old / "settings.json").write_text(json.dumps(document))
+        with self.assertRaisesRegex(ValueError, "Could not preserve the configured CODEX_API_KEY"):
+            settings.save(self.state, {"name": "REVIEW_POLL_SECONDS", "value": "60"})
+        self.assertEqual(setup.active_bundle(self.state), old)
+        self.assertEqual(self.document(), document)
+        self.assertEqual(list(self.state.glob(".review-setup-*")), [old])
+        mount.write_text("fixture-mounted")
+        setup.apply_saved_setup(self.state)
+        self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-mounted")
+
     def test_invalid_values_keep_the_active_setup(self):
         self.seed()
         link = (self.state / "setup").readlink()
@@ -396,7 +415,8 @@ class SettingsTests(unittest.TestCase):
                 settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": ""})
         profile = "a" * 32
         self.seed(values={**SAVED, "REVIEW_PROVIDER": "cursor", "REVIEW_AUTH_MODE": "login", "REVIEW_LOGIN_PROFILE": profile})
-        with patch.object(providers, "team_command", return_value={"teams": teams}) as command:
+        with patch.object(providers, "team_command", return_value={"teams": teams}) as command, \
+                patch.object(settings.tempfile, "TemporaryDirectory", side_effect=PermissionError("no writable temp")):
             settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "1"})
             self.assertEqual([c.args[0] for c in command.call_args_list], [["list"]])
             # The live sign-in profile is listed, never switched.
