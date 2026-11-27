@@ -7,6 +7,9 @@ from importlib.resources import files
 from pathlib import Path
 from unittest.mock import patch as mock
 
+import tiktoken
+import tiktoken.model
+
 from cursor_pr import engine, source
 from cursor_pr.vendor import patch
 from cursor_pr.vendor import tokens
@@ -105,6 +108,19 @@ class VendoredTests(unittest.TestCase):
     def test_the_encoding_is_pr_agent_s_choice(self):
         self.assertEqual([encoding(name).name for name in ("gpt-4", "gpt-4o", "gpt-4.1", "claude-sonnet-4-5", "unknown")],
                          ["cl100k_base", "o200k_base", "o200k_base", "o200k_base", "o200k_base"])
+
+    def test_an_unreadable_encoding_is_not_replaced_by_another(self):
+        loaded = tiktoken.get_encoding("o200k_base")
+
+        def get_encoding(name):
+            if name == "cl100k_base":
+                raise OSError("cannot read the encoding file")
+            return loaded
+        with mock.object(tiktoken, "get_encoding", side_effect=get_encoding), \
+                mock.object(tiktoken.model, "get_encoding", side_effect=get_encoding):
+            with self.assertRaises(OSError):
+                encoding("gpt-4")
+            self.assertIs(encoding("gpt-unknown"), loaded)
 
     def test_the_encoding_files_are_bundled_and_checked_before_use(self):
         saved = {name: os.environ.get(name) for name in ("TIKTOKEN_CACHE_DIR", "DATA_GYM_CACHE_DIR")}

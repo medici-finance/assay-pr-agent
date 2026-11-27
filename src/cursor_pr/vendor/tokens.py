@@ -40,8 +40,14 @@ def prepare():
 
 
 def encoding(model):
+    """The encoding tiktoken maps a GPT model name to, and o200k_base for any other name.
+
+    Only an unknown name falls back. A file that cannot be read is an error: falling back to another
+    encoding would quietly change every count.
+    """
     prepare()
     try:
-        return tiktoken.encoding_for_model(model) if "gpt" in model else tiktoken.get_encoding("o200k_base")
-    except Exception:
-        return tiktoken.get_encoding("o200k_base")
+        name = tiktoken.encoding_name_for_model(model) if "gpt" in model else "o200k_base"
+    except KeyError:
+        name = "o200k_base"
+    return tiktoken.get_encoding(name)
