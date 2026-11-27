@@ -260,6 +260,26 @@ class QueueRestartTests(unittest.TestCase):
         _, logged = self.restart()
         self.assertEqual(logged, [f"Review of {self.gl.key} #4 comment 82 was interrupted by a restart; {self.UNRECORDED}"])
 
+    def test_upgrade_that_stops_before_its_records_are_written_is_done_again(self):
+        self.old_queue((self.gl.key, 4, 82, "queued"))
+
+        class Stopped(Exception):
+            pass
+
+        real = sqlite3.connect
+
+        class Halfway(sqlite3.Connection):
+            def execute(self, statement, *args):
+                if statement.startswith("INSERT INTO acknowledgements"):
+                    raise Stopped
+                return super().execute(statement, *args)
+        # The poller stops after the table is created and before the waiting requests get a record.
+        with patch("cursor_pr.poll.sqlite3.connect", side_effect=lambda path: real(path, factory=Halfway)), \
+                self.assertRaises(Stopped):
+            Jobs(self.state)
+        self.assertEqual(self.sql("SELECT name FROM sqlite_master WHERE name='acknowledgements'"), [])
+        self.assertEqual(Jobs(self.state).waiting_acknowledgements(), [(self.gl.key, 4, 82)])
+
     def test_review_child_is_given_the_queue_and_its_request(self):
         jobs = Jobs(self.state)
         jobs.enqueue(*self.job)

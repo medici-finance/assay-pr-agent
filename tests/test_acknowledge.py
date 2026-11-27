@@ -494,6 +494,29 @@ class NoticeTests(Offline):
             post.assert_not_called()
             self.assertIn("Forge did not identify the change head", logged.output[0])
 
+    def test_a_removal_that_uses_the_time_up_does_not_keep_the_notice_from_being_tried(self):
+        jobs = Jobs(self.state)
+        jobs.enqueue(self.gl.key, 3, 81, acknowledge=True)
+        ack = Acknowledgement(jobs, self.state)
+        job = self.gl.key, 3, 81
+        jobs.next()
+        jobs.finish(job, "failed")
+        clock = [1000.0]
+
+        def slow(*_):
+            clock[0] += acknowledge.FINISH_SECONDS + 1  # GitLab held every call to its timeout.
+            raise httpx.ReadTimeout("slow")
+        with patch.object(acknowledge.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(acknowledge, "remove", side_effect=slow), \
+                patch.object(acknowledge, "run_forge", return_value=dict(headSha="a" * 40)) as read, \
+                patch.object(acknowledge, "post_comment") as post, \
+                self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
+            ack.finished(self.gl, 3, 81, "failed")
+        self.assertEqual(len(logged.output), 1)  # The removal, and it alone, failed.
+        self.assertLessEqual(read.call_args.kwargs["timeout"], acknowledge.NOTICE_SECONDS)
+        post.assert_called_once()
+        self.assertEqual((jobs.acknowledgement(job), jobs.acknowledgement_tries(job)), ((1, 0), 1))
+
     def test_failure_notice_goes_to_the_forge_helper_as_a_head_bound_comment(self):
         # The real path below the notice, with only the helper process and the credential replaced.
         head, sent = "b" * 40, []
