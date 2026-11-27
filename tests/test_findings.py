@@ -440,6 +440,24 @@ class QuotedEvidenceTests(unittest.TestCase):
             wrong = engine.parse_answer(envelope([dict(issue(start=line, end=line), relevant_code=quote)]), anchors)
             self.assertEqual(wrong["dropped"][0]["reason"], "quoted code does not match the cited lines")
 
+    def test_one_markdown_fence_can_wrap_an_explicit_quote(self):
+        anchors = shown("return value * 2")
+        exact = dict(issue(start=1, end=1), relevant_code="```python\n1 +return value * 2\n```")
+        parsed = engine.parse_answer(envelope([exact]), anchors)
+        self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
+        self.assertEqual(parsed["dropped"], [])
+        for quote in ("```python\nreturn value * 3\n```", "Prose before the quote.\n\n" + exact["relevant_code"]):
+            with self.subTest(quote=quote):
+                wrong = engine.parse_answer(envelope([dict(exact, relevant_code=quote)]), anchors)
+                self.assertEqual(wrong["findings"], [])
+                self.assertEqual(wrong["dropped"][0]["reason"], "quoted code does not match the cited lines")
+
+    def test_explicit_quote_can_include_literal_source_fences(self):
+        quote = "```text\nvalue\n```"
+        raw = envelope([dict(issue(start=1, end=3), relevant_code=quote)])
+        parsed = engine.parse_answer(raw, shown("```text", "value", "```"))
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
     def test_a_fenced_block_counts_as_the_quote_and_inline_spans_do_not(self):
         fenced = issue(start=4, end=4, body="It adds up.\n```\ntotal += item\n```\n")
         self.assertEqual(self.parse(fenced)["findings"][0]["evidence"], "verified")
