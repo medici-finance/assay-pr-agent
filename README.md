@@ -8,7 +8,7 @@ The reviewer reads changes written by people who need no access to your deployme
 
 - Deterministic checks run first at zero model tokens: ShellCheck, actionlint, Hadolint, zizmor, OSV-Scanner and, when configured, Assay's Go analysis report.
 - One bounded model call per review, under a token budget of 6,000 estimated input tokens by default, with at most three findings.
-- Qualgen history advisories for the changed paths, published outside the prompt and the token estimate.
+- Bounded Qualgen history advisories for files shown in the prompt, with additional advisories in the review report.
 - Hardened for hostile pull requests: a requester allowlist for comment triggers, model tools disabled, untrusted input labelled, and a posted comment that is flattened and quoted as code.
 
 The rest of this section states what the code enforces, in the order a request meets it. The sections after it cover installation and operation.
@@ -37,7 +37,7 @@ The CLI receives an allow-listed environment: its own provider's key or sign-in 
 
 ### Untrusted input and evidence binding
 
-The regular prompt contains PR-Agent's review rubric, scanner diagnostics that fall on shown lines, and the diff hunks. It can include the forge's title and description when available, or recent commit messages in a local or CI review. Mid and max can add surrounding code and other bounded context. Max can also include eligible conversation comments, excluding internal GitLab notes and earlier review summaries. Hadolint, zizmor, OSV-Scanner and Qualgen output stays in the report. The prompt labels the diagnostics, patch and context as `untrusted data` and instructs the model to work without tools. The reviewer checks the change before and after reading its file list and refuses it if the head moves.
+The regular prompt contains PR-Agent's review rubric, scanner diagnostics that fall on shown lines, and the diff hunks. It can include the forge's title and description when available, or recent commit messages in a local or CI review. Mid and max can add surrounding code and other bounded context. Max can also include eligible conversation comments, excluding internal GitLab notes and earlier review summaries. Qualgen advisories may appear for files shown in the prompt. Hadolint, zizmor and OSV-Scanner output stays in the report. The prompt labels the diagnostics, patch and context as `untrusted data` and instructs the model to work without tools. The reviewer checks the change before and after reading its file list and refuses it if the head moves.
 
 A finding is accepted only if it names a reviewed file and cites a contiguous range of head lines that the shown hunks contain. One failing finding rejects the whole answer: the review ends as `model-unavailable` and its scanner results are still posted. A file name containing a C0 control character (below U+0020), or a duplicate file name, stops the review before the model is called.
 
@@ -360,7 +360,7 @@ Set `REVIEW_QUALGEN_INTERVAL_SECONDS` in Docker or enter the refresh interval du
 
 An authorized GitHub or GitLab `/review` runs `qualgen check` for the changed paths and adds its notices to the posted summary. A notice can identify a frequently co-changed file that is missing from the change. The summary identifies the mined commit and marks paths with insufficient history. Live reference notices are included only when the checkout is at the reviewed head. While the first snapshot is being built, the review reports that history is unavailable. The comment shows up to 20 entries; the JSON includes the full advisory list.
 
-Qualgen uses local CPU, disk and Git history. Its output goes directly into the summary, outside the Cursor prompt, token estimate and model cache key. An over-budget review or a model failure can still publish historical advisories.
+Qualgen uses local CPU, disk and Git history. Its advisories go into the review prompt as untrusted data, at most 12 entries for files with reviewable hunks in the prompt, with each detail cut at 300 characters, so they count toward the token estimate and are part of the model cache key. The reviewer fits the patch first. In higher tiers, the advisories share space with optional context while keeping each included context block and preserving the token allowance for verification. The model checks these hints against the patch. The advisories are also added to the posted summary, and an estimate, an over-budget review or a model failure still reports them.
 
 ### Base drift
 
