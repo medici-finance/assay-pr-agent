@@ -25,12 +25,13 @@ with open(here / "prompts", "a") as log:
 answer = (here / (kind + ".answer")).read_text()
 if answer == "fail":
     sys.exit(3)
-print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": answer}))
+usage = {"input_tokens": {"review": 10, "deep": 50, "verification": 15}[kind], "output_tokens": 2}
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": answer, "usage": usage}))
 """
 
 
-def finding(line, header):
-    return {"relevant_file": "src/app.py", "start_line": line, "end_line": line,
+def finding(line, header, path="src/app.py"):
+    return {"relevant_file": path, "start_line": line, "end_line": line,
             "issue_header": header, "issue_content": header + " detail."}
 
 
@@ -144,12 +145,52 @@ class TierTests(unittest.TestCase):
         self.assertEqual([(row["name"], row["state"]) for row in report["passes"]],
                          [("review", "cached"), ("deep", "called"), ("verification", "called")])
         self.assertEqual(report["passes"][0]["estimated_input_tokens"], engine.tokens(mid_prompt))
+        self.assertNotIn("model_usage", report["passes"][0])
+        self.assertEqual([row["model_usage"]["input_tokens"] for row in report["passes"][1:]], [50, 15])
+        self.assertEqual(report["model_usage"], {"input_tokens": 65, "output_tokens": 4})
         for expected in ("# Whole changed files\n## src/app.py at the head", "# Call sites in context\n## Use of compute in src/caller.py lines 1-3",
                          "# Existing tests\n## tests/test_app.py at the head", "def test_existing():", "# Change description"):
             self.assertIn(expected, deep)
         self.assertEqual((code, report["state"], report["delivered"]), (0, "reviewed", "max"))
         self.assertEqual([f["title"] for f in report["findings"]], ["Real", "From the deep pass"])
         self.assertEqual(report["verification"], {"state": "filtered", "before": 3, "after": 2})
+        self.assertLessEqual(report["estimated_input_tokens"], report["max_input_tokens"])
+
+    def test_deep_pass_can_review_a_file_the_first_pass_cannot_fit(self):
+        self.write("src/data.py", "".join(f"VALUE_{n} = {n}  # generated row\n" for n in range(250)))
+        self.commit("add data rows")
+        deep_only = finding(17, "Data issue", "src/data.py")
+        self.answers(deep=answer(deep_only), verification=answer(deep_only))
+        base = ["--max-input-tokens", "1000"]
+        for deep_only_scope in (True, False):
+            with self.subTest(deep_only_scope=deep_only_scope):
+                selected = ["--path", "src/data.py"] if deep_only_scope else []
+                mid = self.check("--tier", "mid", "--estimate", *base, *selected)[1]
+                if deep_only_scope:
+                    self.assertEqual(mid["state"], "over-budget")
+                else:
+                    self.assertEqual(mid["degraded"], ["src/data.py"])
+                code, report = self.check("--tier", "max", *base, *selected)
+                expected_status = (2, "partial") if deep_only_scope else (0, "reviewed")
+                self.assertEqual((code, report["state"]), expected_status)
+                self.assertEqual((report["delivered"], report["degraded"]), ("max", []))
+                self.assertEqual([row["name"] for row in report["passes"]],
+                                 (["deep", "verification"] if deep_only_scope else ["review", "deep", "verification"]))
+                self.assertEqual([item["path"] for item in report["findings"]], ["src/data.py"])
+                self.assertLessEqual(report["estimated_input_tokens"], report["max_input_tokens"])
+
+    def test_max_with_only_shared_context_delivers_mid(self):
+        with patch.object(context, "gather", return_value={"change description": "Describes this change."}):
+            code, report = self.check("--tier", "max")
+        self.assertEqual((code, report["state"], report["delivered"]), (2, "degraded", "mid"))
+        self.assertEqual([kind for kind, _ in self.prompts()], ["review", "verification"])
+
+    def test_verifier_can_use_more_than_the_planning_reserve(self):
+        issue = dict(finding(42, "Detailed"), issue_content="Verified behavior in the changed routine. " * 350)
+        self.answers(review=answer(issue), verification=answer(issue))
+        code, report = self.check("--tier", "mid", "--max-input-tokens", "5000")
+        self.assertEqual((code, report["verification"]["state"]), (0, "filtered"))
+        self.assertGreater(report["passes"][-1]["estimated_input_tokens"], 5000 // 4)
         self.assertLessEqual(report["estimated_input_tokens"], report["max_input_tokens"])
 
     def test_tier_falls_back_to_the_one_below_and_says_so(self):
