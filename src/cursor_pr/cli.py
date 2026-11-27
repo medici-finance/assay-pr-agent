@@ -22,7 +22,7 @@ from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
-from .engine import CursorFailure, pack, review, tokens
+from .engine import CursorFailure, pack, review, section, tokens
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
 
 
