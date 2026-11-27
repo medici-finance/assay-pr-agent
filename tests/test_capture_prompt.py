@@ -305,6 +305,53 @@ class CapturePromptTest(unittest.TestCase):
                          "--cache-dir", str(self.root / "cache")])
         self.assertEqual(sorted(path.name for path in out.iterdir()), [])
 
+    def test_a_link_left_at_a_predictable_name_is_not_written_through(self):
+        out = self.root / "out"
+        out.mkdir()
+        kept = self.root / "kept.txt"
+        kept.write_text("mine\n")
+        for name in ("branch.prompt.txt", "branch.anchors.json", "branch.prompt.txt.part", "branch.anchors.json.part"):
+            (out / name).symlink_to(kept)
+        result = self.capture()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(kept.read_text(), "mine\n")
+        for name in ("branch.prompt.txt", "branch.anchors.json"):
+            self.assertFalse((out / name).is_symlink(), name)
+        self.assertIn("You are PR-Reviewer", (out / "branch.prompt.txt").read_text())
+        # Nothing of this run's own is left beside the output.
+        self.assertEqual(sorted(path.name for path in out.iterdir() if not path.is_symlink()),
+                         ["branch.anchors.json", "branch.prompt.txt"])
+
+    def test_a_second_capture_waits_for_the_one_using_the_output_directory(self):
+        import fcntl
+        out = self.root / "out"
+        self.assertEqual(self.capture().returncode, 0)
+        first = (out / "branch.prompt.txt").read_text()
+        # This test stands in for a capture that is still running there.
+        held = os.open(out, os.O_RDONLY)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        second = subprocess.Popen([sys.executable, str(SCRIPT), str(out / "branch"), "--repo", str(self.repo),
+                                   "--base", self.base, "--cache-dir", str(self.root / "cache")], env=self.env,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(second.kill)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            second.wait(timeout=5)
+        # It has neither removed nor replaced what the running capture owns.
+        self.assertEqual((out / "branch.prompt.txt").read_text(), first)
+        self.assertTrue((out / "branch.anchors.json").exists())
+        fcntl.flock(held, fcntl.LOCK_UN)
+        _, err = second.communicate(timeout=120)
+        self.assertEqual(second.returncode, 0, err)
+        self.assertEqual((out / "branch.prompt.txt").read_text(), first)
+
+    def test_warns_about_untracked_files_the_developer_configured_status_to_hide(self):
+        self.git("config", "status.showUntrackedFiles", "no")
+        (self.repo / "new.py").write_text("y = 2\n")
+        result = self.capture()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("capture-prompt: warning: 1 uncommitted or untracked path(s)", result.stderr)
+
     def test_refuses_other_tiers(self):
         result = self.capture("--tier", "mid")
         self.assertEqual(result.returncode, 1)

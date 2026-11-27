@@ -9,11 +9,14 @@ Writes OUT_PREFIX.prompt.txt (the rubric and the numbered patch) and OUT_PREFIX.
 See AGENTS.md for how the prompt is used.
 """
 import contextlib
+import fcntl
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -60,7 +63,8 @@ def committed(repo, reported, asked, ours=()):
             inside.append(":(top,exclude,literal)" + path.resolve().relative_to(Path(top).resolve()).as_posix())
         except (TypeError, ValueError):
             pass
-    status = git(repo, "status", "--porcelain", "--", ":(top)", *inside)
+    # Every untracked file, whatever status.showUntrackedFiles says in the developer's configuration.
+    status = git(repo, "status", "--porcelain", "--untracked-files=all", "--", ":(top)", *inside)
     return head[:12], None if status is None else len(status.splitlines())
 
 
@@ -72,6 +76,22 @@ def main(argv):
         os.environ.pop(name, None)
     prompt_file = Path(f"{prefix}.prompt.txt")
     anchors_file = Path(f"{prefix}.anchors.json")
+    # One capture at a time in an output directory, from removing the earlier output to putting the
+    # new one in place: two that share a prefix would otherwise remove or mix each other's files.
+    # The lock is on the directory itself, so it adds no file there, and ends with this process.
+    try:
+        prompt_file.parent.mkdir(parents=True, exist_ok=True)
+        held = os.open(prompt_file.parent, os.O_RDONLY)
+    except OSError as err:
+        return fail(f"could not use the output directory ({err}); choose another OUT_PREFIX")
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        return capture_to(prompt_file, anchors_file, options)
+    finally:
+        os.close(held)
+
+
+def capture_to(prompt_file, anchors_file, options):
     # First of all, before any option can be refused: a run that fails for whatever reason must not
     # leave an earlier run's prompt to be reviewed as if it were current.
     try:
@@ -131,20 +151,24 @@ def main(argv):
     if len(captured) > 1:
         return fail(f"the review sent {len(captured)} prompts; this script expects one")
     prompt, anchors = captured[0]
-    # Each file is written beside its place and moved there whole, the prompt last: the prompt is what
-    # gets reviewed, so it appears only complete and only when all else is in place. Whatever stops
-    # this, a failed write, a prompt that cannot be encoded or an interrupt, nothing is left behind.
-    staged = {target: target.with_name(target.name + ".part") for target in (anchors_file, prompt_file)}
+    # Each file is written in a directory of this run's own, made beside its place under a name
+    # nothing else has, and moved to its place whole. Nothing is written through a name another
+    # could have put there: a link left at a predictable name would be written through, and the
+    # move replaces a link at the final name instead of following it. The prompt is moved last: it
+    # is what gets reviewed, so it appears only complete and only when all else is in place.
+    # Whatever stops this, a failed write, a prompt that cannot be encoded or an interrupt, nothing
+    # is left behind.
     contents = {anchors_file: json.dumps({path: sorted(lines) for path, lines in anchors.items()}, indent=1),
                 prompt_file: prompt}
+    staging = None
     try:
-        prompt_file.parent.mkdir(parents=True, exist_ok=True)
-        for target, part in staged.items():
-            part.write_text(contents[target], encoding="utf-8")
-        for target, part in staged.items():
-            part.replace(target)
+        staging = Path(tempfile.mkdtemp(prefix=".capture-", dir=prompt_file.parent))
+        for target, text in contents.items():
+            (staging / target.name).write_text(text, encoding="utf-8")
+        for target in contents:
+            (staging / target.name).replace(target)
     except BaseException as err:
-        for path in (*staged.values(), *staged):
+        for path in contents:
             try:
                 path.unlink(missing_ok=True)
             except OSError:
@@ -152,6 +176,9 @@ def main(argv):
         if not isinstance(err, (OSError, ValueError)):
             raise
         return fail(f"could not write the capture ({err}); nothing was left behind")
+    finally:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
     head, dirty = committed(args.repo, report.get("head"), args.head, (prompt_file, anchors_file))
     print(f"prompt: {prompt_file}")
     print(f"anchors: {anchors_file}")
