@@ -163,11 +163,26 @@ def base_line(patch, line, *, nearest=False):
             break
         if line < end:
             previous = hunk.source_start
+            removed_start = None
+            inserted = 0
             for row in hunk:
                 if row.target_line_no == line:
-                    return (row.source_line_no or max(1, previous)) if nearest else row.source_line_no
-                if row.source_line_no is not None:
+                    if row.source_line_no is not None or not nearest:
+                        return row.source_line_no
+                    if removed_start is not None:
+                        # Pair a replacement line with its position in the removed block.
+                        return min(removed_start + inserted, previous)
+                    return max(1, previous)
+                if row.is_removed:
                     previous = row.source_line_no
+                    if removed_start is None:
+                        removed_start = previous
+                elif row.is_added:
+                    inserted += 1
+                elif row.is_context:
+                    previous = row.source_line_no
+                    removed_start = None
+                    inserted = 0
             return None
         offset = hunk.source_start + hunk.source_length + (hunk.source_length == 0) - end
     return line + offset

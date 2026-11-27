@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from cursor_pr import context, discovery, engine
 from cursor_pr.config import project_from
-from cursor_pr.source import Change, File, local_change
+from cursor_pr.source import Change, File, base_line, hunks, local_change
 
 
 class TierContextTests(unittest.TestCase):
@@ -136,6 +136,22 @@ class TierContextTests(unittest.TestCase):
         wide = engine.verification([issue], [file], radius=15)
         self.assertIn("- -old_first()\n- -old_second()\n10 +new_first()\n11 +new_second()", wide)
         self.assertNotIn("distant_old()", wide)
+
+    def test_verification_aligns_base_excerpts_with_large_replacement(self):
+        old = [f"old_{number:02}()" for number in range(1, 33)]
+        new = [f"new_{number:02}()" for number in range(1, 36)]
+        diff = "@@ -1,33 +1,36 @@\n" + "".join(f"-{line}\n" for line in old) + "".join(
+            f"+{line}\n" for line in new) + " retained()\n"
+        file = File("app.py", diff, "modified")
+        patch_rows = hunks(file)
+        self.assertIsNone(base_line(patch_rows, 1))
+        self.assertEqual([base_line(patch_rows, line, nearest=True) for line in (1, 18, 35, 36)], [1, 18, 32, 33])
+        with patch.object(context, "blob", side_effect=["\n".join(old), "\n".join(new)]):
+            comparison = context.verification_comparison(Path("."), Path("."), "base", "head")
+            base, head = comparison(file, 1, 1, 3)
+        self.assertIn("1: old_01()", base)
+        self.assertNotIn("old_32()", base)
+        self.assertIn("1: new_01()", head)
 
     def test_verification_keeps_deletion_adjacent_to_the_cited_context_line(self):
         issue = dict(path="app.py", line=2, end_line=2, title="Removed step", message="Check the missing step.")
