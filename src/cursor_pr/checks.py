@@ -53,6 +53,17 @@ def scanner(path):
         return "actionlint", ["-shellcheck=", "-pyflakes=", "-format", "{{json .}}", "-"]
 
 
+def blob(root, head, path, limit=1_000_000):
+    """The immutable content of one path at the reviewed head, or None when Git cannot supply it."""
+    try:
+        spec = head + ":" + path
+        if int(git(root, "cat-file", "-s", spec)) > limit:
+            return None
+        return git(root, "cat-file", "blob", spec)
+    except (ReviewError, OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
 def scan_files(root, head, files):
     checks = []
     for file in files:
@@ -69,13 +80,12 @@ def scan_files(root, head, files):
             result["reason"] = "tool unavailable"
             continue
         try:
-            spec = head + ":" + path
-            if int(git(root, "cat-file", "-s", spec)) > 1_000_000:
-                raise ReviewError("file exceeds scanner size limit")
-            blob = git(root, "cat-file", "blob", spec)
+            content = blob(root, head, path)
+            if content is None:
+                raise ReviewError("immutable source unavailable")
             # stdin in a clean directory avoids project-local config and external source files.
             with tempfile.TemporaryDirectory() as empty:
-                proc = subprocess.run([tool, *args], input=blob, cwd=empty, env=child_env(), capture_output=True, timeout=20)
+                proc = subprocess.run([tool, *args], input=content, cwd=empty, env=child_env(), capture_output=True, timeout=20)
             if proc.returncode not in (0, 1):
                 raise ReviewError("scanner failed")
             rows = json.loads(proc.stdout)
