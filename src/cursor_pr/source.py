@@ -232,7 +232,7 @@ def local_description(root, base, head):
     byte_limit = 4 * DESCRIPTION_LIMIT
     output = bytearray()
     deadline = time.monotonic() + 45
-    args = ["git", "--literal-pathspecs", "-C", str(root), "log", "--no-show-signature", "--reverse", f"-{DESCRIPTION_COMMITS + 1}",
+    args = ["git", "--literal-pathspecs", "-C", str(root), "log", "--no-show-signature", f"-{DESCRIPTION_COMMITS + 1}",
             "--format=%s%n%n%b%x00", base + ".." + head, "--"]
     try:
         with subprocess.Popen(args, env=child_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
@@ -252,17 +252,27 @@ def local_description(root, base, head):
                     process.kill()
     except (OSError, subprocess.TimeoutExpired):
         return ""
-    # Preserve the newest commits when the count is capped. A final incomplete message
-    # from reaching the byte limit is useful as a prefix, with the truncation signalled.
+    # Spend the budget newest-first, then display the retained messages in chronological order.
     clipped = len(output) > byte_limit
     messages = output[:byte_limit].decode("utf8", "replace").split("\0")
-    if clipped:
-        chosen = messages[:DESCRIPTION_COMMITS]
-    else:
-        chosen = messages[:-1][-DESCRIPTION_COMMITS:]
-        clipped = len(messages) - 1 > DESCRIPTION_COMMITS
-    description = bounded_text("\n\n".join(m.strip() for m in chosen if m.strip()), DESCRIPTION_LIMIT)
-    return description + TRUNCATED if clipped and not description.endswith(TRUNCATED) else description
+    if not clipped:
+        messages.pop()  # Trailing separator after the last complete message.
+    clipped = clipped or len(messages) > DESCRIPTION_COMMITS
+    chosen, remaining = [], DESCRIPTION_LIMIT
+    for message in messages[:DESCRIPTION_COMMITS]:
+        if remaining <= 0:
+            clipped = True
+            break
+        text = bounded_text(message, len(message))
+        if not text:
+            continue
+        if len(text) > remaining:
+            clipped = True
+            text = text[:remaining].rstrip()
+        chosen.append(text)
+        remaining -= len(text) + 2
+    description = "\n\n".join(reversed(chosen))
+    return description + TRUNCATED if clipped else description
 
 
 def ci_refs():

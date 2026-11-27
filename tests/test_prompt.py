@@ -79,6 +79,21 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertTrue(description.endswith(source.TRUNCATED))
         self.assertEqual(len(description), source.DESCRIPTION_LIMIT + len(source.TRUNCATED))
 
+    def test_local_description_preserves_recent_messages_when_an_older_one_is_large(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        def git(*args):
+            return subprocess.check_output(["git", "-c", "user.name=Test",
+                                            "-c", "user.email=test@example.org", *args], cwd=root)
+        git("init", "-q")
+        git("commit", "--allow-empty", "-qm", "base")
+        base = source.commit(root, "HEAD")
+        git("commit", "--allow-empty", "-qm", "Old subject\n\n" + "large message " * 1000)
+        git("commit", "--allow-empty", "-qm", "Recent subject")
+        description = source.local_description(root, base, source.commit(root, "HEAD"))
+        self.assertTrue(description.startswith("Old subject"))
+        self.assertTrue(description.endswith("Recent subject" + source.TRUNCATED))
+        self.assertLessEqual(len(description), source.DESCRIPTION_LIMIT + len(source.TRUNCATED))
+
     def test_prompt_carries_the_description_only_when_there_is_one(self):
         files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
         plain = engine.pack(files, [])

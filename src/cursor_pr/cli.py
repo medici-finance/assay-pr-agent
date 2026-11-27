@@ -1,4 +1,5 @@
 import argparse
+from collections import defaultdict
 import fcntl
 from contextlib import ExitStack
 import json
@@ -22,7 +23,7 @@ from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
-from .engine import CursorFailure, pack, review, tokens
+from .engine import CursorFailure, pack, render_sections, review, tokens
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
 
 
@@ -44,23 +45,30 @@ def rank(path):
     return 3
 
 
-def fit(files, checks, limit, *, title="", description=""):
+def fit(files, checks, limit, *, title="", description="", rendered=None):
     """Pack the prompt, leaving out whole files until it fits the input budget.
 
     Returns the prompt parts, the estimate of what will be sent, the estimate of the full
     prompt, and the paths left out. Nothing is left out when even one file cannot fit.
     """
-    prompt, anchors, unseen, has_text = full_pack = pack(files, checks, title=title, description=description)
+    if rendered is None:
+        rendered = render_sections(files)
+    prompt, anchors, unseen, has_text = full_pack = pack(files, checks, title=title, description=description, rendered=rendered)
     estimated = full = tokens(prompt) if has_text else 0
     if full <= limit:
         return full_pack, full, full, []
     # Measure each file with its scanner evidence before choosing what to leave out.
     # A file that cannot fit alone leaves first, so a smaller file can still be reviewed.
+    findings_by_path = defaultdict(list)
+    for check in checks:
+        for finding in check["findings"]:
+            findings_by_path[finding["path"]].append(finding)
     overhead = tokens(pack([], [], title=title, description=description)[0])
     sizes = {}
     for file in files:
-        if file.path not in unseen:
-            standalone, _, _, _ = pack([file], checks, title=title, description=description)
+        if rendered[file.path][0] is not None:
+            file_checks = [{"findings": findings_by_path.get(file.path, ())}]
+            standalone, _, _, _ = pack([file], file_checks, title=title, description=description, rendered=rendered)
             sizes[file.path] = tokens(standalone) - overhead
     queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
@@ -71,11 +79,11 @@ def fit(files, checks, limit, *, title="", description=""):
         while len(queue) > 1 and freed < estimated - limit:
             dropped.append(queue.pop(0))
             freed += sizes[dropped[-1]]
-        prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), title, description)
+        prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), title, description, rendered=rendered)
         estimated = tokens(prompt) if has_text else 0
     if not has_text or estimated > limit:
         if title or description:
-            fitted, estimate, _, skipped = fit(files, checks, limit)
+            fitted, estimate, _, skipped = fit(files, checks, limit, rendered=rendered)
             if fitted[3] and estimate <= limit:
                 return fitted, estimate, full, skipped
         return full_pack, full, full, []

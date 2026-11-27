@@ -72,8 +72,8 @@ class DriftTests(unittest.TestCase):
         renamed = File("moved.py", "", "renamed", True, "shared.py")
         self.assertEqual(drift.check(self.root, self.head, "main", [renamed])["both"], ["shared.py"])
 
-    def test_overlap_uses_literal_non_ascii_paths(self):
-        path = "café.md"
+    def test_overlap_preserves_whitespace_and_non_ascii_in_the_first_path(self):
+        path = " café.md "
         self.write(path, "Base text.\n")
         self.commit("add documentation on the base")
         changed = File(path, "", "added", True)
