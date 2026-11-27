@@ -30,6 +30,10 @@ BUDGET_SECONDS = 20
 START_SECONDS = 5
 # The removal and the notice of one request, right after its review:
 FINISH_SECONDS = 20
+# What the notice may still take to start when the removal before it used that time up. The two
+# share the count of tries, so a removal that is slow every time must not keep the notice from
+# ever being tried.
+NOTICE_SECONDS = 5
 TIMEOUT_SECONDS = 15
 HELPER_SECONDS = 45
 PAGES = 5
@@ -218,6 +222,7 @@ class Acknowledgement:
         notice_sent, marker_cleared = owed
         if deadline is None:
             deadline = time.monotonic() + FINISH_SECONDS
+        in_time = time.monotonic() < deadline
 
         def clear():
             if project.provider == "gitlab" and self.jobs.pending(project.key, number):
@@ -232,7 +237,8 @@ class Acknowledgement:
         cleared = bool(marker_cleared) or self.attempt(clear, "clear the queued marker on", project, number, comment)
 
         def report_failure():
-            notify(project, number, comment, self.state, deadline)
+            notify(project, number, comment, self.state,
+                   max(deadline, time.monotonic() + NOTICE_SECONDS) if in_time else deadline)
             self.jobs.record_notice(job)
 
         notice_needed = status == "failed" and not notice_sent
