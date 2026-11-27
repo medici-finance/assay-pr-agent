@@ -124,14 +124,24 @@ def verification(findings, files, radius=15):
     shown = []
     for finding in findings:
         rows = []
+        start, end = finding["line"] - radius, finding["end_line"] + radius
         for hunk in hunks(by_path[finding["path"]]):
             near = False
+            pending_removals = []
             for line in hunk:
                 number = line.target_line_no
                 if number is not None:
-                    near = finding["line"] - radius <= number <= finding["end_line"] + radius
-                if near:  # A removed line has no head number and follows its neighbour.
+                    near = start <= number <= end
+                    if line.is_context:
+                        pending_removals.clear()
+                    elif near:
+                        rows.extend(pending_removals)
+                        pending_removals.clear()
+                if near:
                     rows.append(f"{number if number is not None else '-'} {line.line_type}{line.value.rstrip()}")
+                elif line.is_removed:
+                    # Keep the old side until a replacement line enters the window.
+                    pending_removals.append(f"- {line.line_type}{line.value.rstrip()}")
         shown.append(f"## {finding['path']} around lines {finding['line']}-{finding['end_line']}\n" + "\n".join(rows))
     listed = [{"relevant_file": f["path"], "start_line": f["line"], "end_line": f["end_line"],
                "issue_header": f["title"], "issue_content": f["message"]} for f in findings]

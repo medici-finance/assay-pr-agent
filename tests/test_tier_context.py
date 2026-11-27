@@ -74,6 +74,19 @@ class TierContextTests(unittest.TestCase):
         file = File("app.py", "@@ -1 +1 @@\n-foo()\n+bar()\n", "modified")
         self.assertIn("keep the finding unchanged and unverified", engine.verification([issue], [file]))
 
+    def test_verification_keeps_the_old_lines_of_a_replacement_at_the_start_of_a_hunk(self):
+        issue = dict(path="app.py", line=11, end_line=11, title="Changed behavior", message="Check the replacement.")
+        file = File("app.py", "@@ -10,5 +10,5 @@\n-old_first()\n-old_second()\n+new_first()\n+new_second()\n"
+                    " context()\n-other_old()\n+other_new()\n tail()\n"
+                    "@@ -100 +100 @@\n-distant_old()\n+distant_new()\n", "modified")
+
+        narrow = engine.verification([issue], [file], radius=0)
+        self.assertTrue(narrow.endswith(
+            "## app.py around lines 11-11\n- -old_first()\n- -old_second()\n11 +new_second()"))
+        wide = engine.verification([issue], [file], radius=15)
+        self.assertIn("- -old_first()\n- -old_second()\n10 +new_first()\n11 +new_second()", wide)
+        self.assertNotIn("distant_old()", wide)
+
 
 class CallSiteTests(unittest.TestCase):
     def setUp(self):
