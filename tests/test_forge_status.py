@@ -291,8 +291,8 @@ class ForgeStatusRequestTests(unittest.TestCase):
         from cursor_pr.config import project_from
         from cursor_pr.poll import run_review
         project = project_from(dict(provider="github", url="https://github.com/" + SLUG, requester_ids=[7], checkout=str(self.root)))
-        with patch.dict(os.environ, {"REVIEW_FORGE_STATUS": "1"}), patch("cursor_pr.poll.subprocess.run") as run:
-            run.return_value.stdout = json.dumps({"state": "reviewed", "publication": "posted-or-already-present"}).encode()
+        with patch.dict(os.environ, {"REVIEW_FORGE_STATUS": "1"}), patch("cursor_pr.poll.supervised") as run:
+            run.return_value = json.dumps({"state": "reviewed", "publication": "posted-or-already-present"}).encode()
             self.assertEqual(run_review(project, 7, self.root), "reviewed")
         self.assertEqual(run.call_args.kwargs["env"]["REVIEW_FORGE_STATUS"], "1")
         self.assertNotIn("--forge-status", run.call_args.args[0])

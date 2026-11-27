@@ -4,6 +4,7 @@ from importlib.metadata import PackageNotFoundError, version
 import json
 from pathlib import Path
 import struct
+from tempfile import TemporaryDirectory
 from urllib.parse import quote
 
 from .scanners import safe_path
@@ -118,29 +119,27 @@ def log(report, source=None):
     results, rules, lines = [], {}, {}
     for tool, name, path, line, end, text in rows:
         # Six scanners share one driver, so the message names the tool that reported the line.
-        text = (text if tool == "model" else f"{tool}: {text}")[:MESSAGE_LIMIT]
+        text = text if tool == "model" else f"{tool}: {text}"
         # A URI reference: a '#' or '%' in a path must not read as a fragment or an escape.
         location = {"artifactLocation": {"uri": quote(path, safe="/")}}
-        result = {"ruleId": name, "level": "warning" if tool in WARNINGS else "note", "message": {"text": text},
-                  "locations": [{"physicalLocation": location}]}
-        # A finding without a line, such as an OSV-Scanner vulnerability, has only these to identify it.
-        fingerprint = hashlib.sha256(json.dumps([path, name, text]).encode()).hexdigest()
+        result = {"ruleId": name, "level": "warning" if tool in WARNINGS else "note",
+                  "message": {"text": text[:MESSAGE_LIMIT]}, "locations": [{"physicalLocation": location}]}
         if type(line) is int and line > 0:
             extent = end if type(end) is int and end >= line else None
             location["region"] = {"startLine": line, **({"endLine": extent} if extent is not None else {})}
-            # The line's own text identifies the result, so a line added above it is not a new alert.
+            # Prefer source context and its occurrence count to the absolute line offset.
             if path not in lines:
                 blob = source(path) if source else None
                 lines[path] = line_hashes(blob, requested[path]) if blob is not None else {}
-            # Without the line's text there is no value: the upload-sarif action computes it instead.
-            fingerprint = lines[path].get(line)
-            if fingerprint:
-                # The finding keeps its own identity when other findings appear on that line.
-                span = extent - line if extent is not None else None
-                key = hashlib.sha256(json.dumps([span, text]).encode()).hexdigest()
-                fingerprint = f"{fingerprint}:{key}"
-        if fingerprint:
-            result["partialFingerprints"] = {"primaryLocationLineHash": fingerprint}
+            source_key = lines[path].get(line, f"line:{line}")
+            # Preserve distinct results even when the required source line is unavailable.
+            span = extent - line if extent is not None else None
+            key = hashlib.sha256(json.dumps([span, text]).encode()).hexdigest()
+            fingerprint = f"{source_key}:{key}"
+        else:
+            # An OSV-Scanner vulnerability has only the path, rule and message to identify it.
+            fingerprint = hashlib.sha256(json.dumps([path, name, text]).encode()).hexdigest()
+        result["partialFingerprints"] = {"primaryLocationLineHash": fingerprint}
         rules.setdefault(name, describe(tool, name))
         results.append(result)
     return {"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0", "runs": [{
@@ -150,4 +149,12 @@ def log(report, source=None):
 
 
 def write(path, report, source=None):
-    Path(path).write_text(json.dumps(log(report, source), ensure_ascii=True, indent=2) + "\n", encoding="utf8")
+    path = Path(path)
+    if path.is_symlink():
+        raise OSError(f"Cannot write SARIF to a symbolic link: {path}")
+    # Publish the completed log atomically. Replacement never follows a link at the destination.
+    with TemporaryDirectory(dir=path.parent, prefix=".sarif-") as directory:
+        temporary = Path(directory) / "report.sarif"
+        temporary.touch(mode=0o600)
+        temporary.write_text(json.dumps(log(report, source), ensure_ascii=True, indent=2) + "\n", encoding="utf8")
+        temporary.replace(path)

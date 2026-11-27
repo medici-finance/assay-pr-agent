@@ -147,18 +147,24 @@ class SarifLogTests(unittest.TestCase):
         self.assertEqual(prints(results(dict(alone, findings=alone["findings"] + [
             dict(alone["findings"][0], path="copy.py", message="elsewhere")]), head_text)),
             keys[:1] + prints(results(model(("elsewhere", 3)), head_text)))
-        self.assertEqual(prints(results(model(("first", 3), ("second", 3)), None)), [None, None])
+        first, second = prints(results(model(("first", 3), ("second", 3))))
+        self.assertNotEqual(first, second)
+        self.assertEqual(prints(results(model(("second", 3), ("first", 3)))), [second, first])
+        self.assertEqual(prints(results(model(("first", 3)))), [first])
 
-    def test_unreadable_lines_carry_no_fingerprint_and_lineless_ones_keep_one(self):
-        # Without the line's text there is no value: the upload-sarif action computes it from its checkout.
-        for reader in (None, lambda path: None):
-            self.assertEqual([bool(value) for value in prints(results(report(), reader))],
-                             [False, False, False, False, False, True])
-        self.assertEqual([bool(value) for value in prints(results(report(), head_text))], [True] * 6)
+    def test_unreadable_source_falls_back_to_line_numbers(self):
+        values = prints(results(report()))
+        self.assertEqual(values, prints(results(report(), lambda path: None)))
+        # The two shellcheck results have the same rule and message on different lines.
+        self.assertNotEqual(values[1], values[2])
+        self.assertTrue(values[1]["primaryLocationLineHash"].startswith("line:2:"))
+        self.assertTrue(values[2]["primaryLocationLineHash"].startswith("line:5:"))
         past_end = report(findings=[{"path": "src/app.py", "line": 13, "end_line": 13, "title": "T", "message": "m"}],
                           checks=[], static_checks=[])
-        self.assertEqual(prints(results(past_end, head_text)), [None])
-        # A finding without a line is identified by its path, rule and message.
+        fingerprint = prints(results(past_end, head_text))[0]["primaryLocationLineHash"]
+        self.assertTrue(fingerprint.startswith("line:13:"))
+
+    def test_lineless_results_are_identified_by_path_rule_and_message(self):
         advisories = [("GHSA-1234-5678-9abc", "requests 2.25.1"), ("GHSA-1234-5678-9abc", "urllib3 1.26.5"),
                       ("GHSA-0000-1111-2222", "requests 2.25.1")]
         value = report(findings=[], checks=[], static_checks=[
@@ -166,6 +172,18 @@ class SarifLogTests(unittest.TestCase):
                 {"rule": rule, "message": message, "line": None} for rule, message in advisories]}])
         self.assertEqual(prints(results(value)), [{"primaryLocationLineHash": hashlib.sha256(
             json.dumps(["uv.lock", rule, "osv-scanner: " + message]).encode()).hexdigest()} for rule, message in advisories])
+
+    def test_fingerprints_include_text_beyond_the_display_limit(self):
+        prefix = "x" * sarif.MESSAGE_LIMIT
+        finding = {"path": "src/app.py", "line": 3, "end_line": 3, "title": "Issue"}
+        for line in (3, None):
+            with self.subTest(line=line):
+                value = report(findings=[dict(finding, line=line, message=prefix + suffix)
+                                         for suffix in ("first defect", "second defect")],
+                               checks=[], static_checks=[])
+                first, second = results(value, head_text)
+                self.assertEqual(first["message"], second["message"])
+                self.assertNotEqual(first["partialFingerprints"], second["partialFingerprints"])
 
     def test_paths_are_percent_encoded_uri_references(self):
         paths = ["src/a#b.py", "sp ace/ü.py", "50%.yml", "q?x.yml", "plain/dir/file.sh"]
@@ -271,12 +289,17 @@ class SarifFlagTests(unittest.TestCase):
 
     def test_export_reuses_the_temporary_managed_checkout(self):
         candidate = self.root
+        base = self.git("rev-parse", "HEAD")
+        path = "example.py"
+        (candidate / path).write_text("value = 1\n")
+        self.git("add", path)
+        self.git("commit", "-qm", "Add a Python change")
         original = self.root / "checkout-without-head"
         original.mkdir()
         url = "https://github.com/example/repo/pull/1"
         project = project_from(dict(provider="github", url=url.removesuffix("/pull/1"), requester_ids=[7],
                                     checkout=str(original), managed=True))
-        change = local_change(candidate, self.base, "HEAD")
+        change = local_change(candidate, base, "HEAD")
         change = type(change)(change.head, change.files, url)
         active = False
 
@@ -296,14 +319,18 @@ class SarifFlagTests(unittest.TestCase):
 
         target = candidate / "managed.sarif"
         self.root = original
+        answer = {"findings": [{"path": path, "line": 1, "end_line": 1, "title": "Example",
+                                "message": "A finding on a path without a scanner."}], "cursor_usage": None}
         with patch.object(cli, "scan_checkout", side_effect=checkout), patch.object(cli, "blob", side_effect=read), \
              patch.object(cli, "forge_change", return_value=change), \
+             patch.object(cli, "scan_files", return_value=[]), patch.object(engine, "invoke", return_value=answer), \
              patch.dict(os.environ, {"CURSOR_REVIEW_POLLER_CHILD": "1", "REVIEW_FORGE_PROJECT": json.dumps(dict(
                  provider=project.provider, url=project.url, checkout=str(project.checkout),
                  requester_ids=sorted(project.requesters), managed=True))}):
-            code, _, error = self.check("--change", "example/repo#1", "--estimate", "--sarif", str(target))
+            code, _, error = self.check("--change", "example/repo#1", "--sarif", str(target))
         self.assertEqual(code, 0, error)
-        self.assertEqual(len(json.loads(target.read_text())["runs"][0]["results"]), 1)
+        row, = json.loads(target.read_text())["runs"][0]["results"]
+        self.assertIn("partialFingerprints", row)
         self.assertFalse(active)
 
     def test_fingerprints_read_the_reviewed_head(self):
@@ -318,7 +345,7 @@ class SarifFlagTests(unittest.TestCase):
         self.assertEqual([r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for r in rows], ["example.sh", "ghost.sh"])
         self.assertTrue(rows[0]["partialFingerprints"]["primaryLocationLineHash"].startswith(
             sarif.line_hashes(EXAMPLE.encode())[2] + ":"))
-        self.assertNotIn("partialFingerprints", rows[1])
+        self.assertTrue(rows[1]["partialFingerprints"]["primaryLocationLineHash"].startswith("line:2:"))
         head = self.git("rev-parse", "HEAD")
         self.assertEqual(blob(self.root, head, "example.sh"), EXAMPLE.encode())
         self.assertIsNone(blob(self.root, head, "ghost.sh"))
@@ -338,3 +365,27 @@ class SarifFlagTests(unittest.TestCase):
         self.assertEqual((code, json.loads(out)["state"]), (2, "estimate"))
         self.assertIn("cursor-review:", err)
         self.assertTrue(loop.is_symlink())
+
+    def test_existing_output_link_is_rejected(self):
+        target = self.root / "original.txt"
+        target.write_text("keep me")
+        link = self.root / "review.sarif"
+        link.symlink_to(target.name)
+        code, out, err = self.check("--base", self.base, "--estimate", "--sarif", str(link))
+        self.assertEqual((code, json.loads(out)["state"]), (2, "estimate"))
+        self.assertIn("symbolic link", err)
+        self.assertEqual(target.read_text(), "keep me")
+        self.assertTrue(link.is_symlink())
+
+    def test_replacing_a_private_report_keeps_it_private(self):
+        target = self.root / "review.sarif"
+        target.write_text("old report")
+        target.chmod(0o600)
+        previous = os.umask(0o022)
+        try:
+            code, _, error = self.check("--base", self.base, "--estimate", "--sarif", str(target))
+        finally:
+            os.umask(previous)
+        self.assertEqual(code, 0, error)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(target.read_text())["version"], "2.1.0")
