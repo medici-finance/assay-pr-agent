@@ -86,7 +86,9 @@ def request(project, method, url, headers, deadline=None, **options):
     left = TIMEOUT_SECONDS if deadline is None else min(TIMEOUT_SECONDS, deadline - time.monotonic())
     if left < SHORTEST_SECONDS:
         raise OutOfTime()  # Too little is as good as none: no request is worth starting for it.
-    host = urlsplit(url).netloc
+    # One name for one host, however its URL is written: any case, the default port given or not.
+    site = urlsplit(url)
+    host = (site.hostname or "").lower(), site.port or 443
     if host in unanswered and unanswered[host].is_alive():
         raise Busy()
     unanswered.pop(host, None)
@@ -111,7 +113,10 @@ def request(project, method, url, headers, deadline=None, **options):
                         raise OutOfTime()
                     state["sending"] = True
                     started[0] += 1
-                answer.put((client.request(method, url, headers=headers, **options), None))
+                response = client.request(method, url, headers=headers, **options)
+            # Said only when the client is closed, so that the next request to this host finds
+            # nothing of this one still open, and a close that fails is not lost behind the answer.
+            answer.put((response, None))
         except BaseException as err:
             answer.put((None, err))
     thread = threading.Thread(target=send, name="forge-marker-request", daemon=True)
@@ -119,11 +124,13 @@ def request(project, method, url, headers, deadline=None, **options):
     try:
         response, error = answer.get(timeout=max(cutoff - time.monotonic(), 0))
     except queue.Empty:
+        # Its thread is still running either way, be it only to prepare a client, and stays the
+        # one for this host until it ends.
+        unanswered[host] = thread
         with settle:
             state["waited_for"] = False
             if not state["sending"]:
                 raise OutOfTime() from None  # It never got to send, and now will not.
-        unanswered[host] = thread
         raise httpx.ReadTimeout("The forge did not answer in time") from None
     if error is not None:
         raise error

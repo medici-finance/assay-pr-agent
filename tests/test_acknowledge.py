@@ -315,7 +315,7 @@ class MarkerTests(Offline):
             self.assertEqual(asked, ["POST", "GET"])
             del asked[1:]
             release.set()
-            acknowledge.unanswered["api.github.com"].join(10)
+            acknowledge.unanswered["api.github.com", 443].join(10)
             ack.finished(self.gh, 3, 81, "reviewed")  # The forge answers again, and so the removal is made.
         self.assertEqual(asked, ["POST", "POST", "DELETE"])
         self.assertIsNone(ack.jobs.owed(job))
@@ -331,14 +331,18 @@ class MarkerTests(Offline):
             return client(transport=httpx.MockTransport(lambda request: asked.append(request) or httpx.Response(200)),
                           **options)
         before = acknowledge.started[0]
-        with patch.object(acknowledge.httpx, "Client", side_effect=slow_to_prepare), \
-                self.assertRaises(acknowledge.OutOfTime):
-            acknowledge.request(self.gh, "POST", GITHUB, {}, time.monotonic() + 1.2)
-        self.assertTrue(ready.wait(10))
-        for thread in threading.enumerate():
-            if thread.name == "forge-marker-request":
-                thread.join(10)
-        self.assertEqual((asked, acknowledge.started[0] - before, acknowledge.unanswered), ([], 0, {}))
+        self.addCleanup(acknowledge.unanswered.clear)
+        with patch.object(acknowledge.httpx, "Client", side_effect=slow_to_prepare) as prepared:
+            with self.assertRaises(acknowledge.OutOfTime):
+                acknowledge.request(self.gh, "POST", GITHUB, {}, time.monotonic() + 1.2)
+            # While that client is still being prepared no second one is, also under another
+            # spelling of the same host.
+            with self.assertRaises(acknowledge.Busy):
+                acknowledge.request(self.gh, "POST", GITHUB.replace("api.github.com", "API.GitHub.com:443"), {})
+            self.assertEqual(prepared.call_count, 1)
+            self.assertTrue(ready.wait(10))
+            acknowledge.unanswered["api.github.com", 443].join(10)
+        self.assertEqual((asked, acknowledge.started[0] - before), ([], 0))
 
     def test_a_call_that_started_is_a_try_however_little_time_it_had(self):
         ack = self.ack()
