@@ -4,7 +4,7 @@ import os
 import queue
 import threading
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -35,6 +35,7 @@ START_SECONDS = 5
 # The removal and the notice of one request, right after its review:
 FINISH_SECONDS = 20
 TIMEOUT_SECONDS = 15
+SHORTEST_SECONDS = 1
 HELPER_SECONDS = 45
 PAGES = 5
 
@@ -59,8 +60,15 @@ def refused(response):
     return 300 <= response.status_code < 500 and not limited
 
 
-# The one request the forge has not answered within its time, still running in its thread.
-unanswered = [None]
+# For each forge host, the one request it has not answered within its time, still running in its thread.
+unanswered = {}
+
+
+class Busy(OutOfTime):
+    """The forge still has a request of ours open. Nothing was sent, so nothing was tried."""
+
+    def __init__(self):
+        ReviewError.__init__(self, "an earlier request to the forge is still unanswered")
 
 
 def request(project, method, url, headers, deadline=None, **options):
@@ -71,19 +79,25 @@ def request(project, method, url, headers, deadline=None, **options):
     each connect, write and read by itself, so a forge that sends a few bytes just inside every read
     could hold a call for as long as it liked. The request therefore runs in a thread of its own and
     is waited for until the time is up, and no longer. A request left behind like that stays the only
-    one: while it runs, no other is started, so a forge that does this costs one thread and one
-    connection, not one per call.
+    one to its host: while it runs no other is started there, which is no try and is made up for in
+    a later cycle. So a forge that does this costs one thread and one connection, not one per call,
+    and no other forge's calls.
     """
     left = TIMEOUT_SECONDS if deadline is None else min(TIMEOUT_SECONDS, deadline - time.monotonic())
-    if left <= 0:
-        raise OutOfTime()
-    if unanswered[0] is not None and unanswered[0].is_alive():
-        raise ReviewError("an earlier request to the forge is still unanswered")
+    if left < SHORTEST_SECONDS:
+        raise OutOfTime()  # Too little is as good as none: no request is worth starting for it.
+    host = urlsplit(url).netloc
+    if host in unanswered and unanswered[host].is_alive():
+        raise Busy()
+    unanswered.pop(host, None)
     answer = queue.SimpleQueue()
+    # A forge that is only slow runs into httpx's own timeout, just before the wait here is over:
+    # the error then names what was slow, and its thread has ended when the next call is made.
+    patience = left - SHORTEST_SECONDS / 2
 
     def send():
         try:
-            with httpx.Client(timeout=left, follow_redirects=False,
+            with httpx.Client(timeout=patience, follow_redirects=False,
                               **(client_options() if project.provider == "gitlab" else {})) as client:
                 answer.put((client.request(method, url, headers=headers, **options), None))
         except BaseException as err:
@@ -94,7 +108,7 @@ def request(project, method, url, headers, deadline=None, **options):
     try:
         response, error = answer.get(timeout=left)
     except queue.Empty:
-        unanswered[0] = thread
+        unanswered[host] = thread
         raise httpx.ReadTimeout("The forge did not answer in time") from None
     if error is not None:
         raise error

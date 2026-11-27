@@ -285,30 +285,37 @@ class MarkerTests(Offline):
         with httpx.Client() as made:
             client = type(made)
         release, asked = threading.Event(), []
-        self.addCleanup(lambda: acknowledge.unanswered.__setitem__(0, None))
+        self.addCleanup(acknowledge.unanswered.clear)
         self.addCleanup(release.set)
 
         def open_ended(**options):
             def hold(request):
                 # As a forge sending a few bytes inside every read timeout: no timeout of httpx's ends it.
                 asked.append(request.method)
-                release.wait(30)
+                if len(asked) == 1:
+                    release.wait(30)
                 return httpx.Response(200, json=dict(id=101, content="eyes"), request=request)
             return client(transport=httpx.MockTransport(hold), **options)
         with patch.object(acknowledge.httpx, "Client", side_effect=open_ended):
             began = time.monotonic()
             with self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
-                ack.finished(self.gh, 3, 81, "reviewed", began + 0.3)
-            self.assertLess(time.monotonic() - began, 5)
+                ack.finished(self.gh, 3, 81, "reviewed", began + 3)
+            self.assertLess(time.monotonic() - began, 15)  # Not the 30 seconds the forge would have taken.
             self.assertIn("ReadTimeout", logged.output[0])
             self.assertEqual(ack.jobs.owed(job)["cleared_tries"], 1)
-            # While that request is still open no other is started: one thread at most is left behind.
-            with self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
+            # While that request is still open no other is started to that host: one thread at most is
+            # left behind. Nothing is sent, so it is no try and no line.
+            with self.assertNoLogs("cursor_pr.acknowledge", level="WARNING"):
                 ack.finished(self.gh, 3, 81, "reviewed")
-            self.assertIn("an earlier request to the forge is still unanswered", logged.output[0])
-            self.assertEqual(asked, ["POST"])
+                ack.queued(self.gh, 3, 82)
+            self.assertEqual((asked, ack.jobs.owed(job)["cleared_tries"]), (["POST"], 1))
+            self.assertNotIn((self.gh.key, 3, 82), ack.marked)
+            # Another forge is not kept waiting for this one.
+            self.assertEqual(acknowledge.request(self.gl, "GET", "https://gitlab.com/api/v4/user", {}).status_code, 200)
+            self.assertEqual(asked, ["POST", "GET"])
+            del asked[1:]
             release.set()
-            acknowledge.unanswered[0].join(10)
+            acknowledge.unanswered["api.github.com"].join(10)
             ack.finished(self.gh, 3, 81, "reviewed")  # The forge answers again, and so the removal is made.
         self.assertEqual(asked, ["POST", "POST", "DELETE"])
         self.assertIsNone(ack.jobs.owed(job))
@@ -332,7 +339,7 @@ class MarkerTests(Offline):
                 patch.object(acknowledge, "run_forge", side_effect=subprocess.TimeoutExpired("change", 2)), \
                 self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
             ack.finished(self.gh, 3, 81, "failed", 1002.0)  # Two seconds are left of the cycle's time.
-        self.assertEqual((waits, len(logged.output)), ([2.0], 2))
+        self.assertEqual((waits, len(logged.output)), ([1.5], 2))  # Half a second short of what was left.
         # Counted, each for itself: a forge that never answers in time cannot keep them due for ever.
         owed = ack.jobs.owed(job)
         self.assertEqual([owed[name] for name in ("cleared", "cleared_tries", "notice_sent", "notice_sent_tries")], [0, 1, 0, 1])
@@ -407,11 +414,12 @@ class MarkerTests(Offline):
                 patch.object(acknowledge.httpx, "Client", side_effect=silent), \
                 self.assertLogs("cursor_pr.acknowledge", level="WARNING"):
             ack.mark({self.gh.key: self.gh})
-            self.assertEqual((waits, clock[0] - 1000), ([15, 5], 20))  # The pass's budget, whatever the requests take.
+            # Each request stops half a second before its time is over; with under a second left none starts.
+            self.assertEqual((waits, clock[0] - 1000), ([14.5, 5.0], 19.5))  # Within the pass's budget of 20.
             # A request the pass did not get to, or got no answer for, has a short try when its review starts.
             del waits[:]
             ack.starting(self.gh, 3, 83)
-            self.assertEqual(waits, [5])
+            self.assertEqual(waits, [4.5])
             # Its removal and its notice right after the review share one limit as well.
             del waits[:]
             before = clock[0]
@@ -437,7 +445,7 @@ class MarkerTests(Offline):
             before = clock[0]
             clock[0] += 0  # Rows are due at once: none was tried yet, except the first, which waits a minute.
             ack.settle({self.gh.key: self.gh})
-            self.assertEqual((waits, clock[0] - before), ([15, 5], 20))
+            self.assertEqual((waits, clock[0] - before), ([14.5, 5.0], 19.5))
 
     def test_cycle_marks_before_the_reviews_and_again_at_a_review_the_pass_missed(self):
         jobs = Jobs(self.state)
