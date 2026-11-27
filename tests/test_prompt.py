@@ -43,19 +43,21 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         project = project_from(dict(provider="github", url="https://github.com/org/repo", checkout=tmp.name, requester_ids=[1]))
         change = {"url": project.change_url(1), "headSha": "a" * 40, "state": "open", "baseRef": "main",
-                  "changedFiles": 0, "title": "Add a script", "body": "It does " + "x" * 2000}
+                  "baseSha": "b" * 40, "changedFiles": 0, "title": "Add a script", "body": "It does " + "x" * 2000}
         files = {"headSha": "a" * 40, "complete": True, "changedFiles": 0, "files": []}
         with patch.object(source, "run_forge", side_effect=[change, files, change]):
             got = source.forge_change("org/repo#1", project=project)
         self.assertEqual(got.title, "Add a script")
+        self.assertEqual(got.base, "b" * 40)
         self.assertTrue(got.description.startswith("It does xxx"))
         self.assertTrue(got.description.endswith("…[truncated]"))
         self.assertLessEqual(len(got.description), source.DESCRIPTION_LIMIT + len(" …[truncated]"))
         self.assertTrue(got.description_truncated)
-        clipped = dict(change, body="A bounded excerpt", descriptionTruncated=True)
+        clipped = dict(change, body="A bounded excerpt", descriptionTruncated=True, baseSha="c" * 40)
         with patch.object(source, "run_forge", side_effect=[change, files, clipped]):
             got = source.forge_change("org/repo#1", project=project)
         self.assertEqual(got.description, "A bounded excerpt")
+        self.assertEqual(got.base, "")
         self.assertTrue(got.description_truncated)
         # The forge helper reports no title or body yet: then there is nothing to pass on.
         bare = {key: value for key, value in change.items() if key not in ("title", "body")}
@@ -416,9 +418,12 @@ class ChangeDescriptionTests(unittest.TestCase):
         body = "Check the updated defaults."
         change = source.Change(source.commit(root, "HEAD"), [small, large], "org/repo#1", description=body)
         raw = {"change description": body, "whole changed files": "Inspect the values."}
+        mid_size = engine.tokens(engine.pack([small], [])[0])
+        deep_size = engine.tokens(engine.pack([small, large], [], focus=cli.DEEP_FOCUS)[0])
+        limit = max((4 * mid_size + 6) // 7 + 50, (deep_size + mid_size + 200 + 8) // 9)
         args = cli.parser().parse_args(["--change", "org/repo#1", "--repo", str(root),
                                         "--cache-dir", str(root / "cache"), "--tier", "max",
-                                        "--max-input-tokens", "1000", "--estimate"])
+                                        "--max-input-tokens", str(limit), "--estimate"])
         with patch.object(cli, "forge_change", return_value=change), patch.object(cli, "scan_files", return_value=[]), \
              patch.object(context, "gather", return_value=raw):
             report, _ = cli.run_request(args)
@@ -435,9 +440,13 @@ class ChangeDescriptionTests(unittest.TestCase):
                                 description=body)
         advice = {"state": "complete", "advisories": [
             {"path": file.path, "kind": "co-change", "detail": "Look at caller."}], "unscreened": []}
+        description, _ = context.assemble(context.MID, {"change description": body}, 10000)
+        # Keep just enough room for the complete description and the context wrapper.
+        full_size = engine.tokens(engine.pack([file], [])[0]) + engine.tokens(description) + 80
+        limit = (4 * full_size + 6) // 7
         args = cli.parser().parse_args(["--change", "org/repo#1", "--repo", str(root),
                                         "--cache-dir", str(root / "cache"), "--tier", "mid",
-                                        "--max-input-tokens", "815", "--qualgen-store", str(root / "history")])
+                                        "--max-input-tokens", str(limit), "--qualgen-store", str(root / "history")])
         prompts = []
 
         def invoke(prompt, *args, **kwargs):

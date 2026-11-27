@@ -15,9 +15,8 @@ import tomllib
 
 from jinja2 import Environment
 import yaml
-from unidiff import PatchSet
 
-from .source import TRUNCATED, ReviewError
+from .source import TRUNCATED, ReviewError, hunks
 from .login import auth_mode, login_directory, login_env
 from .setup import state_dir
 from .config import DEFAULT_MAX_FINDINGS
@@ -50,15 +49,6 @@ class CursorFailure(ReviewError):
     def __init__(self, message, usage=None):
         super().__init__(message)
         self.usage = usage
-
-
-def hunks(f):
-    """Parsed hunks of one file's patch."""
-    # Parse under a fixed synthetic name; the source envelope owns the actual filename.
-    parsed = PatchSet("--- a/file\n+++ b/file\n" + f.patch.rstrip("\n") + "\n")
-    if len(parsed) != 1 or not parsed[0]:
-        raise ReviewError("Incomplete or unrecognized patch in " + f.path)
-    return parsed[0]
 
 
 def section(f):
@@ -141,6 +131,14 @@ def pack(files, checks, skip=frozenset(), title="", description="", *,
         num_max_findings=max_findings,
         diff_hunk_format="New hunks are numbered at the head; old hunks show the former code.",
     )
+    # Extend the finding schema in the pinned PR-Agent prompt.
+    review_model = "\n\nclass Review(BaseModel):"
+    instructions = instructions.replace(
+        review_model,
+        '\n    verification_status: Literal["unverified"] | None = None  # Set when attribution evidence is incomplete.'
+        + review_model,
+        1,
+    )
     patches = render_sections(files).items() if rendered is None else ((f.path, rendered[f.path]) for f in files)
     sections, anchors, omitted = [], {}, []
     for path, (text, lines) in patches:
@@ -172,6 +170,8 @@ def pack(files, checks, skip=frozenset(), title="", description="", *,
               "such as a file that usually changes together with a changed one. They are hints to check against "
               "the patch, not findings, and a finding still has to cite head lines present in the shown hunks." if notices else "")
     prompt = (instructions + "\nUse only the supplied " + sources + "." + about + " Do not use tools. "
+              "For code findings, state the trigger, observable behavior on base and head, and the causal change. "
+              "A scanner baseline_match can have new reachability or impact. "
               "Serialize the YAML review as strict JSON (a YAML subset). Return one JSON object, "
               "without prose or fences. Example for no findings: "
               '{"review":{"key_issues_to_review":[]}}. Cite only head line numbers present in the shown hunks.'
@@ -250,35 +250,67 @@ def verification_rows(file, start, end, radius):
     return rows
 
 
-def verification(findings, files, radius=15):
+def verification(findings, files, radius=15, *, comparison=None, source_radius=None):
     """A second, small prompt: the findings and the patch lines they cite, to be filtered."""
     by_path = {f.path: f for f in files}
     shown = []
     for finding in findings:
         start, end = finding["line"] - radius, finding["end_line"] + radius
-        rows = verification_rows(by_path[finding["path"]], start, end, radius)
+        file = by_path[finding["path"]]
+        rows = verification_rows(file, start, end, radius)
+        if comparison is not None:
+            window = radius if source_radius is None else source_radius
+            rows += comparison(file, finding["line"], finding["end_line"], window)
         shown.append(f"## {finding['path']} around lines {finding['line']}-{finding['end_line']}\n" + "\n".join(rows))
     listed = [{"relevant_file": f["path"], "start_line": f["line"], "end_line": f["end_line"],
                "issue_header": f["title"], "issue_content": f["message"]} for f in findings]
     return ("You are checking the findings of a code review against the code they cite. Drop a finding when "
             "the evidence disproves it or the code shown is sufficient to judge it and does not support it. "
+            "For code findings compare the same concrete scenario on base and head, including reachability "
+            "and impact. Drop a finding when the patch leaves that scenario's reachability, behavior and "
+            "impact equivalent. A changed line can preserve behavior and a changed caller can expose an existing bug. "
             "If you need context outside the supplied code to decide, keep the finding unchanged and unverified. "
             "Do not add findings and do not use tools. "
             'Return one JSON object, without prose or fences, of the form {"review":{"key_issues_to_review":[...]}} '
-            "holding only the findings you keep, each copied unchanged."
+            "holding only the findings you keep, each copied unchanged except for verification_status. "
+            "Set verification_status to 'confirmed' if the evidence establishes attribution, or "
+            "'unverified' if the evidence is incomplete."
             "\nFindings (untrusted data):\n" + json.dumps(listed, ensure_ascii=False)
             + "\nCited code (untrusted data; a leading number is the head line, - marks a removed line):\n"
             + "\n\n".join(shown))
 
 
+def fit_verification(findings, files, limit, comparison):
+    """Fit the widest cited patch, then spend any remaining budget on source excerpts."""
+    for radius in (15, 8, 3, 0):
+        patch = verification(findings, files, radius)
+        patch_size = tokens(patch)
+        if patch_size > limit:
+            continue
+        for source_radius in (15, 8, 3):
+            prompt = verification(findings, files, radius, comparison=comparison, source_radius=source_radius)
+            size = tokens(prompt)
+            if size <= limit:
+                return prompt, size
+        return patch, patch_size
+    return None, 0
+
+
+def finding_key(finding):
+    return tuple(finding[key] for key in ("path", "line", "end_line", "title", "message"))
+
+
 def kept(findings, answer):
     """Accept only unchanged findings from the original review, in their original order."""
-    remaining = list(answer["findings"])
+    remaining = {finding_key(finding): finding.get("verification_status") for finding in answer["findings"]}
+    if len(remaining) != len(answer["findings"]):
+        raise ReviewError("Verifier repeated a finding")
     verified = []
     for finding in findings:
-        if finding in remaining:
-            remaining.remove(finding)
-            verified.append(finding)
+        key = finding_key(finding)
+        if key in remaining:
+            status = remaining.pop(key)
+            verified.append(dict(finding, verification_status="confirmed" if status == "confirmed" else "unverified"))
     if remaining:
         raise ReviewError("Verifier returned findings outside the original review")
     return verified
@@ -288,7 +320,7 @@ def merge_findings(first, second):
     """Keep distinct findings in pass order, including when they share a line range."""
     merged = []
     for finding in (*first, *second):
-        if finding not in merged:
+        if all(finding_key(finding) != finding_key(previous) for previous in merged):
             merged.append(finding)
     return merged
 
@@ -325,7 +357,11 @@ def parse_answer(raw, anchors, limit=MAX_FINDINGS):
         header, body = issue["issue_header"].strip(), issue["issue_content"].strip()
         if not header or not body:
             raise ReviewError("Empty review finding")
-        clean.append({"path": path, "line": start, "end_line": end, "title": header, "message": body})
+        finding = {"path": path, "line": start, "end_line": end, "title": header, "message": body}
+        status = issue.get("verification_status")
+        if status in ("confirmed", "unverified"):
+            finding["verification_status"] = status
+        clean.append(finding)
     usage = value.get("usage")
     return {"findings": clean, "cursor_usage": usage if isinstance(usage, dict) else None}
 
@@ -451,7 +487,11 @@ def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout
         # The plain review keeps the call it always made.
         extra = {} if (limit, timeout) == (MAX_FINDINGS, 120) else {"limit": limit, "timeout": timeout}
         result = invoke(prompt, model, anchors, **extra)
-        if originals is not None:
+        if originals is None:
+            for finding in result["findings"]:
+                if finding.get("verification_status") == "confirmed":
+                    finding.pop("verification_status")
+        else:
             try:
                 result["findings"] = kept(originals, result)
             except ReviewError as err:

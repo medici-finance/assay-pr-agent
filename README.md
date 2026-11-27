@@ -49,7 +49,7 @@ Every pull request path, model title and message, scanner rule and message, and 
 
 ### Local scanners
 
-ShellCheck, actionlint, Hadolint, zizmor and OSV-Scanner never read the checkout's working tree or follow a link. Each receives one immutable Git blob from the reviewed head: ShellCheck and actionlint on standard input in an empty temporary directory, the other three as a file in a temporary directory with an environment of only `PATH` and `HOME` (plus the advisory database cache for OSV-Scanner). Each run has a timeout and a size cap, and Hadolint, zizmor and OSV-Scanner refuse anything that is not a regular file, such as a symlink or a submodule. For a managed checkout whose reviewed commit is missing locally, the reviewer fetches only that change's ref into a temporary checkout, uses it only if its SHA matches, and discards it. Nothing from the change is built or executed.
+ShellCheck, actionlint, Hadolint, zizmor and OSV-Scanner never read the checkout's working tree or follow a link. Each receives an immutable Git blob from the reviewed revision: ShellCheck and actionlint on standard input in an empty temporary directory, the other three as a file in a temporary directory with an environment of only `PATH` and `HOME` (plus the advisory database cache for OSV-Scanner). Each run has a timeout and a size cap, and Hadolint, zizmor and OSV-Scanner refuse anything that is not a regular file, such as a symlink or a submodule. For a managed checkout whose reviewed commit is missing locally, the reviewer fetches only that change's ref into a temporary checkout, uses it only if its SHA matches, and discards it. Nothing from the change is built or executed.
 
 ### CI artifacts
 
@@ -285,6 +285,8 @@ The local form compares the merge base to committed `HEAD`, or to an explicit `-
 
 The prompt can include messages from up to 32 recent commits in a local or CI review, or a forge change's title and description when the forge helper reports them. The title and description are cut at 256 and 1,500 characters, labelled untrusted, and counted in the token estimate. The reviewer drops this optional context when doing so allows it to review more files within the token budget. Commit messages explain the history of a change. A complete forge description can guide checks for material discrepancies against the patch within the same cap as code findings. When the shown patch excludes changed files, the model needs visible contradictory lines to report a mismatch. The reviewer uses a truncated description for intent only.
 
+For each code finding, the prompt asks for a concrete scenario, the behavior on the base and head, and the change that introduced, worsened or exposed the problem. It asks the model to mark incomplete comparisons as unverified. Mid and max batch the findings in their existing verification pass and fit the source excerpts into the tier's remaining token budget. The JSON and posted summary carry the verifier's confidence for retained findings.
+
 ### Cost and coverage
 
 - `--estimate` makes zero Cursor calls. It performs the same diff preparation and static checks as a review.
@@ -301,7 +303,7 @@ The prompt can include messages from up to 32 recent commits in a local or CI re
 | Tier | Command | Budget | Model calls | What the model sees |
 |---|---|---|---|---|
 | `regular` | `/review` | 1× | 1 | The patch and scanner evidence. Up to `REVIEW_MAX_FINDINGS` findings. |
-| `mid` | `/review-mid` | 2× | up to 2 | The patch and scanner evidence, together with context from outside the patch: the change description (or its commit messages), what the base changed in the same files, 25 lines around each hunk, and where the changed functions and types are used. Up to `REVIEW_MAX_FINDINGS_MID` findings, then a verification call that sees only the findings and the lines they cite and may drop findings but not add any. |
+| `mid` | `/review-mid` | 2× | up to 2 | The patch and scanner evidence, together with context from outside the patch: the change description (or its commit messages), what the base changed in the same files, 25 lines around each hunk, and where the changed functions and types are used. Up to `REVIEW_MAX_FINDINGS_MID` findings, then a verification call that sees the findings, their patch context and nearby base and head lines when available. |
 | `max` | `/review-max` | 10× | up to 3 | The mid prompt, unchanged when it fits, so a cached mid result is reused. An independently budgeted deep pass can include files that the first pass left out, plus the whole changed source files, 15 lines around each use of a changed name, existing tests for the touched modules, and eligible earlier comments. Then verification of the findings across the completed passes. The report shows up to `REVIEW_MAX_FINDINGS_MAX` findings and prioritizes findings from the deep pass when the cap applies. |
 
 Code context comes from Git objects at the reviewed head. Earlier comments come from configured review requesters. The reviewer uses only visible GitHub comments and public GitLab notes. The reviewer sends both as untrusted data, and every finding must cite patch lines. It truncates or omits context to stay within the budget and reports each block’s status. The delivered tier is the highest whose context reached the model in a completed pass: mid needs a mid-tier block, and max also needs a block that only the deep pass adds. A block planned for a pass that failed is reported as `not sent`, and a review that reached no model reports no delivered tier. If the requested tier cannot be delivered, a planned pass fails, or findings cannot be verified, the review reports `degraded` and keeps available findings.
@@ -312,7 +314,7 @@ The first prompt of a mid or max review can use up to 1.75 times the configured 
 
 ### Static analysis
 
-ShellCheck and actionlint run on the reviewed head’s Git blobs in a temporary directory. The runner uses stdin and the tool defaults. To avoid duplicate shell findings, actionlint’s embedded ShellCheck integration is disabled. Standalone ShellCheck covers changed `.sh` and `.bash` files. If a forge head is absent locally, an applicable scanner reports `could-not-check`.
+ShellCheck and actionlint run on the reviewed head’s Git blobs in a temporary directory. The runner uses stdin and the tool defaults. To avoid duplicate shell findings, actionlint’s embedded ShellCheck integration is disabled. Standalone ShellCheck covers changed `.sh` and `.bash` files. If a forge head is absent locally, an applicable scanner reports `could-not-check`. For modified files with an available immutable base, the same tool checks the base blob when a head finding maps to unchanged source. The JSON and model evidence keep the head diagnostics and mark matches with `baseline_match`. A complete review groups matches that were shown to the model. The comment lists each match the model could not see. A matched warning can still lead to a model finding if the patch changes its reachability or impact. A failed or unavailable comparison leaves each head diagnostic visible on its own. The extra scan uses local runtime only.
 
 To reuse Assay’s Go linters, pass `--go-report path/to/report.json` from its [pinned analysis action](https://github.com/medici-finance/assay/tree/main/actions/go-analysis). Supply an artifact from a trusted producer. The runner checks the `go-analysis/v1` schema, source SHA, coverage count, totals and gate, then imports new and worsened findings for the selected files. Scanner diagnostics outside the shown hunks remain in the report. Only diagnostics located in the supplied patch consume model context.
 
@@ -394,6 +396,53 @@ Add `--post` to the `--change` command to post the reviewed commit and findings 
 
 The standalone poller supports `/review`. For additional upstream PR-Agent chat commands such as `/ask` and `/improve`, see [GitHub integration](https://docs.pr-agent.ai/installation/github/) and [GitLab integration](https://docs.pr-agent.ai/installation/gitlab/). GitLab pipeline jobs alone do not receive comment events. The upstream comment server and this CLI are separate entry points.
 
+### Export SARIF
+
+Add `--sarif review.sarif` to any review or estimate to write the same findings as a [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html) log after the JSON report is printed. The log has one run whose driver is `assay-pr-agent` and one result per model finding and per ShellCheck, actionlint, Go analysis, hadolint, zizmor or OSV-Scanner finding. `ruleId` is the scanner rule or `model-finding`. The report keeps no scanner severity, so `level` is a fixed mapping: `warning` for model findings and OSV-Scanner vulnerabilities, `note` for every other scanner finding. Each result names a repository-relative, percent-encoded `artifactLocation.uri` and, when the finding has a line, `region.startLine`, plus `region.endLine` for a model finding. OSV-Scanner findings carry no line, so they name the lockfile without a region. Messages are cut at 1,000 characters and a finding without a safe relative path is left out. `partialFingerprints.primaryLocationLineHash` starts with the same line hash that the `upload-sarif` action computes: a hash of the 100 characters from the start of the finding's line, ignoring spaces and tabs, so the text that follows the line is part of the value, with a number that keeps identical lines apart. A suffix based on the finding’s full message and span length distinguishes results on the same line independently of their order. A rerun that rephrases the finding can produce a new fingerprint because the model report has no stable issue ID. Findings the log cannot tell apart, such as two ShellCheck SC2086 on one line with one message, keep one identity. A line added above a finding leaves its fingerprint unchanged if the hashed context and its occurrence count stay the same. The text is read from the reviewed head in `--repo` or from the verified temporary checkout for a managed `--change` review. When the reviewed source is unavailable, including files larger than 1 MB, the fingerprint uses the line number, span length and full message. A change in source availability or line number can change that fingerprint. A finding without a line is identified by its path, rule and message. `invocations[0].executionSuccessful` is `true` only for the `reviewed`, `empty` and `estimate` states. The path is resolved against the directory you run the command from, not `--repo`. If the file cannot be written, the JSON report is still printed, the reason goes to stderr and the exit code is 2. The poller does not request the export.
+
+GitHub code scanning accepts SARIF 2.1.0 files from third-party tools. It is available for public repositories on GitHub.com and for organization-owned repositories with GitHub Code Security enabled. The job needs `contents: read` to check out the source. Uploading with `upload-sarif` needs `security-events: write` and, for private repositories, `actions: read`. Actions skips the steps after a failed one, and `cursor-review` exits 2 for partial coverage, an over-budget prompt or a failed model, so the upload states that it also runs after a failure when the file exists. In a `pull_request` workflow, check out the source head with full history so annotation lines match the commit reviewed by `--ci`. Both examples remove old report files before the review so a reused workspace cannot upload a stale log.
+
+```yaml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rm -f review.sarif review.json
+      - id: review
+        run: cursor-review --ci --max-input-tokens 4000 --sarif review.sarif > review.json
+      - uses: github/codeql-action/upload-sarif@v4
+        if: ${{ !cancelled() && (steps.review.outcome == 'success' || steps.review.outcome == 'failure') && hashFiles('review.sarif') != '' }}
+        with:
+          sarif_file: review.sarif
+```
+
+GitLab ingests SARIF 2.1.0 from an `artifacts:reports:sarif` artifact on GitLab Ultimate: generally available in GitLab 19.2, and from 18.11 with the `sarif_ingestion` feature flag, which is on by default from 19.1. The findings appear in the pipeline Security tab and in the merge request security widget. GitLab deduplicates findings with the same rule, path and line range. Exact-span model findings with the same `model-finding` rule and multiple occurrences of one OSV advisory in a single lockfile can therefore appear as one entry. Use `review.json` for the complete result list. For this example, use a detached merge request pipeline so the working tree matches the reviewed source head. GitLab ingests the findings only when the job succeeds, and `cursor-review` exits 2 for partial coverage, an over-budget prompt or a failed model, so keep that exit status from failing the job and read the outcome from `review.json`:
+
+```yaml
+review:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "detached"'
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - rm -f review.sarif review.json
+    - cursor-review --ci --max-input-tokens 4000 --sarif review.sarif > review.json || review_exit=$?
+    - test -s review.sarif
+  artifacts:
+    when: always
+    paths: [review.json]
+    reports:
+      sarif: review.sarif
+```
+
+The test suite checks the log's contents and never uploads it to a forge. [Upload a SARIF file to GitHub](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/uploading-a-sarif-file-to-github) · [SARIF support for code scanning](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning) · [GitLab SARIF reports](https://docs.gitlab.com/user/application_security/detect/sarif/)
+
 ## Verification
 
 ```sh
@@ -401,6 +450,8 @@ uv run --frozen python -m unittest discover -s tests -v
 ```
 
 The fixtures exercise GitHub and GitLab polling, restart handling, the Assay forge envelope/command contract, caching, the budget cutoff, incomplete inputs and Cursor failure handling. Install ShellCheck to run the integration fixtures. Tests substitute a local executable for inference and never post externally.
+
+Before proposing a change to this repository, coding agents follow [AGENTS.md](AGENTS.md), which includes running this reviewer's own prompt on the branch.
 
 ## License
 
