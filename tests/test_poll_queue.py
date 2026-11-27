@@ -593,7 +593,7 @@ class InstanceLockTests(unittest.TestCase):
     def test_lock_is_held_while_polling_and_released_on_exit(self):
         opened = []
 
-        def cycle(projects, state, jobs, since, *args):
+        def cycle(projects, state, jobs, since, *args, **kwargs):
             self.assertIn("BlockingIOError", self.holder().stderr)
             opened.append(jobs.path)
 

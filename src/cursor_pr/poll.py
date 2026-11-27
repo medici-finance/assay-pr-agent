@@ -278,7 +278,7 @@ def main():
             if watch.enabled and any(p.managed and not p.checkout.is_dir() for p in projects.values()):
                 watch.wait(2)
                 continue
-            cycle(projects, state, jobs, since)
+            cycle(projects, state, jobs, since, ack=ack)
             watch.wait(args.interval)
 
 

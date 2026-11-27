@@ -324,10 +324,11 @@ class NoticeTests(Offline):
              patch("cursor_pr.poll.load_config", return_value={self.gh.key: self.gh}), \
              patch("cursor_pr.poll.providers.cursor_account", side_effect=lambda: nullcontext()), \
              patch("cursor_pr.poll.forge_credentials", side_effect=lambda *args: nullcontext()), \
-             patch("cursor_pr.poll.cycle"), patch("cursor_pr.poll.logging.basicConfig"), \
+             patch("cursor_pr.poll.cycle") as cycled, patch("cursor_pr.poll.logging.basicConfig"), \
              patch("cursor_pr.acknowledge.Acknowledgement") as marker, self.assertLogs("cursor_pr.poll", level="WARNING"):
             main()
         marker.return_value.finished.assert_called_once_with(self.gh, 3, 81, "failed")
+        self.assertIs(cycled.call_args.kwargs["ack"], marker.return_value)  # The running poller marks too.
         reopened = Jobs(self.state)
         self.assertEqual((reopened.abandoned, reopened.pending(self.gh.key, 3)), ([], False))
 
