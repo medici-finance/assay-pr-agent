@@ -15,6 +15,11 @@ from urllib.parse import parse_qs, urlsplit
 from . import dialog, settings, setup
 
 
+SAVED = "Saved. The sync and reviewer services reload it between cycles."
+UNREADABLE = ("The saved settings could not be read to show them here. "
+              "Reload the page to try again, or run the setup wizard.")
+
+
 class Session:
     def __init__(self):
         self.cv = threading.Condition()
@@ -108,6 +113,27 @@ class Session:
             self.cv.notify_all()
             return self.view.copy()
 
+    def unread(self, *notices):
+        """Replace a settings page that can no longer be shown; the next load reads it again."""
+        return self.show({"sections": [], "projects": [], "unread": True}, *notices)
+
+    def reread(self, state):
+        """Read the settings again for a page that could not be read back after a save."""
+        with self.cv:
+            if not self.view.get("unread"):
+                return
+        with self.editing:
+            with self.cv:
+                if not self.view.get("unread"):
+                    return
+            try:
+                page = settings.view(state)
+            except Exception:
+                with self.cv:
+                    self.view["messages"] = [UNREADABLE]
+                return
+            self.show(page)
+
     def launch(self, state, *, force_login=False, resume=False):
         """Start the wizard; one started from the settings page returns to it afterwards."""
         with self.cv:
@@ -139,6 +165,38 @@ class Session:
         with self.cv:
             self.view = {"id": self.view["id"] + 1, **result}
             self.cv.notify_all()
+
+
+def change_setting(session, state, data):
+    """Apply one settings-page change against the view the browser rendered.
+
+    Returns the HTTP status and the JSON reply: 409 for a stale view, 400 when
+    nothing was saved, and 200 with the new view once the save committed. If the
+    settings cannot be read back after a committed save, the 200 view says so
+    ("unread") rather than reporting the save as failed.
+    """
+    with session.editing:
+        with session.cv:
+            current = session.view["status"] == "settings" and session.view["id"] == data.get("id")
+        if not current:
+            return 409, None
+        try:
+            settings.save(state, data)
+        except (ValueError, OSError) as err:
+            return 400, {"error": str(err)}
+        except Exception:
+            # Like the wizard, never echo an unexpected failure's details.
+            return 400, {"error": "The setting could not be saved. Try again or use the setup wizard."}
+        # The save has committed: from here on, the reply must not say otherwise.
+        try:
+            page = settings.view(state)
+        except Exception:
+            view = session.unread(SAVED, UNREADABLE)
+        else:
+            view = session.show(page, SAVED)
+    if view is None:
+        return 409, None
+    return 200, view
 
 
 def serve(state, *, force_login=False):
@@ -217,6 +275,7 @@ def serve(state, *, force_login=False):
                 return self.reply(403)
             if not self.unlocked():
                 return self.reply(401)
+            session.reread(state)
             with session.cv:
                 view = session.view.copy()
             self.reply(200, json.dumps(view).encode())
@@ -261,24 +320,8 @@ def serve(state, *, force_login=False):
             self.reply(200 if accepted else 409)
 
         def change(self, data):
-            # One settings-page request against the view the browser rendered.
-            with session.editing:
-                with session.cv:
-                    current = session.view["status"] == "settings" and session.view["id"] == data.get("id")
-                if not current:
-                    return self.reply(409)
-                try:
-                    settings.save(state, data)
-                    page = settings.view(state)
-                except (ValueError, OSError) as err:
-                    return self.reply(400, json.dumps({"error": str(err)}).encode())
-                except Exception:
-                    # Like the wizard, never echo an unexpected failure's details.
-                    return self.reply(400, json.dumps({"error": "The setting could not be saved. Try again or use the setup wizard."}).encode())
-                view = session.show(page, "Saved. The sync and reviewer services reload it between cycles.")
-            if view is None:
-                return self.reply(409)
-            self.reply(200, json.dumps(view).encode())
+            code, reply = change_setting(session, state, data)
+            self.reply(code, b"" if reply is None else json.dumps(reply).encode())
 
     class Server(ThreadingHTTPServer):
         def service_actions(self):

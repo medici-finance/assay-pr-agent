@@ -52,8 +52,14 @@ PROJECT_ROW_FIELDS = (
 LOCATION_HELP = {
     "stored": "Stored on the state volume. Replace it by pasting a new value; it is never shown.",
     "mounted": "Read from the mounted file shown here. Replace it to keep a copy on the state volume instead.",
-    "env": "Supplied by the container environment, which wins over the saved setup.",
     "none": "Not set."}
+
+
+def from_environment(name, what="the saved value"):
+    """Why a row is read-only: the page's own process environment sets it. Never includes the value."""
+    # Only this process's environment is visible here; each service reads its own.
+    return (f"Set by {name} in the environment of the process serving this page, which overrides {what}. "
+            "Change or remove it there. The sync and reviewer services read their own environment.")
 
 
 def plain(rule):
@@ -135,12 +141,21 @@ def global_rows(config):
         if field.get("when") == "cursor" and backend != "cursor" or field.get("when") == "github" and "github" not in forges:
             continue
         row = {key: field[key] for key in ("name", "section", "label", "help") if key in field}
+        env = field["name"] in os.environ
+        if env:
+            row["help"] = from_environment(field["name"])
         if field.get("wizard"):
-            row.update(kind="text", wizard=True, locked=field["name"] in os.environ,
+            # The page shows the provider and sign-in method this process runs with, not only the saved ones.
+            replaced = (field["name"] == "REVIEW_AUTH_MODE" and not env
+                        and backend != saved.get("REVIEW_PROVIDER", "cursor"))
+            if replaced:
+                row["help"] = from_environment("REVIEW_PROVIDER", "the saved provider, so its saved sign-in method "
+                                               "does not apply and an API key is used unless REVIEW_AUTH_MODE is also set")
+            row.update(kind="text", wizard=True, locked=env or replaced,
+                       source="env" if env or replaced else "saved" if field["name"] in saved else "default",
                        value=providers.LABELS[backend] if field["name"] == "REVIEW_PROVIDER" else
                        {"login": "Sign in with the CLI", "api-key": "API key"}[mode])
         else:
-            env = field["name"] in os.environ
             row.update(kind=field.get("kind", "number"), locked=env,
                        source="env" if env else "saved" if field["name"] in saved else "default",
                        value=os.environ[field["name"]] if env else saved.get(field["name"], field.get("default", "")))
@@ -173,14 +188,16 @@ def credential_rows(config):
         different_instance = name in GITLAB_CREDENTIALS and (
             setup.gitlab_instances(setup.effective_projects(config)) != setup.gitlab_instances(config["projects"]))
         location = None if different_instance else config["secrets"].get(name)
-        where = ("env" if name in os.environ or name + "_FILE" in os.environ
+        variable = next((v for v in (name, name + "_FILE") if v in os.environ), None)
+        where = ("env" if variable
                  else "mounted" if location and Path(location).is_absolute() else "stored" if location else "none")
         rows.append({"name": name, "section": "Credentials", "label": label, "kind": "secret", "optional": optional,
                      "multiline": name not in (TOKEN, *providers.KEYS.values()), "state": where,
                      "locked": where == "env" or different_instance,
                      "value": location if where == "mounted" else "",
-                     "help": "Use the setup wizard or container environment for a different GitLab instance."
-                     if different_instance and where != "env" else LOCATION_HELP[where]})
+                     "help": from_environment(variable, "the saved credential") if variable
+                     else "Use the setup wizard or container environment for a different GitLab instance."
+                     if different_instance else LOCATION_HELP[where]})
     return rows
 
 
@@ -193,7 +210,7 @@ def project_rows(config):
         fields = []
         for name, label, kind, help in PROJECT_ROW_FIELDS:
             field = {"name": name, "label": label, "kind": kind, "locked": locked, "value": values[name],
-                     "help": "Repositories are supplied by the container environment." if locked else help}
+                     "help": from_environment("REVIEW_PROJECTS", "the saved repositories") if locked else help}
             if kind == "choice":
                 field["choices"] = VISIBILITIES
             fields.append(field)
@@ -325,4 +342,7 @@ def save(state, change):
         except BaseException:
             shutil.rmtree(bundle)
             raise
-        shutil.rmtree(old)
+        try:
+            shutil.rmtree(old)
+        except OSError:
+            pass  # The change is active; a failure here must not be reported as an unsaved change.

@@ -132,6 +132,13 @@ function field(item, project) {
 }
 function render(view) {
   message.textContent = view.messages.join("\n");
+  if (view.unread) {
+    // The save went through, but its settings could not be read back to list them.
+    const again = document.createElement("button");
+    again.type = "button"; again.className = "secondary"; again.textContent = "Reload settings";
+    again.onclick = () => load().catch(fail);
+    groups.replaceChildren(again); again.focus(); return;
+  }
   groups.replaceChildren(...view.sections.flatMap(group => [heading("h2", group.title), ...group.settings.map(item => field(item))]),
     heading("h2", "Repositories"), ...view.projects.flatMap(project =>
       [heading("h3", project.url), ...project.settings.map(item => field(item, project))]));

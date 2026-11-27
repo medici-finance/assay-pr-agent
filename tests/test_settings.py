@@ -1,3 +1,6 @@
+import contextlib
+import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -8,9 +11,9 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from cursor_pr import accounts, providers, settings, setup
+from cursor_pr import accounts, dialog, providers, settings, setup, web_setup
 from cursor_pr.manager import ConfigurationWatch
-from cursor_pr.web_setup import Session
+from cursor_pr.web_setup import Session, change_setting
 
 SAVED = {"REVIEW_OPERATOR": "alice:13", "REVIEW_GITHUB_APP_ID": "41", "REVIEW_GITHUB_INSTALLATION_ID": "42",
          "REVIEW_MODEL": "model-a", "REVIEW_MAX_INPUT_TOKENS": "6000", "REVIEW_POLL_SECONDS": "120",
@@ -170,6 +173,46 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(item(view, "REVIEW_AUTH_MODE")["value"], "Sign in with the CLI")
             with self.assertRaises(StopIteration):
                 item(view, "ANTHROPIC_API_KEY")
+
+    def test_overridden_rows_name_the_variable_and_never_its_value(self):
+        self.seed()
+        key = self.root / "mounted-codex.key"
+        with patch.dict(os.environ, {"REVIEW_MAX_INPUT_TOKENS": "7000", "CODEX_API_KEY": "secret-from-env"}):
+            view = settings.view(self.state)
+            tokens, key_row = item(view, "REVIEW_MAX_INPUT_TOKENS"), item(view, "CODEX_API_KEY")
+            self.assertIn("Set by REVIEW_MAX_INPUT_TOKENS in the environment", tokens["help"])
+            self.assertIn("Set by CODEX_API_KEY in the environment", key_row["help"])
+            self.assertTrue(key_row["locked"])
+            self.assertNotIn("secret-from-env", json.dumps(view))
+        with patch.dict(os.environ, {"CODEX_API_KEY_FILE": str(key)}):
+            view = settings.view(self.state)
+            self.assertIn("Set by CODEX_API_KEY_FILE in the environment", item(view, "CODEX_API_KEY")["help"])
+            self.assertNotIn(str(key), json.dumps(view))
+        with patch.dict(os.environ, {"REVIEW_PROJECTS": json.dumps(self.document()["projects"])}):
+            project, = settings.view(self.state)["projects"]
+            self.assertTrue(all("Set by REVIEW_PROJECTS in the environment" in row["help"] for row in project["settings"]))
+
+    def test_provider_and_sign_in_rows_follow_the_effective_values(self):
+        self.seed(values={**SAVED, "REVIEW_AUTH_MODE": "login"})
+        view = settings.view(self.state)
+        for name in ("REVIEW_PROVIDER", "REVIEW_AUTH_MODE"):
+            self.assertFalse(item(view, name)["locked"])
+            self.assertIn("setup wizard", item(view, name)["help"])
+        with patch.dict(os.environ, {"REVIEW_PROVIDER": "claude"}):
+            view = settings.view(self.state)
+            provider, mode = item(view, "REVIEW_PROVIDER"), item(view, "REVIEW_AUTH_MODE")
+            self.assertEqual((provider["value"], provider["locked"], provider["source"]), ("Claude", True, "env"))
+            self.assertIn("Set by REVIEW_PROVIDER in the environment", provider["help"])
+            # The saved sign-in method belongs to the saved provider, which is not the one in use.
+            self.assertEqual((mode["value"], mode["locked"], mode["source"]), ("API key", True, "env"))
+            self.assertIn("REVIEW_PROVIDER", mode["help"])
+            self.assertIn("saved sign-in method does not apply", mode["help"])
+        with patch.dict(os.environ, {"REVIEW_PROVIDER": "codex", "REVIEW_AUTH_MODE": "api-key"}):
+            view = settings.view(self.state)
+            mode = item(view, "REVIEW_AUTH_MODE")
+            self.assertEqual((mode["value"], mode["locked"]), ("API key", True))
+            self.assertIn("Set by REVIEW_AUTH_MODE in the environment", mode["help"])
+            self.assertEqual(item(view, "CODEX_API_KEY")["state"], "stored")
 
     def test_gitlab_override_does_not_reuse_credentials_from_another_instance(self):
         original = dict(provider="gitlab", url="https://gitlab.com/org/repo", requester_ids=[13])
@@ -427,6 +470,108 @@ class SettingsSessionTests(unittest.TestCase):
         self.assertTrue(finished.wait(timeout=2))
         thread.join(timeout=2)
         self.assertEqual(session.view["status"], "quit")
+
+    def test_a_save_that_commits_is_reported_saved_even_if_the_page_cannot_be_read_back(self):
+        session = Session()
+        session.show(settings.view(self.state))
+        rendered = session.view["id"]
+        change = {"id": rendered, "name": "REVIEW_MAX_INPUT_TOKENS", "value": "9000"}
+        with patch.object(settings, "view", side_effect=OSError("settings.json vanished")):
+            code, reply = change_setting(session, self.state, change)
+        self.assertEqual(code, 200)
+        self.assertTrue(reply["unread"])
+        self.assertEqual(reply["messages"], [web_setup.SAVED, web_setup.UNREADABLE])
+        self.assertNotIn("vanished", json.dumps(reply))
+        self.assertEqual(json.loads((self.state / "setup" / "settings.json").read_text())["settings"]["REVIEW_MAX_INPUT_TOKENS"], "9000")
+        # The page rendered before the save is stale, and a reload reads the settings again.
+        self.assertEqual(change_setting(session, self.state, change), (409, None))
+        with patch.object(settings, "view", side_effect=ValueError("still unreadable")):
+            session.reread(self.state)
+        self.assertTrue(session.view["unread"])
+        self.assertEqual(session.view["messages"], [web_setup.UNREADABLE])
+        session.reread(self.state)
+        self.assertNotIn("unread", session.view)
+        self.assertEqual(item(session.view, "REVIEW_MAX_INPUT_TOKENS")["value"], "9000")
+
+    def test_a_committed_save_is_reported_saved_when_the_old_bundle_cannot_be_removed(self):
+        session = Session()
+        session.show(settings.view(self.state))
+        old = setup.active_bundle(self.state)
+        with patch.object(settings.shutil, "rmtree", side_effect=PermissionError("busy")):
+            code, reply = change_setting(session, self.state, {"id": session.view["id"], "name": "REVIEW_MAX_INPUT_TOKENS", "value": "9000"})
+        self.assertEqual(code, 200)
+        self.assertEqual(reply["messages"], [web_setup.SAVED])
+        self.assertNotEqual(setup.active_bundle(self.state), old)
+        self.assertEqual(item(reply, "REVIEW_MAX_INPUT_TOKENS")["value"], "9000")
+
+    def test_a_save_that_fails_is_reported_unsaved(self):
+        session = Session()
+        session.show(settings.view(self.state))
+        before = (self.state / "setup").readlink()
+        code, reply = change_setting(session, self.state, {"id": session.view["id"], "name": "REVIEW_MAX_INPUT_TOKENS", "value": "0"})
+        self.assertEqual((code, reply), (400, {"error": "Enter a positive integer"}))
+        self.assertEqual((self.state / "setup").readlink(), before)
+        with patch.object(settings, "save", side_effect=RuntimeError("internal detail")):
+            code, reply = change_setting(session, self.state, {"id": session.view["id"], "name": "REVIEW_MAX_INPUT_TOKENS", "value": "9"})
+        self.assertEqual(code, 400)
+        self.assertNotIn("internal detail", reply["error"])
+
+    def test_the_settings_route_reports_a_committed_save_whose_page_cannot_be_read(self):
+        key, real, calls = "fixture-setup-key", settings.view, []
+
+        def view(state):
+            calls.append(state)
+            if len(calls) == 2:  # the read right after the save
+                raise OSError("settings.json vanished")
+            return real(state)
+
+        def run():
+            try:
+                web_setup.serve(self.state)
+            except dialog.QuitSetup:
+                pass
+
+        with patch.object(web_setup.secrets, "token_urlsafe", return_value=key), patch.object(settings, "view", side_effect=view), \
+             patch("sys.stdin", io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            server = threading.Thread(target=run, daemon=True)
+            server.start()
+
+            def request(method="GET", path="/step", headers=None, body=None):
+                conn = http.client.HTTPConnection("127.0.0.1", 8765, timeout=5)
+                try:
+                    conn.request(method, path, headers=headers or {}, body=body)
+                    res = conn.getresponse()
+                    return res.status, res.read()
+                finally:
+                    conn.close()
+
+            origin = {"Origin": "http://127.0.0.1:8765", "Content-Type": "application/json"}
+            for _ in range(100):
+                try:
+                    status, _ = request("POST", "/login", origin, json.dumps({"key": key}))
+                    break
+                except ConnectionError:
+                    threading.Event().wait(0.02)
+            self.assertEqual(status, 200)
+            headers = {**origin, "Cookie": f"pr_agent_setup={key}"}
+            page = json.loads(request(headers=headers)[1])
+            change = json.dumps({"id": page["id"], "name": "REVIEW_MAX_INPUT_TOKENS", "value": "9000"})
+            # The usual guards still apply to the route.
+            self.assertEqual(request("POST", "/setting", {k: v for k, v in headers.items() if k != "Cookie"}, change)[0], 401)
+            self.assertEqual(request("POST", "/setting", {k: v for k, v in headers.items() if k != "Origin"}, change)[0], 403)
+            status, body = request("POST", "/setting", headers, change)
+            self.assertEqual(status, 200)
+            reply = json.loads(body)
+            self.assertTrue(reply["unread"])
+            self.assertEqual(reply["messages"][0], web_setup.SAVED)
+            self.assertEqual(json.loads((self.state / "setup" / "settings.json").read_text())["settings"]["REVIEW_MAX_INPUT_TOKENS"], "9000")
+            self.assertEqual(request("POST", "/setting", headers, change)[0], 409)
+            reloaded = json.loads(request(headers=headers)[1])
+            self.assertNotIn("unread", reloaded)
+            self.assertEqual(item(reloaded, "REVIEW_MAX_INPUT_TOKENS")["value"], "9000")
+            self.assertEqual(request("POST", "/step", headers, json.dumps({"id": reloaded["id"], "action": "quit"}))[0], 200)
+            server.join(timeout=5)
+            self.assertFalse(server.is_alive())
 
     def test_closing_the_settings_page_ends_the_session(self):
         session = Session()
