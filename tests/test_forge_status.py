@@ -284,10 +284,7 @@ class ForgeStatusRequestTests(unittest.TestCase):
     def test_gitlab_status_names_the_merge_request_pipeline_of_the_reviewed_commit(self):
         own = dict(id=55, sha=HEAD, project_id=123, ref="refs/merge-requests/7/head")
         cases = ((own, {"ref": "refs/merge-requests/7/head", "pipeline_id": 55}),
-                 (own | dict(project_id=124), {"ref": "topic/ref"}),    # It is another project's.
-                 (own | dict(id="55"), {"ref": "topic/ref"}),
-                 (own | dict(ref=""), {"ref": "topic/ref"}),
-                 (None, {"ref": "topic/ref"}))
+                 (None, {"ref": "topic/ref"}))  # No pipeline: the branch is all there is to go by.
         for pipeline, expected in cases:
             with self.subTest(pipeline=pipeline):
                 self.requests.clear()
@@ -297,6 +294,18 @@ class ForgeStatusRequestTests(unittest.TestCase):
                 self.assertEqual(report["forge_status"], "posted")
                 body = json.loads(self.requests[-1].content)
                 self.assertEqual({name: body[name] for name in ("ref", "pipeline_id") if name in body}, expected)
+
+    def test_gitlab_status_is_not_sent_past_a_pipeline_it_cannot_name(self):
+        own = dict(id=55, sha=HEAD, project_id=123, ref="refs/merge-requests/7/head")
+        for update in (dict(project_id=124), dict(id="55"), dict(id=0), dict(ref=""), dict(ref=None)):
+            with self.subTest(update=update), self.assertLogs("cursor_pr.forge_status", level="WARNING") as logged:
+                self.requests.clear()
+                self.gitlab_source = dict(sha=HEAD, source_project_id=123, target_project_id=123,
+                                          source_branch="topic/ref", head_pipeline=own | update)
+                report, *_ = self.exercise("gitlab", "--forge-status")
+                self.assertEqual(report["forge_status"], "failed")
+                self.assertIn("cannot be addressed", logged.output[0])
+                self.assertEqual([request.method for request in self.requests], ["GET"])
 
     def test_gitlab_status_is_not_sent_past_a_pipeline_of_another_commit(self):
         # Merged results, a merge train, or a pipeline of the head before this one.

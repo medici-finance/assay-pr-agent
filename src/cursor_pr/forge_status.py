@@ -132,9 +132,12 @@ def gitlab_source_ref(client, headers, base, slug, number, head):
             # in place of the real one. No status is better than that.
             raise ReviewError("The GitLab merge request's pipeline is not for the reviewed commit")
         number, own = pipeline.get("id"), pipeline.get("ref")
-        if (type(number) is int and number > 0 and pipeline.get("project_id") == target
+        if not (type(number) is int and number > 0 and pipeline.get("project_id") == target
                 and isinstance(own, str) and own and own.isprintable()):
-            return {"ref": own, "pipeline_id": number}
+            # It is there and cannot be named. The branch alone could put the status on another
+            # pipeline of this commit and report it as posted.
+            raise ReviewError("The GitLab merge request's pipeline cannot be addressed from the configured project")
+        return {"ref": own, "pipeline_id": number}
     return {"ref": ref}
 
 
