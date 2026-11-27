@@ -96,6 +96,17 @@ class CapturePromptTest(unittest.TestCase):
         self.assertIn("state: model-unavailable", err.getvalue())
         self.assertIn("error: review() got an unexpected keyword argument", err.getvalue())
 
+    def test_shows_what_cursor_review_printed_when_there_is_no_report(self):
+        spec = importlib.util.spec_from_file_location("capture_prompt", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        err = io.StringIO()
+        with patch.object(cli, "main", lambda: print("unexpected diagnostic") or 2), contextlib.redirect_stderr(err):
+            code = module.main(["capture-prompt.py", str(self.root / "out" / "branch"), "--base", self.base])
+        self.assertEqual(code, 1)
+        self.assertIn("unexpected diagnostic", err.getvalue())
+        self.assertIn("stopped before producing a report (exit 2)", err.getvalue())
+
     def test_refuses_other_tiers(self):
         result = self.capture("--tier", "mid")
         self.assertEqual(result.returncode, 1)

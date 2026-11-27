@@ -67,6 +67,7 @@ def main(argv):
     try:
         report = json.loads(out.getvalue())
     except ValueError:
+        sys.stderr.write(out.getvalue())
         return fail(f"cursor-review stopped before producing a report (exit {code}); see the message above")
     if not captured:
         return fail(f"the review never reached the model step (state: {report.get('state')}, "
