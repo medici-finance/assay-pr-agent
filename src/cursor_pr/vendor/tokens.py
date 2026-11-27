@@ -1,6 +1,6 @@
-"""Token counting from PR-Agent 0.50.0, reduced to what this reviewer uses.
+"""Token counting, adapted from PR-Agent 0.50.0 and modified here (see README.md beside this file).
 
-PR-Agent chooses a tiktoken encoding with the three lines kept below, and points tiktoken at encoding
+PR-Agent chooses a tiktoken encoding the way ``encoding`` below does, and points tiktoken at encoding
 files bundled in LiteLLM so that nothing is downloaded at run time. The two files this reviewer needs
 are bundled here instead, under the names tiktoken's cache gives them, and are checked against the
 hashes tiktoken publishes before first use. The code is MIT licensed; see LICENSE.pr-agent.
