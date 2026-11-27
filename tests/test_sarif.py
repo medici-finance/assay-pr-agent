@@ -359,3 +359,14 @@ class SarifFlagTests(unittest.TestCase):
         self.assertEqual((code, json.loads(out)["state"]), (2, "estimate"))
         self.assertIn("cursor-review:", err)
         self.assertTrue(loop.is_symlink())
+
+    def test_existing_output_link_is_rejected(self):
+        target = self.root / "original.txt"
+        target.write_text("keep me")
+        link = self.root / "review.sarif"
+        link.symlink_to(target.name)
+        code, out, err = self.check("--base", self.base, "--estimate", "--sarif", str(link))
+        self.assertEqual((code, json.loads(out)["state"]), (2, "estimate"))
+        self.assertIn("symbolic link", err)
+        self.assertEqual(target.read_text(), "keep me")
+        self.assertTrue(link.is_symlink())

@@ -4,6 +4,7 @@ from importlib.metadata import PackageNotFoundError, version
 import json
 from pathlib import Path
 import struct
+from tempfile import TemporaryDirectory
 from urllib.parse import quote
 
 from .scanners import safe_path
@@ -151,4 +152,11 @@ def log(report, source=None):
 
 
 def write(path, report, source=None):
-    Path(path).write_text(json.dumps(log(report, source), ensure_ascii=True, indent=2) + "\n", encoding="utf8")
+    path = Path(path)
+    if path.is_symlink():
+        raise OSError(f"Cannot write SARIF to a symbolic link: {path}")
+    # Publish the completed log atomically. Replacement never follows a link at the destination.
+    with TemporaryDirectory(dir=path.parent, prefix=".sarif-") as directory:
+        temporary = Path(directory) / "report.sarif"
+        temporary.write_text(json.dumps(log(report, source), ensure_ascii=True, indent=2) + "\n", encoding="utf8")
+        temporary.replace(path)
