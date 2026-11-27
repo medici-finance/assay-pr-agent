@@ -22,8 +22,8 @@ from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
-from .engine import CursorFailure, pack, review, section, tokens
-from .source import ReviewError, ci_refs, forge_change, local_change, post_comment
+from .engine import CursorFailure, pack, review, tokens
+from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
 
 
 LOCKS = {"package-lock.json", "pnpm-lock.yaml", "go.sum", "npm-shrinkwrap.json"}
@@ -56,23 +56,35 @@ def fit(files, checks, limit, *, title="", description="", advisories=(), scoped
     estimated = full = tokens(prompt) if has_text else 0
     if full <= limit:
         return full_pack, full, full, []
-    sizes = {f.path: tokens(text) for f in files if (text := section(f)[0])}
-    # A file that cannot fit even alone leaves first, so it never takes a file that fits with it.
-    overhead = tokens(pack(files, checks, frozenset(sizes), title, description, advisories, scoped,
+    # Measure each file with the evidence and caveats the reduced review would include.
+    singleton_scoped = scoped or len(files) > 1
+    overhead = tokens(pack([], [], title=title, description=description, scoped=singleton_scoped,
                            commit_messages=commit_messages)[0])
+    advised_paths = {advisory["path"] for advisory in advisories}
+    sizes = {}
+    for file in files:
+        if file.path not in unseen:
+            standalone, _, _, _ = pack([file], checks, title=title, description=description,
+                                        advisories=advisories, scoped=singleton_scoped,
+                                        commit_messages=commit_messages)
+            sizes[file.path] = tokens(standalone) - overhead
     queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
     while estimated > limit and queue:
         # Per-file sizes are approximate, so the last file only leaves after a real recount.
         dropped.append(queue.pop(0))
         freed = sizes[dropped[-1]]
-        while len(queue) > 1 and freed < estimated - limit:
+        while len(queue) > 1 and freed < estimated - limit and dropped[-1] not in advised_paths:
             dropped.append(queue.pop(0))
             freed += sizes[dropped[-1]]
         prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), title, description, advisories, scoped,
                                                  commit_messages=commit_messages)
         estimated = tokens(prompt) if has_text else 0
     if not has_text or estimated > limit:
+        if title or description:
+            fitted, estimate, _, skipped = fit(files, checks, limit, advisories=advisories, scoped=scoped)
+            if fitted[3] and estimate <= limit:
+                return fitted, estimate, full, skipped
         return full_pack, full, full, []
     return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped)
 
@@ -156,6 +168,11 @@ def execute(args):
     else:
         base, head = ci_refs() if args.ci else (args.base, args.head or "HEAD")
         change = local_change(root, base, head)
+        drift_base = change.base
+        github_pr = os.getenv("GITHUB_ACTIONS") == "true" and os.getenv("GITHUB_EVENT_NAME") == "pull_request"
+        if args.ci and not github_pr and os.getenv("CI_PIPELINE_SOURCE") == "merge_request_event":
+            target = os.getenv("CI_MERGE_REQUEST_TARGET_BRANCH_SHA")
+            drift_base = target if valid_sha(target) else None
 
     paths = {f.path for f in change.files}
     selected = set(args.path) if args.path else paths
@@ -187,7 +204,7 @@ def execute(args):
         if args.change:
             drifted = drift.forge(root, checkout, change, bool(project), files)
         else:
-            drifted = drift.check(root, change.head, change.base, files)
+            drifted = drift.check(root, change.head, drift_base, files)
     go = None
     if args.go_report:
         go = go_report(args.go_report, change.head)

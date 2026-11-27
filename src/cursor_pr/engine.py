@@ -2,6 +2,7 @@
 import fcntl
 import hashlib
 from importlib.metadata import distribution
+from itertools import islice
 import json
 import os
 from pathlib import Path
@@ -81,8 +82,9 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
     # The author's title and description give intent. They are as untrusted as the patch itself.
     change = {"title": title, "description": description} if title or description else None
     # Repository-history notices are hints about the changed files, never findings of their own.
+    shown_advisories = (a for a in advisories if anchors.get(a["path"]))
     notices = [{"path": a["path"], "kind": a["kind"], "detail": a["detail"][:300] + "…" * (len(a["detail"]) > 300)}
-               for a in advisories[:12]]
+               for a in islice(shown_advisories, 12)]
     description_label = "Commit messages" if commit_messages else "Change description"
     context = [name for name, present in ((description_label.lower(), change), ("history advisories", notices)) if present]
     sources = ", ".join(context + ["patch"]) + " and scanner evidence" if context else "patch and scanner evidence"

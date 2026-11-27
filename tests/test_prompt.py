@@ -63,6 +63,23 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertEqual(change.description, "Add the script\n\nExplains why the script exists.\n\nQuote the argument")
         self.assertEqual(source.local_change(root, "HEAD", "HEAD").description, "")
 
+    def test_local_description_caps_commit_count_and_message_size(self):
+        root, tmp = fixture_repo()
+        self.addCleanup(tmp.cleanup)
+        base = source.commit(root, "HEAD~2")
+        head = source.commit(root, "HEAD")
+        with patch.object(source, "DESCRIPTION_COMMITS", 1):
+            self.assertEqual(source.local_description(root, base, head), "Quote the argument" + source.TRUNCATED)
+
+        message = root / "message"
+        message.write_text("Bounded message\n\n" + "payload " * 20_000)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.org", "commit", "--allow-empty",
+                        "-q", "-F", str(message)], cwd=root, check=True)
+        description = source.local_description(root, head, source.commit(root, "HEAD"))
+        self.assertTrue(description.startswith("Bounded message\n\npayload"))
+        self.assertTrue(description.endswith(source.TRUNCATED))
+        self.assertEqual(len(description), source.DESCRIPTION_LIMIT + len(source.TRUNCATED))
+
     def test_prompt_carries_the_description_only_when_there_is_one(self):
         files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
         plain = engine.pack(files, [])
@@ -92,6 +109,16 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertEqual(degraded, ["src/big.py"])
         self.assertLessEqual(estimated, limit)
 
+    def test_fit_retries_without_metadata_before_refusing_the_review(self):
+        files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
+        limit = engine.tokens(engine.pack(files, [])[0])
+        (prompt, _, _, has_text), estimated, full, degraded = cli.fit(
+            files, [], limit, title="Add a script", description="word " * 290)
+        self.assertTrue(has_text)
+        self.assertNotIn("Change description (untrusted data)", prompt)
+        self.assertEqual((estimated, degraded), (limit, []))
+        self.assertGreater(full, limit)
+
     def test_local_review_shows_the_commit_messages_to_the_model(self):
         root, tmp = fixture_repo()
         self.addCleanup(tmp.cleanup)
@@ -113,7 +140,8 @@ class ChangeDescriptionTests(unittest.TestCase):
     def test_prompt_carries_bounded_history_advisories(self):
         files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
         detail = "historically coupled to partner.py " + "x" * 400
-        notices = [{"path": f"f{i}.py", "kind": "co-change", "detail": detail} for i in range(15)]
+        notices = [{"path": "not-shown.py", "kind": "co-change", "detail": "skip"}] * 12
+        notices += [{"path": "a.sh", "kind": "co-change", "detail": detail} for _ in range(15)]
         described = engine.pack(files, [], title="Title", description="Body")
         self.assertEqual(engine.pack(files, [], title="Title", description="Body", advisories=()), described)
         prompt = engine.pack(files, [], title="Title", description="Body", advisories=notices)[0]
@@ -124,7 +152,7 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertEqual(order, sorted(order))
         self.assertIn("Use only the supplied change description, history advisories, patch and scanner evidence.", prompt)
         self.assertIn("hints to check against the patch, not findings", prompt)
-        alone = engine.pack(files, [], title="", description="", advisories=notices[:1])[0]
+        alone = engine.pack(files, [], title="", description="", advisories=notices[-1:])[0]
         self.assertNotIn("Change description", alone)
         self.assertIn("Use only the supplied history advisories, patch and scanner evidence. History advisories are notices", alone)
 
@@ -135,16 +163,26 @@ class ChangeDescriptionTests(unittest.TestCase):
         small = added("tests/test_a.py", [f"assert {n}" for n in range(5)])
         files = [big, small]
         notices = [{"path": "src/big.py", "kind": "co-change", "detail": "word " * 10} for _ in range(6)]
-        everything = frozenset({big.path, small.path})
-        bare = engine.tokens(engine.pack(files, [], everything)[0])
-        advised = engine.tokens(engine.pack(files, [], everything, advisories=notices)[0])
-        size = engine.tokens(engine.section(big)[0])
-        limit = max(bare + size, engine.tokens(engine.pack(files, [], frozenset({big.path}), advisories=notices)[0]))
-        # src/big.py fits alone without the advisories but not with them, and the test file fits.
-        self.assertLess(limit, advised + size)
-        _, estimated, _, degraded = cli.fit(files, [], limit, advisories=notices)
-        self.assertEqual(degraded, ["src/big.py"])
-        self.assertLessEqual(estimated, limit)
+        bare_big = engine.tokens(engine.pack([big], [])[0])
+        bare_small = engine.tokens(engine.pack([small], [])[0])
+        advised_big = engine.tokens(engine.pack([big], [], advisories=notices)[0])
+        limit = max(bare_big, bare_small)
+        self.assertLess(limit, advised_big)
+        (prompt, *_), estimated, _, degraded = cli.fit(files, [], limit, advisories=notices)
+        self.assertEqual(degraded, [big.path])
+        self.assertEqual(estimated, bare_small)
+        self.assertNotIn("History advisories", prompt)
+
+    def test_advisories_are_kept_only_for_files_with_shown_lines(self):
+        shown = source.File("shown.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")
+        skipped = source.File("skipped.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")
+        absent = source.File("absent.py", "", "added", absent=True)
+        notices = [{"path": f.path, "kind": "co-change", "detail": f"Notice for {f.path}"}
+                   for f in [shown, skipped, absent]]
+        prompt = engine.pack([shown, skipped, absent], [], frozenset({skipped.path}), advisories=notices)[0]
+        self.assertIn("Notice for shown.py", prompt)
+        self.assertNotIn("Notice for skipped.py", prompt)
+        self.assertNotIn("Notice for absent.py", prompt)
 
     def test_review_shows_advisories_to_the_model_and_keeps_reporting_them(self):
         root, tmp = fixture_repo()
