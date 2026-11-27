@@ -243,7 +243,7 @@ def verification_rows(file, start, end, radius):
     return rows
 
 
-def verification(findings, files, radius=15, *, comparison=None):
+def verification(findings, files, radius=15, *, comparison=None, source_radius=None):
     """A second, small prompt: the findings and the patch lines they cite, to be filtered."""
     by_path = {f.path: f for f in files}
     shown = []
@@ -252,7 +252,8 @@ def verification(findings, files, radius=15, *, comparison=None):
         file = by_path[finding["path"]]
         rows = verification_rows(file, start, end, radius)
         if comparison is not None:
-            rows += comparison(file, finding["line"], finding["end_line"], radius)
+            window = radius if source_radius is None else source_radius
+            rows += comparison(file, finding["line"], finding["end_line"], window)
         shown.append(f"## {finding['path']} around lines {finding['line']}-{finding['end_line']}\n" + "\n".join(rows))
     listed = [{"relevant_file": f["path"], "start_line": f["line"], "end_line": f["end_line"],
                "issue_header": f["title"], "issue_content": f["message"]} for f in findings]
@@ -272,6 +273,22 @@ def verification(findings, files, radius=15, *, comparison=None):
             + "\n\n".join(shown))
 
 
+def fit_verification(findings, files, limit, comparison):
+    """Fit the widest cited patch, then spend any remaining budget on source excerpts."""
+    for radius in (15, 8, 3, 0):
+        patch = verification(findings, files, radius)
+        patch_size = tokens(patch)
+        if patch_size > limit:
+            continue
+        for source_radius in (15, 8, 3):
+            prompt = verification(findings, files, radius, comparison=comparison, source_radius=source_radius)
+            size = tokens(prompt)
+            if size <= limit:
+                return prompt, size
+        return patch, patch_size
+    return None, 0
+
+
 def finding_key(finding):
     return tuple(finding[key] for key in ("path", "line", "end_line", "title", "message"))
 
@@ -286,7 +303,7 @@ def kept(findings, answer):
         key = finding_key(finding)
         if key in remaining:
             status = remaining.pop(key)
-            verified.append(dict(finding, verification_status=status) if status else finding)
+            verified.append(dict(finding, verification_status="confirmed" if status == "confirmed" else "unverified"))
     if remaining:
         raise ReviewError("Verifier returned findings outside the original review")
     return verified

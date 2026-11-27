@@ -28,8 +28,8 @@ from .artifacts import forge_go_report
 from .checks import blob, go_report, scan_files
 from .sync import scan_checkout
 from .discovery import context_comments
-from .engine import (MAX_FINDINGS, CursorFailure, merge_findings, pack, prompt_advisories, rank, render_sections,
-                     review, tokens, verification, visible_advisories)
+from .engine import (MAX_FINDINGS, CursorFailure, fit_verification, merge_findings, pack, prompt_advisories, rank,
+                     render_sections, review, tokens, visible_advisories)
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
 
 
@@ -243,7 +243,9 @@ def finding_line(issue, *, compact=False, shorten_path=False, clip=None):
     if shorten_path and len(path) > 80:
         tag = hashlib.sha256(path.encode("utf-8")).hexdigest()[:12]
         path = f"…/{path[-80:]} [{tag}]"
-    title_text = ("Unverified " if issue.get("verification_status") == "unverified" else "") + issue["title"]
+    status = issue.get("verification_status")
+    prefix = {"confirmed": "Confirmed ", "unverified": "Unverified "}.get(status, "")
+    title_text = prefix + issue["title"]
     title = fence(title_text, 60 if compact else None)
     message = fence(issue["message"], COMPACT_FINDING_MESSAGE if compact else clip)
     return f"- {fence(path)}:{issue['line']} — {title}. {message}" + (" (shortened)" if clip else "")
@@ -782,24 +784,16 @@ def execute_review(args, verification_resources):
         left = budget - report["estimated_input_tokens"]
         report["verification"] = {"state": "unavailable", "before": before}
         comparison = context.verification_comparison(root, checkout, patch_base, change.head)
-        for radius in (15, 8, 3, 0):
-            check = verification(findings, files, radius)
-            size = tokens(check)
-            if size <= left:
-                if radius:
-                    with_source = verification(findings, files, radius, comparison=comparison)
-                    with_source_size = tokens(with_source)
-                    if with_source_size <= left:
-                        check, size = with_source, with_source_size
-                row = {"name": "verification", "estimated_input_tokens": size, "state": "planned"}
-                passes.append(row)
-                report["estimated_input_tokens"] += size
-                verdict, _ = run_pass(row, check, coverage, args, change.identity,
-                                      cap=before, timeout=120, originals=findings)
-                if verdict is not None:
-                    findings = verdict["findings"]
-                    report["verification"] = {"state": "filtered", "before": before, "after": len(findings)}
-                break
+        check, size = fit_verification(findings, files, left, comparison)
+        if check is not None:
+            row = {"name": "verification", "estimated_input_tokens": size, "state": "planned"}
+            passes.append(row)
+            report["estimated_input_tokens"] += size
+            verdict, _ = run_pass(row, check, coverage, args, change.identity,
+                                  cap=before, timeout=120, originals=findings)
+            if verdict is not None:
+                findings = verdict["findings"]
+                report["verification"] = {"state": "filtered", "before": before, "after": len(findings)}
     cap = caps[tier]
     if len(findings) > cap:
         report["omitted_findings"] = len(findings) - cap

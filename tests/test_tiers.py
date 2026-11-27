@@ -148,6 +148,8 @@ class TierTests(unittest.TestCase):
         self.assertEqual((code, report["state"], report["delivered"]), (0, "reviewed", "mid"))
         self.assertEqual([(f["line"], f["title"]) for f in report["findings"]], [(42, "Real")])
         self.assertEqual(report["findings"][0]["verification_status"], "confirmed")
+        self.assertIn("Confirmed Real", cli.finding_line(report["findings"][0]))
+        self.assertIn("Unverified Real", cli.finding_line(dict(report["findings"][0], verification_status="unverified")))
         self.assertEqual(report["verification"], {"state": "filtered", "before": 2, "after": 1})
         self.assertEqual({row["name"]: row["state"] for row in report["context"]},
                          {"change description": "included", "overlap with the base": "empty",

@@ -93,13 +93,36 @@ class TierContextTests(unittest.TestCase):
         issue = dict(path="app.py", line=1, end_line=1, title="First issue", message="First defect")
         other = dict(issue, title="Other issue", message="Different defect")
         self.assertEqual(engine.merge_findings([issue], [issue, other]), [issue, other])
-        self.assertEqual(engine.kept([issue, other], {"findings": [other]}), [other])
+        self.assertEqual(engine.kept([issue, other], {"findings": [other]}),
+                         [dict(other, verification_status="unverified")])
         uncertain = dict(issue, verification_status="unverified")
         confirmed = dict(issue, verification_status="confirmed")
         self.assertEqual(engine.kept([uncertain, other], {"findings": [confirmed]}), [confirmed])
         self.assertEqual(engine.kept([confirmed], {"findings": [uncertain]}), [uncertain])
+        self.assertEqual(engine.kept([confirmed], {"findings": [issue]}), [uncertain])
+        self.assertEqual(engine.kept([confirmed], {"findings": [dict(issue, verification_status="unknown")]}),
+                         [uncertain])
         file = File("app.py", "@@ -1 +1 @@\n-foo()\n+bar()\n", "modified")
         self.assertIn("keep the finding unchanged and unverified", engine.verification([issue], [file]))
+
+    def test_verification_tries_smaller_source_excerpts_with_the_same_patch(self):
+        patch = "@@ -1,20 +1,20 @@\n-old()\n+new()\n" + "".join(f" line_{n}()\n" for n in range(2, 21))
+        file = File("app.py", patch, "modified")
+        finding = dict(path="app.py", line=1, end_line=1, title="Example", message="Example defect")
+
+        def comparison(file, start, end, radius):
+            return [f"Source excerpt radius {radius} " + "context " * (radius * 8)]
+
+        patch_only = engine.verification([finding], [file], radius=15)
+        variants = {radius: engine.verification([finding], [file], radius=15, comparison=comparison,
+                                                source_radius=radius) for radius in (15, 8, 3)}
+        self.assertIn("16  line_16()", patch_only)
+        for expected in (variants[8], variants[3], patch_only):
+            with self.subTest(expected=expected.splitlines()[-1]):
+                limit = engine.tokens(expected)
+                prompt, size = engine.fit_verification([finding], [file], limit, comparison)
+                self.assertEqual((prompt, size), (expected, limit))
+                self.assertIn("16  line_16()", prompt)
 
     def test_verification_keeps_the_old_lines_of_a_replacement_at_the_start_of_a_hunk(self):
         issue = dict(path="app.py", line=11, end_line=11, title="Changed behavior", message="Check the replacement.")
