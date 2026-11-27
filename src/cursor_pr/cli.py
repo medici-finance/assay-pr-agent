@@ -23,7 +23,7 @@ from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
-from .engine import ModelFailure, pack, review, section, tokens
+from .engine import ModelFailure, encodings, pack, review, section, tokens
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment
 
 
@@ -56,10 +56,19 @@ def fit(files, checks, limit, *, title="", description="", advisories=(), scoped
     estimated = full = tokens(prompt, model) if has_text else 0
     if full <= limit:
         return full_pack, full, full, []
-    sizes = {f.path: tokens(text, model) for f in files if (text := section(f)[0])}
+    model_encodings = encodings(model)
+    counters = (model,) if len(model_encodings) == 1 else model_encodings
+
+    def counts(text):
+        return tuple(tokens(text, counter) for counter in counters)
+
+    file_counts = {f.path: counts(text) for f in files if (text := section(f)[0])}
+    sizes = {path: max(counts) for path, counts in file_counts.items()}
     # A file that cannot fit even alone leaves first, so it never takes a file that fits with it.
-    overhead = tokens(pack(files, checks, frozenset(sizes), title, description, advisories, scoped)[0], model)
-    queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
+    overhead = counts(pack(files, checks, frozenset(sizes), title, description, advisories, scoped)[0])
+    fits_alone = {path for path, counts in file_counts.items()
+                  if all(base + extra <= limit for base, extra in zip(overhead, counts, strict=True))}
+    queue = sorted(sizes, key=lambda path: (path in fits_alone, rank(path), -sizes[path], path))
     dropped = []
     while estimated > limit and queue:
         # Per-file sizes are approximate, so the last file only leaves after a real recount.
@@ -126,18 +135,33 @@ def publish(address, head, report, *, project=None, state=None):
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {fence(path)}")
     tracked = report.get("outcomes")
-    if tracked and tracked["fixed"] + tracked["unaddressed"]:
+    if tracked and tracked["fixed"] + tracked["unaddressed"] + tracked["repeated"]:
         # An accept rate needs a finding whose code the author either changed or left alone.
         rate = f"{tracked['accept_rate']}%" if tracked["accept_rate"] is not None else "not available"
         body.append(f"Tracked findings for this change: {tracked['fixed']} addressed and {tracked['unaddressed']} left unchanged "
                     f"at a later review (accept rate {rate}); {tracked['repeated']} raised again; "
                     f"{tracked['open']} awaiting a later review.")
-    if "receipt" in report:
-        body.extend(["", *receipt.render(report["receipt"])])
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
     # A finding may quote a multiline source fragment, including forge quick actions.
-    text = "\n".join(" ".join(line.splitlines()) for line in body) + "\n"
-    post_comment(project, int(number), head, text, state if state is not None else state_dir())
+    lines = [" ".join(line.splitlines()) for line in body]
+    destination = state if state is not None else state_dir()
+    dedupe_body = "\n".join(lines) + "\n"
+    if "receipt" in report:
+        # Retrying a post may hit the model cache and change the receipt, but the review is the same.
+        lines[-2:-2] = ["", *receipt.render(report["receipt"])]
+        post_comment(project, int(number), head, "\n".join(lines) + "\n", destination, dedupe_body=dedupe_body)
+    else:
+        post_comment(project, int(number), head, dedupe_body, destination)
+
+
+def has_reviewable_text(file):
+    """An unavailable or malformed patch cannot establish that the file has no text."""
+    if file.patch_unavailable:
+        return True
+    try:
+        return bool(section(file)[1])
+    except (ReviewError, UnidiffParseError):
+        return True
 
 
 def parser():
@@ -223,21 +247,24 @@ def execute(args):
     (prompt, anchors, no_text, has_text), estimated, full, degraded = fit(
         files, checks, args.max_input_tokens, title=change.title, description=change.description,
         advisories=qualgen["advisories"] if qualgen else (), scoped=selected != paths, model=args.model)
-    # Only what a review could have covered and did not is a loss of coverage.
-    omitted = sorted(paths - selected)
+    # An absent forge patch does not establish that the file has no text.
+    unavailable = {f.path for f in files if f.patch_unavailable}
+    omitted = sorted((paths - selected) | unavailable)
     backend = providers.provider()
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
               "estimated_input_tokens": estimated, "max_input_tokens": args.max_input_tokens,
-              "model_invocations": 0, "cache_hit": False, "omitted": omitted, "not_reviewable": no_text,
+              "model_invocations": 0, "cache_hit": False, "omitted": omitted,
+              "not_reviewable": [path for path in no_text if path not in unavailable],
               "checks": checks,
               "findings": [], "model_usage": None, "full_input_tokens": full, "degraded": degraded,
               "drift": drifted}
-    # What the review could cover and did: the denominators of the receipt.
-    deselected, text = paths - selected, len(files) - len(no_text)
-    # A degraded review is over the limit in full but reviews what it kept; only a refusal reviews nothing.
-    reviewed = 0 if estimated > args.max_input_tokens else text - len(degraded)
-    report["coverage"] = {"changed": len(paths), "text": text + len(deselected), "reviewed": reviewed,
-                          "skipped": text - reviewed, "excluded": len(deselected), "no_text": len(no_text)}
+    deselected = [f for f in change.files if f.path not in selected]
+    known_no_text = len(report["not_reviewable"]) + sum(not has_reviewable_text(f) for f in deselected)
+    prompt_files = len(files) - len(no_text)
+    report["coverage"] = {"changed": len(paths), "text": len(paths) - known_no_text, "reviewed": 0,
+                          "skipped": prompt_files if estimated > args.max_input_tokens else len(degraded),
+                          "excluded": len(deselected), "no_text": known_no_text,
+                          "unavailable": len(unavailable) + sum(f.patch_unavailable for f in deselected)}
     if static:
         report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
@@ -245,53 +272,63 @@ def execute(args):
     if qualgen:
         report["qualgen"] = qualgen
     if estimated > args.max_input_tokens:
-        return dict(report, state="over-budget"), 2
+        return dict(report, state="over-budget"), 2, None
     if args.estimate:
-        return dict(report, state="estimate"), 2 if degraded else 0
+        return dict(report, state="estimate"), 2 if degraded or unavailable else 0, None
     if has_text:
         try:
             answer, cached = review(prompt, args.model, anchors, args.cache_dir,
                                     change.identity)
         except ModelFailure as err:
             return dict(report, state="model-unavailable", error=str(err),
-                        model_invocations=err.invocations, model_usage=err.usage), 2
+                        model_invocations=err.invocations, model_usage=err.usage), 2, None
         except (ReviewError, OSError, ValueError, KeyError, TypeError, AttributeError,
                 subprocess.TimeoutExpired, yaml.YAMLError) as err:
             # Preserve deterministic diagnostics even if the model failed.
             return dict(report, state="model-unavailable", error=str(err) if isinstance(err, ReviewError)
-                        else type(err).__name__, model_invocations=None), 2
+                        else type(err).__name__, model_invocations=None), 2, None
         # A result cached before the keys were renamed still carries the old one.
         report.update(answer, cache_hit=cached, model_invocations=int(not cached))
+        report["coverage"]["reviewed"] = prompt_files - len(degraded)
         report.pop("cursor_usage", None)
         if cached:
             report["model_usage"] = None
-        if args.post and os.getenv("REVIEW_STATE_DIR") and state_dir().is_dir():
-            # What became of earlier findings, and what this review posts to track. Never at the cost of the review.
-            try:
-                report["outcomes"] = outcomes.record(state_dir(), args.change, change.head, report["findings"], anchors)
-            except (OSError, ValueError, KeyError, sqlite3.Error):
-                pass
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
     if degraded:
         report["state"] = "degraded"
     else:
         report["state"] = "partial" if incomplete else ("reviewed" if has_text else "empty")
-    return report, 2 if incomplete or degraded else 0
+    return report, 2 if incomplete or degraded else 0, (anchors, paths)
+
+
+def track(report, tracking, *, persist):
+    # Tracking is best effort. A failure must never prevent a review from being posted.
+    try:
+        report["outcomes"] = outcomes.record(*tracking, persist=persist)
+    except (OSError, ValueError, KeyError, sqlite3.Error):
+        report.pop("outcomes", None)
 
 
 def run_request(args):
-    report, code = execute(args)
+    report, code, scope = execute(args)
     # Preserve the legacy JSON fields for consumers that have not migrated to model_*.
     cursor = report["provider"] == "cursor"
     report["cursor_invocations"] = report["model_invocations"] if cursor else 0
     report["cursor_usage"] = report["model_usage"] if cursor else None
     report["receipt"] = receipt.build(report)
     if args.post:
+        tracking = None
+        if scope is not None and os.getenv("REVIEW_STATE_DIR") and state_dir().is_dir():
+            tracking = (state_dir(), report["source"], report["head"], report["findings"], *scope)
+            track(report, tracking, persist=False)
         try:
             publish(args.change, report["head"], report, project=getattr(args, "forge_project", None),
                     state=getattr(args, "forge_state", None))
         except (ReviewError, OSError, ValueError, subprocess.TimeoutExpired) as err:
+            report.pop("outcomes", None)
             return dict(report, publication="failed", publication_error=str(err) or type(err).__name__), 2
+        if tracking is not None:
+            track(report, tracking, persist=True)
         report["publication"] = "posted-or-already-present"
     return report, code
 

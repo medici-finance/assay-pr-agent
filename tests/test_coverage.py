@@ -8,7 +8,7 @@ from cursor_pr import cli, engine, source
 
 ADDED = source.File("app.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")
 DELETED = source.File("old.py", "@@ -1 +0,0 @@\n-x = 1\n", "removed")
-BINARY = source.File("logo.png", "", "added", True)
+BINARY = source.File("logo.png", "", "added", True, known_no_text=True)
 NO_DRIFT = {"state": "could-not-check", "behind": None, "both": [], "references": []}
 
 
@@ -45,6 +45,14 @@ class CoverageStateTests(unittest.TestCase):
         self.assertEqual((code, report["state"], shown), (0, "empty", []))
         self.assertEqual(report["not_reviewable"], ["logo.png", "old.py"])
         self.assertEqual(engine.pack([DELETED], [])[2:], (["old.py"], False))
+
+    def test_an_unavailable_patch_makes_a_review_partial(self):
+        missing = source.File("app.py", "", "modified", True)
+        removed = source.File("removed.py", "", "removed", True)
+        report, code, shown, posts = self.run_review([missing, removed])
+        self.assertEqual((code, report["state"], shown), (2, "partial", []))
+        self.assertEqual((report["omitted"], report["not_reviewable"]), (["app.py"], ["removed.py"]))
+        self.assertIn("- Outside review coverage: ` app.py `", posts[0])
 
     def test_what_is_left_out_of_a_review_still_makes_it_partial(self):
         other = source.File("other.py", "@@ -0,0 +1 @@\n+y = 2\n", "added")
