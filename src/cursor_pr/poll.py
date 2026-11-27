@@ -21,7 +21,6 @@ from .discovery import poll_project
 from .manager import ConfigurationWatch
 from .login import auth_mode, ensure_session, login_directory
 from . import acknowledge, buildinfo, history, setup, providers
-from .acknowledge import PENDING as MARK_PENDING
 
 log = logging.getLogger(__name__)
 
@@ -80,8 +79,9 @@ class Jobs:
             db.execute("""CREATE TABLE IF NOT EXISTS schedule (
                 project TEXT NOT NULL, number INTEGER NOT NULL, comments INTEGER NOT NULL, newest TEXT NOT NULL,
                 wait INTEGER NOT NULL, seen REAL NOT NULL, PRIMARY KEY(project, number))""")
+            upgraded = db.execute("SELECT 1 FROM sqlite_master WHERE name='acknowledgements'").fetchone() is None
             db.execute("""CREATE TABLE IF NOT EXISTS acknowledgements (
-                project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL, marker_id INTEGER,
+                project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,
                 notice_sent INTEGER NOT NULL DEFAULT 0, tries INTEGER NOT NULL DEFAULT 0,
                 retry_at REAL NOT NULL DEFAULT 0, cleared INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(project, number, comment))""")
@@ -89,6 +89,11 @@ class Jobs:
             for column, kind in (("tries", "INTEGER"), ("retry_at", "REAL"), ("cleared", "INTEGER")):
                 if column not in columns:
                     db.execute(f"ALTER TABLE acknowledgements ADD COLUMN {column} {kind} NOT NULL DEFAULT 0")
+            if upgraded:
+                # Requests a version without acknowledgements left waiting. With a record, they are
+                # marked and, when one fails, reported like any other.
+                db.execute("""INSERT INTO acknowledgements (project, number, comment)
+                    SELECT project, number, comment FROM requests WHERE status IN ('queued','started')""")
             # Only the process holding the instance lock opens the queue, and a review child holds
             # that lock until it exits and settles its own row before it does. So a row still started
             # belongs to a review that was cut off. It runs once more, held to the head in its row if
@@ -102,8 +107,6 @@ class Jobs:
                            [job for job, status, _ in settled if status == "failed"])
         for job, _, reason in settled:
             log.warning("Review of %s #%d comment %d was interrupted by a restart; %s", *job, reason)
-        # Requests this start gave up on, so the requester can be told.
-        self.abandoned = [tuple(job) for job, status, _ in settled if status == "failed"]
 
     def activated(self, project):
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -122,8 +125,8 @@ class Jobs:
             inserted = db.execute("INSERT OR IGNORE INTO requests (project, number, comment, status) VALUES (?,?,?,?)",
                                   (project, number, comment, status))
             if acknowledge and inserted.rowcount:
-                db.execute("INSERT INTO acknowledgements (project, number, comment, marker_id) VALUES (?,?,?,?)",
-                           (project, number, comment, MARK_PENDING))
+                db.execute("INSERT INTO acknowledgements (project, number, comment) VALUES (?,?,?)",
+                           (project, number, comment))
 
     def next(self):
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -176,22 +179,17 @@ class Jobs:
             db.execute("""UPDATE acknowledgements SET tries=tries+1, retry_at=?
                 WHERE project=? AND number=? AND comment=?""", (at, *job))
 
-    def unmarked(self):
-        """Waiting requests whose marker was never asked for: the poller stopped right after queueing them."""
+    def waiting_acknowledgements(self):
+        """Requests that are waiting for their review and are to be marked on the forge."""
         with closing(sqlite3.connect(self.path)) as db:
             return db.execute("""SELECT project, number, comment FROM requests JOIN acknowledgements
-                USING (project, number, comment) WHERE status='queued' AND marker_id=?""",
-                              (MARK_PENDING,)).fetchall()
+                USING (project, number, comment) WHERE status='queued' ORDER BY requests.rowid""").fetchall()
 
     def acknowledgement(self, job):
+        """Whether the request's notice was sent and its marker removed, or None when it owes the forge nothing."""
         with closing(sqlite3.connect(self.path)) as db:
-            return db.execute("""SELECT marker_id, notice_sent, cleared FROM acknowledgements
+            return db.execute("""SELECT notice_sent, cleared FROM acknowledgements
                 WHERE project=? AND number=? AND comment=?""", job).fetchone()
-
-    def record_marker(self, job, marker):
-        with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("UPDATE acknowledgements SET marker_id=? WHERE project=? AND number=? AND comment=?",
-                       (marker, *job))
 
     def record_notice(self, job):
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -402,6 +400,8 @@ def cycle(projects, state, jobs, since, runner=None, ack=None, idle=None):
         key, number, comment = job
         status = "failed"
         if key in projects:
+            if ack is not None:
+                ack.starting(projects[key], number, comment)
             try:
                 tier = jobs.tier(job)
                 extra = () if tier == "regular" else (tier,)
