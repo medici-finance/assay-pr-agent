@@ -103,6 +103,35 @@ class TierContextTests(unittest.TestCase):
         prompt = engine.verification([issue], [file], radius=0)
         self.assertTrue(prompt.endswith("## app.py around lines 2-2\n- -check_config()\n2  finish()"))
 
+    def test_narrow_verification_bounds_large_deletions_to_the_nearest_lines(self):
+        deleted = "".join(f"-removed_{i:03d}()\n" for i in range(32))
+        file = File("app.py", f"@@ -1,34 +1,2 @@\n initialize()\n{deleted} finish()\n", "modified")
+        after = dict(path="app.py", line=2, end_line=2, title="Removed step", message="Check the missing step.")
+        before = dict(after, line=1, end_line=1)
+
+        narrow_after = engine.verification([after], [file], radius=0)
+        self.assertTrue(narrow_after.endswith("[28 removed lines omitted from this window]\n"
+                                              "- -removed_028()\n- -removed_029()\n"
+                                              "- -removed_030()\n- -removed_031()\n2  finish()"))
+        narrow_before = engine.verification([before], [file], radius=0)
+        self.assertTrue(narrow_before.endswith("1  initialize()\n"
+                                               "- -removed_000()\n- -removed_001()\n"
+                                               "- -removed_002()\n- -removed_003()\n"
+                                               "[28 removed lines omitted from this window]"))
+        wide = engine.verification([after], [file], radius=15)
+        self.assertGreater(wide.count("- -removed_"), narrow_after.count("- -removed_"))
+
+    def test_narrow_verification_marks_a_shortened_removed_line(self):
+        deleted = "x" * 5000
+        file = File("app.py", f"@@ -1,2 +1 @@\n-{deleted}\n finish()\n", "modified")
+        issue = dict(path="app.py", line=1, end_line=1, title="Removed step", message="Check the missing step.")
+
+        narrow = engine.verification([issue], [file], radius=0)
+        wide = engine.verification([issue], [file], radius=15)
+        self.assertIn(" [remaining text omitted]\n1  finish()", narrow)
+        self.assertNotIn(deleted, narrow)
+        self.assertLess(len(narrow), len(wide))
+
 
 class CallSiteTests(unittest.TestCase):
     def setUp(self):

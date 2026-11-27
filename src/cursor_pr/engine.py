@@ -1,4 +1,5 @@
 """One bounded Cursor request using the published PR-Agent review rubric."""
+from collections import deque
 import fcntl
 import hashlib
 from importlib.metadata import distribution
@@ -118,30 +119,59 @@ def pack(files, checks, skip=frozenset(), *, context="", max_findings=MAX_FINDIN
     return prompt, anchors, omitted, bool(sections)
 
 
+def removed_excerpt(lines, omitted, width, *, nearest_end):
+    """Render a bounded excerpt with omissions marked at the side they came from."""
+    rows = []
+    if omitted and nearest_end:
+        rows.append(f"[{omitted} removed lines omitted from this window]")
+    for line in lines:
+        text = line.value.rstrip()
+        if len(text) > width:
+            text = text[:width] + " [remaining text omitted]"
+        rows.append(f"- -{text}")
+    if omitted and not nearest_end:
+        rows.append(f"[{omitted} removed lines omitted from this window]")
+    return rows
+
+
+def verification_rows(file, start, end, radius):
+    """Keep a small old-side excerpt next to an in-range head line."""
+    rows = []
+    removed_limit, removed_width = 4 + radius, 160 + 32 * radius
+    for hunk in hunks(file):
+        near = False
+        removed = deque(maxlen=removed_limit)
+        removed_count = 0
+        for line in hunk:
+            if line.is_removed:
+                removed_count += 1
+                # Keep the prefix after an in-range row, or the suffix before one.
+                if not near or len(removed) < removed_limit:
+                    removed.append(line)
+                continue
+            number = line.target_line_no
+            next_near = near if number is None else start <= number <= end
+            if removed_count and (near or next_near or line.is_context):
+                if near or next_near:
+                    rows.extend(removed_excerpt(removed, removed_count - len(removed), removed_width,
+                                                nearest_end=not near))
+                removed.clear()
+                removed_count = 0
+            near = next_near
+            if near:
+                rows.append(f"{number if number is not None else '-'} {line.line_type}{line.value.rstrip()}")
+        if near and removed_count:
+            rows.extend(removed_excerpt(removed, removed_count - len(removed), removed_width, nearest_end=False))
+    return rows
+
+
 def verification(findings, files, radius=15):
     """A second, small prompt: the findings and the patch lines they cite, to be filtered."""
     by_path = {f.path: f for f in files}
     shown = []
     for finding in findings:
-        rows = []
         start, end = finding["line"] - radius, finding["end_line"] + radius
-        for hunk in hunks(by_path[finding["path"]]):
-            near = False
-            pending_removals = []
-            for line in hunk:
-                number = line.target_line_no
-                if number is not None:
-                    near = start <= number <= end
-                    if near:
-                        rows.extend(pending_removals)
-                        pending_removals.clear()
-                    elif line.is_context:
-                        pending_removals.clear()
-                if near:
-                    rows.append(f"{number if number is not None else '-'} {line.line_type}{line.value.rstrip()}")
-                elif line.is_removed:
-                    # An old line can supply evidence for the next addition or context line.
-                    pending_removals.append(f"- {line.line_type}{line.value.rstrip()}")
+        rows = verification_rows(by_path[finding["path"]], start, end, radius)
         shown.append(f"## {finding['path']} around lines {finding['line']}-{finding['end_line']}\n" + "\n".join(rows))
     listed = [{"relevant_file": f["path"], "start_line": f["line"], "end_line": f["end_line"],
                "issue_header": f["title"], "issue_content": f["message"]} for f in findings]
