@@ -123,11 +123,12 @@ class TierTests(unittest.TestCase):
                              commit_messages=True)[0]
         self.assertEqual(self.prompts(), [["review", prompt]])
         self.assertIn("observable behavior on base and head", prompt)
-        self.assertIn("prefix its title with Unverified", prompt)
+        self.assertIn("Set verification_status to 'unverified'", prompt)
         self.assertEqual((code, report["state"], report["tier"], report["delivered"]), (0, "reviewed", "regular", "regular"))
         self.assertEqual(report["verification"], {"state": "not-needed"})
 
     def test_mid_adds_context_to_the_plain_prompt_and_verifies_the_findings(self):
+        self.answers(verification=answer(dict(finding(42, "Real"), verification_status="confirmed")))
         code, report = self.check("--tier", "mid")
         (first, prompt), (second, check) = self.prompts()
         self.assertEqual((first, second), ("review", "verification"))
@@ -146,6 +147,7 @@ class TierTests(unittest.TestCase):
         self.assertIn("compare the same concrete scenario on base and head", check)
         self.assertEqual((code, report["state"], report["delivered"]), (0, "reviewed", "mid"))
         self.assertEqual([(f["line"], f["title"]) for f in report["findings"]], [(42, "Real")])
+        self.assertEqual(report["findings"][0]["verification_status"], "confirmed")
         self.assertEqual(report["verification"], {"state": "filtered", "before": 2, "after": 1})
         self.assertEqual({row["name"]: row["state"] for row in report["context"]},
                          {"change description": "included", "overlap with the base": "empty",
@@ -259,7 +261,11 @@ class TierTests(unittest.TestCase):
         ], "unscreened": []}
         raw = {"change description": "Check how the new values are used.",
                "whole changed files": "These values come from the fixtures."}
-        args = ("--tier", "max", "--max-input-tokens", "1000", "--path", small, "--path", large)
+        files = [file for file in cli.local_change(self.root, "main", "HEAD").files if file.path in (small, large)]
+        mid_size = engine.tokens(engine.pack([file for file in files if file.path == small], [])[0])
+        deep_size = engine.tokens(engine.pack(files, [], focus=cli.DEEP_FOCUS)[0])
+        limit = (mid_size + deep_size + 200 + 8) // 9
+        args = ("--tier", "max", "--max-input-tokens", str(limit), "--path", small, "--path", large)
         with patch.object(context, "gather", return_value=raw), patch.object(cli.history, "screen", return_value=qualgen):
             _, plain = self.check(*args)
             _, advised = self.check(*args, "--qualgen-store", str(self.root / "qualgen"))
@@ -272,8 +278,15 @@ class TierTests(unittest.TestCase):
         qualgen = {"state": "complete", "advisories": [
             {"path": "src/app.py", "kind": "co-change", "detail": "Check prior use of this path. " * 9},
         ], "unscreened": []}
-        args = ("--tier", "mid", "--max-input-tokens", "1400")
-        with patch.object(context, "gather", return_value={"change description": "The patch adjusts a returned value."}), \
+        raw = {"change description": "The patch adjusts a returned value."}
+        files = cli.local_change(self.root, "main", "HEAD").files
+        text, _ = context.assemble(context.MID, raw, 1000)
+        first_size = engine.tokens(engine.pack(files, [], context=text, context_description="history")[0])
+        row = dict(path="src/app.py", line=42, end_line=42, title=issue["issue_header"], message=issue["issue_content"])
+        verify_size = engine.tokens(engine.verification([row], files, radius=15))
+        limit = (first_size + verify_size + 1) // 2 + 8
+        args = ("--tier", "mid", "--max-input-tokens", str(limit))
+        with patch.object(context, "gather", return_value=raw), \
              patch.object(cli.history, "screen", return_value=qualgen):
             _, plain = self.check(*args)
             code, advised = self.check(*args, "--qualgen-store", str(self.root / "qualgen"))

@@ -240,7 +240,9 @@ def forge_change(address, expected_url=None, *, project=None, with_description=F
     title = bounded_text(last.get("title"), TITLE_LIMIT)
     description = bounded_text(last.get("body"), DESCRIPTION_LIMIT)
     truncated = last.get("descriptionTruncated") is True or any(text.endswith(TRUNCATED) for text in (title, description))
-    base, patch_base = last.get("baseSha"), last.get("diffBaseSha")
+    # Evidence from the old side is usable only when both reads agree around the patch fetch.
+    base = first.get("baseSha") if first.get("baseSha") == last.get("baseSha") else None
+    patch_base = first.get("diffBaseSha") if first.get("diffBaseSha") == last.get("diffBaseSha") else None
     return Change(head, files, first.get("url") or address, base=base if valid_sha(base) else "",
                   base_ref=base_ref if isinstance(base_ref, str) else "", title=title, description=description,
                   description_truncated=truncated, patch_base=patch_base if valid_sha(patch_base) else "")

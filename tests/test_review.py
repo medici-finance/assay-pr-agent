@@ -75,7 +75,7 @@ class ReviewTest(unittest.TestCase):
         self.assertFalse(self.check(*args, "--model", "another-model")[1]["cache_hit"])
         self.assertEqual(self.calls.read_text().splitlines(), ["call", "call"])
 
-    def test_scanner_suppresses_an_equivalent_shifted_warning(self):
+    def test_scanner_marks_an_equivalent_shifted_warning_without_hiding_it(self):
         old_head = self.head
         script = self.root / "example.sh"
         script.write_text("#!/bin/sh\n# The existing warning moves.\necho $argument\necho $new\n")
@@ -85,22 +85,46 @@ class ReviewTest(unittest.TestCase):
         shifted = dict(warning, line=3, endLine=3)
         new = dict(warning, line=4, endLine=4)
         previous = dict(warning, line=2, endLine=2)
-        for old, expected in (([previous], [4]), ([dict(previous, level="style")], [3, 4])):
+        for old, expected in (([previous], [3]), ([dict(previous, level="style")], [])):
             with self.subTest(previous=old):
                 with patch.object(checks.shutil, "which", return_value="/scanner"), \
                      patch.object(checks, "scan_blob", side_effect=[[shifted, new], old]) as scan:
                     code, report = self.check("--base", old_head, "--estimate")
                 check, = report["checks"]
                 self.assertEqual(code, 0)
-                self.assertEqual([row["line"] for row in check["findings"]], expected)
-                self.assertEqual(check.get("existing_findings", 0), 2 - len(expected))
+                self.assertEqual([row["line"] for row in check["findings"]], [3, 4])
+                self.assertEqual([row["line"] for row in check["findings"] if row.get("baseline_match")], expected)
+                self.assertEqual(check.get("existing_findings", 0), len(expected))
                 self.assertEqual([call.args[2] for call in scan.call_args_list],
                                  [script.read_bytes(), b"#!/bin/sh\necho $argument\n"])
+                if expected:
+                    change = source.local_change(self.root, old_head, "HEAD")
+                    self.assertIn('"baseline_match": true', engine.pack(change.files, [check])[0])
+                    with patch.object(cli, "post_comment") as post:
+                        cli.publish("example/repo#1", change.head, dict(report, state="reviewed"))
+                    body = post.call_args.args[3]
+                    self.assertIn("Scanner diagnostics also reported on the base: 1.", body)
+                    self.assertIn(":4 ", body)
+                    self.assertNotIn(":3 ", body)
+                    with patch.object(cli, "post_comment") as post:
+                        cli.publish("example/repo#1", change.head, dict(report, state="degraded"))
+                    self.assertIn(":3 ", post.call_args.args[3])
         with patch.object(checks.shutil, "which", return_value="/scanner"), \
              patch.object(checks, "scan_blob", side_effect=[[shifted, new], source.ReviewError("base unavailable")]):
             code, report = self.check("--base", old_head, "--estimate")
         self.assertEqual(code, 0)
         self.assertEqual([row["line"] for row in report["checks"][0]["findings"]], [3, 4])
+        self.assertNotIn("existing_findings", report["checks"][0])
+
+    def test_actionlint_baseline_maps_related_locations(self):
+        old = b"jobs:\n  build: {}\n  build: {}\n"
+        head = b"# Shift the whole file\n" + old
+        file = source.File(".github/workflows/ci.yml", "@@ -1,3 +1,4 @@\n+# Shift the whole file\n"
+                           " jobs:\n   build: {}\n   build: {}\n", "modified")
+        existing = {"line": 3, "column": 3, "kind": "syntax", "message": "previously defined at line:2,col:3"}
+        shifted = dict(existing, line=4, message="previously defined at line:3,col:3")
+        with patch.object(checks, "scan_blob", return_value=[existing]):
+            self.assertEqual(checks.baseline_matches(file, [shifted], head, old, "actionlint", [], float("inf")), {0})
 
     def test_budget_comes_from_saved_setup_unless_overridden(self):
         bundle = self.root/"state/.review-setup-fixture"

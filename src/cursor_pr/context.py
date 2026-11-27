@@ -84,6 +84,8 @@ def verification_comparison(root, checkout, base, head):
                 ("Base source", root, base, file.previous or file.path, old),
                 ("Head source", checkout, head, file.path, start)):
             text = excerpt_blob(repo, revision, path) if revision and line is not None else None
+            if text is None and label == "Base source" and revision and line is not None and root != checkout:
+                text = excerpt_blob(checkout, revision, path)
             if text is not None:
                 lines = file_lines(text)
                 offset = max(0, line - radius - 1)

@@ -43,19 +43,21 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         project = project_from(dict(provider="github", url="https://github.com/org/repo", checkout=tmp.name, requester_ids=[1]))
         change = {"url": project.change_url(1), "headSha": "a" * 40, "state": "open", "baseRef": "main",
-                  "changedFiles": 0, "title": "Add a script", "body": "It does " + "x" * 2000}
+                  "baseSha": "b" * 40, "changedFiles": 0, "title": "Add a script", "body": "It does " + "x" * 2000}
         files = {"headSha": "a" * 40, "complete": True, "changedFiles": 0, "files": []}
         with patch.object(source, "run_forge", side_effect=[change, files, change]):
             got = source.forge_change("org/repo#1", project=project)
         self.assertEqual(got.title, "Add a script")
+        self.assertEqual(got.base, "b" * 40)
         self.assertTrue(got.description.startswith("It does xxx"))
         self.assertTrue(got.description.endswith("…[truncated]"))
         self.assertLessEqual(len(got.description), source.DESCRIPTION_LIMIT + len(" …[truncated]"))
         self.assertTrue(got.description_truncated)
-        clipped = dict(change, body="A bounded excerpt", descriptionTruncated=True)
+        clipped = dict(change, body="A bounded excerpt", descriptionTruncated=True, baseSha="c" * 40)
         with patch.object(source, "run_forge", side_effect=[change, files, clipped]):
             got = source.forge_change("org/repo#1", project=project)
         self.assertEqual(got.description, "A bounded excerpt")
+        self.assertEqual(got.base, "")
         self.assertTrue(got.description_truncated)
         # The forge helper reports no title or body yet: then there is nothing to pass on.
         bare = {key: value for key, value in change.items() if key not in ("title", "body")}

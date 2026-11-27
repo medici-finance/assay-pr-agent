@@ -243,7 +243,8 @@ def finding_line(issue, *, compact=False, shorten_path=False, clip=None):
     if shorten_path and len(path) > 80:
         tag = hashlib.sha256(path.encode("utf-8")).hexdigest()[:12]
         path = f"…/{path[-80:]} [{tag}]"
-    title = fence(issue["title"], 60 if compact else None)
+    title_text = ("Unverified " if issue.get("verification_status") == "unverified" else "") + issue["title"]
+    title = fence(title_text, 60 if compact else None)
     message = fence(issue["message"], COMPACT_FINDING_MESSAGE if compact else clip)
     return f"- {fence(path)}:{issue['line']} — {title}. {message}" + (" (shortened)" if clip else "")
 
@@ -401,10 +402,16 @@ def publish(address, head, report, *, project=None, state=None):
         body.append(f"{label} could not complete the review.")
     elif not report["findings"]:
         body.append("No model findings in the reviewed scope.")
+    summarize_matches = report["state"] == "reviewed"
+    existing = sum(check.get("existing_findings", 0) for check in report["checks"]) if summarize_matches else 0
+    if existing:
+        body.append(f"Scanner diagnostics also reported on the base: {existing}.")
     for check in report["checks"]:
         if check["state"] != "complete":
             body.append(f"- {check['tool']}: could not check {fence(check.get('path') or check.get('reason', ''))}")
         for item in check["findings"]:
+            if summarize_matches and item.get("baseline_match"):
+                continue
             detail = " ".join(part for part in (fence(item["rule"]), fence(item.get("message", ""))) if part)
             body.append(f"- {fence(item['path'])}:{item['line']} — {detail}")
     if report.get("static_checks"):
@@ -764,7 +771,7 @@ def execute_review(args, verification_resources):
         coverage.update({path: lines for path, lines in locations.items() if lines})
         if depth == "max":
             deep_findings = answer["findings"]
-        findings = merge_findings(findings, answer["findings"]) if findings else answer["findings"]
+        findings = merge_findings(findings, answer["findings"])
     # Report only what reached the model: a block of a pass that failed was not sent.
     sent = merged_fates(blocks for _, blocks in completed)
     report["context"] = [sent.get(name) or (dict(row, state="not sent") if row["state"] in USED else row)
@@ -776,9 +783,14 @@ def execute_review(args, verification_resources):
         report["verification"] = {"state": "unavailable", "before": before}
         comparison = context.verification_comparison(root, checkout, patch_base, change.head)
         for radius in (15, 8, 3, 0):
-            check = verification(findings, files, radius, comparison=comparison)
+            check = verification(findings, files, radius)
             size = tokens(check)
             if size <= left:
+                if radius:
+                    with_source = verification(findings, files, radius, comparison=comparison)
+                    with_source_size = tokens(with_source)
+                    if with_source_size <= left:
+                        check, size = with_source, with_source_size
                 row = {"name": "verification", "estimated_input_tokens": size, "state": "planned"}
                 passes.append(row)
                 report["estimated_input_tokens"] += size
@@ -791,8 +803,9 @@ def execute_review(args, verification_resources):
     cap = caps[tier]
     if len(findings) > cap:
         report["omitted_findings"] = len(findings) - cap
-        from_deep = [issue for issue in findings if issue in deep_findings]
-        from_first = [issue for issue in findings if issue not in deep_findings]
+        deep_keys = {engine.finding_key(issue) for issue in deep_findings}
+        from_deep = [issue for issue in findings if engine.finding_key(issue) in deep_keys]
+        from_first = [issue for issue in findings if engine.finding_key(issue) not in deep_keys]
         # A max cap below the mid cap can leave more deep findings than the cap allows.
         from_deep = from_deep[:cap]
         findings = from_first[:cap - len(from_deep)] + from_deep

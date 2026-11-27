@@ -94,6 +94,10 @@ class TierContextTests(unittest.TestCase):
         other = dict(issue, title="Other issue", message="Different defect")
         self.assertEqual(engine.merge_findings([issue], [issue, other]), [issue, other])
         self.assertEqual(engine.kept([issue, other], {"findings": [other]}), [other])
+        uncertain = dict(issue, verification_status="unverified")
+        confirmed = dict(issue, verification_status="confirmed")
+        self.assertEqual(engine.kept([uncertain, other], {"findings": [confirmed]}), [confirmed])
+        self.assertEqual(engine.kept([confirmed], {"findings": [uncertain]}), [uncertain])
         file = File("app.py", "@@ -1 +1 @@\n-foo()\n+bar()\n", "modified")
         self.assertIn("keep the finding unchanged and unverified", engine.verification([issue], [file]))
 

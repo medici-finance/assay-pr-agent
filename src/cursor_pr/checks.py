@@ -13,6 +13,7 @@ from unidiff.errors import UnidiffParseError
 from .source import ReviewError, base_line, hunks, child_env, git
 
 BASE_SCAN_SECONDS = 30
+RELATED_LOCATION = re.compile(r"(at line:)([0-9]+)(?=,col:[0-9]+)")
 
 
 def go_report(path, head):
@@ -87,17 +88,26 @@ def scan_blob(tool, args, content, timeout=20):
     return rows
 
 
-def diagnostic(row, line):
+def diagnostic(row, line, message=None):
     end = row.get("endLine", row["line"])
     return (line, end - row["line"], row.get("column"), row.get("endColumn"), row.get("level"),
-            row.get("code"), row.get("kind"), row["message"])
+            row.get("code"), row.get("kind"), row["message"] if message is None else message)
 
 
-def changed_diagnostics(file, rows, head, base, tool, args, deadline):
-    """Keep rows that cannot be matched to an equivalent diagnostic at the old location."""
+def baseline_matches(file, rows, head, base, tool, args, deadline):
+    """Find equivalent tool diagnostics at unchanged locations on the base."""
     try:
         patch = hunks(file)
         old_lines, head_lines = base.split(b"\n"), head.split(b"\n")
+
+        def related_location(match):
+            line = int(match[2])
+            old = base_line(patch, line)
+            if (old is None or not 0 < line <= len(head_lines) or not 0 < old <= len(old_lines)
+                    or old_lines[old - 1] != head_lines[line - 1]):
+                return "at changed location"
+            return match[1] + str(old)
+
         candidates = []
         for row in rows:
             line, end = row["line"], row.get("endLine", row["line"])
@@ -106,22 +116,22 @@ def changed_diagnostics(file, rows, head, base, tool, args, deadline):
                     and (old_end := base_line(patch, end)) == old + end - line
                     and 0 < old <= old_end <= len(old_lines)
                     and old_lines[old - 1:old_end] == head_lines[line - 1:end]):
-                candidates.append(diagnostic(row, old))
+                message = RELATED_LOCATION.sub(related_location, row["message"]) if tool == "actionlint" else None
+                candidates.append(diagnostic(row, old, message))
             else:
                 candidates.append(None)
         remaining = deadline - time.monotonic()
         if not any(candidates) or remaining <= 0:
-            return rows
+            return set()
         previous = Counter(diagnostic(row, row["line"]) for row in scan_blob(tool, args, base, min(20, remaining)))
     except (ReviewError, UnidiffParseError, ValueError, TypeError, KeyError, OSError, subprocess.TimeoutExpired):
-        return rows
-    new = []
-    for row, key in zip(rows, candidates, strict=True):
+        return set()
+    matched = set()
+    for index, key in enumerate(candidates):
         if previous[key]:
             previous[key] -= 1
-        else:
-            new.append(row)
-    return new
+            matched.add(index)
+    return matched
 
 
 def scan_files(root, head, files, *, base_root=None, base=""):
@@ -145,20 +155,24 @@ def scan_files(root, head, files, *, base_root=None, base=""):
             if content is None:
                 raise ReviewError("immutable source unavailable")
             rows = scan_blob(tool, args, content)
+            matched = set()
             if (rows and base and file.patch and file.status in ("modified", "M")
                     and time.monotonic() < deadline):
                 old = blob(base_root if base_root is not None else root, base, file.path)
+                if old is None and base_root is not None and base_root != root:
+                    old = blob(root, base, file.path)
                 if old is not None:
-                    kept = changed_diagnostics(file, rows, content, old, tool, args, deadline)
-                    if len(kept) != len(rows):
-                        result["existing_findings"] = len(rows) - len(kept)
-                    rows = kept
+                    matched = baseline_matches(file, rows, content, old, tool, args, deadline)
             if tool == "shellcheck":
                 findings = [{"path": path, "rule": f"SC{r['code']}", "line": r["line"],
                              "message": r["message"]} for r in rows]
             else:
                 findings = [{"path": path, "rule": r["kind"], "line": r["line"],
                              "message": r["message"]} for r in rows]
+            if matched:
+                result["existing_findings"] = len(matched)
+                for index in matched:
+                    findings[index]["baseline_match"] = True
             result.update(state="complete", findings=findings)
         except (ReviewError, ValueError, TypeError, KeyError, OSError, subprocess.TimeoutExpired):
             result["reason"] = "immutable source unavailable or scanner failed"
