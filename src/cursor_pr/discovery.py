@@ -104,6 +104,6 @@ def poll_project(project, jobs, since, ack=None):
                     if not public:
                         jobs.enqueue(project.key, number, comment, "ignored")
                         continue
-                jobs.enqueue(project.key, number, comment)
+                jobs.enqueue(project.key, number, comment, acknowledge=ack is not None)
                 if ack is not None:
                     ack.queued(project, number, comment)

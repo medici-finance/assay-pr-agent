@@ -93,26 +93,34 @@ class MarkerTests(Offline):
                              "Bearer fixture" if forge == "github" else "fixture")
             self.assertNotIn("private-token" if forge == "github" else "authorization", headers)
 
+    def ack(self):
+        jobs = Jobs(self.state)
+        for project in (self.gh, self.gl):
+            for comment in (81, 82):
+                jobs.enqueue(project.key, 3, comment, acknowledge=True)
+        return Acknowledgement(jobs, self.state)
+
     def test_github_marker_uses_the_comment_reaction_endpoints(self):
-        ack = Acknowledgement(Jobs(self.state), self.state)
+        ack = self.ack()
         ack.queued(self.gh, 3, 81)
         self.assertEqual(self.calls, [("POST", GITHUB, self.calls[0][2], b'{"content":"eyes"}')])
         ack.finished(self.gh, 3, 81, "reviewed")
         self.assertEqual(self.sent(), [
             ("POST", GITHUB),
-            ("POST", GITHUB),  # Answered with the reaction already there, whose ID is then deleted.
             ("DELETE", GITHUB + "/101")])  # Not the other account's reaction, nor our own different one.
         self.check_headers("github")
         self.assertEqual([row["id"] for row in self.eyes], [11, 13])
 
     def test_gitlab_marker_uses_the_merge_request_award(self):
-        ack = Acknowledgement(Jobs(self.state), self.state)
+        ack = self.ack()
         ack.queued(self.gl, 3, 81)
         self.assertEqual(self.sent(), [
             ("GET", "https://gitlab.com/api/v4/user"),
             ("GET", GITLAB + "?per_page=100&page=1"),
             ("POST", GITLAB + "?name=hourglass")])
         self.assertEqual(self.calls[-1][3], b"")
+        while job := ack.jobs.next():
+            ack.jobs.finish(job, "reviewed")
         ack.finished(self.gl, 3, 81, "reviewed")
         self.assertEqual(self.sent()[3:], [
             ("GET", "https://gitlab.com/api/v4/user"),
@@ -128,7 +136,7 @@ class MarkerTests(Offline):
         ack.queued(self.gh, 3, 82)  # Another comment gets a reaction of its own.
         self.assertEqual(self.sent(), [("POST", GITHUB), ("POST", GITHUB.replace("comments/81/", "comments/82/"))])
         for comment in (81, 82):
-            jobs.enqueue(self.gl.key, 3, comment)
+            jobs.enqueue(self.gl.key, 3, comment, acknowledge=True)
             ack.queued(self.gl, 3, comment)
         self.assertEqual(self.sent()[2:], [
             ("GET", "https://gitlab.com/api/v4/user"), ("GET", GITLAB + "?per_page=100&page=1"),
@@ -145,19 +153,42 @@ class MarkerTests(Offline):
                                        ("GET", GITLAB + "?per_page=100&page=1"), ("DELETE", GITLAB + "/105")])
         self.assertEqual([row["id"] for row in self.awards], [21, 23])
 
+    def test_failed_github_queue_marker_is_never_recreated_at_finish(self):
+        ack = self.ack()
+        self.refuse = {("POST", GITHUB): 403}
+        with self.assertLogs("cursor_pr.acknowledge", level="WARNING"):
+            ack.queued(self.gh, 3, 81)
+        self.refuse.clear()
+        ack.finished(self.gh, 3, 81, "reviewed")
+        self.assertEqual(self.sent(), [("POST", GITHUB)])
+
+    def test_gitlab_marker_lookup_stops_on_the_matching_award(self):
+        ack = self.ack()
+        self.awards.extend([dict(id=201, name="hourglass", user=dict(id=ME))] +
+                           [dict(id=i, name="hourglass", user=dict(id=OTHER)) for i in range(202, 299)])
+        while job := ack.jobs.next():
+            ack.jobs.finish(job, "reviewed")
+        ack.finished(self.gl, 3, 81, "reviewed")
+        self.assertEqual(self.sent(), [("GET", "https://gitlab.com/api/v4/user"),
+                                       ("GET", GITLAB + "?per_page=100&page=1"), ("DELETE", GITLAB + "/201")])
+
     def test_failures_are_logged_without_the_url_or_token_and_never_raised(self):
-        ack = Acknowledgement(Jobs(self.state), self.state)
         def finished(project, number, comment):
+            ack = self.ack()
+            ack.jobs.record_marker((self.gh.key, 3, 81), 12)
+            while job := ack.jobs.next():
+                ack.jobs.finish(job, "reviewed")
             # The reviewer's own marker is there to be removed, beside everyone else's.
             self.eyes[:] = [dict(id=11, user=dict(id=OTHER), content="eyes"),
                             dict(id=12, user=dict(id=ME), content="eyes"), dict(id=13, user=dict(id=ME), content="heart")]
             self.awards[:] = [dict(id=21, name="hourglass", user=dict(id=OTHER)),
                               dict(id=22, name="hourglass", user=dict(id=ME)), dict(id=23, name="fire", user=dict(id=ME))]
             ack.finished(project, number, comment, "reviewed")
+        ack = self.ack()
         cases = [({("POST", GITHUB): 403}, (self.gh, 3, 81), ack.queued, "Could not mark acme/github#3 comment 81: HTTP 403"),
                  ({("GET", GITLAB): 403}, (self.gl, 3, 81), ack.queued, "Could not mark acme/gitlab#3 comment 81: HTTP 403"),
                  ({("POST", GITLAB): 404}, (self.gl, 3, 81), ack.queued, "Could not mark acme/gitlab#3 comment 81: HTTP 404"),
-                 ({("POST", GITHUB): 401}, (self.gh, 3, 81), finished, CLEAR + " 401"),
+                 ({("DELETE", GITHUB + "/12"): 401}, (self.gh, 3, 81), finished, CLEAR + " 401"),
                  ({("GET", "https://gitlab.com/api/v4/user"): 403}, (self.gl, 3, 81), finished, "Could not clear the queued marker on acme/gitlab#3 comment 81: HTTP 403")]
         for refuse, (project, number, comment), call, line in cases:
             with self.subTest(line=line):
@@ -215,13 +246,17 @@ class NoticeTests(Offline):
                               (project, number, comment)).fetchone()[0]
 
     def test_failed_review_posts_one_fixed_comment_on_the_current_head_and_nothing_else(self):
-        ack = Acknowledgement(Jobs(self.state), self.state)
+        jobs = Jobs(self.state)
+        for project in (self.gh, self.gl):
+            jobs.enqueue(project.key, 3, 81, acknowledge=True)
+        ack = Acknowledgement(jobs, self.state)
         head = "a" * 40
         with patch.object(acknowledge, "run_forge", return_value=dict(headSha=head)) as read, \
                 patch.object(acknowledge, "post_comment") as post, patch.object(acknowledge, "remove"):
             ack.finished(self.gh, 3, 81, "failed")
+            jobs.enqueue(self.gh.key, 3, 82, acknowledge=True)
             for status in ("reviewed", "partial", "empty", "over-budget", "model-unavailable"):
-                ack.finished(self.gh, 3, 81, status)
+                ack.finished(self.gh, 3, 82, status)
             read.assert_called_once_with("change", self.gh, numbers=[3])
             post.assert_called_once_with(self.gh, 3, head, NOTICE, self.state)
             post.side_effect = ReviewError("pr-agent-forge comment exited 1: change is no longer open")
@@ -232,8 +267,9 @@ class NoticeTests(Offline):
                                              "acme/gitlab#3: pr-agent-forge comment exited 1: change is no longer open"])
             post.reset_mock()
             read.return_value = dict(headSha="not a head")
+            jobs.enqueue(self.gh.key, 3, 83, acknowledge=True)
             with self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
-                ack.finished(self.gh, 3, 81, "failed")
+                ack.finished(self.gh, 3, 83, "failed")
             post.assert_not_called()
             self.assertIn("Forge did not identify the change head", logged.output[0])
 
@@ -308,6 +344,25 @@ class NoticeTests(Offline):
         with patch("cursor_pr.poll.poll_project"):
             cycle(self.projects, self.state, jobs, dict.fromkeys(self.projects), review, ack)
         ack.finished.assert_called_once_with(self.gh, 3, 81, "reviewed")
+
+    def test_restart_cleans_up_terminal_requests_without_rerunning_the_review(self):
+        jobs = Jobs(self.state)
+        for comment, status in ((81, "reviewed"), (82, "failed")):
+            job = (self.gh.key, 3, comment)
+            jobs.enqueue(*job, acknowledge=True)
+            jobs.record_marker(job, comment + 100)
+            self.assertEqual(jobs.next(), job)
+            jobs.finish(job, status)
+
+        jobs = Jobs(self.state)
+        self.assertIsNone(jobs.next())
+        ack = Acknowledgement(jobs, self.state)
+        with patch.object(acknowledge, "remove") as remove, patch.object(acknowledge, "notify") as notify:
+            for key, number, comment, status in jobs.unfinished_acknowledgements():
+                ack.finished(self.projects[key], number, comment, status)
+        self.assertEqual([call.args[3] for call in remove.call_args_list], [181, 182])
+        notify.assert_called_once_with(self.gh, 3, self.state)
+        self.assertEqual(jobs.unfinished_acknowledgements(), [])
 
     def test_restart_tells_the_requester_about_a_review_it_gave_up_on(self):
         jobs = Jobs(self.state)

@@ -62,6 +62,9 @@ class Jobs:
                 db.execute("UPDATE requests SET status='failed' WHERE status='started'")
             db.execute("""CREATE TABLE IF NOT EXISTS activations (
                 project TEXT PRIMARY KEY, since TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS acknowledgements (
+                project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL, marker_id INTEGER,
+                notice_sent INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(project, number, comment))""")
             # Only the process holding the instance lock opens the queue, and a review child holds
             # that lock until it exits and settles its own row before it does. So a row still started
             # belongs to a review that was cut off. It runs once more, held to the head in its row if
@@ -71,6 +74,8 @@ class Jobs:
                 settled.append((job, "failed", GIVEN_UP) if attempts >= 2 else (job, "queued", "queued again"))
                 db.execute("UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?",
                            (settled[-1][1], *job))
+            db.executemany("INSERT OR IGNORE INTO acknowledgements (project, number, comment) VALUES (?,?,?)",
+                           [job for job, status, _ in settled if status == "failed"])
         for job, _, reason in settled:
             log.warning("Review of %s #%d comment %d was interrupted by a restart; %s", *job, reason)
         # Requests this start gave up on, so the requester can be told.
@@ -88,10 +93,13 @@ class Jobs:
             return db.execute("SELECT 1 FROM requests WHERE project=? AND number=? AND comment=?",
                               (project, number, comment)).fetchone() is not None
 
-    def enqueue(self, project, number, comment, status="queued"):
+    def enqueue(self, project, number, comment, status="queued", *, acknowledge=False):
         with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("INSERT OR IGNORE INTO requests (project, number, comment, status) VALUES (?,?,?,?)",
-                       (project, number, comment, status))
+            inserted = db.execute("INSERT OR IGNORE INTO requests (project, number, comment, status) VALUES (?,?,?,?)",
+                                  (project, number, comment, status))
+            if acknowledge and inserted.rowcount:
+                db.execute("INSERT INTO acknowledgements (project, number, comment) VALUES (?,?,?)",
+                           (project, number, comment))
 
     def next(self):
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -103,6 +111,29 @@ class Jobs:
         with closing(sqlite3.connect(self.path)) as db:
             return db.execute("SELECT 1 FROM requests WHERE project=? AND number=? AND status IN ('queued','started')",
                               (project, number)).fetchone() is not None
+
+    def unfinished_acknowledgements(self):
+        with closing(sqlite3.connect(self.path)) as db:
+            return db.execute("""SELECT project, number, comment, status FROM requests JOIN acknowledgements
+                USING (project, number, comment) WHERE status NOT IN ('queued','started')""").fetchall()
+
+    def acknowledgement(self, job):
+        with closing(sqlite3.connect(self.path)) as db:
+            return db.execute("""SELECT marker_id, notice_sent FROM acknowledgements
+                WHERE project=? AND number=? AND comment=?""", job).fetchone()
+
+    def record_marker(self, job, marker):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("UPDATE acknowledgements SET marker_id=? WHERE project=? AND number=? AND comment=?",
+                       (marker, *job))
+
+    def record_notice(self, job):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("UPDATE acknowledgements SET notice_sent=1 WHERE project=? AND number=? AND comment=?", job)
+
+    def clear_acknowledgement(self, job):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("DELETE FROM acknowledgements WHERE project=? AND number=? AND comment=?", job)
 
     def finish(self, job, status):
         """Settle a review the child did not settle itself, and return how the request ended."""
@@ -266,9 +297,9 @@ def main():
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
         jobs = Jobs(state)
         ack = acknowledge.Acknowledgement(jobs, state)
-        for key, number, comment in jobs.abandoned:
+        for key, number, comment, status in jobs.unfinished_acknowledgements():
             if key in projects:
-                ack.finished(projects[key], number, comment, "failed")
+                ack.finished(projects[key], number, comment, status)
         since = {key: jobs.activated(key) for key in projects}
         log.info("Polling %s with %d seconds between cycles", ", ".join(projects), args.interval)
         if mine_seconds:
