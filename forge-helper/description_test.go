@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/medici-finance/assay/tools/desk/forgechange"
 )
 
 type testTransport func(*http.Request) (*http.Response, error)
@@ -65,6 +67,19 @@ func TestChangeDescriptionUsesTheValidatedForgeResponse(t *testing.T) {
 				t.Fatalf("regular change exposed description: %s", encoded)
 			}
 		})
+	}
+}
+
+func TestChangeReportsMetadataTruncation(t *testing.T) {
+	capture := forgeCapture{}
+	payload, err := json.Marshal(map[string]string{"title": "title", "body": strings.Repeat("a", maxChangeBody+1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = capture.Write(payload)
+	described := capture.describe(forgechange.Change{}, "github")
+	if !described.DescriptionTruncated || len(described.Body) != maxChangeBody {
+		t.Fatalf("bounded body length %d, truncated %t", len(described.Body), described.DescriptionTruncated)
 	}
 }
 

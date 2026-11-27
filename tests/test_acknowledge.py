@@ -162,6 +162,54 @@ class MarkerTests(Offline):
         ack.finished(self.gh, 3, 81, "reviewed")
         self.assertEqual(self.sent(), [("POST", GITHUB)])
 
+    def test_github_reaction_whose_id_was_never_recorded_is_found_and_removed(self):
+        job = self.gh.key, 3, 81
+        for lost in ("answer", "poller"):
+            with self.subTest(lost=lost):
+                self.state = Path(self.enterContext(tempfile.TemporaryDirectory()))  # A queue of its own.
+                ack = self.ack()
+                if lost == "answer":
+                    # GitHub creates the reaction and its answer never arrives.
+                    respond = self.respond
+
+                    def timed_out(request):
+                        respond(request)
+                        raise httpx.ReadTimeout("no answer", request=request)
+                    with patch.object(self, "respond", timed_out), self.assertLogs("cursor_pr.acknowledge", level="WARNING"):
+                        ack.queued(self.gh, 3, 81)
+                else:
+                    # The poller stops after GitHub created the reaction and before the ID is kept.
+                    record = ack.jobs.record_marker
+
+                    def stopped(job, marker):
+                        if marker != acknowledge.UNKNOWN:
+                            raise KeyboardInterrupt
+                        record(job, marker)
+                    with patch.object(ack.jobs, "record_marker", stopped), self.assertRaises(KeyboardInterrupt):
+                        ack.queued(self.gh, 3, 81)
+                self.assertEqual(len([row for row in self.eyes if row["user"]["id"] == ME and row["content"] == "eyes"]), 1)
+                # After a restart the request finishes, and the marker goes with it.
+                Acknowledgement(Jobs(self.state), self.state).finished(self.gh, 3, 81, "reviewed")
+                self.assertEqual([row["id"] for row in self.eyes], [11, 13])
+                self.assertEqual(self.sent()[-2][0], "POST")
+                self.assertRegex(self.sent()[-1][1], r"/reactions/[0-9]+$")
+                self.assertIsNone(Jobs(self.state).acknowledgement(job))
+
+    def test_unrecorded_github_reaction_is_kept_for_later_only_while_github_may_still_have_it(self):
+        job = self.gh.key, 3, 81
+        ack = self.ack()
+        ack.jobs.record_marker(job, acknowledge.UNKNOWN)
+        # No answer: it may be there, so the removal stays owed.
+        self.refuse = {("POST", GITHUB): 502}
+        with self.assertLogs("cursor_pr.acknowledge", level="WARNING"):
+            ack.finished(self.gh, 3, 81, "reviewed")
+        self.assertIsNotNone(ack.jobs.acknowledgement(job))
+        # Refused: this account has no reaction there and cannot have made one.
+        self.refuse = {("POST", GITHUB): 403}
+        ack.finished(self.gh, 3, 81, "reviewed")
+        self.assertIsNone(ack.jobs.acknowledgement(job))
+        self.assertNotIn("DELETE", [method for method, _ in self.sent()])
+
     def test_gitlab_marker_lookup_stops_on_the_matching_award(self):
         ack = self.ack()
         self.awards.extend([dict(id=201, name="hourglass", user=dict(id=ME))] +

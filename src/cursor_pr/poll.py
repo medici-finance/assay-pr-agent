@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 
-from .config import load_config
+from .config import FINDINGS_SETTINGS, load_config
 from .credentials import SETUP_INPUTS, forge_credentials
 from .discovery import poll_project
 from .manager import ConfigurationWatch
@@ -217,6 +217,8 @@ def run_review(project, number, state, tier="regular", comment=None):
         argv.extend(["--go-analysis-producer", project.go_analysis])
     if os.getenv("REVIEW_MAX_INPUT_TOKENS"):
         argv.extend(["--max-input-tokens", os.environ["REVIEW_MAX_INPUT_TOKENS"]])
+    if os.getenv(FINDINGS_SETTINGS[tier]):
+        argv.extend(["--max-findings", os.environ[FINDINGS_SETTINGS[tier]]])
     if os.getenv("REVIEW_MODEL"):
         argv.extend(["--model", os.environ["REVIEW_MODEL"]])
     if tier != "regular":
@@ -449,6 +451,7 @@ def main():
             if idle_max < 1:
                 raise ValueError("REVIEW_POLL_IDLE_MAX_SECONDS must be positive")
             setup.max_input_tokens(state)
+            setup.max_findings(state)
             mine_seconds = history.interval()
             projects = load_config(state)
             stack.enter_context(providers.cursor_account())

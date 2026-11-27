@@ -14,6 +14,10 @@ MARK = {"github": ("eyes", "content"), "gitlab": ("hourglass", "name")}
 NOTICE = ("A `/review` request on this change did not produce a posted review: the review could not be "
           "completed or published. Post `/review` again to retry it.\n")
 PAGES = 5
+# Stored in place of a GitHub reaction's ID from just before the reaction is asked for until the
+# answer is recorded. A poller that stopped in between, or an answer that never arrived, leaves it:
+# a reaction may then exist whose ID nobody kept.
+UNKNOWN = 0
 
 
 def request(project, method, url, headers, **options):
@@ -66,27 +70,42 @@ def own_award(project, root, markers, headers):
     raise ReviewError("Too many markers to search")
 
 
-def add(project, number, comment):
+def react(project, markers, headers):
+    """Ask GitHub for the reviewer's reaction and return the answer. It creates one only if there is none."""
+    return request(project, "POST", markers, headers, json={"content": MARK["github"][0]})
+
+
+def reaction_id(response):
+    response.raise_for_status()  # GitHub answers 200 when this account has already reacted.
+    row = response.json()
+    if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] < 1 or row.get("content") != MARK["github"][0]:
+        raise ReviewError("The forge did not identify the reviewer's reaction")
+    return row["id"]
+
+
+def add(project, number, comment, sending=lambda: None):
+    """Mark the request. sending is called just before GitHub is asked to create the reaction."""
     root, markers, headers = reviewer(project, number, comment)
-    emoji, field = MARK[project.provider]
-    if field == "name":
+    if project.provider == "gitlab":
         if own_award(project, root, markers, headers):
             return  # An account can award an emoji once, so this one already says a request is waiting.
-        response = request(project, "POST", markers, headers, params={"name": emoji})
-    else:
-        response = request(project, "POST", markers, headers, json={"content": emoji})
-    response.raise_for_status()  # GitHub answers 200 when this account has already reacted.
-    if project.provider == "github":
-        row = response.json()
-        if not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] < 1 or row.get(field) != emoji:
-            raise ReviewError("The forge did not identify the reviewer's reaction")
-        return row["id"]
+        request(project, "POST", markers, headers, params={"name": MARK["gitlab"][0]}).raise_for_status()
+        return
+    sending()
+    return reaction_id(react(project, markers, headers))
 
 
 def remove(project, number, comment, marker_id):
     if project.provider == "github" and marker_id is None:
         return
     root, markers, headers = reviewer(project, number, comment)
+    if project.provider == "github" and marker_id == UNKNOWN:
+        # Asking again is how GitHub tells an account the ID of the reaction it already has. Refused,
+        # as it is without the permission or once the comment is gone, there is none of ours to remove.
+        response = react(project, markers, headers)
+        if 400 <= response.status_code < 500:
+            return
+        marker_id = reaction_id(response)
     ident = marker_id if project.provider == "github" else own_award(project, root, markers, headers)
     if ident is not None:
         response = request(project, "DELETE", f"{markers}/{ident}", headers)
@@ -111,10 +130,17 @@ class Acknowledgement:
         self.state = state
 
     def queued(self, project, number, comment):
+        job = project.key, number, comment
+
         def mark():
-            marker = add(project, number, comment)
+            try:
+                marker = add(project, number, comment, lambda: self.jobs.record_marker(job, UNKNOWN))
+            except httpx.HTTPStatusError as err:
+                if project.provider == "github" and err.response.status_code < 500:
+                    self.jobs.record_marker(job, None)  # Refused, so there is no reaction to look for later.
+                raise
             if marker is not None:
-                self.jobs.record_marker((project.key, number, comment), marker)
+                self.jobs.record_marker(job, marker)
         self.attempt(mark, "mark", project, number, comment)
 
     def finished(self, project, number, comment, status):
