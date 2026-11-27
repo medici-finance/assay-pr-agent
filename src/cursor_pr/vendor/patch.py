@@ -6,10 +6,13 @@ rewritten here; README.md beside this file lists what changed. MIT licensed; see
 import json
 import re
 
-# Characters that some readers take as a line break. Inside a line of the change they could make text
-# from the change look like a line of this format, so they are shown as a space; the quote check in
-# engine.finding ignores whitespace, so a quote of such a line still matches.
-_BREAKS = str.maketrans(dict.fromkeys("\r\v\f\x1c\x1d\x1e\x85  ", " "))
+# Escape embedded line separators to keep source lines on one display line without losing code.
+_SEPARATORS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+_ESCAPES = {char: f"\\u{ord(char):04x}" for char in _SEPARATORS}
+_BREAKS = str.maketrans(_ESCAPES)
+# Double any backslashes already in front of a separator or its escape to keep them distinct.
+_SLASHES = re.compile(r"\\+(?=[" + re.escape(_SEPARATORS) + "]|"
+                      + "|".join(value[1:] for value in _ESCAPES.values()) + ")")
 _HUNK = re.compile(r"^@@", re.M)
 
 
@@ -24,8 +27,9 @@ def to_hunk_only_patch(patch_str: str) -> str:
 
 
 def one_line(value):
-    """One line of the change as shown: its line ending removed, other line breaks shown as a space."""
-    return value.removesuffix("\n").removesuffix("\r").translate(_BREAKS)
+    """Remove the diff line ending and show any embedded line separators as Unicode escapes."""
+    value = value.removesuffix("\n").removesuffix("\r")
+    return _SLASHES.sub(lambda match: match[0] * 2, value).translate(_BREAKS)
 
 
 def numbered(name, hunks):

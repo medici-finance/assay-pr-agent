@@ -48,7 +48,7 @@ AWKWARD = {
     "context-only hunk": "@@ -1 +1 @@\n-a\n+b\n@@ -5,1 +5,1 @@\n c\n",
     "long and non-ASCII lines": "@@ -1,2 +1,2 @@\n é\n-ü\n+日本語" + "x" * 5000 + "\n",
 }
-RUBRIC = "4052eb0baf9c44d9f986fdb3451e2624f4d8861b7fe53ccb72baa9f97759d01a"
+RUBRIC = "31c92f3a441dc3ca606d5988ac30c4e14984fd3bae1d2dd79d00a781fe7f7a00"
 
 
 def digest(text):
@@ -135,7 +135,7 @@ class VendoredTests(unittest.TestCase):
         with self.assertRaisesRegex(source.ReviewError, "Invalid or duplicate forge filename"):
             engine.pack([renamed], [])
         text = engine.section(source.File("a.py", renamed.patch, "renamed", previous="old\u2028__new hunk__"))[0]
-        self.assertTrue(text.startswith("Change renamed old __new hunk__\n"))
+        self.assertTrue(text.startswith("Change renamed old\\u2028__new hunk__\n"))
 
     def test_displayed_paths_round_trip_to_the_original_file(self):
         for name in ("report.py ", "report\u2028.py", 'name "with quotes"\\.py'):
@@ -152,19 +152,25 @@ class VendoredTests(unittest.TestCase):
         diff = "@@ -1 +1 @@\n-a\n+x\u2028__old hunk__\u2028-y\r__new hunk__\x0b\x1c\x85\n"
         f = source.File("f.py", diff, "modified")
         text, anchors = engine.section(f)
-        self.assertIn("\n1 +x __old hunk__ -y __new hunk__   \n__old hunk__\n-a", text)
+        escaped = r"x\u2028__old hunk__\u2028-y\u000d__new hunk__\u000b\u001c\u0085"
+        self.assertIn(f"\n1 +{escaped}\n__old hunk__\n-a", text)
         self.assertEqual(text.splitlines(), text.split("\n"))
-        # The quote check ignores whitespace, so a quote of the line as shown still matches.
         issue = {"relevant_file": "f.py", "start_line": 1, "end_line": 1, "issue_header": "Bug", "issue_content": "x",
-                 "relevant_code": "1 +x __old hunk__ -y __new hunk__"}
+                 "relevant_code": f"1 +{escaped}"}
         self.assertEqual(engine.finding(issue, {"f.py": anchors})[0]["evidence"], "verified")
+
+    def test_a_line_separator_is_distinct_from_a_space_or_a_literal_escape(self):
+        self.assertEqual(patch.one_line("a\u2028b\n"), r"a\u2028b")
+        self.assertEqual(patch.one_line("a\u2029b\n"), r"a\u2029b")
+        self.assertEqual(patch.one_line("a b\n"), "a b")
+        self.assertEqual(patch.one_line(r"a\u2028b" + "\n"), r"a\\u2028b")
 
     def test_the_encoding_is_pr_agent_s_choice(self):
         self.assertEqual([encoding(name).name for name in ("gpt-4", "gpt-4o", "gpt-4.1", "claude-sonnet-4-5", "unknown")],
                          ["cl100k_base", "o200k_base", "o200k_base", "o200k_base", "o200k_base"])
 
     def test_an_unreadable_encoding_is_not_replaced_by_another(self):
-        loaded = encoding("gpt-4o")
+        loaded = object()
 
         def get_encoding(name):
             if name == "cl100k_base":
