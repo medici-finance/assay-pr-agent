@@ -29,10 +29,13 @@ def change(address, url):
     """(provider, slug, GitLab API base) for a reviewed change. The link comes from the forge, so pin it."""
     slug, _, number = address.rpartition("#")
     site = urlsplit(url)
-    match = re.fullmatch(r"/([\w.-]+/[\w.-]+)/(pull|-/merge_requests)/([1-9][0-9]*)", site.path)
-    provider = "github" if match and match[2] == "pull" else "gitlab"
     base = os.getenv("GITLAB_API_BASE", "").rstrip("/")
     instance = urlsplit(base)
+    # A GitLab instance may be served under a path, such as https://host/gitlab/group/project.
+    root = instance.path.removesuffix("/api/v4")
+    path = site.path[len(root):] if "/-/merge_requests/" in site.path and root and site.path.startswith(root + "/") else site.path
+    match = re.fullmatch(r"/([\w.-]+/[\w.-]+)/(pull|-/merge_requests)/([1-9][0-9]*)", path)
+    provider = "github" if match and match[2] == "pull" else "gitlab"
     if (not match or match[1].casefold() != slug.casefold() or match[3] != number
             or not url.isprintable() or site.scheme != "https" or site.username is not None
             or site.query or site.fragment or (provider == "github" and site.netloc != "github.com")
