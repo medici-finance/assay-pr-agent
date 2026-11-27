@@ -9,7 +9,7 @@ from .providers import KEYS
 from dataclasses import dataclass
 from pathlib import Path
 import re
-import select
+import selectors
 import subprocess
 import time
 
@@ -232,14 +232,16 @@ def local_description(root, base, head):
     byte_limit = 4 * DESCRIPTION_LIMIT
     output = bytearray()
     deadline = time.monotonic() + 45
-    args = ["git", "--literal-pathspecs", "-C", str(root), "log", "--no-show-signature", f"-{DESCRIPTION_COMMITS + 1}",
-            "--format=%s%n%n%b%x00", base + ".." + head, "--"]
+    args = ["git", "--literal-pathspecs", "-C", str(root), "log", "--no-show-signature", "--encoding=UTF-8",
+            f"-{DESCRIPTION_COMMITS + 1}", "--format=%s%n%n%b%x00", base + ".." + head, "--"]
     try:
-        with subprocess.Popen(args, env=child_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+        with selectors.DefaultSelector() as ready, \
+             subprocess.Popen(args, env=child_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
             try:
+                ready.register(process.stdout, selectors.EVENT_READ)
                 while len(output) <= byte_limit:
                     remaining = max(0, deadline - time.monotonic())
-                    if not select.select([process.stdout], [], [], remaining)[0]:
+                    if not ready.select(remaining):
                         return ""
                     chunk = os.read(process.stdout.fileno(), byte_limit + 1 - len(output))
                     if not chunk:
@@ -250,7 +252,7 @@ def local_description(root, base, head):
             finally:
                 if process.poll() is None:
                     process.kill()
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         return ""
     # Spend the budget newest-first, then display the retained messages in chronological order.
     clipped = len(output) > byte_limit

@@ -86,11 +86,12 @@ def fit(files, checks, limit, *, title="", description="", rendered=None):
             freed += sizes[dropped[-1]]
         prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), title, description, rendered=rendered)
         estimated = tokens(prompt) if has_text else 0
-    if not has_text or estimated > limit:
-        if title or description:
-            fitted, estimate, _, skipped = fit(files, checks, limit, rendered=rendered)
-            if fitted[3] and estimate <= limit:
-                return fitted, estimate, full, skipped
+    fits = has_text and estimated <= limit
+    if (title or description) and (not fits or len(dropped) > 1):
+        fitted, estimate, _, skipped = fit(files, checks, limit, rendered=rendered)
+        if fitted[3] and estimate <= limit and (not fits or len(skipped) < len(dropped)):
+            return fitted, estimate, full, skipped
+    if not fits:
         return full_pack, full, full, []
     return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped)
 

@@ -1,3 +1,6 @@
+import fcntl
+import os
+import resource
 import subprocess
 import tempfile
 import unittest
@@ -94,6 +97,34 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertTrue(description.endswith("Recent subject" + source.TRUNCATED))
         self.assertLessEqual(len(description), source.DESCRIPTION_LIMIT + len(source.TRUNCATED))
 
+    def test_local_description_ignores_the_configured_log_output_encoding(self):
+        root, tmp = fixture_repo()
+        self.addCleanup(tmp.cleanup)
+        subprocess.run(["git", "config", "i18n.logOutputEncoding", "UTF-16LE"], cwd=root, check=True)
+        base, head = (source.commit(root, ref) for ref in ("HEAD~2", "HEAD"))
+        self.assertEqual(source.local_description(root, base, head),
+                         "Add the script\n\nExplains why the script exists.\n\nQuote the argument")
+
+    def test_local_description_reads_high_numbered_pipes(self):
+        minimum = 1024
+        limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if limit != resource.RLIM_INFINITY and limit <= minimum:
+            self.skipTest("open file limit is too low to allocate a high-numbered pipe")
+        root, tmp = fixture_repo()
+        self.addCleanup(tmp.cleanup)
+        base, head = (source.commit(root, ref) for ref in ("HEAD~1", "HEAD"))
+        popen = subprocess.Popen
+
+        def high_stdout(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            with process.stdout:
+                high = fcntl.fcntl(process.stdout, fcntl.F_DUPFD, minimum)
+            process.stdout = os.fdopen(high, "rb")
+            return process
+
+        with patch.object(source.subprocess, "Popen", side_effect=high_stdout):
+            self.assertEqual(source.local_description(root, base, head), "Quote the argument")
+
     def test_prompt_carries_the_description_only_when_there_is_one(self):
         files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
         plain = engine.pack(files, [])
@@ -119,8 +150,9 @@ class ChangeDescriptionTests(unittest.TestCase):
         limit = max(bare + size, engine.tokens(engine.pack(files, [], frozenset({big.path}), "", description)[0]))
         # src/big.py fits alone without the description but not with it, and the test file fits.
         self.assertLess(limit, described + size)
-        _, estimated, _, degraded = cli.fit(files, [], limit, description=description)
+        (prompt, _, _, _), estimated, _, degraded = cli.fit(files, [], limit, description=description)
         self.assertEqual(degraded, ["src/big.py"])
+        self.assertIn("Change description (untrusted data)", prompt)
         self.assertLessEqual(estimated, limit)
 
     def test_fit_omits_metadata_before_dropping_files_that_fit(self):
@@ -136,6 +168,23 @@ class ChangeDescriptionTests(unittest.TestCase):
         self.assertLess(engine.tokens(engine.pack(files[:1], checks, **metadata)[0]), limit)
 
         self.assertEqual(cli.fit(files, checks, limit, **metadata), (plain, limit, full, []))
+
+    def test_fit_omits_metadata_to_review_more_files_during_degradation(self):
+        def added(path, count):
+            body = "".join(f"+VALUE_{n} = {n}\n" for n in range(count))
+            return source.File(path, f"@@ -0,0 +1,{count} @@\n" + body, "added")
+
+        files = [added("src/a.py", 30), added("src/b.py", 30), added("uv.lock", 300)]
+        metadata = {"description": "word " * 210}
+        wanted = engine.pack(files, [], frozenset({"uv.lock"}))
+        estimated = engine.tokens(wanted[0])
+        limit = estimated + 5  # Allow for per-file estimates around section boundaries.
+        full = engine.tokens(engine.pack(files, [], **metadata)[0])
+        self.assertGreater(engine.tokens(engine.pack(files, [])[0]), limit)
+        self.assertLessEqual(engine.tokens(engine.pack(files[:1], [], **metadata)[0]), limit)
+        self.assertGreater(engine.tokens(engine.pack(files[:2], [], **metadata)[0]), limit)
+
+        self.assertEqual(cli.fit(files, [], limit, **metadata), (wanted, estimated, full, ["uv.lock"]))
 
     def test_fit_retries_without_metadata_before_refusing_the_review(self):
         files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
