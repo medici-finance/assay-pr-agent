@@ -16,6 +16,7 @@ import tomllib
 import unicodedata
 
 from jinja2 import Environment
+from markdown_it import MarkdownIt
 import yaml
 
 from .source import TRUNCATED, ReviewError, hunks
@@ -427,11 +428,15 @@ def answer_finding(fields, loader, scalars):
     for name in FINDING_TEXT_FIELDS:
         value = fields.get(name)
         if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "str":
-            strip = name != "relevant_code"
-            key = (value, strip)
-            if key not in scalars:
-                scalars[key] = normalized_text(value.value, strip=strip)
-            item[name] = scalars[key]
+            # The displayed message is trimmed, but leading spaces can change Markdown structure.
+            views = ((name, True), ("quote_message", False)) if name == "issue_content" else (
+                (name, name != "relevant_code"),
+            )
+            for field, strip in views:
+                key = (value, strip)
+                if key not in scalars:
+                    scalars[key] = normalized_text(value.value, strip=strip)
+                item[field] = scalars[key]
     for name in FINDING_LINE_FIELDS:
         value = fields.get(name)
         if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "int":
@@ -549,7 +554,8 @@ def finding(issue, anchors, *, normalized=False, verification=False, evidence_bu
             return None, dropped
         valid["verification_status"] = status
     if not verification:
-        evidence = quoted_evidence(issue.get("relevant_code"), body, lines, start, end,
+        evidence = quoted_evidence(issue.get("relevant_code"), issue.get("quote_message", body),
+                                   lines, start, end,
                                    evidence_budget if evidence_budget is not None else EvidenceBudget())
         if evidence is None:
             return None, dict(dropped, reason="quoted code does not match the cited lines")
@@ -590,8 +596,7 @@ def quoted_evidence(code, message, lines, start, end, budget):
     return "unverified"
 
 
-FENCE_START = re.compile(r" {0,3}(`{3,}(?!`)|~{3,}(?!~))([^\r\n]*)")
-BLOCKQUOTE_PREFIX = re.compile(r" {0,3}>[ \t]?")
+MARKDOWN = MarkdownIt("commonmark").disable("inline")
 # A quoted line as the patch shows it: indented, numbered, and marked as added.
 SHOWN = re.compile(r"([1-9]\d*) (?:\+| )(.*)")
 # An explicit elision such as "..." or "# …": it stands for cited lines the quote leaves out.
@@ -599,43 +604,12 @@ ELISION = re.compile(r"(?:(?:#|//)[ \t]*)?(?:\.{3,}|…)")
 # The patch display's hunk markers stand for no code at all.
 MARKER = re.compile(r"__(?:new|old) hunk__")
 ELIDED = object()
-# These default-ignorable Hangul fillers are classified as printable letters.
-INVISIBLE_FILLERS = frozenset("\u115f\u1160\u3164\uffa0")
-
-
-def blockquote_line(line, depth=None):
-    """Remove the quote container prefixes, retaining any deeper markers as text."""
-    count, start = 0, 0
-    while depth is None or count < depth:
-        prefix = BLOCKQUOTE_PREFIX.match(line, start)
-        if prefix is None:
-            break
-        start = prefix.end()
-        count += 1
-    return line[start:], count
+# These printable glyphs are blank, including the Hangul fillers and blank Braille cell.
+BLANK_GLYPHS = frozenset("\u115f\u1160\u2800\u3164\uffa0")
 
 
 def fenced_quote(message):
-    lines = iter(message.split("\n"))
-    for line in lines:
-        text, depth = blockquote_line(line.removesuffix("\r"))
-        opening = FENCE_START.fullmatch(text)
-        if opening is None:
-            continue
-        marker = opening[1][0]
-        if marker == "`" and marker in opening[2]:
-            continue
-        closer = re.compile(rf" {{0,3}}{marker}{{{len(opening[1])},}}[ \t]*")
-        body = []
-        for line in lines:
-            text, count = blockquote_line(line.removesuffix("\r"), depth)
-            if count != depth:
-                break
-            if closer.fullmatch(text):
-                return "\n".join(body)
-            body.append(text)
-        break
-    return ""
+    return next((token.content for token in MARKDOWN.parse(message) if token.type == "fence"), "")
 
 
 def checkable(quote):
@@ -796,7 +770,7 @@ def substantive(content):
     `return x` or `x = 1` counts; `}` or `);` alone does not, since it would match almost any range.
     """
     visible = [char for char in content if char.isprintable() and not char.isspace()
-               and char not in INVISIBLE_FILLERS and unicodedata.category(char) not in ("Mn", "Me")]
+               and char not in BLANK_GLYPHS and unicodedata.category(char) not in ("Mn", "Me")]
     return len(visible) >= 3 and any(char.isalnum() for char in visible)
 
 

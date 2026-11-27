@@ -9,7 +9,7 @@ description = "Single-pass Cursor reviewer for GitHub pull requests and GitLab m
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
-dependencies = ["pr-agent==0.50.0", "httpx"]
+dependencies = ["pr-agent==0.50.0", "httpx", "markdown-it-py==4.3.0"]
 
 [project.scripts]
 cursor-review-setup = "cursor_pr.setup:main"

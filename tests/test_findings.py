@@ -404,7 +404,7 @@ class QuotedEvidenceTests(unittest.TestCase):
         self.assertEqual(parsed["dropped"], [])
 
     def test_invisible_formatting_does_not_make_a_quote_substantive(self):
-        for invisible in ("\u200d", "\u115f", "\u1160", "\u3164", "\uffa0"):
+        for invisible in ("\u200d", "\u115f", "\u1160", "\u2800", "\u3164", "\uffa0"):
             with self.subTest(invisible=invisible):
                 source_line = "x" + invisible * 2
                 raw = envelope([dict(issue(start=1, end=1), relevant_code=source_line)])
@@ -471,6 +471,23 @@ class QuotedEvidenceTests(unittest.TestCase):
                              ("> > ~~~~\n> > > result\n> > ~~~~", "> result")):
             with self.subTest(body=body):
                 parsed = engine.parse_answer(envelope([issue(start=1, end=1, body=body)]), shown(source))
+                self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_fence_indentation_matches_the_rendered_code(self):
+        body = "  ```python\nif ready:\n      send()\n  ```"
+        parsed = engine.parse_answer(envelope([issue(start=1, end=2, body=body)]),
+                                     shown("if ready:", "    send()"))
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_fenced_quote_in_an_ordered_list(self):
+        body = "10. Code:\n    ```python\n    send()\n    ```"
+        parsed = engine.parse_answer(envelope([issue(start=1, end=1, body=body)]), shown("send()"))
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_fenced_quote_can_end_without_a_closing_fence(self):
+        for body in ("> ```python\n> send()\nDiscussion outside the quote.", "```python\nsend()"):
+            with self.subTest(body=body):
+                parsed = engine.parse_answer(envelope([issue(start=1, end=1, body=body)]), shown("send()"))
                 self.assertEqual(parsed["findings"][0]["evidence"], "verified")
 
     def test_pack_records_the_text_of_every_shown_head_line(self):
