@@ -157,6 +157,23 @@ class ReviewTest(unittest.TestCase):
                     with self.assertRaisesRegex(source.ReviewError, "Forge files do not match the reviewed head"):
                         source.forge_change("org/repo#1", project=project)
 
+    def test_optional_forge_description_is_head_bound_and_best_effort(self):
+        project, (first, files, last) = self.forge_fixture("github")
+        described = dict(last, title=" Verify acceptance criteria ", body=" The new state is visible. ")
+        with patch.object(source, "run_forge", side_effect=[first, files, described]) as read:
+            change = source.forge_change("org/repo#1", project=project, with_description=True)
+        self.assertEqual(change.description, "Verify acceptance criteria\n\nThe new state is visible.")
+        self.assertEqual(read.call_args.args[0], "change-with-description")
+
+        with patch.object(source, "run_forge", side_effect=[first, files, source.ReviewError("unsupported"), last]):
+            change = source.forge_change("org/repo#1", project=project, with_description=True)
+        self.assertEqual(change.description, "")
+
+        moved = dict(described, headSha="b" * 40)
+        with patch.object(source, "run_forge", side_effect=[first, files, moved]):
+            with self.assertRaisesRegex(source.ReviewError, "Change moved during the forge read"):
+                source.forge_change("org/repo#1", project=project, with_description=True)
+
     def test_failed_post_reports_reason(self):
         project, reads = self.forge_fixture("github")
         reason = "pr-agent-forge comment exited 1: reviewed head differs from current head"

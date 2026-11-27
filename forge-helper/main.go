@@ -46,6 +46,14 @@ func execute(verb string, in request) (any, error) {
 		rt.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 		transport = &http.Client{Transport: rt}
 	}
+	var capture *changeCapture
+	if verb == "change-with-description" {
+		if transport == nil {
+			transport = &http.Client{Transport: http.DefaultTransport}
+		}
+		capture = &changeCapture{next: transport.Transport}
+		transport.Transport = capture
+	}
 	client, err := forgechange.New(forgechange.Config{
 		Forge: in.Forge, ProjectURL: in.ProjectURL, Repository: in.Repository,
 		Token: in.Token, GitLabLoopback: in.GitLabLoopback, HTTPClient: transport,
@@ -78,12 +86,16 @@ func execute(verb string, in request) (any, error) {
 			return nil, errors.New("all change comment reads failed")
 		}
 		return out, nil
-	case "change", "change-files":
+	case "change", "change-with-description", "change-files":
 		if len(in.Numbers) != 1 {
 			return nil, errors.New("expected one change number")
 		}
-		if verb == "change" {
-			return client.Change(in.Numbers[0])
+		if verb != "change-files" {
+			change, err := client.Change(in.Numbers[0])
+			if err != nil || capture == nil {
+				return change, err
+			}
+			return capture.describe(change, in.Forge), nil
 		}
 		return client.ChangedFiles(in.Numbers[0])
 	case "comment":

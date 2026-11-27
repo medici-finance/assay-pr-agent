@@ -285,7 +285,8 @@ def execute(args):
     if args.go_analysis_producer and not args.expected_change_url:
         raise ReviewError("--go-analysis-producer requires --expected-change-url")
     if args.change:
-        change = forge_change(args.change, args.expected_change_url, project=getattr(args, "forge_project", None))
+        change = forge_change(args.change, args.expected_change_url, project=getattr(args, "forge_project", None),
+                              with_description=args.tier != "regular")
     else:
         base, head = ci_refs() if args.ci else (args.base, args.head or "HEAD")
         change = local_change(root, base, head)
