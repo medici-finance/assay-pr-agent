@@ -39,6 +39,10 @@ def answer(*findings):
     return json.dumps({"review": {"key_issues_to_review": list(findings)}})
 
 
+def verified_answer(*findings):
+    return answer(*({"verification_status": "confirmed", **finding} for finding in findings))
+
+
 class TierTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -60,7 +64,7 @@ class TierTests(unittest.TestCase):
         (self.bin / "cursor-agent").write_text(SHIM)
         (self.bin / "cursor-agent").chmod(0o700)
         self.answers(review=answer(finding(42, "Real"), finding(41, "Spurious")), deep=answer(finding(42, "Real")),
-                     verification=answer(finding(42, "Real")))
+                     verification=verified_answer(finding(42, "Real")))
         env = patch.dict(os.environ, {"PATH": str(self.bin) + os.pathsep + os.environ["PATH"], "GH_TOKEN": "fixture",
                                       "REVIEW_STATE_DIR": str(Path(tmp.name) / "state")})
         env.start()
@@ -128,7 +132,7 @@ class TierTests(unittest.TestCase):
         self.assertEqual(report["verification"], {"state": "not-needed"})
 
     def test_mid_adds_context_to_the_plain_prompt_and_verifies_the_findings(self):
-        self.answers(verification=answer(dict(finding(42, "Real"), verification_status="confirmed")))
+        self.answers(verification=verified_answer(dict(finding(42, "Real"), verification_status="confirmed")))
         code, report = self.check("--tier", "mid")
         (first, prompt), (second, check) = self.prompts()
         self.assertEqual((first, second), ("review", "verification"))
@@ -157,12 +161,23 @@ class TierTests(unittest.TestCase):
         self.assertEqual(report["cursor_invocations"], 2)
         self.assertLessEqual(report["estimated_input_tokens"], report["max_input_tokens"])
 
+    def test_a_completed_verifier_can_leave_the_review_degraded(self):
+        self.answers(verification=verified_answer(
+            finding(42, "Real"), dict(finding(41, "Spurious"), verification_status="unverified")))
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"], report["delivered"]), (2, "degraded", "mid"))
+        self.assertEqual(report["verification"], {"state": "filtered", "before": 2, "after": 2})
+        self.assertEqual([row["verification_status"] for row in report["findings"]], ["confirmed", "unverified"])
+        with patch.object(cli, "post_comment") as post:
+            cli.publish("org/repo#1", self.head, report)
+        self.assertIn("Some retained findings are unverified.", post.call_args.args[3])
+
     def test_max_reuses_the_mid_prompt_then_runs_a_deep_pass(self):
         self.check("--tier", "mid")
         mid_prompt = self.prompts()[0][1]
         (self.bin / "prompts").unlink()
         self.answers(deep=answer(finding(42, "Real"), finding(43, "From the deep pass")),
-                     verification=answer(finding(42, "Real"), finding(43, "From the deep pass")))
+                     verification=verified_answer(finding(42, "Real"), finding(43, "From the deep pass")))
         code, report = self.check("--tier", "max")
         self.assertEqual([kind for kind, _ in self.prompts()], ["deep", "verification"])  # The mid pass was cached.
         deep = self.prompts()[0][1]
@@ -205,7 +220,7 @@ class TierTests(unittest.TestCase):
         (self.bin / "prompts").unlink()
         os.environ["REVIEW_MAX_FINDINGS_MAX"] = "1"
         found = [finding(42, "Real"), finding(41, "Spurious"), finding(43, "Deep")]
-        self.answers(deep=answer(found[0], found[2]), verification=answer(*found))
+        self.answers(deep=answer(found[0], found[2]), verification=verified_answer(*found))
         code, report = self.check("--tier", "max")
         # Two deep findings and a cap of one: the report keeps one deep finding.
         self.assertEqual((report["max_findings"], report["omitted_findings"]), (1, 2))
@@ -276,7 +291,7 @@ class TierTests(unittest.TestCase):
 
     def test_history_leaves_room_to_verify_a_mid_finding(self):
         issue = dict(finding(42, "Check the returned value"), issue_content="behavior " * 1330 + "here")
-        self.answers(review=answer(issue), verification=answer(issue))
+        self.answers(review=answer(issue), verification=verified_answer(issue))
         qualgen = {"state": "complete", "advisories": [
             {"path": "src/app.py", "kind": "co-change", "detail": "Check prior use of this path. " * 9},
         ], "unscreened": []}
@@ -303,7 +318,7 @@ class TierTests(unittest.TestCase):
         first = [finding(42, f"First {index}") for index in range(1, 7)]
         deep = [finding(42, f"Deep {index}") for index in range(1, 7)]
         self.answers(review=answer(*first), deep=answer(*deep))
-        for state, verdict in (("filtered", answer(*first, *deep)), ("unavailable", "fail")):
+        for state, verdict in (("filtered", verified_answer(*first, *deep)), ("unavailable", "fail")):
             with self.subTest(verification=state):
                 self.answers(verification=verdict)
                 _, report = self.check("--tier", "max", "--model", state)
@@ -319,7 +334,7 @@ class TierTests(unittest.TestCase):
         self.write("src/data.py", "".join(f"VALUE_{n} = {n}  # generated row\n" for n in range(250)))
         self.commit("add data rows")
         deep_only = finding(17, "Data issue", "src/data.py")
-        self.answers(deep=answer(deep_only), verification=answer(deep_only))
+        self.answers(deep=answer(deep_only), verification=verified_answer(deep_only))
         base = ["--max-input-tokens", "1000"]
         for deep_only_scope in (True, False):
             with self.subTest(deep_only_scope=deep_only_scope):
@@ -346,7 +361,7 @@ class TierTests(unittest.TestCase):
 
     def test_verifier_can_use_more_than_the_planning_reserve(self):
         issue = dict(finding(42, "Detailed"), issue_content="Verified behavior in the changed routine. " * 350)
-        self.answers(review=answer(issue), verification=answer(issue))
+        self.answers(review=answer(issue), verification=verified_answer(issue))
         code, report = self.check("--tier", "mid", "--max-input-tokens", "5000")
         self.assertEqual((code, report["verification"]["state"]), (0, "filtered"))
         self.assertGreater(report["passes"][-1]["estimated_input_tokens"], 5000 // 4)
@@ -354,7 +369,7 @@ class TierTests(unittest.TestCase):
 
     def test_verification_rejects_a_rewritten_finding_and_can_retry(self):
         real = finding(42, "Real")
-        self.answers(verification=answer(dict(real, issue_content="Rewritten detail.")))
+        self.answers(verification=verified_answer(dict(real, issue_content="Rewritten detail.")))
         code, report = self.check("--tier", "mid")
         self.assertEqual((code, report["state"]), (2, "degraded"))
         self.assertEqual(report["verification"], {"state": "unavailable", "before": 2})
@@ -365,7 +380,7 @@ class TierTests(unittest.TestCase):
         self.assertEqual(report["passes"][-1]["model_usage"]["input_tokens"], 15)
         self.assertEqual(report["model_invocations"], 2)
 
-        self.answers(verification=answer(real))
+        self.answers(verification=verified_answer(real))
         code, report = self.check("--tier", "mid")
         self.assertEqual((code, report["state"]), (0, "reviewed"))
         self.assertEqual(report["verification"], {"state": "filtered", "before": 2, "after": 1})
@@ -428,7 +443,7 @@ class TierTests(unittest.TestCase):
         self.assertEqual((code, report["state"], report["delivered"]), (2, "over-budget", None))
         self.assertNotIn("delivered", comment(report))
         # A failed deep pass sent none of its own context.
-        self.answers(review=answer(finding(42, "Real")), deep="fail", verification=answer(finding(42, "Real")))
+        self.answers(review=answer(finding(42, "Real")), deep="fail", verification=verified_answer(finding(42, "Real")))
         code, report = self.check("--tier", "max", "--model", "other")
         states = {row["name"]: row["state"] for row in report["context"]}
         self.assertEqual((report["delivered"], states["whole changed files"], states["surrounding code"]),

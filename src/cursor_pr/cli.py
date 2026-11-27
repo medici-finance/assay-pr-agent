@@ -388,6 +388,8 @@ def publish(address, head, report, *, project=None, state=None):
             body.append("The findings could not be verified by a second pass.")
         elif check["state"] == "filtered":
             body.append(f"A verification pass kept {check['after']} of {check['before']} findings.")
+            if any(finding.get("verification_status") == "unverified" for finding in report["findings"]):
+                body.append("Some retained findings are unverified.")
         if omitted_findings := report.get("omitted_findings"):
             noun = "finding" if omitted_findings == 1 else "findings"
             # A prepared report from an older worker recorded the omitted count and the capped list.
@@ -821,7 +823,8 @@ def execute_review(args, verification_resources):
     report["degraded"] = degraded
     if report["delivered"] == "max":
         report["prompt_limit"] = deep_limit
-    lowered = ((has_text and report["delivered"] != tier) or report["verification"]["state"] == "unavailable"
+    unverified = tier != "regular" and any(f.get("verification_status") == "unverified" for f in findings)
+    lowered = ((has_text and report["delivered"] != tier) or report["verification"]["state"] == "unavailable" or unverified
                or any(row["state"] == "failed" for row in passes))
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
     if degraded or lowered:
