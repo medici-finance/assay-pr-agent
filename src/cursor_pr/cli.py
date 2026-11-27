@@ -260,6 +260,9 @@ def execute(args):
         report.update(answer, cache_hit=cached, cursor_invocations=int(not cached))
         if cached:
             report["cursor_usage"] = None
+    if report.get("dropped") and not report["findings"]:
+        # The model answered but nothing it said could be checked: as unusable as no answer, whatever the coverage.
+        return dict(report, state="findings-dropped"), 2
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
     if degraded:
         report["state"] = "degraded"
