@@ -12,7 +12,6 @@ import subprocess
 import sys
 import threading
 
-from .cli import CLEANUP_SECONDS, QUEUED_REVIEW_SECONDS
 from .config import load_config
 from .credentials import SETUP_INPUTS, forge_credentials
 from .discovery import poll_project
@@ -26,11 +25,15 @@ log = logging.getLogger(__name__)
 GIVEN_UP = "marked failed, a new /review retries it"
 UNRECORDED = "marked failed, the head it started at was not recorded, a new /review retries it"
 
-# How long the poller waits for a review child: the child's own limits and a margin.
-REVIEW_WAIT_SECONDS = QUEUED_REVIEW_SECONDS + CLEANUP_SECONDS + 30
+# The longest a review may run. Its waits on the forge, the model and the scanners have timeouts of
+# their own. This is for one that hangs anyway.
+REVIEW_SECONDS = 1800
+# How long the supervisor is given to end a review before the poller stops waiting for it.
+STOP_SECONDS = 30
+SUPERVISOR = Path(__file__).with_name("supervise.py")
 
-# The instance lock's descriptor while this process holds it. A review child inherits it, so the
-# lock outlives a poller that is killed while a review runs.
+# The instance lock's descriptor while this process holds it. A review's supervisor and the review
+# inherit it, so the lock is not free again until a review that outlived its poller has been ended.
 lock_fd = None
 
 
@@ -133,9 +136,6 @@ def run_review(project, number, state, comment=None):
         argv.extend(["--queue", str(state / "requests.sqlite3"), "--request", project.key, str(number), str(comment)])
     env = dict(os.environ)
     env["CURSOR_REVIEW_POLLER_CHILD"] = "1"
-    env.pop("CURSOR_REVIEW_LOCK_FD", None)
-    if comment is not None and lock_fd is not None:
-        env["CURSOR_REVIEW_LOCK_FD"] = str(lock_fd)
     env["REVIEW_STATE_DIR"] = str(state)
     env["REVIEW_FORGE_PROJECT"] = json.dumps(dict(provider=project.provider, url=project.url,
         managed=project.managed, checkout=str(project.checkout), requester_ids=sorted(project.requesters),
@@ -145,18 +145,12 @@ def run_review(project, number, state, comment=None):
     for key in list(env):
         if key.startswith("REVIEW_SECRET_"):
             del env[key]
-    # The review child inherits the instance lock, so the lock is held until it exits even when the
-    # poller is killed first. No replacement recovers this request while the review can still run.
-    # The child bounds itself, and its watchdog ends it and the commands it started. The wait here is
-    # bounded past that as well, so that nothing left holding the report pipe can keep the queue waiting.
-    try:
-        result = subprocess.run(argv, cwd=project.checkout, env=env, stdout=subprocess.PIPE,
-                                pass_fds=(lock_fd,) if lock_fd is not None else (), timeout=REVIEW_WAIT_SECONDS)
-    except subprocess.TimeoutExpired:
-        log.warning("Review %s did not end within %d seconds and was stopped", address, REVIEW_WAIT_SECONDS)
+    stdout = supervised(argv, cwd=project.checkout, env=env)
+    if stdout is None:
+        log.warning("Review %s did not end within %d seconds and was stopped", address, REVIEW_SECONDS + STOP_SECONDS)
         return "failed"
     try:
-        report = json.loads(result.stdout)
+        report = json.loads(stdout)
     except ValueError:
         return "failed"
     log.info("Review %s state=%s publication=%s provider=%s model_invocations=%s", address, report["state"],
@@ -165,6 +159,38 @@ def run_review(project, number, state, comment=None):
         log.warning("Review %s publication failed: %r", address,
                     report.get("publication_error", "reason not reported"))
     return report["state"] if report.get("publication") == "posted-or-already-present" else "failed"
+
+
+def supervised(argv, **options):
+    """Run a review under its supervisor and return what it printed, or None if it had to be given up on.
+
+    The supervisor ends the review, and whatever the review started, when this process is gone, when
+    the review's time is up, or when the review ends. This process tells it that it is gone by
+    nothing more than exiting: the supervisor holds the read end of a pipe that only this process
+    can write to. So a review never runs beside a later poller, however this one stops.
+    """
+    lifeline, hold = os.pipe()
+    keep = (lock_fd,) if lock_fd is not None else ()
+    process = None
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-I", str(SUPERVISOR), str(lifeline), str(REVIEW_SECONDS),
+             ",".join(map(str, keep)), *argv], stdout=subprocess.PIPE, pass_fds=(lifeline, *keep), **options)
+        return process.communicate(timeout=REVIEW_SECONDS + STOP_SECONDS)[0]
+    except subprocess.TimeoutExpired:
+        return None
+    finally:
+        # Closing the poller's end is what tells the supervisor to end the review: on a timeout,
+        # on an interrupt, and on any other way out of here.
+        os.close(lifeline)
+        os.close(hold)
+        if process is not None:
+            try:
+                process.wait(timeout=STOP_SECONDS)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            process.stdout.close()
 
 
 def cycle(projects, state, jobs, since, runner=None):

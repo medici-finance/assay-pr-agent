@@ -133,16 +133,16 @@ class PollTests(unittest.TestCase):
     def test_worker_passes_configured_ci_producer_to_review(self):
         from dataclasses import replace
         for project, producer in ((self.gh, "go.yml"), (self.gl, "go-lint")):
-            with patch("cursor_pr.poll.subprocess.run") as run:
-                run.return_value.stdout = b'{"state":"reviewed","publication":"posted-or-already-present"}'
+            with patch("cursor_pr.poll.supervised") as run:
+                run.return_value = b'{"state":"reviewed","publication":"posted-or-already-present"}'
                 self.assertEqual(run_review(replace(project, go_analysis=producer), 3, self.state), "reviewed")
                 argv = run.call_args.args[0]
                 self.assertEqual(argv[argv.index("--go-analysis-producer")+1], producer)
                 self.assertEqual(argv[argv.index("--expected-change-url")+1], project.change_url(3))
 
     def test_publication_failure_reason_is_logged(self):
-        with patch("cursor_pr.poll.subprocess.run") as run:
-            run.return_value.stdout = json.dumps({
+        with patch("cursor_pr.poll.supervised") as run:
+            run.return_value = json.dumps({
                 "state": "reviewed", "publication": "failed",
                 "publication_error": "pr-agent-forge comment exited 1: publication scope changed"}).encode()
             with self.assertLogs("cursor_pr.poll", level="WARNING") as logs:

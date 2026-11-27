@@ -129,66 +129,14 @@ def publish(address, head, report, *, project=None, state=None):
     post_comment(project, int(number), head, text, state if state is not None else state_dir())
 
 
-# The longest a review started from the queue may run. Its waits have timeouts of their own. This is
-# for one that hangs anyway: it holds the poller's lock, and no poller starts until it is gone.
-QUEUED_REVIEW_SECONDS = 1800
-# How long it then has to unwind before it is ended from outside.
-CLEANUP_SECONDS = 30
-
-
-# The review closes the pipe with no message if it dies. The watchdog ends the review group on
-# that EOF or at the deadline, so an unfinished command cannot run beside a recovered review.
-WATCHDOG = """import os, select, signal, sys
-if not select.select([0], [], [], float(sys.argv[1]))[0] or not os.read(0, 1):
-    try:
-        os.killpg(int(sys.argv[2]), signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-"""
-
-class ReviewTimeout(SystemExit):
+class Stopped(SystemExit):
     pass
 
 
-def out_of_time(signum, frame):
-    # Unwinds like any exit: the command being waited on is killed and the temporary files go. The row
-    # is not settled and stays started, for the next poller.
-    raise ReviewTimeout(f"cursor-review: still running after {QUEUED_REVIEW_SECONDS} seconds, giving up")
-
-
-@contextmanager
-def time_limit():
-    # The alarm lets the review unwind. The separate watchdog also handles a hard hang or
-    # death during a command, and keeps the state-volume lock until it signals the review group.
-    pid = os.getpid()
-    if os.getpgrp() != pid:
-        os.setpgrp()
-    lock = os.environ.pop("CURSOR_REVIEW_LOCK_FD", None)
-    guard = subprocess.Popen([sys.executable, "-I", "-c", WATCHDOG, str(QUEUED_REVIEW_SECONDS + CLEANUP_SECONDS),
-                              str(pid)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True,
-                             pass_fds=(int(lock),) if lock is not None else ())
-    timed_out = False
-    try:
-        previous = signal.signal(signal.SIGALRM, out_of_time)
-        signal.alarm(QUEUED_REVIEW_SECONDS)
-        try:
-            yield
-        except ReviewTimeout as error:
-            timed_out = True
-            print(error, file=sys.stderr, flush=True)
-            raise
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, previous)
-    finally:
-        # Distinguish orderly unwinding from unexpected EOF when the review process dies.
-        try:
-            with guard.stdin as pipe:
-                if not timed_out:
-                    pipe.write(b"1")
-        finally:
-            guard.wait()
+def stopped(number, frame):
+    # The supervisor asks before it ends the review. Leaving like any exit removes the temporary
+    # files and ends the command being waited on. The row is not settled and stays started.
+    raise Stopped("cursor-review: stopped by its supervisor")
 
 
 def request_row(args):
@@ -409,15 +357,6 @@ def run_request(args):
 
 def main():
     args = parser().parse_args()
-    if not args.request:
-        return run(args)
-    # Armed until the report is written and a failure is reported and settled: a review that blocks
-    # on its last output would otherwise hold the poller's lock with nothing left to end it.
-    with time_limit():
-        return run(args)
-
-
-def run(args):
     # Load PR-Agent settings only from an empty directory, independent of the target repo.
     args.repo = args.repo.resolve()
     args.cache_dir = args.cache_dir.resolve()
@@ -426,6 +365,7 @@ def run(args):
     if args.qualgen_store:
         args.qualgen_store = args.qualgen_store.resolve()
     old = Path.cwd()
+    asked = signal.signal(signal.SIGTERM, stopped) if args.request else None
     try:
         with ExitStack() as stack:
             state = state_dir().resolve()
@@ -472,15 +412,18 @@ def run(args):
             if args.request:
                 # At once, before the cleanup or the report can fail.
                 settle(args, review_outcome(report))
-        print(json.dumps(report, ensure_ascii=True, indent=2))
+        print(json.dumps(report, ensure_ascii=True, indent=2), flush=True)
         return status
     except (ReviewError, OSError, ValueError, TypeError, KeyError, AttributeError,
             UnidiffParseError, yaml.YAMLError, subprocess.TimeoutExpired) as err:
-        print(f"cursor-review: {err}", file=sys.stderr)
         if args.request:
+            # Before the diagnostic, which fails when nobody reads it any more.
             settle(args, "failed")
+        print(f"cursor-review: {err}", file=sys.stderr)
         return 2
     finally:
+        if args.request:
+            signal.signal(signal.SIGTERM, asked)
         os.chdir(old)
 
 
