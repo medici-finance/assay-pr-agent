@@ -21,10 +21,10 @@ Before you open a pull request, and before you push new commits to one, run this
    ```sh
    git fetch origin
    BASE="$(git merge-base origin/main HEAD)" && test -n "$BASE" && \
-     uv run --frozen --python 3.12 python ci/capture-prompt.py /tmp/review-capture/branch --base "$BASE" --max-input-tokens 200000
+     uv run --frozen --python 3.12 python ci/capture-prompt.py "/tmp/review-capture/$(git rev-parse HEAD)" --base "$BASE" --max-input-tokens 200000
    ```
 
-   - Run it as one command. `/tmp/review-capture/branch` is the output prefix: use any fixed path outside the repository, and write it out again in later steps; a shell variable does not survive in a harness that starts a new shell per command. The script writes `<prefix>.prompt.txt` and `<prefix>.anchors.json`.
+   - Run it as one command and check that it succeeded. The output prefix is named after the commit being captured, so it is yours alone on a machine other agents share, and a run that failed before the script started leaves no file there to mistake for a new one. The script prints the two files it wrote, `<prefix>.prompt.txt` and `<prefix>.anchors.json`: take the prompt's path from that line and write it out in the later steps. A shell variable does not survive in a harness that starts a new shell per command.
    - The base is the branch your pull request targets. For a pull request stacked on another branch, use `origin/<that-branch>` in place of `origin/main`. If `git merge-base` prints nothing, as in a shallow clone, the command stops there: fetch more history (`git fetch --unshallow origin`) and run it again.
    - Read what the script prints. `captured: <base>..<commit>` is what the prompt holds: check the commit is your `HEAD`. A warning about uncommitted or untracked paths means part of your work is not in the prompt: commit it and capture again. `files left out` names changed files that are not in the prompt.
    - `--max-input-tokens 200000` is far above the deployed budget so the whole change fits. Keep it.

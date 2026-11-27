@@ -155,39 +155,52 @@ class CapturePromptTest(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in out.iterdir()), [])
         self.assertFalse(self.started.exists())
 
-    def test_fixture_and_capture_ignore_the_developers_git_environment(self):
-        # As when the suite runs from a hook of another repository, with signing on that cannot work.
+    def elsewhere(self):
+        # Another repository, and the variables that point Git at it, with signing on that cannot work.
         other = self.root / "other"
-        other.mkdir()
+        other.mkdir(exist_ok=True)
         subprocess.run(["git", "init", "-q", str(other)], check=True, env=self.clean)
-        theirs = dict(GIT_DIR=str(other / ".git"), GIT_WORK_TREE=str(other), GIT_INDEX_FILE=str(other / ".git" / "index"),
-                      GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="commit.gpgsign", GIT_CONFIG_VALUE_0="true",
-                      GIT_CONFIG_KEY_1="gpg.program", GIT_CONFIG_VALUE_1="false")
+        return other, dict(GIT_DIR=str(other / ".git"), GIT_WORK_TREE=str(other), GIT_INDEX_FILE=str(other / ".git" / "index"),
+                           GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="commit.gpgsign", GIT_CONFIG_VALUE_0="true",
+                           GIT_CONFIG_KEY_1="gpg.program", GIT_CONFIG_VALUE_1="false")
+
+    def test_fixture_ignores_the_developers_git_environment(self):
+        # As when the suite runs from a hook of another repository.
+        other, theirs = self.elsewhere()
         with patch.dict(os.environ, theirs):
             (self.repo / "more.py").write_text("x = 1\n")
             self.git("add", "more.py")
             self.git("commit", "-qm", "Committed in the fixture, unsigned")
             self.assertEqual(self.git("log", "-1", "--format=%s"), "Committed in the fixture, unsigned")
-            self.env = dict(self.env, **{key: value for key, value in self.clean.items() if key.startswith("GIT_")})
-            result = self.capture()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("more.py", (self.root / "out" / "branch.prompt.txt").read_text())
         log = subprocess.run(["git", "-C", str(other), "log", "--oneline"], capture_output=True, text=True, env=self.clean)
         self.assertEqual(log.stdout, "")  # Nothing was committed to the other repository.
 
-    def test_no_provider_starts_its_cli(self):
-        for provider, key in (("cursor", "CURSOR_API_KEY"), ("codex", "CODEX_API_KEY"), ("claude", "ANTHROPIC_API_KEY")):
-            with self.subTest(provider=provider):
-                self.env = dict(self.env, REVIEW_PROVIDER=provider, **{key: "fixture"})
-                result = self.capture()
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertFalse(self.started.exists(), self.started.read_text() if self.started.exists() else "")
-
-    def test_capture_needs_no_credential(self):
-        self.env = {key: value for key, value in self.env.items() if not key.endswith("_API_KEY")}
+    def test_capture_describes_its_repository_when_git_is_pointed_elsewhere(self):
+        # The script itself is started with those variables set, as from a hook.
+        other, theirs = self.elsewhere()
+        head = self.git("rev-parse", "HEAD")
+        self.env = dict(self.env, **{name: value for name, value in theirs.items() if not name.startswith("GIT_CONFIG")})
         result = self.capture()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(self.started.exists())
+        self.assertIn(f"captured: {self.base}..{head[:12]}", result.stdout)
+        self.assertNotIn("warning", result.stderr)
+        self.assertIn("sum(row['amount'] for row in rows)", (self.root / "out" / "branch.prompt.txt").read_text())
+
+    def test_no_provider_starts_its_cli_or_needs_a_credential(self):
+        # With a key, without one, and with a home directory that holds no login of any kind.
+        home = self.root / "home"
+        home.mkdir()
+        bare = {name: value for name, value in self.env.items()
+                if not name.endswith(("_API_KEY", "_TOKEN")) and "AUTH" not in name}
+        bare.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"))
+        for provider, key in (("cursor", "CURSOR_API_KEY"), ("codex", "CODEX_API_KEY"), ("claude", "ANTHROPIC_API_KEY")):
+            for name, env in (("key", dict(self.env, **{key: "fixture"})), ("no credential", bare)):
+                with self.subTest(provider=provider, credential=name):
+                    self.env = dict(env, REVIEW_PROVIDER=provider)
+                    result = self.capture()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f"provider: {provider} (not called)", result.stdout)  # The one asked for ran.
+                    self.assertFalse(self.started.exists(), self.started.read_text() if self.started.exists() else "")
 
     def test_only_a_local_change_against_a_base_is_captured(self):
         out = self.root / "out" / "branch"
@@ -221,6 +234,31 @@ class CapturePromptTest(unittest.TestCase):
         prompt = (self.root / "out" / "branch.prompt.txt").read_text()
         self.assertNotIn("return 1", prompt)  # Only what is committed is in the prompt.
         self.assertNotIn("new.py", prompt)
+
+    def test_another_commit_than_the_checkouts_is_named_and_not_warned_about(self):
+        first = self.git("rev-parse", "HEAD")
+        (self.repo / "example.py").write_text("def total(rows):\n    return 2\n")
+        self.git("commit", "-qam", "Later work")
+        (self.repo / "untracked.py").write_text("z = 3\n")
+        result = self.capture("--head", first)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"captured: {self.base}..{first[:12]}", result.stdout)
+        self.assertNotIn("warning", result.stderr)  # The checkout's state says nothing about that commit.
+        self.assertNotIn("return 2", (self.root / "out" / "branch.prompt.txt").read_text())
+
+    def test_says_so_when_the_checkout_cannot_be_checked(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("capture_prompt_unchecked", SCRIPT)
+        script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(script)
+        git = script.git
+        err, out = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stderr(err), contextlib.redirect_stdout(out), \
+                patch.object(script, "git", lambda repo, *args: None if args[0] == "status" else git(repo, *args)):
+            code = script.main(["capture-prompt.py", str(self.root / "out" / "branch"), "--repo", str(self.repo),
+                                "--base", self.base, "--cache-dir", str(self.root / "cache")])
+        self.assertEqual(code, 0)
+        self.assertIn("warning: could not check", err.getvalue())
 
     def test_what_cursor_review_printed_is_kept_when_it_exits(self):
         result = self.capture("--base", "no-such-revision")

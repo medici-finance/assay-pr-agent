@@ -11,6 +11,7 @@ See AGENTS.md for how the prompt is used.
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -29,18 +30,38 @@ def fail(message):
     return 1
 
 
-def committed(repo, head):
-    """The commit that was captured and how many paths in the checkout are not part of any commit."""
-    def git(*args):
-        result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
-        return result.stdout if result.returncode == 0 else ""
-    return (head or git("rev-parse", "HEAD").strip() or "HEAD")[:12], len(git("status", "--porcelain").splitlines())
+# Variables with which Git is pointed at a repository other than the one it is run in, as it is
+# inside a hook. A capture describes --repo, whatever started it.
+ELSEWHERE = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
+             "GIT_NAMESPACE", "GIT_PREFIX", "GIT_ALTERNATE_OBJECT_DIRECTORIES")
+
+
+def git(repo, *args):
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def committed(repo, reported, asked):
+    """The commit that was captured, and how many paths of the checkout are in no commit.
+
+    The count is None when it does not apply (another commit than the checkout's was captured) or
+    could not be found out.
+    """
+    head = git(repo, "rev-parse", "--verify", f"{reported or asked or 'HEAD'}^{{commit}}")
+    if head is None:
+        return reported or asked or "HEAD", None
+    if head != git(repo, "rev-parse", "--verify", "HEAD^{commit}"):
+        return head[:12], None
+    status = git(repo, "status", "--porcelain")
+    return head[:12], None if status is None else len(status.splitlines())
 
 
 def main(argv):
     if len(argv) < 2 or argv[1].startswith("-"):
         return fail("usage: capture-prompt.py OUT_PREFIX --base REV [cursor-review options]")
     prefix, options = Path(argv[1]), argv[2:]
+    for name in ELSEWHERE:
+        os.environ.pop(name, None)
     prompt_file = Path(f"{prefix}.prompt.txt")
     anchors_file = Path(f"{prefix}.anchors.json")
     # First of all, before any option can be refused: a run that fails for whatever reason must not
@@ -123,10 +144,14 @@ def main(argv):
         if not isinstance(err, (OSError, ValueError)):
             raise
         return fail(f"could not write the capture ({err}); nothing was left behind")
-    head, dirty = committed(args.repo, report.get("head"))
+    head, dirty = committed(args.repo, report.get("head"), args.head)
     print(f"prompt: {prompt_file}")
     print(f"anchors: {anchors_file}")
     print(f"captured: {args.base}..{head}")
+    print(f"provider: {report.get('provider')} (not called)")
+    if dirty is None and not args.head:
+        print(f"capture-prompt: warning: could not check {args.repo} for work that is not committed; "
+              "only committed changes are in this prompt", file=sys.stderr)
     if dirty:
         # Said loudly: a prompt captured before the last fixes were committed reviews the old change.
         print(f"capture-prompt: warning: {dirty} uncommitted or untracked path(s) in {args.repo} are NOT in this prompt; "
