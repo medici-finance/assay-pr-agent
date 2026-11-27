@@ -203,7 +203,10 @@ class TierTests(unittest.TestCase):
         # The fixture's review answer has two findings.
         os.environ["REVIEW_MAX_FINDINGS"] = "1"
         code, report = self.check()
-        self.assertEqual((code, report["state"], report["max_findings"]), (2, "model-unavailable", 1))
+        self.assertEqual((code, report["state"], report["max_findings"]), (0, "reviewed", 1))
+        self.assertEqual([f["title"] for f in report["findings"]], ["Real"])
+        self.assertEqual(report["dropped"],
+                         [{"path": "src/app.py", "line": 41, "reason": "over the finding limit"}])
         self.assertIn("A concise list (0-1 issues)", self.prompts()[-1][1])
         os.environ["REVIEW_MAX_FINDINGS"] = "2"
         code, report = self.check()
@@ -416,6 +419,11 @@ class TierTests(unittest.TestCase):
         self.assertEqual([row["title"] for row in report["findings"]], ["Real", "Spurious"])
         self.assertEqual([row["verification_status"] for row in report["findings"]], ["unverified", "unverified"])
         self.assertEqual(report["passes"][-1]["state"], "failed")
+        self.answers(verification=verified_answer(finding(42, "Real")))
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"]), (0, "reviewed"))
+        self.assertEqual([row["state"] for row in report["passes"]], ["cached", "called"])
+        self.assertEqual([row["title"] for row in report["findings"]], ["Real"])
 
     def test_tier_falls_back_to_the_one_below_and_says_so(self):
         change = cli.local_change(self.root, "main", self.head)

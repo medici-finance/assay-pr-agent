@@ -48,11 +48,11 @@ class ParseAnswerTests(unittest.TestCase):
             self.assertEqual(set(dropped), {"path", "line", "reason"})
 
     def test_dropped_line_number_cannot_break_result_serialization(self):
-        parsed_answer = {"review": {"key_issues_to_review": [issue(), issue(start=2**20_000)]}}
-        with patch.object(engine.yaml, "safe_load", return_value=parsed_answer):
-            result = engine.parse_answer(envelope([]), ANCHORS)
-        self.assertEqual(json.loads(json.dumps(result))["dropped"],
-                         [{"path": "a.py", "line": None, "reason": "cited line outside the reviewed patch"}])
+        raw = json.loads(envelope([issue(), issue(start=123456)]))
+        raw["result"] = raw["result"].replace("123456", "9" * 4500)
+        result = engine.parse_answer(json.dumps(raw), ANCHORS)
+        [dropped] = json.loads(json.dumps(result))["dropped"]
+        self.assertEqual((dropped["path"], dropped["line"]), ("a.py", None))
         self.assertEqual(len(result["findings"]), 1)
 
     def test_the_answer_itself_must_still_be_valid(self):

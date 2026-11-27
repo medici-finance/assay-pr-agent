@@ -332,6 +332,18 @@ def tokens(prompt):
     return len(TokenEncoder.get_token_encoder("gpt-4o").encode(prompt, disallowed_special=()))
 
 
+class ReviewAnswerLoader(yaml.SafeLoader):
+    def construct_bounded_int(self, node):
+        try:
+            return self.construct_yaml_int(node)
+        except ValueError:
+            # Let per-finding validation reject an integer Python cannot convert.
+            return None
+
+
+ReviewAnswerLoader.add_constructor("tag:yaml.org,2002:int", ReviewAnswerLoader.construct_bounded_int)
+
+
 def parse_answer(raw, anchors, limit=MAX_FINDINGS):
     value = json.loads(raw)
     if value.get("type") != "result" or value.get("subtype") != "success" or value.get("is_error") is not False:
@@ -344,7 +356,7 @@ def parse_answer(raw, anchors, limit=MAX_FINDINGS):
         answer = fenced.group(1)
     if len(answer) > 32_768:
         raise ReviewError("Cursor answer exceeds the review size limit")
-    issues = yaml.safe_load(answer)["review"]["key_issues_to_review"]
+    issues = yaml.load(answer, Loader=ReviewAnswerLoader)["review"]["key_issues_to_review"]
     if not isinstance(issues, list):
         raise ReviewError("Invalid Cursor finding list")
     # A bad finding costs the others nothing: the call is already paid for and there is no retry.
