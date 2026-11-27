@@ -87,7 +87,7 @@ def check(root, head, base, files, *, head_repo=None):
             fork = git(head_repo, "merge-base", tip, head, alternates=objects)
         # The merge base is an ancestor of the tip, so everything below reads root alone.
         behind = int(git(root, "rev-list", "--count", f"{fork}..{tip}"))
-        result.update(base=tip, behind=behind)
+        result.update(base=tip, fork=fork, behind=behind)
         if behind:
             moved = set(git(root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z",
                             fork, tip, "--", strip=False).split("\0"))

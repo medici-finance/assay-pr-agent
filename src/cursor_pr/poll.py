@@ -60,8 +60,23 @@ class Jobs:
             db.execute("UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?",
                        (status, *job))
 
+    # Tiers live in their own table: a request without a row is a plain /review.
+    TIERS = "CREATE TABLE IF NOT EXISTS tiers (project TEXT, number INTEGER, comment INTEGER, tier TEXT NOT NULL, " \
+            "PRIMARY KEY(project, number, comment))"
 
-def run_review(project, number, state):
+    def set_tier(self, project, number, comment, tier):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(self.TIERS)
+            db.execute("INSERT OR IGNORE INTO tiers VALUES (?,?,?,?)", (project, number, comment, tier))
+
+    def tier(self, job):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(self.TIERS)
+            row = db.execute("SELECT tier FROM tiers WHERE project=? AND number=? AND comment=?", job).fetchone()
+            return row[0] if row else "regular"
+
+
+def run_review(project, number, state, tier="regular"):
     address = f"{project.slug}#{number}"
     argv = [sys.executable, "-I", "-m", "cursor_pr.cli", "--repo", str(project.checkout),
             "--change", address, "--expected-change-url", project.change_url(number),
@@ -76,6 +91,8 @@ def run_review(project, number, state):
         argv.extend(["--max-input-tokens", os.environ["REVIEW_MAX_INPUT_TOKENS"]])
     if os.getenv("REVIEW_MODEL"):
         argv.extend(["--model", os.environ["REVIEW_MODEL"]])
+    if tier != "regular":
+        argv.extend(["--tier", tier])
     env = dict(os.environ)
     env["CURSOR_REVIEW_POLLER_CHILD"] = "1"
     env["REVIEW_STATE_DIR"] = str(state)
@@ -111,7 +128,8 @@ def cycle(projects, state, jobs, since, runner=run_review):
         status = "failed"
         if key in projects:
             try:
-                status = runner(projects[key], number, state)
+                tier = jobs.tier(job)
+                status = runner(projects[key], number, state, *(() if tier == "regular" else (tier,)))
             except Exception:
                 log.exception("Review failed for %s #%d comment %d", key, number, comment)
         jobs.finish(job, status)

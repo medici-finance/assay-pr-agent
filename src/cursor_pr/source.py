@@ -162,7 +162,7 @@ class Change:
     description: str = ""
 
 
-def forge_change(address, expected_url=None, *, project=None):
+def forge_change(address, expected_url=None, *, project=None, with_description=False):
     if not re.fullmatch(r"[\w.\-]+/[\w.\-]+#[1-9][0-9]*", address):
         raise ReviewError("Use an owner/repo#number address from the configured projects")
     repo, number = address.rsplit("#", 1)
@@ -178,7 +178,15 @@ def forge_change(address, expected_url=None, *, project=None):
     result = run_forge("change-files", project, numbers=numbers)
     if result.get("headSha") != head:
         raise ReviewError("Forge files do not match the reviewed head")
-    last = run_forge("change", project, numbers=numbers)
+    last = None
+    if with_description:
+        try:
+            last = run_forge("change-with-description", project, numbers=numbers)
+        except (OSError, ReviewError, ValueError, subprocess.TimeoutExpired):
+            # A helper without optional metadata support can still confirm the change.
+            pass
+    if last is None:
+        last = run_forge("change", project, numbers=numbers)
     if any(first.get(k) != last.get(k) for k in ("headSha", "baseRef", "changedFiles", "url", "state")):
         raise ReviewError("Change moved during the forge read")
     rows = result.get("files")
