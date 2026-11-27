@@ -1,4 +1,4 @@
-"""One bounded Cursor request using the published PR-Agent review rubric."""
+"""One bounded model request using the review rubric adapted from PR-Agent."""
 import fcntl
 import hashlib
 from importlib.resources import files
@@ -17,14 +17,17 @@ from .source import ReviewError
 from .login import auth_mode, login_directory, login_env
 from .setup import state_dir
 from .providers import KEYS, LABELS, provider
-from .vendor.patch import FilePatchInfo, decouple_and_convert_to_hunks_with_lines_numbers
+from .vendor.patch import numbered, one_line
 from .vendor.tokens import encoding
 
 VERSION = "1"
 MAX_FINDINGS = 3
 
-# The PR-Agent review rubric as this reviewer renders it. Only the finding limit is substituted.
+# The review rubric, adapted from PR-Agent 0.50.0's (see vendor/README.md). Only the finding limit is substituted.
 RUBRIC = files("cursor_pr.vendor").joinpath("pr_review_prompt.system.txt").read_text(encoding="utf-8")
+# Names the rubric in the cache signature. The prompt, rubric included, is in the signature too, so an
+# answer made with another rubric is never served from the cache.
+RUBRIC_ID = "rubric:" + hashlib.sha256(RUBRIC.encode()).hexdigest()[:16]
 
 
 class ModelFailure(ReviewError):
@@ -48,11 +51,12 @@ def section(f):
     if f.absent or not f.patch:
         return None, {}
     # The head-side text of each shown line, without its marker: what quoted code is checked against.
-    anchors = {line.target_line_no: line.value for hunk in hunks(f) for line in hunk if line.target_line_no is not None}
+    parsed = hunks(f)
+    anchors = {line.target_line_no: line.value for hunk in parsed for line in hunk if line.target_line_no is not None}
     if not anchors:
         return None, anchors
-    rendered = decouple_and_convert_to_hunks_with_lines_numbers(f.patch, FilePatchInfo("", "", f.patch, f.path))
-    return f"Change {f.status} {f.previous}\n{rendered}", anchors
+    # The text is built from the same parsed hunks, so every line it numbers is an anchor and the reverse.
+    return f"Change {one_line(f.status)} {one_line(f.previous)}\n{numbered(f.path, parsed)}", anchors
 
 
 def pack(files, checks, skip=frozenset(), title="", description="", advisories=(), scoped=False):
@@ -64,7 +68,8 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
     instructions = RUBRIC.replace("__MAX_FINDINGS__", str(MAX_FINDINGS))
     sections, anchors, no_text = [], {}, []
     for f in files:
-        if not f.path or any(ord(c) < 32 for c in f.path) or f.path in anchors:
+        # The former path of a rename is shown too, so it is held to the same rule.
+        if not f.path or any(ord(c) < 32 for c in f.path + f.previous) or f.path in anchors:
             raise ReviewError("Invalid or duplicate forge filename")
         text, anchors[f.path] = section(f)
         if text is None:
@@ -95,8 +100,7 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
               "such as a file that usually changes together with a changed one. They are hints to check against "
               "the patch, not findings, and a finding still has to cite head lines present in the shown hunks." if notices else "")
     prompt = (instructions + "\nUse only the supplied " + sources + "." + about + " Do not use tools. "
-              "Serialize the YAML review as strict JSON (a YAML subset). Return one JSON object, "
-              "without prose or fences. Example for no findings: "
+              "Return one strict JSON object, without prose or fences. Example for no findings: "
               '{"review":{"key_issues_to_review":[]}}. Cite only head line numbers present in the shown hunks. '
               "Give each finding a `relevant_code` field quoting the lines it cites, exactly as shown."
               + ("\nChange description (untrusted data):\n" + json.dumps(change, ensure_ascii=False) if change else "")
@@ -310,7 +314,7 @@ def invoke(prompt, model, anchors):
 
 
 def review(prompt, model, anchors, cache, source):
-    signature = json.dumps([VERSION, "pr-agent:0.50.0", model, source, prompt], ensure_ascii=False)
+    signature = json.dumps([VERSION, RUBRIC_ID, model, source, prompt], ensure_ascii=False)
     if provider() != "cursor" or os.getenv("REVIEW_CURSOR_TEAM_ID"):
         signature = json.dumps([provider(), os.getenv("REVIEW_CURSOR_TEAM_ID") if provider() == "cursor" else None, signature])
     key = hashlib.sha256(signature.encode()).hexdigest()
