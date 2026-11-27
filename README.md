@@ -1,6 +1,6 @@
 # Assay PR Agent
 
-A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It builds on [PR-Agent](https://github.com/the-pr-agent/pr-agent). The PR-Agent contributors provide the review prompt, line-numbered diff formatter and token estimator used here. We ship their [MIT-licensed](https://github.com/the-pr-agent/pr-agent/blob/main/LICENSE) Python package in the container, with its original license notice. Choose Cursor Agent, Claude Code, or Codex CLI for inference. Assay’s installed `deskread` and `deskpost` handle authenticated forge access when you use a change number. Local and CI runs require only the Git objects.
+A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It builds on [PR-Agent](https://github.com/the-pr-agent/pr-agent). The PR-Agent contributors provide the review prompt, line-numbered diff formatter and token estimator used here. We ship their [MIT-licensed](https://github.com/the-pr-agent/pr-agent/blob/main/LICENSE) Python package in the container, with its original license notice. Choose Cursor Agent, Claude Code, or Codex CLI for inference. The `pr-agent-forge` helper uses Assay’s Go library for authenticated forge access when you use a change number. Local and CI runs require only the Git objects.
 
 ## Install with Docker Compose
 
@@ -63,19 +63,19 @@ In `REVIEW_PROJECTS`, use `"managed": true` in place of a checkout path for a ma
 
 Post a new comment containing just `/review` on an open GitHub PR or GitLab MR. The service polls the configured projects every two minutes by default. It accepts new requests from the human accounts you configure and posts the result on the reviewed head. Setup takes GitHub or GitLab usernames and stores their numeric account IDs. A poll uses zero model tokens. Requests run one at a time with the existing prompt budget and cache.
 
-Assay’s `deskmonitor pr` supplies the open change numbers. Batched `deskread comments --change` calls read their conversations on every cycle, including changes with no new commits. The poller skips old commands, edits detectable from the forge timestamps, bot responses and ordinary messages. For GitLab, Assay v1.0.94 omits the internal-note flag. Only an otherwise eligible command gets a single [GitLab note lookup](https://docs.gitlab.com/api/notes/#retrieve-a-merge-request-note), using the existing Assay reviewer credential and instance. Internal and system notes cannot start a review.
+The helper lists open changes and reads their conversations on every cycle, including changes with no new commits. The poller skips old commands, edits detectable from the forge timestamps, bot responses and ordinary messages. For GitLab, an otherwise eligible command gets a single [GitLab note lookup](https://docs.gitlab.com/api/notes/#retrieve-a-merge-request-note), using the configured GitLab reviewer credential and instance. Internal and system notes cannot start a review.
 
 Each project starts watching at its first activation. Keep the state volume across restarts to pick up requests posted during downtime on still-open changes. Queued reviews survive a restart. A review interrupted after starting needs a fresh `/review` to run again. Duplicate reads do not incur another model call. A deleted comment or a change closed between polls may never be observed.
 
 ### Docker setup
 
-The image includes all three provider CLIs, git-sync, Qualgen, Assay’s released forge tools, ShellCheck, actionlint, Hadolint, zizmor and OSV-Scanner. Use an **amd64 Linux** runner or Docker’s amd64 emulation. To build from source:
+The image includes all three provider CLIs, git-sync, Qualgen, the Go forge helper, ShellCheck, actionlint, Hadolint, zizmor and OSV-Scanner. Use an **amd64 Linux** runner or Docker’s amd64 emulation. To build from source:
 
 ```sh
 docker build --platform linux/amd64 -t assay-pr-agent .
 ```
 
-Add `--build-arg REVIEW_BUILD_SHA=$(git rev-parse HEAD)` to have a local image report its commit; otherwise the startup banner shows `commit unknown` and the build time.
+Add `--build-arg REVIEW_BUILD_SHA=$(git rev-parse HEAD)` to include the agent commit in the startup banner. The Dockerfile pins the Assay source revision used to compile the helper. To build the helper against a local Assay checkout, run `./forge-helper/build.sh /path/to/assay /absolute/path/on/PATH/pr-agent-forge`.
 
 ### Interactive setup
 
@@ -103,17 +103,18 @@ To change settings or rotate credentials, run the setup command again, or run `d
 
 ### Standalone Docker credentials
 
-Mount the checkout for each project read-only and a writable volume at `/state` for the request queue, cache and Assay audit records. The container runs as UID 10001. It generates the reviewer configuration on first start and updates it from the supplied settings on restart. You can use it without installing Assay on the host.
+Mount the checkout for each project read-only and a writable volume at `/state` for the request queue, cache and publication receipts. The container runs as UID 10001. Supply the credentials and project settings at startup or save them with the setup wizard. The helper needs no Assay installation or home-directory settings.
 
 | Docker setting | What to supply |
 |---|---|
 | `CURSOR_API_KEY` | Cursor API key for headless inference. |
-| `REVIEW_OPERATOR` | The responsible human’s forge `login:numeric-id` (the setup wizard also accepts a bare username and looks up the ID). Assay uses this for posting attribution. The project’s `requester_ids` separately control who can request reviews. |
+| `REVIEW_OPERATOR` | Optional responsible operator’s forge `login:numeric-id` for the comment attribution check. The project’s `requester_ids` control who can request reviews. |
 | `REVIEW_GITHUB_APP_ID`, `REVIEW_GITHUB_INSTALLATION_ID` | Numeric IDs for the GitHub App and the installation covering your repositories. Use a reviewer installation with access to read PRs and diffs and write PR conversation comments. |
 | `REVIEW_GITHUB_PRIVATE_KEY` **or** `REVIEW_GITHUB_PRIVATE_KEY_FILE` | The App’s unencrypted RSA PEM or an absolute path to the mounted PEM. The value accepts actual line breaks or literal `\n`. |
 | `REVIEW_GITLAB_TOKEN` **or** `REVIEW_GITLAB_TOKEN_FILE` | A dedicated GitLab reviewer token with API permission to read MRs and post notes, or an absolute path to the mounted token. |
 | `REVIEW_GITLAB_BASE_URL` | HTTPS GitLab installation URL, including optional port and path prefix. An entry in `REVIEW_PROJECTS` can specify `gitlab_base`. |
 | `REVIEW_GITLAB_CA_FILE`, `REVIEW_GITLAB_CRL_FILE` | Optional absolute paths to a PEM private CA bundle and PEM CRL. The corresponding variables without `_FILE` accept inline PEM. Supply the same paths to setup, sync and reviewer. |
+| `REVIEW_WITHHELD_IDENTIFIERS` | Optional comma-separated identifiers to block in comments on internal and public projects. |
 | `REVIEW_PROJECTS` | JSON project list. Each entry has a forge, full HTTPS URL, checkout path, allowed human account IDs and optional `visibility` (`private` by default, `internal`, or `public`). Set the actual visibility to authorize posting on public or internal projects. |
 
 Supply only the providers you use. Each container supports a GitHub App installation on github.com and one GitLab instance. The poller derives `GITLAB_API_BASE` from the configured GitLab projects. An explicit value must match their HTTPS instance and end in `/api/v4`.
@@ -167,9 +168,9 @@ spec:
             path: github.pem
 ```
 
-Assay uses mode-0600 runtime copies of the supplied credentials. In Docker these live in `/dev/shm`; incoming keys are excluded from the project settings and review database. Keep one service instance per state volume. The normal `/review` path uses GitLab’s token without rotating it. `REVIEW_MODEL` selects the Cursor model.
+The agent uses mode-0600 runtime copies of the supplied credentials. In Docker these live in `/dev/shm`; incoming keys are excluded from the project settings and review database. Keep one service instance per state volume. The normal `/review` path uses GitLab’s token without rotating it. `REVIEW_MODEL` selects the Cursor model.
 
-On an unconfigured interactive first start, the container runs setup before polling. Deployments with an existing Assay reviewer configuration can still mount it at `/home/reviewer/.config/assay` and omit the standalone setup variables. When supplying credentials alongside a mounted roster, its existing repository and identity rules apply.
+On an unconfigured interactive first start, the container runs setup before polling. If your deployment supplied credentials through a mounted Assay roster, move them into the setup wizard or the environment variables above.
 
 **Upgrading from v0.1.0.** Stop the old receiver and start the polling image with the same state volume. It reads the existing project settings, request queue and cache. You can remove the forge webhooks, reverse proxy, published port, `REVIEW_PUBLIC_URL` and webhook secrets. The polling container only needs outbound connections.
 
@@ -199,7 +200,7 @@ cursor-review --repo /path/to/checkout --change 'org/repo#42' --estimate
 cursor-review --repo /path/to/checkout --change 'org/repo#42' --model MODEL
 ```
 
-The local form compares the merge base to committed `HEAD`, or to an explicit `--head`. Both commits and their common ancestor must be available locally. The forge form uses the configured Assay backend for that repository. Both providers use the `owner/repo#number` address accepted by `deskread`. GitLab subgroup projects can also use CI mode independent of deskread’s slug syntax. Forge access requires the installed desk tools and their normal role/repository configuration. It reads metadata before and after the file list, checks head and file-count consistency, and records missing patches as incomplete coverage.
+The local form compares the merge base to committed `HEAD`, or to an explicit `--head`. Both commits and their common ancestor must be available locally. The forge form uses an `owner/repo#number` address from the configured projects and requires `pr-agent-forge` on `PATH`. GitLab subgroup projects can use CI mode with local Git objects. It reads metadata before and after the file list, checks head and file-count consistency, and records missing patches as incomplete coverage.
 
 ### Cost and coverage
 
@@ -284,20 +285,21 @@ GitHub uses a `pull_request` event and its recorded base and head SHAs. Fetch su
 
 ### Publish a summary
 
-Add `--post` to the `--change` command to post the reviewed commit and findings as a single ordinary comment. Assay handles GitHub/GitLab routing, reviewer custody, repeated identical comments and the current-head check via `deskpost comment ... --kind mr --head SHA`. A stale head is refused. Publication requires the configured Assay reviewer role. A failed post can be retried with the same model and cache without paying again for an unchanged prompt. No write happens by default.
+Add `--post` to the `--change` command to post the reviewed commit and findings as a single ordinary comment. The helper checks visibility and the current head before publishing under the configured reviewer credential. The agent stores a receipt on its state volume to suppress identical retries for the same head, including after restart. A failed post can be retried with the same model and cache without paying again for an unchanged prompt. No write happens by default.
 
 The standalone poller supports `/review`. For additional upstream PR-Agent chat commands such as `/ask` and `/improve`, see [GitHub integration](https://docs.pr-agent.ai/installation/github/) and [GitLab integration](https://docs.pr-agent.ai/installation/gitlab/). GitLab pipeline jobs alone do not receive comment events. The upstream comment server and this CLI are separate entry points.
 
 ### Export SARIF
 
-Add `--sarif review.sarif` to any review or estimate to write the same findings as a [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html) log after the JSON report is printed. The log has one run whose driver is `assay-pr-agent` and one result per model finding and per ShellCheck, actionlint, Go analysis, hadolint, zizmor or OSV-Scanner finding. `ruleId` is the scanner rule or `model-finding`. The report keeps no scanner severity, so `level` is a fixed mapping: `warning` for model findings and OSV-Scanner vulnerabilities, `note` for every other scanner finding. Each result names a repository-relative `artifactLocation.uri` and, when the finding has a line, `region.startLine`, plus `region.endLine` for a model finding. OSV-Scanner findings carry no line, so they name the lockfile without a region. Messages are cut at 1,000 characters and a finding without a safe relative path is left out. `partialFingerprints.primaryLocationLineHash` is a hash of the path, rule, line and message, so the same reviewed head always gives the same values and a rule that repeats one message on several lines stays several results. `invocations[0].executionSuccessful` is `true` only for the `reviewed`, `empty` and `estimate` states. The path is resolved against the directory you run the command from, not `--repo`. If the file cannot be written, the JSON report is still printed, the reason goes to stderr and the exit code is 2. The poller does not request the export.
+Add `--sarif review.sarif` to any review or estimate to write the same findings as a [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html) log after the JSON report is printed. The log has one run whose driver is `assay-pr-agent` and one result per model finding and per ShellCheck, actionlint, Go analysis, hadolint, zizmor or OSV-Scanner finding. `ruleId` is the scanner rule or `model-finding`. The report keeps no scanner severity, so `level` is a fixed mapping: `warning` for model findings and OSV-Scanner vulnerabilities, `note` for every other scanner finding. Each result names a repository-relative, percent-encoded `artifactLocation.uri` and, when the finding has a line, `region.startLine`, plus `region.endLine` for a model finding. OSV-Scanner findings carry no line, so they name the lockfile without a region. Messages are cut at 1,000 characters and a finding without a safe relative path is left out. `partialFingerprints.primaryLocationLineHash` starts with the same line hash that the `upload-sarif` action computes: a hash of the 100 characters from the start of the finding's line, ignoring spaces and tabs, so the text that follows the line is part of the value, with a number that keeps identical lines apart. A suffix based on the finding’s message and span length keeps each result’s identity stable when findings on the same line are added, removed or reordered. Findings the log cannot tell apart, such as two ShellCheck SC2086 on one line with one message, keep one identity. A line added above a finding does not change its identity, and the same reviewed head always gives the same values. The text is read from the reviewed head in `--repo` or from the verified temporary checkout used for managed scans. A result whose file is not there is written without a fingerprint, and the action computes it from its checkout. A finding without a line is identified by its path, rule and message. `invocations[0].executionSuccessful` is `true` only for the `reviewed`, `empty` and `estimate` states. The path is resolved against the directory you run the command from, not `--repo`. If the file cannot be written, the JSON report is still printed, the reason goes to stderr and the exit code is 2. The poller does not request the export.
 
-GitHub code scanning accepts SARIF 2.1.0 files from third-party tools. It is available for public repositories on GitHub.com and for organization-owned repositories with GitHub Code Security enabled. Upload it from a GitHub Actions job with the `upload-sarif` action, which needs `security-events: write` and, for private repositories, `actions: read`:
+GitHub code scanning accepts SARIF 2.1.0 files from third-party tools. It is available for public repositories on GitHub.com and for organization-owned repositories with GitHub Code Security enabled. Upload it from a GitHub Actions job with the `upload-sarif` action, which needs `security-events: write` and, for private repositories, `actions: read`. Actions skips the steps after a failed one, and `cursor-review` exits 2 for partial coverage, an over-budget prompt or a failed model, so the upload states that it also runs after a failure when the file exists. Both examples remove the file before the review: a runner that keeps its working directory could otherwise upload the previous run's log when a review fails before writing its own.
 
 ```yaml
     steps:
-      - run: cursor-review --ci --max-input-tokens 4000 --sarif review.sarif > review.json
+      - run: rm -f review.sarif && cursor-review --ci --max-input-tokens 4000 --sarif review.sarif > review.json
       - uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('review.sarif') != ''
         with:
           sarif_file: review.sarif
 ```
@@ -307,6 +309,7 @@ GitLab ingests SARIF 2.1.0 from an `artifacts:reports:sarif` artifact on GitLab 
 ```yaml
 review:
   script:
+    - rm -f review.sarif
     - cursor-review --ci --max-input-tokens 4000 --sarif review.sarif > review.json || review_exit=$?
     - test -s review.sarif
   artifacts:
@@ -326,11 +329,11 @@ GitHub receives one check run named `assay-pr-agent/review` on the reviewed head
 
 GitLab receives one commit status with the same name on the reviewed head: `success` or `failed` by the same rule, with a fixed description of at most 255 characters and the change as its target. GitLab adds the status to the commit's newest pipeline, or creates a pipeline, as a job in an `external` stage.
 
-The outcome is in the JSON report as `forge_status`: `posted`, `failed` or `skipped`. A refusal, a missing permission included, logs one line without the credential and changes neither the exit code nor the summary comment. When `--post` itself fails, no status is attempted and the report has no `forge_status` key.
+The forge helper checks the current head, repository visibility and status text against the same publication policy used for comments before either status is sent. The outcome is in the JSON report as `forge_status`: `posted`, `failed` or `skipped`. A refusal, a missing permission included, logs one line without the credential and changes neither the exit code nor the summary comment. When `--post` itself fails, no status is attempted and the report has no `forge_status` key.
 
 The default reviewer credentials cannot post it, and setup still requests the least privilege. Creating a check run takes a GitHub App with **Checks** write permission (`checks: write`); the wizard requests only contents read, pull requests write and Actions read. A commit status takes a GitLab token with the `api` scope and the Developer role; the wizard creates a Reporter token. Add the permission to the reviewer credential before turning this on.
 
-To make it a required check on GitHub, add `assay-pr-agent/review` under **Require status checks before merging** on the protected branch, or under **Require status checks to pass before merging** in a ruleset. GitHub then blocks merging until the check succeeds on the pull request's latest commit, so every new push waits for a fresh `/review`. The check can be required from any source or from the reviewer App alone; in a ruleset, naming the App as the only accepted source takes **Commit statuses** write permission (`statuses: write`) on it as well. [Require status checks before merging](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging) · [REST API endpoints for check runs](https://docs.github.com/en/rest/checks/runs#create-a-check-run) · [GitLab commit statuses](https://docs.gitlab.com/api/commits/#set-commit-pipeline-status)
+GitHub identifies the check by commit SHA. Pull requests that share a head can share its result, and retargeting a pull request can change the diff without changing the check. Use it as a commit-level status. A merge gate that requires a review of the current pull request diff needs a separate check of the base and head. [REST API endpoints for check runs](https://docs.github.com/en/rest/checks/runs#create-a-check-run) · [GitLab commit statuses](https://docs.gitlab.com/api/commits/#set-commit-pipeline-status)
 
 ### Post inline comments
 
@@ -358,4 +361,4 @@ The fixtures exercise GitHub and GitLab polling, restart handling, the Assay for
 
 ## License
 
-This repository is licensed under the [Apache License 2.0](LICENSE). The license covers this project's own source. Third-party software that the image downloads or bundles keeps its own license and terms: the provider CLIs, PR-Agent, Assay's desk tools and Qualgen, and the scanners.
+This repository is licensed under the [Apache License 2.0](LICENSE). The license covers this project's own source. Third-party software that the image downloads or bundles keeps its own license and terms: the provider CLIs, PR-Agent, Assay’s forge library and Qualgen, and the scanners.

@@ -212,9 +212,26 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # DNS on port 53 to any destination. A selector for kube-system misses
-    # NodeLocal DNSCache (link-local node address) and, on CNIs that evaluate
-    # egress before Service DNAT, the kube-dns Service IP, which is cluster-specific.
+    # Cluster DNS pods by selector. Cilium (and other identity-based CNIs) match a
+    # destination inside the cluster by its identity, never by CIDR, so the ipBlock
+    # rule below does not reach CoreDNS: with only that rule every lookup is dropped
+    # and the forge reads fail as "deskmonitor pr exited 2". The API server sets the
+    # kubernetes.io/metadata.name label on every namespace.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # DNS on port 53 to any other destination, for what the selector cannot name:
+    # NodeLocal DNSCache (link-local node address) and, on CNIs that evaluate egress
+    # before Service DNAT, the kube-dns Service IP, which is cluster-specific.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0

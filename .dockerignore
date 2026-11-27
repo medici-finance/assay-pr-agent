@@ -3,6 +3,10 @@
 !pyproject.toml
 !uv.lock
 !LICENSE
+!forge-helper
+!forge-helper/*.go
+!forge-helper/go.mod
+!forge-helper/build.sh
 !src
 !src/**
 src/**/__pycache__

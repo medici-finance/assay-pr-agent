@@ -10,6 +10,7 @@ from unittest.mock import patch
 import httpx
 
 from cursor_pr import cli, engine, forge_status, source
+from cursor_pr.config import project_from
 from cursor_pr.scanners import fence
 
 HEAD = "a" * 40
@@ -102,6 +103,7 @@ class ForgeStatusRequestTests(unittest.TestCase):
         self.start(patch.dict(os.environ, {"GITLAB_API_BASE": "https://gitlab.example/api/v4",
                                            "REVIEW_STATE_DIR": str(self.root / "state")}))
         os.environ.pop("REVIEW_FORGE_STATUS", None)
+        self.policy = self.start(patch.object(forge_status, "check_publication"))
         self.lookup = self.start(patch.object(forge_status, "reviewer_token", return_value="fixture"))
         self.requests, self.clients = [], []
         self.status, self.location, self.error = 201, None, None
@@ -126,9 +128,13 @@ class ForgeStatusRequestTests(unittest.TestCase):
         change = source.Change(HEAD, [source.File("demo.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")], url or SITES[provider])
         args = cli.parser().parse_args(["--change", address or SLUG + "#7", "--repo", str(self.root), *(["--post"] if post else []),
                                          *options, "--cache-dir", str(self.root / "cache"), "--max-input-tokens", "6000"])
+        slug = (address or SLUG + "#7").partition("#")[0]
+        site = ("https://github.com" if provider == "github" else os.environ["GITLAB_API_BASE"].removesuffix("/api/v4"))
+        args.forge_project = project_from(dict(provider=provider, url=f"{site}/{slug}", checkout=str(self.root),
+                                               requester_ids=[7]))
         posts = []
         with patch.object(cli, "forge_change", return_value=change), \
-             patch.object(cli, "run_desk", side_effect=desk_error or (lambda argv: posts.append(argv))) as desk, \
+             patch.object(cli, "post_comment", side_effect=desk_error or (lambda *args: posts.append(args))) as desk, \
              patch.object(engine, "invoke", return_value={"findings": [finding()], "cursor_usage": None}), \
              (patch.object(cli, "review", side_effect=model) if model else contextlib.nullcontext()):
             report, code = cli.run_request(args)
@@ -153,9 +159,9 @@ class ForgeStatusRequestTests(unittest.TestCase):
                     self.assertEqual(request.headers["PRIVATE-TOKEN"], "fixture")
                     self.assertEqual((body["name"], body["state"], body["target_url"]),
                                  (NAME, "success", SITES[provider]))
-                # The summary comment still goes through deskpost, and the report holds no credential.
                 self.assertEqual(desk.call_count, 1)
-                self.assertEqual(desk.call_args.args[0][:4], ["deskpost", "comment", SLUG, "7"])
+                self.assertEqual(desk.call_args.args[1:3], (7, HEAD))
+                self.assertEqual(self.policy.call_args.args[1:3], (7, HEAD))
                 self.assertNotIn("fixture", json.dumps(report))
         self.assertEqual(self.clients, [{"timeout": 15, "follow_redirects": False, "mounts": {}}] * 2)
 
@@ -182,7 +188,8 @@ class ForgeStatusRequestTests(unittest.TestCase):
         with patch.object(cli, "local_change", return_value=source.Change(HEAD, [source.File("demo.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")], str(self.root))):
             args = cli.parser().parse_args(["--base", "b" * 40, "--repo", str(self.root), "--forge-status",
                                             "--cache-dir", str(self.root / "cache"), "--max-input-tokens", "6000"])
-            report, code = cli.run_request(args)
+            with patch.object(cli, "review", return_value=(dict(findings=[], cursor_usage=None), False)):
+                report, code = cli.run_request(args)
         self.assertEqual((code, report["forge_status"]), (0, "skipped"))
         self.assertEqual(self.requests, [])
 
@@ -228,6 +235,23 @@ class ForgeStatusRequestTests(unittest.TestCase):
         self.assertEqual(self.lookup.call_args.args, ("github", "Org/Project", self.root))
         self.assertEqual([str(r.url) for r in self.requests],
                          ["https://gitlab.example/api/v4/projects/org%2Fproject/statuses/" + HEAD, "https://api.github.com/repos/Org/Project/check-runs"])
+
+    def test_status_only_never_writes_when_the_publication_policy_refuses(self):
+        self.policy.side_effect = source.ReviewError("repository visibility exceeds configured publication scope")
+        with self.assertLogs("cursor_pr.forge_status", level="WARNING"):
+            report, code, posts, _ = self.exercise("github", "--forge-status", post=False)
+        self.assertEqual((code, report["forge_status"], posts), (0, "failed", []))
+        self.assertEqual(self.requests, [])
+        self.lookup.assert_not_called()
+        self.assertIn("src/app.py", self.policy.call_args.args[3])
+
+    def test_gitlab_check_uses_the_configured_installation_prefix(self):
+        with patch.dict(os.environ, {"GITLAB_API_BASE": "https://git.example:8443/gitlab/api/v4"}):
+            url = "https://git.example:8443/gitlab/org/project/-/merge_requests/7"
+            report, *_ = self.exercise("gitlab", "--forge-status", url=url)
+            self.assertEqual(report["forge_status"], "posted")
+            self.assertEqual(str(self.requests[0].url),
+                             f"https://git.example:8443/gitlab/api/v4/projects/org%2Fproject/statuses/{HEAD}")
 
     def test_a_failed_summary_publication_leaves_the_status_unattempted(self):
         report, code, *_ = self.exercise("github", "--forge-status", desk_error=source.ReviewError("deskpost comment exited 1"))
