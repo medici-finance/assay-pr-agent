@@ -425,6 +425,28 @@ class TierTests(unittest.TestCase):
         self.assertEqual([row["state"] for row in report["passes"]], ["cached", "called"])
         self.assertEqual([row["title"] for row in report["findings"]], ["Real"])
 
+    def test_dropped_rows_and_a_verified_empty_result_have_distinct_messages(self):
+        self.answers(review=answer(finding(42, "Real"), "malformed"), verification=verified_answer())
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"], report["findings"]), (0, "reviewed", []))
+        self.assertEqual(report["verification"], {"state": "filtered", "before": 1, "after": 0})
+        with patch.object(cli, "post_comment") as post:
+            cli.publish("org/repo#1", self.head, report)
+        body = post.call_args.args[3]
+        self.assertIn("Dropped 1 model finding: malformed finding.", body)
+        self.assertIn("No model findings remained after verification.", body)
+        self.assertNotIn("No model finding passed the checks.", body)
+
+    def test_an_answer_with_only_invalid_findings_does_not_poison_a_retry(self):
+        self.answers(review=answer(finding(60, "Outside")))
+        code, report = self.check()
+        self.assertEqual((code, report["state"], report["cache_hit"]), (2, "findings-dropped", False))
+        self.answers(review=answer(finding(42, "Real")))
+        code, report = self.check()
+        self.assertEqual((code, report["state"], report["cache_hit"]), (0, "reviewed", False))
+        self.assertEqual([row["title"] for row in report["findings"]], ["Real"])
+        self.assertTrue(self.check()[1]["cache_hit"])
+
     def test_tier_falls_back_to_the_one_below_and_says_so(self):
         change = cli.local_change(self.root, "main", self.head)
         files = sorted(change.files, key=lambda f: f.path)

@@ -409,9 +409,11 @@ def publish(address, head, report, *, project=None, state=None):
                     f"exceeds the limit of {report.get('prompt_limit', report['max_input_tokens'])}.")
     elif report["state"] == "model-unavailable":
         body.append(f"{label} could not complete the review.")
+    elif report["state"] == "findings-dropped":
+        body.append("No model finding passed the checks.")
     elif not report["findings"]:
-        # With every model finding dropped, saying there were none would read as a clean review.
-        body.append("No model finding passed the checks." if report.get("dropped")
+        body.append("No model findings remained after verification."
+                    if report.get("verification", {}).get("state") == "filtered"
                     else "No model findings in the reviewed scope.")
     summarize_matches = report["state"] == "reviewed"
     summarized = 0

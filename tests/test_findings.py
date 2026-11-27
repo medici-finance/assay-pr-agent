@@ -64,7 +64,32 @@ class ParseAnswerTests(unittest.TestCase):
                 raw["result"] = yaml.safe_dump(review).replace("INVALID_DATE", scalar)
                 result = engine.parse_answer(json.dumps(raw), ANCHORS)
                 self.assertEqual([finding["title"] for finding in result["findings"]], ["Possible Bug", "Other Bug"])
-                self.assertEqual(result["dropped"], [{"path": "", "line": None, "reason": "malformed finding"}])
+                self.assertEqual(result["dropped"], [{"path": "a.py", "line": 2, "reason": "malformed finding"}])
+
+    def test_shared_nested_yaml_outside_the_finding_schema_is_ignored(self):
+        raw = json.loads(envelope([]))
+        extra = {"nested": ["INVALID_DATE"]}
+        review = {"review": {"key_issues_to_review": [
+            dict(issue(), extra=extra), dict(issue(header="Other Bug"), extra=extra),
+        ]}}
+        raw["result"] = yaml.safe_dump(review).replace("INVALID_DATE", "2026-02-30")
+        result = engine.parse_answer(json.dumps(raw), ANCHORS)
+        self.assertEqual([finding["title"] for finding in result["findings"]], ["Possible Bug", "Other Bug"])
+        self.assertEqual(result["dropped"], [])
+
+    def test_explicit_yaml_fields_override_shared_fields(self):
+        raw = json.loads(envelope([]))
+        raw["result"] = """
+first: &first {relevant_file: a.py, start_line: 2, end_line: 2, issue_header: First}
+second: &second {relevant_file: a.py, start_line: 3, end_line: 3, issue_header: Second}
+review:
+  key_issues_to_review:
+  - <<: [*first, *second]
+    issue_header: Explicit Header
+    issue_content: Details.
+"""
+        [finding] = engine.parse_answer(json.dumps(raw), ANCHORS)["findings"]
+        self.assertEqual((finding["line"], finding["end_line"], finding["title"]), (2, 2, "Explicit Header"))
 
     def test_the_answer_itself_must_still_be_valid(self):
         base = {"type": "result", "subtype": "success", "is_error": False}
@@ -88,7 +113,7 @@ class DroppedSummaryTests(unittest.TestCase):
                    {"path": "b.py", "line": 3, "reason": "cited line outside the reviewed patch"},
                    {"path": "c.py", "line": None, "reason": "malformed finding"}]
         with patch.object(cli, "post_comment", side_effect=lambda *args: posts.append(args[3])):
-            cli.publish("org/repo#1", "a" * 40, self.report(dropped=dropped))
+            cli.publish("org/repo#1", "a" * 40, self.report(state="findings-dropped", dropped=dropped))
             cli.publish("org/repo#1", "a" * 40, self.report())
         self.assertIn("Dropped 2 model findings: cited line outside the reviewed patch.", posts[0])
         self.assertIn("Dropped 1 model finding: malformed finding.", posts[0])

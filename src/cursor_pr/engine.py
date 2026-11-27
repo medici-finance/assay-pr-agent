@@ -332,21 +332,59 @@ def tokens(prompt):
     return len(TokenEncoder.get_token_encoder("gpt-4o").encode(prompt, disallowed_special=()))
 
 
-class ReviewAnswerLoader(yaml.SafeLoader):
-    def construct_sequence(self, node, deep=False):
-        if not isinstance(node, yaml.SequenceNode):
-            return super().construct_sequence(node, deep=deep)
-        # A conversion failure in one YAML row must leave the others readable.
+YAML_TAG = "tag:yaml.org,2002:"
+FINDING_TEXT_FIELDS = ("relevant_file", "issue_header", "issue_content", "verification_status")
+FINDING_LINE_FIELDS = ("start_line", "end_line")
+ANSWER_FIELDS = frozenset(("review", "key_issues_to_review", *FINDING_TEXT_FIELDS, *FINDING_LINE_FIELDS))
+
+
+def answer_mapping(node, mappings):
+    if not isinstance(node, yaml.MappingNode) or node.tag != YAML_TAG + "map":
+        return {}
+    if node not in mappings:
+        merged = mappings[node] = {}
+        explicit = {}
+        for key, value in node.value:
+            if isinstance(key, yaml.ScalarNode):
+                if key.tag == YAML_TAG + "merge":
+                    parents = value.value if isinstance(value, yaml.SequenceNode) else [value]
+                    for parent in reversed(parents):
+                        merged.update(answer_mapping(parent, mappings))
+                elif key.tag == YAML_TAG + "str" and key.value in ANSWER_FIELDS:
+                    explicit[key.value] = value
+        merged.update(explicit)
+    return mappings[node]
+
+
+def answer_findings(answer):
+    """Read the flat finding schema without constructing unrelated YAML values."""
+    loader = yaml.SafeLoader(answer)
+    try:
+        mappings = {}
+        document = answer_mapping(loader.get_single_node(), mappings)
+        issues = answer_mapping(document.get("review"), mappings).get("key_issues_to_review")
+        if not isinstance(issues, yaml.SequenceNode) or issues.tag != YAML_TAG + "seq":
+            raise ReviewError("Invalid Cursor finding list")
         entries = {}
-        for child in dict.fromkeys(node.value):
-            loader = yaml.SafeLoader("")
-            try:
-                entries[child] = loader.construct_document(child)
-            except (ValueError, TypeError, OverflowError, LookupError, AttributeError, yaml.YAMLError):
-                entries[child] = None
-            finally:
-                loader.dispose()
-        return [entries[child] for child in node.value]
+        for node in issues.value:
+            if node not in entries:
+                fields = answer_mapping(node, mappings)
+                item = {}
+                for name in FINDING_TEXT_FIELDS:
+                    value = fields.get(name)
+                    if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "str":
+                        item[name] = value.value
+                for name in FINDING_LINE_FIELDS:
+                    value = fields.get(name)
+                    if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "int":
+                        try:
+                            item[name] = loader.construct_yaml_int(value)
+                        except (ValueError, IndexError):
+                            pass  # An unconvertible citation makes this finding malformed.
+                entries[node] = item
+            yield entries[node]
+    finally:
+        loader.dispose()
 
 
 def parse_answer(raw, anchors, limit=MAX_FINDINGS):
@@ -361,12 +399,9 @@ def parse_answer(raw, anchors, limit=MAX_FINDINGS):
         answer = fenced.group(1)
     if len(answer) > 32_768:
         raise ReviewError("Cursor answer exceeds the review size limit")
-    issues = yaml.load(answer, Loader=ReviewAnswerLoader)["review"]["key_issues_to_review"]
-    if not isinstance(issues, list):
-        raise ReviewError("Invalid Cursor finding list")
     # A bad finding costs the others nothing: the call is already paid for and there is no retry.
     clean, dropped = [], []
-    for issue in issues:
+    for issue in answer_findings(answer):
         valid, why = finding(issue, anchors)
         if why:
             dropped.append(why)
@@ -539,6 +574,8 @@ def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout
                 result["findings"] = kept(originals, result)
             except ReviewError as err:
                 raise CursorFailure(str(err), result.get("cursor_usage")) from err
+        if result.get("dropped") and not result["findings"]:
+            return result, False  # A later request can retry a reply that yielded no usable findings.
         with tempfile.NamedTemporaryFile(dir=cache, mode="w", delete=False) as file:
             json.dump(result, file)
         os.replace(file.name, path)
