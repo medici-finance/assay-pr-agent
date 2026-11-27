@@ -57,14 +57,18 @@ def fit(files, checks, limit, *, title="", description="", advisories=()):
         return full_pack, full, full, []
     sizes = {f.path: tokens(text) for f in files if (text := section(f)[0])}
     # A file that cannot fit even alone leaves first, so it never takes a file that fits with it.
-    overhead = tokens(pack(files, checks, frozenset(sizes), title, description, advisories)[0])
-    queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
+    advised_paths = {a["path"] for a in advisories}
+    overhead = tokens(pack((), checks, title=title, description=description)[0])
+    alone = {f.path: tokens(pack([f], checks, title=title, description=description, advisories=advisories)[0])
+             for f in files if f.path in sizes and f.path in advised_paths}
+    queue = sorted(sizes, key=lambda path: (alone.get(path, overhead + sizes[path]) <= limit,
+                                           rank(path), -sizes[path], path))
     dropped = []
     while estimated > limit and queue:
         # Per-file sizes are approximate, so the last file only leaves after a real recount.
         dropped.append(queue.pop(0))
         freed = sizes[dropped[-1]]
-        while len(queue) > 1 and freed < estimated - limit:
+        while len(queue) > 1 and freed < estimated - limit and dropped[-1] not in advised_paths:
             dropped.append(queue.pop(0))
             freed += sizes[dropped[-1]]
         prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped), title, description, advisories)
