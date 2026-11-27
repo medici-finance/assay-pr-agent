@@ -343,7 +343,7 @@ Three things stand in for those checks:
 
 - **Quoting.** A comment holds only the finding's title and message, each a code span sized to the longest backtick run inside it, with line breaks collapsed and cut at 255 and 2,000 characters. Nothing else from the report is posted, so no link or mention that a change author or the model wrote can become live.
 - **Head.** The head is read again through `pr-agent-forge` immediately before the first write, and each post names the head: `commit_id` on GitHub, and the merge request's `diff_refs` on GitLab. A moved head is refused and recorded as `inline_publication: "stale"`.
-- **Repeat runs.** Each post ends with a hidden HTML comment naming the head and a digest of the finding. Before posting, the existing reviews or discussions are read, and a finding the reviewer identity already posted for this head is skipped.
+- **Repeat runs.** Each post ends with a hidden HTML comment naming the head and a digest of the finding. Before posting, the existing review comments or discussions are read to the last page, and a finding the reviewer identity already posted for this head is skipped, so a later run with a different set of findings, or one after a run that stopped partway, posts only what is missing.
 
 The reviewer identity is found differently on each forge. On GitLab it is the token's own user. A GitHub installation token cannot read its own identity, so on GitHub it is the author of the newest bot comment that carries the summary's first line. If no identity can be found, nothing is posted, because a duplicate is worse than a missing comment.
 

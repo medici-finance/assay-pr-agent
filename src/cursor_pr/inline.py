@@ -65,21 +65,21 @@ def thread(project, number):
     return items[0]["comments"]
 
 
-def reviews(client, headers, slug, number):
-    """Every review on the pull request, read to the end; an unread page could hide an earlier post."""
+def review_comments(client, headers, slug, number):
+    """Every review comment on the pull request, read to the end; an unread page could hide an earlier post."""
     found, page = [], 1
     while True:
-        response = client.get(f"https://api.github.com/repos/{slug}/pulls/{number}/reviews",
+        response = client.get(f"https://api.github.com/repos/{slug}/pulls/{number}/comments",
                               params={"page": page, "per_page": 100}, headers=headers)
         response.raise_for_status()
         rows = response.json()
         if not isinstance(rows, list):
-            raise ReviewError("Invalid pull request review list")
+            raise ReviewError("Invalid pull request review comment list")
         found += [r for r in rows if isinstance(r, dict)]
         if len(rows) < 100:
             return found
         if page >= PAGES:
-            raise ReviewError("Too many reviews to check for earlier inline comments")
+            raise ReviewError("Too many review comments to check for earlier inline comments")
         page += 1
 
 
@@ -113,17 +113,22 @@ def unmoved(project, number, head):
 
 def github(client, headers, project, slug, number, rows, me, head):
     """(posted, refused, already present) as one review on the reviewed head."""
-    mark = marker(head, rows)
-    if any((r.get("user") or {}).get("id") == me and r.get("commit_id") == head and str(r.get("body") or "").strip() == mark
-           for r in reviews(client, headers, slug, number)):
+    # Each comment closes with its own marker, as on GitLab, so a later run with a different set of
+    # findings, or one after a run that stopped partway, posts only what is not there yet.
+    found = set().union(*(carried(head, c.get("body")) for c in review_comments(client, headers, slug, number)
+                          if (c.get("user") or {}).get("id") == me))
+    rows = [row for row in rows if marker(head, row) not in found]
+    if not rows:
         return 0, 0, True
     unmoved(project, number, head)
     endpoint = f"https://api.github.com/repos/{slug}/pulls/{number}/reviews"
+    mark = marker(head, rows)
 
     def submit(part):
         client.post(endpoint, headers=headers, json={
             "commit_id": head, "event": "COMMENT", "body": mark,
-            "comments": [dict(path=path, line=line, side="RIGHT", body=body) for path, line, body in part]}).raise_for_status()
+            "comments": [dict(path=path, line=line, side="RIGHT", body=f"{body}\n\n{marker(head, [path, line, body])}")
+                         for path, line, body in part]}).raise_for_status()
 
     try:
         submit(rows)
