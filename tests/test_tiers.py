@@ -188,6 +188,40 @@ class TierTests(unittest.TestCase):
             self.assertNotIn("Unrelated advice.", prompt)
         self.assertNotIn("History advisories", calls[-1][1])
 
+    def test_first_pass_history_never_displaces_max_patch_coverage(self):
+        small, large = "tests/test_small.py", "src/large.py"
+        for path, count in ((small, 5), (large, 780)):
+            self.write(path, "".join(f"VALUE_{n} = {n}\n" for n in range(count)))
+        self.commit("add fixtures with different patch sizes")
+        self.answers(review=answer(), deep=answer())
+        qualgen = {"state": "complete", "advisories": [
+            {"path": small, "kind": "co-change", "detail": "Callers need review " * 14}
+            for _ in range(6)
+        ], "unscreened": []}
+        raw = {"change description": "Check how the new values are used.",
+               "whole changed files": "These values come from the fixtures."}
+        args = ("--tier", "max", "--max-input-tokens", "1000", "--path", small, "--path", large)
+        with patch.object(context, "gather", return_value=raw), patch.object(cli.history, "screen", return_value=qualgen):
+            _, plain = self.check(*args)
+            _, advised = self.check(*args, "--qualgen-store", str(self.root / "qualgen"))
+        self.assertEqual(plain["degraded"], [])
+        self.assertEqual((advised["delivered"], advised["degraded"]), ("max", []))
+
+    def test_history_leaves_room_to_verify_a_mid_finding(self):
+        issue = dict(finding(42, "Check the returned value"), issue_content="behavior " * 530 + "here")
+        self.answers(review=answer(issue), verification=answer(issue))
+        qualgen = {"state": "complete", "advisories": [
+            {"path": "src/app.py", "kind": "co-change", "detail": "Check prior use of this path. " * 9},
+        ], "unscreened": []}
+        args = ("--tier", "mid", "--max-input-tokens", "1000")
+        with patch.object(context, "gather", return_value={"change description": "The patch adjusts a returned value."}), \
+             patch.object(cli.history, "screen", return_value=qualgen):
+            _, plain = self.check(*args)
+            code, advised = self.check(*args, "--qualgen-store", str(self.root / "qualgen"))
+        self.assertEqual(plain["verification"]["state"], "filtered")
+        self.assertEqual((code, advised["verification"]["state"]), (0, "filtered"))
+        self.assertEqual(advised["qualgen"], qualgen)
+
     def test_max_retains_deep_findings_and_reports_the_cap(self):
         first = [finding(42, f"First {index}") for index in range(1, 7)]
         deep = [finding(42, f"Deep {index}") for index in range(1, 7)]

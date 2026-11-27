@@ -44,6 +44,8 @@ USED = ("included", "truncated")
 
 def add_history(files, checks, packed, estimate, limit, dropped, advisories, **options):
     """Fit a prefix of the notices without changing the chosen patch scope or tier context."""
+    if estimate >= limit:
+        return packed, estimate
     notices = visible_advisories(advisories, packed[1])
     skipped = frozenset(dropped)
     smallest, largest = 1, len(notices)
@@ -148,9 +150,8 @@ def fit_patch(files, checks, limit, title, description, *, max_findings, focus, 
     return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped), bool(title or description)
 
 
-def with_context(files, checks, packed, estimated, dropped, limit, cap, names, raw, *, rendered,
-                 focus="", advisories=()):
-    """Fit tier-specific context first, then use remaining space for history notices."""
+def with_context(files, checks, packed, estimated, dropped, limit, cap, names, raw, *, rendered, focus=""):
+    """Fit tier-specific context to an already selected scope."""
     text, fates = context.assemble(names, raw, limit - estimated - (120 if focus else 80))
     options = dict(max_findings=cap, focus=focus, rendered=rendered)
     if text:
@@ -161,10 +162,7 @@ def with_context(files, checks, packed, estimated, dropped, limit, cap, names, r
         else:
             fates = [dict(row, state="dropped") if row["state"] in USED else row for row in fates]
             text = ""
-    if advisories:
-        packed, estimated = add_history(files, checks, packed, estimated, limit, dropped, advisories,
-                                        context=text, **options)
-    return packed[0], estimated, fates
+    return packed, estimated, fates, text
 
 
 def run_pass(row, prompt, anchors, args, source, *, cap, timeout, originals=None):
@@ -478,9 +476,9 @@ def execute(args):
     first_paths = set()
     if has_text and estimated <= limit:
         if tier != "regular":
-            prompt, estimated, fates = with_context(
-                files, checks, first_pack, estimated, dropped, limit, cap, context.MID, raw,
-                rendered=rendered, advisories=advisories)
+            first_pack, estimated, fates, first_context = with_context(
+                files, checks, first_pack, estimated, dropped, limit, cap, context.MID, raw, rendered=rendered)
+            prompt = first_pack[0]
         plans.append(({"name": "review", "estimated_input_tokens": estimated, "state": "planned"}, prompt, anchors, fates))
         first_paths = {path for path, lines in anchors.items() if lines}
 
@@ -492,16 +490,38 @@ def execute(args):
             files, checks, deep_limit, cap, focus=DEEP_FOCUS, rendered=rendered)
         deep_anchors = deep_pack[1]
         if deep_size <= deep_limit:
-            deep, deep_size, deep_fates = with_context(
+            deep_pack, deep_size, deep_fates, deep_context = with_context(
                 files, checks, deep_pack, deep_size, deep_dropped, deep_limit, cap, context.DEEP, raw,
-                rendered=rendered, focus=DEEP_FOCUS, advisories=advisories)
+                rendered=rendered, focus=DEEP_FOCUS)
             new_paths = any(lines and path not in first_paths for path, lines in deep_anchors.items())
             extra_context = any(row["name"] not in context.MID and row["state"] in USED for row in deep_fates)
             if new_paths or extra_context:
                 plans.append(({"name": "deep", "estimated_input_tokens": deep_size, "state": "planned"},
-                              deep, deep_anchors, deep_fates))
+                              deep_pack[0], deep_anchors, deep_fates))
             else:
                 deep_fates = [dict(row, state="dropped") if row["state"] in USED else row for row in deep_fates]
+
+    if tier != "regular" and advisories:
+        # Decide both patch scopes before spending from their shared budget. History
+        # may use only space above one base budget reserved for verification.
+        remaining = budget - base - sum(row["estimated_input_tokens"] for row, _, _, _ in plans)
+        for index, (row, _, locations, blocks) in enumerate(plans):
+            if remaining <= 0:
+                break
+            is_deep = row["name"] == "deep"
+            packed, skipped, context_text = ((deep_pack, deep_dropped, deep_context) if is_deep
+                                             else (first_pack, dropped, first_context))
+            original_size = row["estimated_input_tokens"]
+            history_limit = min(deep_limit if is_deep else base, original_size + remaining)
+            packed, size = add_history(files, checks, packed, original_size, history_limit, skipped, advisories,
+                                       context=context_text, max_findings=cap, focus=DEEP_FOCUS if is_deep else "",
+                                       rendered=rendered)
+            increase = size - original_size
+            remaining -= increase
+            if tier == "max" and not is_deep:
+                deep_limit -= increase
+            row["estimated_input_tokens"] = size
+            plans[index] = row, packed[0], locations, blocks
 
     passes = [row for row, _, _, _ in plans]
     context_fates = merged_fates([fates, deep_fates])
