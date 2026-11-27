@@ -254,6 +254,27 @@ class MarkerTests(Offline):
         self.assertEqual([row for row in self.eyes if row["user"]["id"] == ME and row["content"] == "eyes"], [])
         self.assertIsNone(ack.jobs.owed(job))
 
+    def test_time_running_out_between_two_calls_of_one_removal_is_a_try(self):
+        ack = self.ack()
+        job = self.gl.key, 3, 81
+        while started := ack.jobs.next():
+            ack.jobs.finish(started, "reviewed")
+        clock = [1000.0]
+        answer = self.respond
+
+        def slow(request):
+            clock[0] += 3  # The account is read; by then the time for the award listing is gone.
+            return answer(request)
+        self.respond = slow
+        with patch.object(acknowledge.time, "monotonic", side_effect=lambda: clock[0]), \
+                self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
+            ack.finished(self.gl, 3, 81, "reviewed", 1002.0)
+        self.assertEqual([method for method, _ in self.sent()], ["GET"])
+        self.assertIn("no time left for it in this cycle", logged.output[0])
+        owed = ack.jobs.owed(job)
+        self.assertEqual((owed["cleared"], owed["cleared_tries"]), (0, 1))
+        self.assertNotIn((*job, "reviewed"), ack.jobs.unfinished_acknowledgements(acknowledge.time.time()))  # It waits its minute.
+
     def test_a_call_that_started_is_a_try_however_little_time_it_had(self):
         ack = self.ack()
         job = self.gh.key, 3, 81
@@ -367,8 +388,8 @@ class MarkerTests(Offline):
             with patch.object(acknowledge, "run_forge", side_effect=slow), \
                     patch.object(acknowledge, "post_comment", side_effect=lambda *args: helper.append("comment")):
                 ack.finished(self.gh, 3, 81, "failed")
-            # The removal takes its timeout, the read of the change what is left, and no comment is started.
-            self.assertEqual((waits, helper, clock[0] - before), ([15], [("change", 5)], 20))
+            # The read of the change takes all of the time; no comment is started, and no removal.
+            self.assertEqual((waits, helper, clock[0] - before), ([], [("change", 20)], 20))
             self.assertEqual(jobs.acknowledgement((self.gh.key, 3, 81)), (0, 0))  # Both still owed, for a later cycle.
             # And so does the pass over what earlier requests still owe.
             for comment in (82, 83, 84):
@@ -551,29 +572,52 @@ class NoticeTests(Offline):
             post.assert_not_called()
             self.assertIn("Forge did not identify the change head", logged.output[0])
 
-    def test_a_removal_that_uses_the_time_up_does_not_keep_the_notice_from_being_tried(self):
+    def test_notice_goes_first_and_a_removal_it_leaves_no_time_for_is_not_a_try(self):
         jobs = Jobs(self.state)
         jobs.enqueue(self.gl.key, 3, 81, acknowledge=True)
         ack = Acknowledgement(jobs, self.state)
         job = self.gl.key, 3, 81
         jobs.next()
         jobs.finish(job, "failed")
-        clock = [1000.0]
+        clock, order = [1000.0], []
 
-        def slow(*_):
-            clock[0] += acknowledge.FINISH_SECONDS + 1  # GitLab held every call to its timeout.
-            raise httpx.ReadTimeout("slow")
+        def read(verb, project, *, numbers=(), timeout=45):
+            order.append(("change", timeout))
+            clock[0] += 4
+            return dict(headSha="a" * 40)
+
+        def post(*args):
+            order.append("comment")
+            clock[0] += 30  # The helper is slow, and is not cut short.
+
+        def remove(project, number, comment, deadline, said):
+            order.append("remove")
+            if deadline <= clock[0]:
+                raise acknowledge.OutOfTime()
         with patch.object(acknowledge.time, "monotonic", side_effect=lambda: clock[0]), \
-                patch.object(acknowledge, "remove", side_effect=slow), \
-                patch.object(acknowledge, "run_forge", return_value=dict(headSha="a" * 40)) as read, \
-                patch.object(acknowledge, "post_comment") as post, \
-                self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
-            ack.finished(self.gl, 3, 81, "failed")
-        self.assertEqual(len(logged.output), 1)  # The removal, and it alone, failed.
-        self.assertLessEqual(read.call_args.kwargs["timeout"], acknowledge.NOTICE_SECONDS)
-        post.assert_called_once()
+                patch.object(acknowledge, "remove", side_effect=remove), \
+                patch.object(acknowledge, "run_forge", side_effect=read), \
+                patch.object(acknowledge, "post_comment", side_effect=post), \
+                self.assertNoLogs("cursor_pr.acknowledge", level="WARNING"):
+            ack.finished(self.gl, 3, 81, "failed", 1010.0)
+        self.assertEqual(order, [("change", 10.0), "comment", "remove"])
         owed = jobs.owed(job)
-        self.assertEqual([owed[name] for name in ("cleared", "cleared_tries", "notice_sent", "notice_sent_tries")], [0, 1, 1, 0])
+        self.assertEqual([owed[name] for name in ("cleared", "cleared_tries", "notice_sent", "notice_sent_tries")], [0, 0, 1, 0])
+        self.assertEqual(jobs.unfinished_acknowledgements(acknowledge.time.time()), [(*job, "failed")])  # Due at once.
+
+    def test_record_with_nothing_left_owed_goes_with_the_write_that_settled_it(self):
+        jobs = Jobs(self.state)
+        for comment, status in ((81, "reviewed"), (82, "failed")):
+            job = self.gh.key, 3, comment
+            jobs.enqueue(*job, acknowledge=True)
+            jobs.next()
+            jobs.finish(job, status)
+        jobs.record_acknowledgement((self.gh.key, 3, 81), "cleared")
+        self.assertIsNone(jobs.owed((self.gh.key, 3, 81)))  # No second write a stopping poller could miss.
+        jobs.record_acknowledgement((self.gh.key, 3, 82), "cleared")
+        self.assertEqual(jobs.owed((self.gh.key, 3, 82))["notice_sent"], 0)  # The notice is still owed.
+        jobs.record_acknowledgement((self.gh.key, 3, 82), "notice_sent")
+        self.assertIsNone(jobs.owed((self.gh.key, 3, 82)))
 
     def test_failure_notice_goes_to_the_forge_helper_as_a_head_bound_comment(self):
         # The real path below the notice, with only the helper process and the credential replaced.

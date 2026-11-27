@@ -32,12 +32,14 @@ BUDGET_SECONDS = 20
 START_SECONDS = 5
 # The removal and the notice of one request, right after its review:
 FINISH_SECONDS = 20
-# What the notice may still take to start when the removal before it used that time up, so that a
-# removal that is slow every time does not hold the notice back for as long as it is tried.
-NOTICE_SECONDS = 5
 TIMEOUT_SECONDS = 15
 HELPER_SECONDS = 45
 PAGES = 5
+
+
+# How many calls to a forge or to the helper have been started. One action makes several, and
+# running out of time between two of them is a try that was made, not one that was not.
+started = [0]
 
 
 class OutOfTime(ReviewError):
@@ -63,6 +65,7 @@ def request(project, method, url, headers, deadline=None, **options):
         raise OutOfTime()
     with httpx.Client(timeout=left, follow_redirects=False,
                       **(client_options() if project.provider == "gitlab" else {})) as client:
+        started[0] += 1
         return client.request(method, url, headers=headers, **options)
 
 
@@ -182,6 +185,7 @@ def notify(project, number, comment, state, deadline=None):
     left = HELPER_SECONDS if deadline is None else min(HELPER_SECONDS, deadline - time.monotonic())
     if left <= 0:
         raise OutOfTime()
+    started[0] += 1
     head = run_forge("change", project, numbers=[number], timeout=left).get("headSha")
     if not valid_sha(head):
         raise ReviewError("Forge did not identify the change head")
@@ -235,7 +239,6 @@ class Acknowledgement:
             return
         if deadline is None:
             deadline = time.monotonic() + FINISH_SECONDS
-        in_time = time.monotonic() < deadline
 
         def clear():
             if project.provider == "gitlab" and self.jobs.pending(project.key, number):
@@ -246,13 +249,15 @@ class Acknowledgement:
                 remove(project, number, comment, deadline, said)
 
         def report_failure():
-            notify(project, number, comment, self.state,
-                   max(deadline, time.monotonic() + NOTICE_SECONDS) if in_time else deadline)
+            notify(project, number, comment, self.state, deadline)
 
         # Kept apart: each is done, tried again and given up by itself, and while only one is owed
-        # the other is left alone.
-        parts = (("cleared", clear, "clear the queued marker on", comment, "removal of the queued marker", True),
-                 ("notice_sent", report_failure, "report the failed review on", None, "failure notice", status == "failed"))
+        # the other is left alone. The notice goes first and has the whole of the time. A removal
+        # it leaves none for is not a try and is due at once, in a cycle where the notice is not;
+        # the other way round, a slow removal would leave the notice a moment each time until
+        # both were given up together.
+        parts = (("notice_sent", report_failure, "report the failed review on", None, "failure notice", status == "failed"),
+                 ("cleared", clear, "clear the queued marker on", comment, "removal of the queued marker", True))
         for part, action, verb, shown, name, wanted in parts:
             if owed[part] or not wanted:
                 continue
@@ -269,7 +274,7 @@ class Acknowledgement:
                 self.jobs.record_acknowledgement(job, part)
                 owed[part] = 1
         if owed["cleared"] and (owed["notice_sent"] or status != "failed"):
-            self.jobs.clear_acknowledgement(job)
+            self.jobs.clear_acknowledgement(job)  # Also one a poller that stopped left with nothing owed.
 
     def settle(self, projects):
         """Try again what a finished request still owes the forge and is due: its marker's removal, its notice."""
@@ -298,11 +303,17 @@ class Acknowledgement:
     @staticmethod
     def attempt(action, verb, project, number, comment):
         """True when it was done, False when it failed, None when there was no time left to try."""
+        before = started[0]
         try:
             action()
             return True
-        except OutOfTime:
-            return None  # Not a failure, and not worth a line: it is done in a later cycle.
+        except OutOfTime as err:
+            if started[0] == before:
+                return None  # Not a failure, and not worth a line: it is done in a later cycle.
+            # Part of it was done and the time ran out. That is a try, with the pause that follows one.
+            log.warning("Could not %s %s#%d%s: %s", verb, project.slug, number,
+                        f" comment {comment}" if comment else "", err)
+            return False
         except Exception as err:
             # httpx errors quote the request URL. Report the status, or the class, and nothing else.
             detail = f"HTTP {err.response.status_code}" if isinstance(err, httpx.HTTPStatusError) else (
