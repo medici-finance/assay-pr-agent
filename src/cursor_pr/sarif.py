@@ -158,5 +158,6 @@ def write(path, report, source=None):
     # Publish the completed log atomically. Replacement never follows a link at the destination.
     with TemporaryDirectory(dir=path.parent, prefix=".sarif-") as directory:
         temporary = Path(directory) / "report.sarif"
+        temporary.touch(mode=0o600)
         temporary.write_text(json.dumps(log(report, source), ensure_ascii=True, indent=2) + "\n", encoding="utf8")
         temporary.replace(path)

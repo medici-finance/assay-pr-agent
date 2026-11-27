@@ -370,3 +370,16 @@ class SarifFlagTests(unittest.TestCase):
         self.assertIn("symbolic link", err)
         self.assertEqual(target.read_text(), "keep me")
         self.assertTrue(link.is_symlink())
+
+    def test_replacing_a_private_report_keeps_it_private(self):
+        target = self.root / "review.sarif"
+        target.write_text("old report")
+        target.chmod(0o600)
+        previous = os.umask(0o022)
+        try:
+            code, _, error = self.check("--base", self.base, "--estimate", "--sarif", str(target))
+        finally:
+            os.umask(previous)
+        self.assertEqual(code, 0, error)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(target.read_text())["version"], "2.1.0")
