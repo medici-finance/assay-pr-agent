@@ -72,11 +72,15 @@ class CapturePromptTest(unittest.TestCase):
         self.assertFalse(self.started.exists())
 
     def test_a_failed_run_removes_an_earlier_prompt(self):
-        self.assertEqual(self.capture().returncode, 0)
-        result = self.capture("--max-input-tokens", "1")
-        self.assertEqual(result.returncode, 1)
-        self.assertFalse((self.root / "out" / "branch.prompt.txt").exists())
-        self.assertFalse((self.root / "out" / "branch.anchors.json").exists())
+        # However the retry fails: over budget, an option this script refuses, one the parser refuses.
+        for retry, code in ((("--max-input-tokens", "1"), 1), (("--tier", "mid"), 1), (("--estimate",), 1),
+                            (("--no-such-option",), 2)):
+            with self.subTest(retry=retry):
+                self.assertEqual(self.capture().returncode, 0)
+                self.assertTrue((self.root / "out" / "branch.prompt.txt").exists())
+                self.assertEqual(self.capture(*retry).returncode, code)
+                self.assertFalse((self.root / "out" / "branch.prompt.txt").exists())
+                self.assertFalse((self.root / "out" / "branch.anchors.json").exists())
 
     def test_reports_why_the_model_step_failed(self):
         spec = importlib.util.spec_from_file_location("capture_prompt", SCRIPT)

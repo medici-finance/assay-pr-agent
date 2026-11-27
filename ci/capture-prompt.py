@@ -29,6 +29,12 @@ def main(argv):
     if len(argv) < 2 or argv[1].startswith("-"):
         return fail("usage: capture-prompt.py OUT_PREFIX --base REV [cursor-review options]")
     prefix, options = Path(argv[1]), argv[2:]
+    prompt_file = Path(f"{prefix}.prompt.txt")
+    anchors_file = Path(f"{prefix}.anchors.json")
+    # First of all, before any option can be refused: a run that fails for whatever reason must not
+    # leave an earlier run's prompt to be reviewed as if it were current.
+    prompt_file.unlink(missing_ok=True)
+    anchors_file.unlink(missing_ok=True)
     args = cli.parser().parse_args(options)
     for name, flag in LOCAL_ONLY.items():
         if getattr(args, name):
@@ -37,11 +43,6 @@ def main(argv):
         return fail("only the regular tier is captured: its prompt is the one the deployed reviewer sends first")
     if args.max_input_tokens is None:
         options += ["--max-input-tokens", DEFAULT_BUDGET]
-    prompt_file = Path(f"{prefix}.prompt.txt")
-    anchors_file = Path(f"{prefix}.anchors.json")
-    # A failed run must not leave an earlier run's prompt to be reviewed as if it were current.
-    prompt_file.unlink(missing_ok=True)
-    anchors_file.unlink(missing_ok=True)
     providers = getattr(cli, "providers", None)
     for module, label, name in ((cli, "cursor_pr.cli", "review"), (providers, "cursor_pr.cli.providers", "cursor_account"),
                                 (engine, "cursor_pr.engine", "invoke")):
