@@ -220,6 +220,7 @@ window.fetch = async (path, options) => {
   if (path === "/step" && options.method === "POST") {
     requests.push(JSON.parse(options.body));
     await new Promise(resolve => { finishNavigation = resolve; });
+    if (requests.at(-1).id !== view.id) return new Response(null, {status: 409});
   }
   return new Response(JSON.stringify(view));
 };
@@ -227,6 +228,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   const tick = () => new Promise(resolve => setTimeout(resolve, 0));
   const check = (condition, message) => { if (!condition) throw Error(message); };
   const lookup = (key, selector) => document.querySelector('[data-key="' + key + '"] ' + selector);
+  const refreshed = () => new Promise(resolve => {
+    const observer = new MutationObserver(() => { observer.disconnect(); resolve(); });
+    observer.observe(document.querySelector("#groups"), {childList: true});
+  });
   const select = (input, file) => {
     const transfer = new DataTransfer();
     transfer.items.add(file);
@@ -262,15 +267,12 @@ document.addEventListener("DOMContentLoaded", async () => {
     finish("replacement" + String.fromCharCode(10));
     await tick();
     check(!save.disabled, "save stayed disabled after the import");
-    const refreshed = new Promise(resolve => {
-      const observer = new MutationObserver(() => { observer.disconnect(); resolve(); });
-      observer.observe(document.querySelector("#groups"), {childList: true});
-    });
+    const saved = refreshed();
     save.click();
     check(document.querySelector("#quit").disabled && document.querySelector("#wizard").disabled,
           "a navigation control stayed active while saving");
     finishSave();
-    await refreshed;
+    await saved;
     check(requests.length === 1 && requests[0].value === "replacement", "save sent the wrong value");
     check(!lookup("model", ".change").disabled, "the next editor stayed disabled");
     check(!document.querySelector("#quit").disabled && !document.querySelector("#wizard").disabled,
@@ -281,6 +283,16 @@ document.addEventListener("DOMContentLoaded", async () => {
     check(document.querySelector("#groups").inert && document.querySelector("#quit").disabled,
           "editing or closing stayed available after starting the wizard");
     check(requests.length === 2 && requests[1].action === "wizard", "save submitted while navigation was pending");
+    const returned = refreshed();
+    finishNavigation();
+    await returned;
+    view.id = 2; // Another tab saved while this tab still shows the old page.
+    document.querySelector("#wizard").click();
+    const recovered = refreshed();
+    finishNavigation();
+    await Promise.race([recovered, new Promise(resolve => setTimeout(resolve, 500))]);
+    document.querySelector("#wizard").click();
+    check(requests.length === 4 && requests[3].id === 2, "the wizard kept retrying with the stale page ID");
     finishNavigation();
     document.body.dataset.result = "passed";
   } catch (error) {

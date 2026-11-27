@@ -142,8 +142,15 @@ def cursor_team(value, config, state, old):
 
 
 def operator(value, config, state, old):
-    forges = {row["provider"] for row in setup.effective_projects(config)}
-    if forges != {"gitlab"} or ":" in value:
+    if ":" in value:
+        return validate_operator(value)
+    effective = setup.effective_projects(config)
+    forges = {row["provider"] for row in effective}
+    saved_forges = {row["provider"] for row in config["projects"]}
+    if forges != saved_forges or (forges == {"gitlab"} and
+                                 setup.gitlab_instances(effective) != setup.gitlab_instances(config["projects"])):
+        raise ValueError("Repository overrides change the forge for lookup. Enter username:numeric-id for the saved setup.")
+    if forges != {"gitlab"}:
         return validate_operator(accounts.resolve_operator(value, forges))
     base, token, verify = gitlab_access(config, old)
     return validate_operator(accounts.resolve_operator(value, forges, base=base, token=token, verify=verify))
@@ -331,7 +338,7 @@ def replace_credential(config, name, value, remove, written):
 
 
 def save(state, change, *, revision=None):
-    """Change one setting, project field or credential of the saved setup."""
+    """Change one setting and report whether the previous bundle was removed."""
     name, value, project = change.get("name"), change.get("value", ""), change.get("project")
     if not isinstance(name, str) or not isinstance(value, str) or project is not None and not isinstance(project, str):
         raise ValueError("Unknown setting")
@@ -363,6 +370,7 @@ def save(state, change, *, revision=None):
                 elif not Path(location).is_absolute():
                     # A mounted file stays a reference; a stored copy moves with its bundle.
                     shutil.copy(old / location, bundle / setup.SECRETS[secret])
+                    config["secrets"][secret] = setup.SECRETS[secret]
             if written.keys() & gitlab_tls.NAMES.keys():
                 try:
                     gitlab_tls.context(bundle)  # as the wizard does: refuse PEM data that TLS cannot load
@@ -376,4 +384,5 @@ def save(state, change, *, revision=None):
         try:
             shutil.rmtree(old)
         except OSError:
-            pass  # The change is active; a failure here must not be reported as an unsaved change.
+            return False
+        return True

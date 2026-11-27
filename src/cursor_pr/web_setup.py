@@ -17,6 +17,7 @@ from . import dialog, settings, setup
 
 
 SAVED = "Saved. The sync and reviewer services reload it between cycles."
+CLEANUP_WARNING = "The previous settings bundle could not be removed from the state volume."
 UNREADABLE = ("The saved settings could not be read to show them here. "
               "Reload the page to try again, or run the setup wizard.")
 
@@ -190,7 +191,7 @@ def change_setting(session, state, data):
         if not current or revision is None:
             return 409, None
         try:
-            settings.save(state, data, revision=revision)
+            old_bundle_removed = settings.save(state, data, revision=revision)
         except settings.StaleSettings:
             session.unread("The settings changed in another installer. Review the refreshed settings.")
             return 409, None
@@ -200,12 +201,15 @@ def change_setting(session, state, data):
             # Like the wizard, never echo an unexpected failure's details.
             return 400, {"error": "The setting could not be saved. Try again or use the setup wizard."}
         # The save has committed: from here on, the reply must not say otherwise.
+        notices = [SAVED]
+        if not old_bundle_removed:
+            notices.append(CLEANUP_WARNING)
         try:
             page = settings.view(state)
         except Exception:
-            view = session.unread(SAVED, UNREADABLE)
+            view = session.unread(*notices, UNREADABLE)
         else:
-            view = session.show(page, SAVED)
+            view = session.show(page, *notices)
     if view is None:
         return 409, None
     return 200, view

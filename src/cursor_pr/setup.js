@@ -35,7 +35,11 @@ async function api(method, data, path = "/step") {
   const res = await fetch(path, {method, headers: {"Content-Type": "application/json"},
     body: data === undefined ? undefined : JSON.stringify(data), cache: "no-store"});
   if (res.status === 401) throw Error("key");
-  if (!res.ok) throw Error("The installer refused the request. Open http://127.0.0.1:8765/ in this browser and try again.");
+  if (!res.ok) {
+    const error = Error("The installer refused the request. Open http://127.0.0.1:8765/ in this browser and try again.");
+    error.status = res.status;
+    throw error;
+  }
   return res;
 }
 function show_unlock(text) {
@@ -191,8 +195,15 @@ function render(view) {
 }
 wizard.onclick = async () => {
   settingsNavigation(true);
-  try { await api("POST", {id: step.id, action: "wizard"}); await load(); } catch (error) { fail(error); }
-  finally { settingsNavigation(false); }
+  try {
+    await api("POST", {id: step.id, action: "wizard"});
+    await load();
+  } catch (error) {
+    if (error.status === 409) await load().catch(fail);
+    else fail(error);
+  } finally {
+    settingsNavigation(false);
+  }
 };
 async function load() {
   if (quitting) return;

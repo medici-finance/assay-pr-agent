@@ -112,6 +112,22 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(os.environ["REVIEW_MAX_INPUT_TOKENS"], "8000")
         self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-codex")
 
+    def test_an_existing_relative_credential_path_survives_an_unrelated_save(self):
+        self.seed()
+        old = setup.active_bundle(self.state)
+        location = "keys/provider.key"
+        (old / "keys").mkdir()
+        (old / "codex.key").rename(old / location)
+        document = self.document()
+        document["secrets"]["CODEX_API_KEY"] = location
+        (old / "settings.json").write_text(json.dumps(document))
+        with patch.dict(os.environ):
+            setup.apply_saved_setup(self.state)
+            self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-codex")
+        settings.save(self.state, {"name": "REVIEW_MAX_INPUT_TOKENS", "value": "8000"})
+        setup.apply_saved_setup(self.state)
+        self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-codex")
+
     def test_invalid_values_keep_the_active_setup(self):
         self.seed()
         link = (self.state / "setup").readlink()
@@ -278,11 +294,21 @@ class SettingsTests(unittest.TestCase):
         for overrides in ({"REVIEW_PROJECTS": json.dumps([gitlab, other])},
                           {"REVIEW_PROJECTS": json.dumps([other]), "GITLAB_API_BASE": "https://gitlab.com/api/v4"},
                           {"REVIEW_PROJECTS": json.dumps([other]), "REVIEW_GITLAB_BASE_URL": "https://gitlab.com"}):
-            with self.subTest(overrides=overrides), patch.dict(os.environ, {setup.TOKEN: "fixture-env", **overrides}), \
-                    patch.object(accounts, "gitlab_id", return_value=13) as lookup:
+            with self.subTest(overrides=overrides), patch.dict(os.environ, {setup.TOKEN: "fixture-env", **overrides}):
                 with self.assertRaisesRegex(ValueError, "GitLab instance|must match"):
-                    settings.save(self.state, {"name": "REVIEW_OPERATOR", "value": "alice"})
-                lookup.assert_not_called()
+                    settings.gitlab_access(self.document(), setup.active_bundle(self.state))
+
+    def test_operator_lookup_does_not_persist_an_id_from_an_overridden_forge(self):
+        gitlab = dict(provider="gitlab", url="https://gitlab.com/org/repo", requester_ids=[13])
+        other = dict(gitlab, url="https://gitlab.example.org/org/repo")
+        self.seed(projects=[gitlab], secrets={setup.TOKEN: "fixture-token"})
+        with patch.dict(os.environ, {"REVIEW_PROJECTS": json.dumps([other]), setup.TOKEN: "fixture-env"}), \
+                patch.object(accounts, "gitlab_id", return_value=94) as lookup:
+            with self.assertRaisesRegex(ValueError, "username:numeric-id"):
+                settings.save(self.state, {"name": "REVIEW_OPERATOR", "value": "bob"})
+            lookup.assert_not_called()
+            settings.save(self.state, {"name": "REVIEW_OPERATOR", "value": "bob:37"})
+        self.assertEqual(self.document()["settings"]["REVIEW_OPERATOR"], "bob:37")
 
     def test_github_ids_are_saved_in_runtime_format(self):
         self.seed()
@@ -584,7 +610,7 @@ class SettingsSessionTests(unittest.TestCase):
         with patch.object(settings.shutil, "rmtree", side_effect=PermissionError("busy")):
             code, reply = change_setting(session, self.state, {"id": session.view["id"], "name": "REVIEW_MAX_INPUT_TOKENS", "value": "9000"})
         self.assertEqual(code, 200)
-        self.assertEqual(reply["messages"], [web_setup.SAVED])
+        self.assertEqual(reply["messages"], [web_setup.SAVED, "The previous settings bundle could not be removed from the state volume."])
         self.assertNotEqual(setup.active_bundle(self.state), old)
         self.assertEqual(item(reply, "REVIEW_MAX_INPUT_TOKENS")["value"], "9000")
 
