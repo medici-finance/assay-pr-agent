@@ -1,5 +1,6 @@
 """One bounded Cursor request using the published PR-Agent review rubric."""
-from collections import deque
+from bisect import bisect_left
+from collections import defaultdict, deque
 import fcntl
 import hashlib
 from importlib.metadata import distribution
@@ -561,13 +562,14 @@ def quoted_evidence(code, message, lines, start, end):
     if not concrete or not isinstance(lines, dict):
         return "unverified"
     cited = [(line, lines[line].rstrip("\r\n")) for line in range(start, end + 1)]
-    if not quoted_in_order(concrete, cited):
+    raw_matches = quoted_in_order(concrete, cited)
+    if raw_matches is None:
         # A fenced block in the message may be a suggested fix.
         return None if asked else "unverified"
     if covers(parts, cited, single_line=len(concrete) == 1):
         return "verified"
-    quote_margin = common_indent(part[0] for part in concrete)
-    source_margin = common_indent(line for _, line in cited if line.strip(" \t"))
+    quote_margin = common_indent(quote for quote, _ in raw_matches)
+    source_margin = common_indent(line for _, line in raw_matches)
     if quote_margin != source_margin and covers(parts, cited, quote_margin=quote_margin, source_margin=source_margin):
         return "verified"
     return "unverified"
@@ -577,9 +579,9 @@ FENCE_START = re.compile(r"(?m)^[ \t]*(`{3,})(?!`)[^`\r\n]*\r?\n")
 # A quoted line as the patch shows it: indented, numbered, and marked as added.
 SHOWN = re.compile(r"([1-9]\d*) (?:\+| )(.*)")
 # An explicit elision such as "..." or "# …": it stands for cited lines the quote leaves out.
-ELISION = re.compile(r"(?:#|//)?(?:\.{3,}|…)")
+ELISION = re.compile(r"(?:(?:#|//)[ \t]*)?(?:\.{3,}|…)")
 # The patch display's hunk markers stand for no code at all.
-MARKER = re.compile(r"__(?:new|old)hunk__")
+MARKER = re.compile(r"__(?:new|old) hunk__")
 ELIDED = object()
 
 
@@ -591,18 +593,6 @@ def fenced_quote(message):
     return message[opening.end():closing.start()] if closing else ""
 
 
-def quoted(issue):
-    """The code a finding quotes, and whether it is the relevant_code field the prompt asks for.
-
-    Without that field, the first fenced block of its text stands in.
-    """
-    code = issue.get("relevant_code")
-    if isinstance(code, str):
-        return code, True
-    found = FENCED.search(issue["issue_content"])
-    return (found.group(1) if found else ""), False
-
-
 def checkable(quote):
     """The quote's lines in order: each as its raw and numbered forms, or ELIDED for an explicit elision.
 
@@ -611,58 +601,104 @@ def checkable(quote):
     parts = []
     for raw in quote.split("\n"):
         raw = raw.removesuffix("\r")
-        text = raw.rstrip(" \t")
         shown = SHOWN.fullmatch(raw.lstrip(" \t"))
         if shown:
-            parts.append((text, shown[1], shown[2]))
+            parts.append((raw, shown[1], shown[2]))
             continue
-        squeezed = "".join(text.split())
-        if not text or MARKER.fullmatch(squeezed):
+        standalone = raw.strip(" \t")
+        if not standalone or MARKER.fullmatch(standalone):
             continue
-        if ELISION.fullmatch(squeezed):
+        if ELISION.fullmatch(standalone):
             if parts[-1:] != [ELIDED]:
                 parts.append(ELIDED)
         else:
-            parts.append((text, None, text))
+            parts.append((raw, None, raw))
     return parts
 
 
-def matches(part, index, line):
-    text, number, content = part
-    return text.lstrip(" \t") == line.strip(" \t") or (number == str(index) and content == line)
+def numbered_match(part, index, line):
+    return part[1] == str(index) and part[2] == line
 
 
 def quoted_in_order(parts, cited):
-    """Match whole head lines in order, accepting either raw code or the prompt's line display."""
+    """Match whole lines in order and collect the raw pairs used to infer a uniform indent."""
     remaining = iter(cited)
-    return all(any(matches(part, index, line) for index, line in remaining) for part in parts)
+    raw_matches = []
+    for part in parts:
+        text = part[0].lstrip(" \t")
+        for index, line in remaining:
+            if numbered_match(part, index, line):
+                break
+            if text == line.lstrip(" \t"):
+                raw_matches.append((part[0], line))
+                break
+        else:
+            return None
+    return raw_matches
 
 
 def common_indent(lines):
     return os.path.commonprefix([line[:len(line) - len(line.lstrip(" \t"))] for line in lines])
 
 
-def evidence_matches(part, index, line, quote_margin, source_margin, single_line):
-    text, number, content = part
-    if number == str(index) and content == line:
-        return True
-    line = line.rstrip(" \t")
+def evidence_key(text, margin, single_line):
     if single_line:
-        return text.lstrip(" \t") == line.lstrip(" \t")
-    return (text.startswith(quote_margin) and line.startswith(source_margin)
-            and text.removeprefix(quote_margin) == line.removeprefix(source_margin))
+        return text.lstrip(" \t")
+    return text.removeprefix(margin) if text.startswith(margin) else None
+
+
+def evidence_matches(part, index, line, quote_margin, source_margin, single_line):
+    if numbered_match(part, index, line):
+        return True
+    text = evidence_key(part[0], quote_margin, single_line)
+    return text is not None and text == evidence_key(line, source_margin, single_line)
+
+
+def indexed_evidence(cited, source_margin, single_line):
+    text_positions, numbered_positions = defaultdict(list), {}
+    for pos, (index, line) in enumerate(cited):
+        text = evidence_key(line, source_margin, single_line)
+        if text is not None:
+            text_positions[text].append(pos)
+        numbered_positions[str(index)] = pos
+    return text_positions, numbered_positions
+
+
+def isolated_evidence(part, cited, indexed, first, strong_from, quote_margin, single_line):
+    """Between elisions, retain only the earliest match with and without substantive evidence."""
+    text_positions, numbered_positions = indexed
+    positions = text_positions.get(evidence_key(part[0], quote_margin, single_line), ())
+    matching = set()
+    for start in (first, strong_from):
+        offset = bisect_left(positions, start)
+        if offset < len(positions):
+            matching.add(positions[offset])
+    numbered = numbered_positions.get(part[1])
+    if numbered is not None and numbered >= first and part[2] == cited[numbered][1]:
+        matching.add(numbered)
+    return {pos + 1: pos >= strong_from or substantive(cited[pos][1]) for pos in matching}
 
 
 def covers(parts, cited, *, quote_margin="", source_margin="", single_line=False):
     """Find coverage with consistent indentation and a substantive match on the same alignment."""
     reach = {0: False}  # next cited position -> whether any alignment here matched substantive code
-    for part in parts:
+    eliding, indexed = False, None
+    for offset, part in enumerate(parts):
         if not reach:
             return False
         if part is ELIDED:
-            strong_from = min((pos for pos, strong in reach.items() if strong), default=len(cited) + 1)
-            reach = {pos: pos >= strong_from for pos in range(min(reach), len(cited) + 1)}
+            eliding = True
             continue
+        if eliding:
+            eliding = False
+            first = min(reach)
+            strong_from = min((pos for pos, strong in reach.items() if strong), default=len(cited) + 1)
+            if offset + 1 < len(parts) and parts[offset + 1] is ELIDED:
+                if indexed is None:
+                    indexed = indexed_evidence(cited, source_margin, single_line)
+                reach = isolated_evidence(part, cited, indexed, first, strong_from, quote_margin, single_line)
+                continue
+            reach = {pos: pos >= strong_from for pos in range(first, len(cited) + 1)}
         step = {}
         last = max(reach)
         reachable = strong = False
@@ -678,6 +714,8 @@ def covers(parts, cited, *, quote_margin="", source_margin="", single_line=False
                     break
                 reachable = strong = False
         reach = step
+    if eliding:
+        return any(reach.values())
     last_nonblank = max((pos for pos, (_, line) in enumerate(cited) if line.strip(" \t")), default=-1)
     return any(strong and pos > last_nonblank for pos, strong in reach.items())
 

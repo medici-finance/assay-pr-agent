@@ -327,6 +327,30 @@ class QuotedEvidenceTests(unittest.TestCase):
                 parsed = engine.parse_answer(envelope([dict(issue(start=1, end=3), relevant_code=quote)]), anchors)
                 self.assertEqual(parsed["findings"][0]["evidence"], expected)
 
+    def test_uniform_shift_is_allowed_when_the_elision_skips_an_outdent(self):
+        anchors = shown("if ready:", "    prepare()", "    send()")
+        parsed = engine.parse_answer(envelope([dict(issue(start=1, end=3),
+                                                   relevant_code="...\nprepare()\nsend()")]), anchors)
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_raw_quotes_cannot_change_trailing_source_whitespace(self):
+        anchors = shown("    Authorization: token ")
+        exact = dict(issue(start=1, end=1), relevant_code="Authorization: token ")
+        [finding] = engine.parse_answer(envelope([exact]), anchors)["findings"]
+        self.assertEqual(finding["evidence"], "verified")
+        edited = dict(exact, relevant_code="Authorization: token")
+        parsed = engine.parse_answer(envelope([edited]), anchors)
+        self.assertEqual(parsed["findings"], [])
+        self.assertEqual(parsed["dropped"][0]["reason"], "quoted code does not match the cited lines")
+
+    def test_display_markers_and_elisions_must_keep_their_spelling(self):
+        for extra in ("__newhunk__", ". . .", ".\u00a0.\u00a0."):
+            with self.subTest(extra=extra):
+                quoted = dict(issue(start=1, end=1), relevant_code="check_config()\n" + extra)
+                parsed = engine.parse_answer(envelope([quoted]), shown("check_config()"))
+                self.assertEqual(parsed["findings"], [])
+                self.assertEqual(parsed["dropped"][0]["reason"], "quoted code does not match the cited lines")
+
     def test_covered_alignment_must_include_a_substantive_match(self):
         parsed = engine.parse_answer(envelope([dict(issue(start=1, end=2), relevant_code="1 +x\n...")]),
                                      shown("x", "1 +x"))
@@ -348,6 +372,13 @@ class QuotedEvidenceTests(unittest.TestCase):
         cited = [(n, BlankLine(" ")) for n in range(1, 101)] + [(101, "return x")]
         self.assertTrue(engine.covers(engine.checkable("...\nreturn x"), cited))
         self.assertLess(BlankLine.inspections, 4 * len(cited))
+
+    def test_repeated_elisions_do_not_revisit_each_remaining_source_line(self):
+        cited = [(n, "check()") for n in range(1, 501)]
+        parts = engine.checkable("...\ncheck()\n" * 50 + "...")
+        with patch.object(engine, "evidence_matches", wraps=engine.evidence_matches) as matches:
+            self.assertTrue(engine.covers(parts, cited))
+        self.assertLess(matches.call_count, 5 * len(cited))
 
     def test_blank_cited_lines_need_no_quote(self):
         anchors = shown("first = 1", "", "second = 2")
