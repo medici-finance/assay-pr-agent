@@ -14,12 +14,15 @@ class TierContextTests(unittest.TestCase):
     def test_gitlab_context_excludes_non_public_and_unverified_notes(self):
         project = project_from(dict(provider="gitlab", url="https://gitlab.com/team/repo",
                                     checkout=tempfile.gettempdir(), requester_ids=[1]))
-        visible = dict(system=False, internal=False, noteable_type="MergeRequest", noteable_iid=7)
+        visible = dict(system=False, internal=False, noteable_type="MergeRequest", noteable_iid=7,
+                       author={"id": 1, "bot": False})
         notes = [dict(visible, body="Public update"), dict(visible, body="Internal", internal=True),
                  dict(visible, body="Confidential", confidential=True),
                  dict(visible, body="System", system=True),
                  dict(visible, body="Different change", noteable_iid=8),
                  dict(visible, body="Visibility unknown", internal=None),
+                 dict(visible, body="Different author", author={"id": 2}),
+                 dict(visible, body="Bot author", author={"id": 1, "bot": True}),
                  dict(visible, body="Earlier public update")]
         response = Mock()
         response.json.return_value = notes
@@ -29,6 +32,18 @@ class TierContextTests(unittest.TestCase):
             result = discovery.context_comments(project, 7)
         self.assertEqual([note["body"] for note in result], ["Earlier public update", "Public update"])
         self.assertFalse(get.call_args.kwargs["follow_redirects"])
+
+    def test_github_context_requires_a_human_requester_on_this_change(self):
+        project = project_from(dict(provider="github", url="https://github.com/org/repo",
+                                    checkout=tempfile.gettempdir(), requester_ids=[1]))
+        address = project.change_url(7)
+        allowed = dict(authorId=1, authorType="User", databaseId=4, url=f"{address}#issuecomment-4",
+                       body="Authorized update")
+        notes = [allowed, dict(allowed, authorId=2), dict(allowed, authorType="Bot"),
+                 dict(allowed, url=f"{project.change_url(8)}#issuecomment-4")]
+        with patch.object(discovery, "run_forge", return_value={"items": [{"number": 7, "comments": notes}]}) as run:
+            self.assertEqual(discovery.context_comments(project, 7), [allowed])
+        run.assert_called_once_with("context-comments", project, numbers=[7], timeout=120)
 
     def test_blob_preserves_leading_blank_lines_and_indentation_and_grep_is_bounded(self):
         with tempfile.TemporaryDirectory() as path:

@@ -407,7 +407,9 @@ def execute(args):
     metadata = {"title": change.title, "description": change.description} if tier == "regular" else {}
     (prompt, anchors, unseen, has_text), estimated, full, dropped = fit(
         files, checks, limit, cap, rendered=rendered, **metadata)
-    plans, fates, deep_fates = [], [], []
+    plans = []
+    fates = context.assemble(context.MID, raw, 0)[1] if tier != "regular" else []
+    deep_fates = context.assemble(context.DEEP, raw, 0)[1] if tier == "max" else []
     first_paths = set()
     if has_text and estimated <= limit:
         if tier != "regular":

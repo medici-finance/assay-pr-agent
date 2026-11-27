@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 
 	"github.com/medici-finance/assay/tools/desk/forgechange"
 )
@@ -46,12 +47,16 @@ func execute(verb string, in request) (any, error) {
 		rt.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 		transport = &http.Client{Transport: rt}
 	}
-	var capture *changeCapture
-	if verb == "change-with-description" {
+	var capture *forgeCapture
+	visibility := make(commentVisibility)
+	if verb == "change-with-description" || (verb == "context-comments" && in.Forge == "github") {
 		if transport == nil {
 			transport = &http.Client{Transport: http.DefaultTransport}
 		}
-		capture = &changeCapture{next: transport.Transport}
+		capture = &forgeCapture{next: transport.Transport}
+		if verb == "context-comments" {
+			capture.onPage = visibility.record
+		}
 		transport.Transport = capture
 	}
 	client, err := forgechange.New(forgechange.Config{
@@ -68,7 +73,10 @@ func execute(verb string, in request) (any, error) {
 			Numbers []int `json:"numbers"`
 			Capped  bool  `json:"capped"`
 		}{numbers, capped}, err
-	case "comments":
+	case "comments", "context-comments":
+		if verb == "context-comments" && (in.Forge != "github" || len(in.Numbers) != 1) {
+			return nil, errors.New("expected one GitHub change for context comments")
+		}
 		out := struct {
 			Items   []thread `json:"items"`
 			Partial []int    `json:"partial"`
@@ -79,6 +87,11 @@ func execute(verb string, in request) (any, error) {
 				fmt.Fprintf(os.Stderr, "change %d: %v\n", n, err)
 				out.Partial = append(out.Partial, n)
 				continue
+			}
+			if verb == "context-comments" {
+				rows = slices.DeleteFunc(rows, func(row forgechange.Comment) bool {
+					return !visibility[row.DatabaseID]
+				})
 			}
 			out.Items = append(out.Items, thread{n, rows})
 		}

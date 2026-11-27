@@ -402,6 +402,25 @@ class TierTests(unittest.TestCase):
         self.assertIsNotNone(text)
         self.assertIn("## tests/test_app.py at the head", text)
 
+    def test_existing_tests_handles_paths_git_would_quote(self):
+        name = "tests/test_app_é.py"
+        self.write(name, "def test_accented_path(): pass\n")
+        self.commit("add a test with a non-ASCII filename")
+        head = self.git("rev-parse", "HEAD")
+        files = [f for f in cli.local_change(self.root, "main", head).files if f.path == "src/app.py"]
+        text = context.existing_tests(self.root, head, files)
+        self.assertIn(f"## {name} at the head", text)
+        self.assertIn("def test_accented_path(): pass", text)
+        self.assertIn("## tests/test_app.py at the head", text)
+
+    def test_max_reports_context_when_no_prompt_fits(self):
+        raw = {name: "Some useful evidence." for name in (*context.MID, *context.DEEP)}
+        with patch.object(context, "gather", return_value=raw):
+            code, report = self.check("--tier", "max", "--estimate", "--max-input-tokens", "1")
+        self.assertEqual((code, report["state"]), (2, "over-budget"))
+        self.assertEqual({row["name"] for row in report["context"]}, set(raw))
+        self.assertTrue(all(row["state"] == "dropped" for row in report["context"]))
+
     def test_context_heading_alone_cannot_upgrade_the_delivered_tier(self):
         name = "whole changed files"
         long_line = "large source line " * 1000

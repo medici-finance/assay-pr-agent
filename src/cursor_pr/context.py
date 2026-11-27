@@ -241,7 +241,17 @@ def existing_tests(repo, head, files):
     stems = {f.path.rsplit("/", 1)[-1].split(".", 1)[0].lower() for f in live(files) if rank(f.path) == SOURCE_RANK}
     stems = {stem for stem in stems if len(stem) >= 3}
     parts = []
-    for path in git(repo, "ls-tree", "-r", "--name-only", head).splitlines():
+    if not stems:
+        return ""
+    tree = git_bytes(repo, "ls-tree", "-r", "-z", head)
+    for entry in tree.split(b"\0"):
+        metadata, _, raw_path = entry.partition(b"\t")
+        if b" blob " not in metadata:
+            continue
+        try:
+            path = raw_path.decode()
+        except UnicodeDecodeError:
+            continue
         name = path.rsplit("/", 1)[-1].lower()
         if (path not in changed and rank(path) == 1 and any(stem in name for stem in stems) and len(parts) < 6
                 and (text := blob(repo, head, path)) is not None):

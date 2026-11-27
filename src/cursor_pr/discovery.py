@@ -28,8 +28,8 @@ def open_changes(project):
     return numbers
 
 
-def comment_threads(project, numbers):
-    result = run_forge("comments", project, numbers=numbers, timeout=120)
+def comment_threads(project, numbers, *, verb="comments"):
+    result = run_forge(verb, project, numbers=numbers, timeout=120)
     threads = {}
     for row in result["items"]:
         number = row["number"]
@@ -77,9 +77,15 @@ def visible_gitlab_note(note, number):
 
 
 def context_comments(project, number):
-    """Read comments whose visibility permits using them in review context."""
-    if project.provider != "gitlab":
-        return comment_threads(project, [number]).get(number)
+    """Read visible context comments from authorized review requesters."""
+    if project.provider == "github":
+        notes = comment_threads(project, [number], verb="context-comments").get(number)
+        if notes is None:
+            return None
+        return [note for note in notes if type(note.get("authorId")) is int
+                and note["authorId"] in project.requesters and note.get("authorType") == "User"
+                and type(note.get("databaseId")) is int and note["databaseId"] > 0
+                and note.get("url") == f"{project.change_url(number)}#issuecomment-{note['databaseId']}"]
     url, token = gitlab_notes(project, number)
     response = httpx.get(url, headers={"PRIVATE-TOKEN": token}, follow_redirects=False, timeout=15,
                          params={"per_page": 20, "activity_filter": "only_comments",
@@ -89,7 +95,9 @@ def context_comments(project, number):
     rows = response.json()
     if not isinstance(rows, list):
         raise ReviewError("Invalid GitLab note list")
-    return [row for row in reversed(rows) if isinstance(row, dict) and visible_gitlab_note(row, number)]
+    return [row for row in reversed(rows) if isinstance(row, dict) and visible_gitlab_note(row, number)
+            and isinstance(author := row.get("author"), dict) and type(author.get("id")) is int
+            and author["id"] in project.requesters and not author.get("bot")]
 
 
 def public_gitlab_request(project, number, note):

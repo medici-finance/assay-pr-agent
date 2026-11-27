@@ -69,8 +69,8 @@ func TestChangeDescriptionUsesTheValidatedForgeResponse(t *testing.T) {
 }
 
 func TestDescriptionCaptureKeepsBounds(t *testing.T) {
-	var capture changeCapture
-	chunk := []byte(strings.Repeat("a", maxChangeResponse/2))
+	var capture forgeCapture
+	chunk := []byte(strings.Repeat("a", maxCapturedResponse/2))
 	for range 3 {
 		if n, err := capture.Write(chunk); err != nil || n != len(chunk) {
 			t.Fatalf("capture interfered with adapter body reads: %d, %v", n, err)
