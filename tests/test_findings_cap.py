@@ -112,6 +112,18 @@ class RegularCommentSizeTests(unittest.TestCase):
         self.assertLessEqual(size, cli.FORGE_COMMENT_BYTES)
         self.assertGreater(size, cli.FORGE_COMMENT_BYTES - 6 * 8)
 
+    def test_shortening_reserves_space_for_a_finding_with_a_long_path(self):
+        long_path = "p" * 1050 + ".py"
+        findings = [dict(self.finding(1, "short and whole"), path=long_path),
+                    self.finding(2, "y" * 3000)]
+        comment = self.post(self.report(findings, scanner_rows=141))
+
+        self.assertLessEqual(cli.size_of(comment), cli.FORGE_COMMENT_BYTES)
+        self.assertIn("Some findings were shortened to fit the forge comment.", comment)
+        self.assertIn(f"` {long_path} `:1", comment)
+        self.assertIn("` short and whole `\n", comment)
+        self.assertEqual(comment.count("SC2086"), 141)
+
     def test_falls_back_to_compact_rows_when_the_other_rows_leave_too_little_room(self):
         findings = [self.finding(n, "z" * 2000) for n in range(1, 7)]
         comment = self.post(self.report(findings, scanner_rows=300))

@@ -35,6 +35,7 @@ from .source import ReviewError, ci_refs, forge_change, local_change, post_comme
 
 MAX_DEGRADED_ROWS = 50
 FORGE_COMMENT_BYTES = 16 * 1024
+COMPACT_FINDING_MESSAGE = 140
 # Each tier's whole budget is this multiple of the configured input-token limit.
 TIERS = {"regular": 1, "mid": 2, "max": 10}
 TIMEOUTS = {"regular": 120, "mid": 240, "max": 480}
@@ -243,7 +244,7 @@ def finding_line(issue, *, compact=False, shorten_path=False, clip=None):
         tag = hashlib.sha256(path.encode("utf-8")).hexdigest()[:12]
         path = f"…/{path[-80:]} [{tag}]"
     title = fence(issue["title"], 60 if compact else None)
-    message = fence(issue["message"], 140 if compact else clip)
+    message = fence(issue["message"], COMPACT_FINDING_MESSAGE if compact else clip)
     return f"- {fence(path)}:{issue['line']} — {title}. {message}" + (" (shortened)" if clip else "")
 
 
@@ -253,7 +254,7 @@ def size_of(text):
 
 def shortened_finding(issue, allowance):
     """The finding row with the longest message that fits, keeping at least the compact 140 characters."""
-    low, high, best = 140, len(issue["message"]), None
+    low, high, best = COMPACT_FINDING_MESSAGE, len(issue["message"]), None
     while low <= high:
         middle = (low + high) // 2
         row = comment_text([finding_line(issue, clip=middle)])
@@ -265,18 +266,26 @@ def shortened_finding(issue, allowance):
 
 
 def bounded_findings(issues, space):
-    """Share space evenly among findings, shortening only the longest messages; None when they cannot fit."""
+    """Reserve the minimum for each row before sharing space for additional detail."""
     full = [comment_text([finding_line(issue)]) for issue in issues]
-    rows = list(full)
-    remaining = space
+    rows = full.copy()
+    for index, issue in enumerate(issues):
+        if len(issue["message"]) > COMPACT_FINDING_MESSAGE:
+            shortened = comment_text([finding_line(issue, clip=COMPACT_FINDING_MESSAGE)])
+            rows[index] = min((full[index], shortened), key=size_of)
+    minimum_sizes = [size_of(row) for row in rows]
+    remaining = space - sum(minimum_sizes)
+    if remaining < 0:
+        return None
+
     order = sorted(range(len(issues)), key=lambda index: size_of(full[index]))
     for position, index in enumerate(order):
-        share = remaining // (len(order) - position)
-        if size_of(rows[index]) > share:
-            rows[index] = shortened_finding(issues[index], share)
-            if rows[index] is None:
-                return None
-        remaining -= size_of(rows[index])
+        allowance = minimum_sizes[index] + remaining // (len(order) - position)
+        if size_of(full[index]) <= allowance:
+            rows[index] = full[index]
+        else:
+            rows[index] = shortened_finding(issues[index], allowance) or rows[index]
+        remaining -= size_of(rows[index]) - minimum_sizes[index]
     return rows
 
 
