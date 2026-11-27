@@ -7,6 +7,8 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -274,6 +276,42 @@ class MarkerTests(Offline):
         owed = ack.jobs.owed(job)
         self.assertEqual((owed["cleared"], owed["cleared_tries"]), (0, 1))
         self.assertNotIn((*job, "reviewed"), ack.jobs.unfinished_acknowledgements(acknowledge.time.time()))  # It waits its minute.
+
+    def test_forge_that_keeps_a_response_open_holds_a_call_no_longer_than_its_time(self):
+        ack = self.ack()
+        job = self.gh.key, 3, 81
+        ack.jobs.next()
+        ack.jobs.finish(job, "reviewed")
+        with httpx.Client() as made:
+            client = type(made)
+        release, asked = threading.Event(), []
+        self.addCleanup(lambda: acknowledge.unanswered.__setitem__(0, None))
+        self.addCleanup(release.set)
+
+        def open_ended(**options):
+            def hold(request):
+                # As a forge sending a few bytes inside every read timeout: no timeout of httpx's ends it.
+                asked.append(request.method)
+                release.wait(30)
+                return httpx.Response(200, json=dict(id=101, content="eyes"), request=request)
+            return client(transport=httpx.MockTransport(hold), **options)
+        with patch.object(acknowledge.httpx, "Client", side_effect=open_ended):
+            began = time.monotonic()
+            with self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
+                ack.finished(self.gh, 3, 81, "reviewed", began + 0.3)
+            self.assertLess(time.monotonic() - began, 5)
+            self.assertIn("ReadTimeout", logged.output[0])
+            self.assertEqual(ack.jobs.owed(job)["cleared_tries"], 1)
+            # While that request is still open no other is started: one thread at most is left behind.
+            with self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
+                ack.finished(self.gh, 3, 81, "reviewed")
+            self.assertIn("an earlier request to the forge is still unanswered", logged.output[0])
+            self.assertEqual(asked, ["POST"])
+            release.set()
+            acknowledge.unanswered[0].join(10)
+            ack.finished(self.gh, 3, 81, "reviewed")  # The forge answers again, and so the removal is made.
+        self.assertEqual(asked, ["POST", "POST", "DELETE"])
+        self.assertIsNone(ack.jobs.owed(job))
 
     def test_a_call_that_started_is_a_try_however_little_time_it_had(self):
         ack = self.ack()

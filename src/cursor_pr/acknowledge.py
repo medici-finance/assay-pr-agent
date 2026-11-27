@@ -1,6 +1,8 @@
 """Mark a queued review request on the forge, and tell the requester when nothing was posted."""
 import logging
 import os
+import queue
+import threading
 import time
 from urllib.parse import quote
 
@@ -57,16 +59,46 @@ def refused(response):
     return 300 <= response.status_code < 500 and not limited
 
 
+# The one request the forge has not answered within its time, still running in its thread.
+unanswered = [None]
+
+
 def request(project, method, url, headers, deadline=None, **options):
-    # The posture of the GitLab note lookup: no redirects, and a private CA only for its own instance.
-    # With a deadline, no request starts after it and none waits past it for the forge.
+    """One request to the forge API, over within its time whatever the forge does.
+
+    The posture of the GitLab note lookup: no redirects, and a private CA only for its own instance.
+    With a deadline, no request starts after it and none waits past it. httpx applies its timeout to
+    each connect, write and read by itself, so a forge that sends a few bytes just inside every read
+    could hold a call for as long as it liked. The request therefore runs in a thread of its own and
+    is waited for until the time is up, and no longer. A request left behind like that stays the only
+    one: while it runs, no other is started, so a forge that does this costs one thread and one
+    connection, not one per call.
+    """
     left = TIMEOUT_SECONDS if deadline is None else min(TIMEOUT_SECONDS, deadline - time.monotonic())
     if left <= 0:
         raise OutOfTime()
-    with httpx.Client(timeout=left, follow_redirects=False,
-                      **(client_options() if project.provider == "gitlab" else {})) as client:
-        started[0] += 1
-        return client.request(method, url, headers=headers, **options)
+    if unanswered[0] is not None and unanswered[0].is_alive():
+        raise ReviewError("an earlier request to the forge is still unanswered")
+    answer = queue.SimpleQueue()
+
+    def send():
+        try:
+            with httpx.Client(timeout=left, follow_redirects=False,
+                              **(client_options() if project.provider == "gitlab" else {})) as client:
+                answer.put((client.request(method, url, headers=headers, **options), None))
+        except BaseException as err:
+            answer.put((None, err))
+    started[0] += 1
+    thread = threading.Thread(target=send, name="forge-marker-request", daemon=True)
+    thread.start()
+    try:
+        response, error = answer.get(timeout=left)
+    except queue.Empty:
+        unanswered[0] = thread
+        raise httpx.ReadTimeout("The forge did not answer in time") from None
+    if error is not None:
+        raise error
+    return response
 
 
 def reviewer(project, number, comment):
