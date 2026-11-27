@@ -153,6 +153,8 @@ class Jobs:
             if listing_complete:
                 db.executemany("DELETE FROM schedule WHERE project=? AND number=?",
                                [(project, number) for number in saved if number not in numbers])
+                for key in [key for key in self.read if key[0] == project and key[1] not in numbers]:
+                    del self.read[key]  # Forgotten with its row, or it would be kept for every change ever read.
         # A clock that moved back past the last read makes the saved times meaningless, so read now.
         # One that moved back less would make a change wait for longer than it was given, so a read
         # this process made is also due once that long has passed by its own steady clock.
@@ -164,6 +166,7 @@ class Jobs:
     def forget_schedule(self):
         with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("DELETE FROM schedule")
+        self.read.clear()
 
     def observed(self, project, changes, now, interval, cap):
         """Keep one complete read of each change, given as (number, comments, newest, active). A first look,

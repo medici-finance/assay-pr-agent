@@ -1222,6 +1222,7 @@ class ReadScheduleTests(Offline):
         self.partial, self.open = set(), [4, 5]
         self.assertEqual(self.tick(), [4, 5])  # 720
         self.assertEqual([row[0] for row in self.schedule()], [4, 5])  # A closed change is forgotten.
+        self.assertEqual(sorted(number for _, number in self.jobs.read), [4, 5])  # Also in memory.
 
     def test_one_batch_of_reads_is_kept_in_one_transaction(self):
         self.open = list(range(3, 23))
