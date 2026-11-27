@@ -100,9 +100,37 @@ class DroppedSummaryTests(unittest.TestCase):
              patch.object(engine, "invoke", return_value=parsed), \
              patch.object(cli, "post_comment", side_effect=lambda *args: posts.append(args[3])):
             report, code = cli.run_request(args)
-        self.assertEqual((code, report["state"], report["findings"], report["dropped"]), (0, "reviewed", [], parsed["dropped"]))
+        self.assertEqual((code, report["state"], report["findings"], report["dropped"]), (2, "findings-dropped", [], parsed["dropped"]))
         self.assertIn("Dropped 1 model finding: cited line outside the reviewed patch.", posts[0])
         self.assertNotIn("No model findings in the reviewed scope.", posts[0])
+        self.assertIn("findings-dropped", posts[0])
+
+    def run_with(self, parsed, files=None, scan=()):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        args = cli.parser().parse_args(["--repo", tmp.name, "--cache-dir", str(Path(tmp.name) / "cache"),
+                                        "--change", "org/repo#1", "--max-input-tokens", "6000"])
+        files = files or [source.File("a.py", "@@ -0,0 +1,2 @@\n+x = 1\n+y = 2\n", "added")]
+        with patch.object(cli, "forge_change", return_value=source.Change("a" * 40, files, "org/repo#1")), \
+             patch.object(cli, "scan_files", return_value=list(scan)), patch.object(engine, "invoke", return_value=parsed):
+            return cli.run_request(args)
+
+    def test_all_dropped_outranks_incomplete_coverage(self):
+        parsed = {"findings": [], "dropped": [{"path": "a.py", "line": 9, "reason": "malformed finding"}], "cursor_usage": None}
+        check = {"tool": "osv", "path": "go.mod", "state": "could-not-check", "findings": []}
+        report, code = self.run_with(parsed, scan=[check])
+        self.assertEqual((code, report["state"]), (2, "findings-dropped"))
+
+    def test_some_dropped_or_none_returned_keeps_the_usual_state(self):
+        kept = {"path": "a.py", "line": 1, "end_line": 1, "title": "T", "message": "M"}
+        for parsed, state in (({"findings": [kept], "dropped": [{"path": "a.py", "line": 9, "reason": "malformed finding"}],
+                                "cursor_usage": None}, "reviewed"),
+                              ({"findings": [], "dropped": [], "cursor_usage": None}, "reviewed"),
+                              ({"findings": [], "cursor_usage": None}, "reviewed")):
+            with self.subTest(parsed=parsed):
+                report, code = self.run_with(parsed)
+                self.assertEqual((code, report["state"]), (0, state))
+
 
 if __name__ == "__main__":
     unittest.main()
