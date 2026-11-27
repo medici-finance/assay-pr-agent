@@ -222,6 +222,41 @@ class MarkerTests(Offline):
         self.assertEqual([row["id"] for row in self.eyes], [11, 13])
         self.assertIsNone(ack.jobs.acknowledgement(job))
 
+    def test_marker_written_and_then_refused_at_its_removal_is_said_to_be_left(self):
+        ack = self.ack()
+        job = self.gh.key, 3, 81
+        ack.queued(self.gh, 3, 81)  # Written. The credential loses the permission during the review.
+        ack.jobs.next()
+        ack.jobs.finish(job, "reviewed")
+        self.refuse = {("POST", GITHUB): 403}
+        with self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
+            ack.finished(self.gh, 3, 81, "reviewed")
+        self.assertEqual([line.split(": ", 1)[1] for line in logged.output], ["HTTP 403"])
+        self.assertIn("may be left in place", logged.output[0])
+        self.assertIsNone(ack.jobs.acknowledgement(job))  # Final: not tried again.
+
+    def test_a_call_cut_short_by_the_deadline_is_not_a_failed_try(self):
+        ack = self.ack()
+        job = self.gh.key, 3, 81
+        ack.jobs.next()
+        ack.jobs.finish(job, "failed")
+        with httpx.Client() as made:
+            client = type(made)
+        waits = []
+
+        def silent(**options):
+            def wait(request):
+                waits.append(options["timeout"])
+                raise httpx.ReadTimeout("no answer", request=request)
+            return client(transport=httpx.MockTransport(wait), **options)
+        with patch.object(acknowledge.time, "monotonic", return_value=1000.0), \
+                patch.object(acknowledge.httpx, "Client", side_effect=silent), \
+                patch.object(acknowledge, "run_forge", side_effect=subprocess.TimeoutExpired("change", 2)), \
+                self.assertNoLogs("cursor_pr.acknowledge", level="WARNING"):
+            ack.finished(self.gh, 3, 81, "failed", 1002.0)  # Two seconds are left of the cycle's time.
+        self.assertEqual(waits, [2.0])
+        self.assertEqual((ack.jobs.acknowledgement(job), ack.jobs.acknowledgement_tries(job)), ((0, 0), 0))
+
     def test_removal_refused_for_good_is_not_owed_any_longer_and_says_what_may_be_left(self):
         cases = [(self.gh, {("DELETE", GITHUB + "/101"): 403}, "HTTP 403"), (self.gh, {("DELETE", GITHUB + "/101"): 301}, "HTTP 301"),
                  (self.gh, {("DELETE", GITHUB + "/101"): 404}, None), (self.gl, {("GET", GITLAB): 404}, None),
