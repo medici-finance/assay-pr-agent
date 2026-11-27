@@ -552,6 +552,11 @@ def parser():
 
 
 def execute(args):
+    with ExitStack() as verification_resources:
+        return execute_review(args, verification_resources)
+
+
+def execute_review(args, verification_resources):
     if args.max_input_tokens < 1 or (args.head and not args.base) or (args.post and (not args.change or args.estimate)):
         raise ReviewError("Invalid budget or incompatible --head/--post options")
     if bool(args.queue) != bool(args.request) or (args.request and not args.change):
@@ -598,11 +603,12 @@ def execute(args):
             number = args.change.rsplit("#", 1)[1]
             if args.expected_change_url != project.change_url(number):
                 raise ReviewError("Managed checkout and reviewed project differ")
-            resources = getattr(args, "sarif_resources", stack)
+            resources = getattr(args, "sarif_resources", verification_resources if args.tier != "regular" else stack)
             checkout = resources.enter_context(scan_checkout(root, project, number, change.head))
-            if resources is not stack:
+            if hasattr(args, "sarif_resources"):
                 args.sarif_checkout = checkout
-        checks = scan_files(checkout, change.head, files)
+        patch_base = drift.patch_base(root, checkout, change)
+        checks = scan_files(checkout, change.head, files, base_root=root, base=patch_base)
         deadline = time.monotonic() + 180
         for tool, path in missing:
             remaining = deadline - time.monotonic()
@@ -768,8 +774,9 @@ def execute(args):
         before = len(findings)
         left = budget - report["estimated_input_tokens"]
         report["verification"] = {"state": "unavailable", "before": before}
+        comparison = context.verification_comparison(root, checkout, patch_base, change.head)
         for radius in (15, 8, 3, 0):
-            check = verification(findings, files, radius)
+            check = verification(findings, files, radius, comparison=comparison)
             size = tokens(check)
             if size <= left:
                 row = {"name": "verification", "estimated_input_tokens": size, "state": "planned"}

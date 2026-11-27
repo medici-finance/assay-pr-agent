@@ -122,6 +122,8 @@ class TierTests(unittest.TestCase):
         prompt = engine.pack(files, [], title=change.title, description=change.description,
                              commit_messages=True)[0]
         self.assertEqual(self.prompts(), [["review", prompt]])
+        self.assertIn("observable behavior on base and head", prompt)
+        self.assertIn("prefix its title with Unverified", prompt)
         self.assertEqual((code, report["state"], report["tier"], report["delivered"]), (0, "reviewed", "regular", "regular"))
         self.assertEqual(report["verification"], {"state": "not-needed"})
 
@@ -139,6 +141,9 @@ class TierTests(unittest.TestCase):
             self.assertIn(expected, prompt)
         self.assertIn("42 +    return value * 2", check)
         self.assertIn('"issue_header": "Spurious"', check)
+        self.assertIn("Base source (src/app.py)", check)
+        self.assertIn("Head source (src/app.py)", check)
+        self.assertIn("compare the same concrete scenario on base and head", check)
         self.assertEqual((code, report["state"], report["delivered"]), (0, "reviewed", "mid"))
         self.assertEqual([(f["line"], f["title"]) for f in report["findings"]], [(42, "Real")])
         self.assertEqual(report["verification"], {"state": "filtered", "before": 2, "after": 1})

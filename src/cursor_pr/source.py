@@ -1,18 +1,20 @@
 """Read a forge snapshot with Assay, or compare two immutable local Git revisions."""
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
 import os
-from .credentials import SECRET_INPUTS, private_file, validate_token
-from .providers import KEYS
-from dataclasses import dataclass
 from pathlib import Path
 import re
 import selectors
 import subprocess
 import time
 
+from unidiff import PatchSet
+
+from .credentials import SECRET_INPUTS, private_file, validate_token
+from .providers import KEYS
 
 class ReviewError(Exception):
     pass
@@ -142,6 +144,35 @@ def bounded_text(value, limit):
     return value if len(value) <= limit else value[:limit].rstrip() + TRUNCATED
 
 
+def hunks(f):
+    """Parsed hunks of one file's patch."""
+    # Parse under a fixed synthetic name; the source envelope owns the actual filename.
+    parsed = PatchSet("--- a/file\n+++ b/file\n" + f.patch.rstrip("\n") + "\n")
+    if len(parsed) != 1 or not parsed[0]:
+        raise ReviewError("Incomplete or unrecognized patch in " + f.path)
+    return parsed[0]
+
+
+def base_line(patch, line, *, nearest=False):
+    """Find the corresponding base line, with an optional nearby anchor for insertions."""
+    offset = 0
+    for hunk in patch:
+        start = hunk.target_start + (hunk.target_length == 0)
+        end = start + hunk.target_length
+        if line < start:
+            break
+        if line < end:
+            previous = hunk.source_start
+            for row in hunk:
+                if row.target_line_no == line:
+                    return (row.source_line_no or max(1, previous)) if nearest else row.source_line_no
+                if row.source_line_no is not None:
+                    previous = row.source_line_no
+            return None
+        offset = hunk.source_start + hunk.source_length + (hunk.source_length == 0) - end
+    return line + offset
+
+
 @dataclass(frozen=True)
 class File:
     path: str
@@ -161,6 +192,7 @@ class Change:
     title: str = ""
     description: str = ""
     description_truncated: bool = False
+    patch_base: str = ""  # immutable preimage commit when the comparison supplies it
 
 
 def forge_change(address, expected_url=None, *, project=None, with_description=False):
@@ -208,8 +240,10 @@ def forge_change(address, expected_url=None, *, project=None, with_description=F
     title = bounded_text(last.get("title"), TITLE_LIMIT)
     description = bounded_text(last.get("body"), DESCRIPTION_LIMIT)
     truncated = last.get("descriptionTruncated") is True or any(text.endswith(TRUNCATED) for text in (title, description))
-    return Change(head, files, first.get("url") or address, base_ref=base_ref if isinstance(base_ref, str) else "",
-                  title=title, description=description, description_truncated=truncated)
+    base, patch_base = last.get("baseSha"), last.get("diffBaseSha")
+    return Change(head, files, first.get("url") or address, base=base if valid_sha(base) else "",
+                  base_ref=base_ref if isinstance(base_ref, str) else "", title=title, description=description,
+                  description_truncated=truncated, patch_base=patch_base if valid_sha(patch_base) else "")
 
 
 def git(root, *args):
@@ -235,7 +269,8 @@ def local_change(root, base, head):
         except UnicodeDecodeError:
             patch = ""
         files.append(File(path, patch, status, not bool(patch)))
-    return Change(head, files, str(root.resolve()), base=tip, description=local_description(root, base, head))
+    return Change(head, files, str(root.resolve()), base=tip, description=local_description(root, base, head),
+                  patch_base=base)
 
 
 def local_description(root, base, head):

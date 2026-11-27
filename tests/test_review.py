@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from cursor_pr import cli, engine, source
+from cursor_pr import checks, cli, engine, source
 
 
 class ReviewTest(unittest.TestCase):
@@ -74,6 +74,33 @@ class ReviewTest(unittest.TestCase):
         self.assertTrue(self.check(*args)[1]["cache_hit"])
         self.assertFalse(self.check(*args, "--model", "another-model")[1]["cache_hit"])
         self.assertEqual(self.calls.read_text().splitlines(), ["call", "call"])
+
+    def test_scanner_suppresses_an_equivalent_shifted_warning(self):
+        old_head = self.head
+        script = self.root / "example.sh"
+        script.write_text("#!/bin/sh\n# The existing warning moves.\necho $argument\necho $new\n")
+        self.git("add", "example.sh")
+        self.git("commit", "-qm", "Add another argument")
+        warning = {"code": 2086, "column": 6, "endColumn": 8, "level": "info", "message": "Quote the argument."}
+        shifted = dict(warning, line=3, endLine=3)
+        new = dict(warning, line=4, endLine=4)
+        previous = dict(warning, line=2, endLine=2)
+        for old, expected in (([previous], [4]), ([dict(previous, level="style")], [3, 4])):
+            with self.subTest(previous=old):
+                with patch.object(checks.shutil, "which", return_value="/scanner"), \
+                     patch.object(checks, "scan_blob", side_effect=[[shifted, new], old]) as scan:
+                    code, report = self.check("--base", old_head, "--estimate")
+                check, = report["checks"]
+                self.assertEqual(code, 0)
+                self.assertEqual([row["line"] for row in check["findings"]], expected)
+                self.assertEqual(check.get("existing_findings", 0), 2 - len(expected))
+                self.assertEqual([call.args[2] for call in scan.call_args_list],
+                                 [script.read_bytes(), b"#!/bin/sh\necho $argument\n"])
+        with patch.object(checks.shutil, "which", return_value="/scanner"), \
+             patch.object(checks, "scan_blob", side_effect=[[shifted, new], source.ReviewError("base unavailable")]):
+            code, report = self.check("--base", old_head, "--estimate")
+        self.assertEqual(code, 0)
+        self.assertEqual([row["line"] for row in report["checks"][0]["findings"]], [3, 4])
 
     def test_budget_comes_from_saved_setup_unless_overridden(self):
         bundle = self.root/"state/.review-setup-fixture"

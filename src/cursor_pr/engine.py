@@ -15,9 +15,8 @@ import tomllib
 
 from jinja2 import Environment
 import yaml
-from unidiff import PatchSet
 
-from .source import TRUNCATED, ReviewError
+from .source import TRUNCATED, ReviewError, hunks
 from .login import auth_mode, login_directory, login_env
 from .setup import state_dir
 from .config import DEFAULT_MAX_FINDINGS
@@ -50,15 +49,6 @@ class CursorFailure(ReviewError):
     def __init__(self, message, usage=None):
         super().__init__(message)
         self.usage = usage
-
-
-def hunks(f):
-    """Parsed hunks of one file's patch."""
-    # Parse under a fixed synthetic name; the source envelope owns the actual filename.
-    parsed = PatchSet("--- a/file\n+++ b/file\n" + f.patch.rstrip("\n") + "\n")
-    if len(parsed) != 1 or not parsed[0]:
-        raise ReviewError("Incomplete or unrecognized patch in " + f.path)
-    return parsed[0]
 
 
 def section(f):
@@ -172,6 +162,9 @@ def pack(files, checks, skip=frozenset(), title="", description="", *,
               "such as a file that usually changes together with a changed one. They are hints to check against "
               "the patch, not findings, and a finding still has to cite head lines present in the shown hunks." if notices else "")
     prompt = (instructions + "\nUse only the supplied " + sources + "." + about + " Do not use tools. "
+              "For each code finding, state a concrete scenario, the observable behavior on base and head, "
+              "and which change introduced, worsened, or exposed the problem. For any finding reported "
+              "with incomplete evidence, prefix its title with Unverified. "
               "Serialize the YAML review as strict JSON (a YAML subset). Return one JSON object, "
               "without prose or fences. Example for no findings: "
               '{"review":{"key_issues_to_review":[]}}. Cite only head line numbers present in the shown hunks.'
@@ -250,18 +243,24 @@ def verification_rows(file, start, end, radius):
     return rows
 
 
-def verification(findings, files, radius=15):
+def verification(findings, files, radius=15, *, comparison=None):
     """A second, small prompt: the findings and the patch lines they cite, to be filtered."""
     by_path = {f.path: f for f in files}
     shown = []
     for finding in findings:
         start, end = finding["line"] - radius, finding["end_line"] + radius
-        rows = verification_rows(by_path[finding["path"]], start, end, radius)
+        file = by_path[finding["path"]]
+        rows = verification_rows(file, start, end, radius)
+        if comparison is not None:
+            rows += comparison(file, finding["line"], finding["end_line"], radius)
         shown.append(f"## {finding['path']} around lines {finding['line']}-{finding['end_line']}\n" + "\n".join(rows))
     listed = [{"relevant_file": f["path"], "start_line": f["line"], "end_line": f["end_line"],
                "issue_header": f["title"], "issue_content": f["message"]} for f in findings]
     return ("You are checking the findings of a code review against the code they cite. Drop a finding when "
             "the evidence disproves it or the code shown is sufficient to judge it and does not support it. "
+            "For code findings compare the same concrete scenario on base and head, including reachability "
+            "and impact. Drop a finding when the patch leaves that scenario's reachability, behavior and "
+            "impact equivalent. A changed line can preserve behavior and a changed caller can expose an existing bug. "
             "If you need context outside the supplied code to decide, keep the finding unchanged and unverified. "
             "Do not add findings and do not use tools. "
             'Return one JSON object, without prose or fences, of the form {"review":{"key_issues_to_review":[...]}} '
