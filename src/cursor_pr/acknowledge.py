@@ -22,6 +22,9 @@ NOTE = {"github": "#issuecomment-", "gitlab": "#note_"}
 RETRY_SECONDS = 60
 RETRY_CAP_SECONDS = 3600
 TRIES = 12
+# How long one cycle spends on markers and notices before it goes on to the reviews. What is left
+# waits for the next cycle: a forge that answers slowly must not hold the queue back.
+BUDGET_SECONDS = 20
 PAGES = 5
 # Stored in place of a GitHub reaction's ID from just before the reaction is asked for until the
 # answer is recorded. A poller that stopped in between, or an answer that never arrived, leaves it:
@@ -115,18 +118,20 @@ def add(project, number, comment, sending=lambda: None):
     return reaction_id(react(project, markers, headers))
 
 
+def recover(project, number, comment):
+    """The ID of a GitHub reaction that may exist without its ID having been kept, or None if there is none."""
+    # Asking again is how GitHub tells an account the ID of the reaction it already has. Refused for
+    # good, as it is without the permission or once the comment is gone, there is none of ours to
+    # remove. Turned away for now, as by a rate limit, the removal stays owed.
+    root, markers, headers = reviewer(project, number, comment)
+    response = react(project, markers, headers)
+    return None if refused(response) else reaction_id(response)
+
+
 def remove(project, number, comment, marker_id):
     if project.provider == "github" and marker_id in (None, PENDING):
         return
     root, markers, headers = reviewer(project, number, comment)
-    if project.provider == "github" and marker_id == UNKNOWN:
-        # Asking again is how GitHub tells an account the ID of the reaction it already has. Refused
-        # for good, as it is without the permission or once the comment is gone, there is none of ours
-        # to remove. Turned away for now, as by a rate limit, the removal stays owed.
-        response = react(project, markers, headers)
-        if refused(response):
-            return
-        marker_id = reaction_id(response)
     try:
         ident = marker_id if project.provider == "github" else own_award(project, root, markers, headers)
     except httpx.HTTPStatusError as err:
@@ -174,7 +179,7 @@ class Acknowledgement:
         acknowledgement = self.jobs.acknowledgement(job)
         if acknowledgement is None:
             return
-        marker, notice_sent = acknowledgement
+        marker, notice_sent, marker_cleared = acknowledgement
 
         def report_failure():
             notify(project, number, comment, self.state)
@@ -185,11 +190,22 @@ class Acknowledgement:
             report_failure, "report the failed review on", project, number, None)
 
         def clear():
-            # GitLab's marker stays while another request is waiting; its last request clears it.
-            if project.provider != "gitlab" or not self.jobs.pending(project.key, number):
-                remove(project, number, comment, marker)
+            if project.provider == "gitlab" and self.jobs.pending(project.key, number):
+                # GitLab's marker stays while another request is waiting; its last request clears it.
+                # Each of them gets a record for that, also one queued by a version that kept none.
+                self.jobs.acknowledge_pending(project.key, number)
+            else:
+                found = marker
+                if project.provider == "github" and marker == UNKNOWN:
+                    # Kept before it is removed: if the removal fails, the next try must not ask
+                    # for the reaction again, which would put one on a request that has finished.
+                    found = recover(project, number, comment)
+                    self.jobs.record_marker(job, found)
+                remove(project, number, comment, found)
+            # Kept apart from the notice: while only the notice is owed, the marker is left alone.
+            self.jobs.record_cleared(job)
 
-        cleared = self.attempt(clear, "clear the queued marker on", project, number, comment)
+        cleared = bool(marker_cleared) or self.attempt(clear, "clear the queued marker on", project, number, comment)
         if notified and cleared:
             self.jobs.clear_acknowledgement(job)
             return
@@ -203,9 +219,17 @@ class Acknowledgement:
 
     def settle(self, projects):
         """Try again what a finished request still owes the forge and is due: its marker's removal, its notice."""
+        started = time.monotonic()
         for key, number, comment, status in self.jobs.unfinished_acknowledgements(time.time()):
-            if key in projects:
+            if key in projects and time.monotonic() - started < BUDGET_SECONDS:
                 self.finished(projects[key], number, comment, status)
+
+    def mark(self, projects):
+        """Mark the waiting requests that have not been marked: the new ones, and those a stopped poller left."""
+        started = time.monotonic()
+        for key, number, comment in self.jobs.unmarked():
+            if key in projects and time.monotonic() - started < BUDGET_SECONDS:
+                self.queued(projects[key], number, comment)
 
     @staticmethod
     def attempt(action, verb, project, number, comment):

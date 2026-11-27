@@ -142,6 +142,5 @@ def poll_project(project, jobs, since, ack=None):
                 tier = COMMANDS[note["body"].strip()]
                 if tier != "regular":
                     jobs.set_tier(project.key, number, comment, tier)
+                # Marked by the cycle once the reading is done, within a time budget: see Acknowledgement.mark.
                 jobs.enqueue(project.key, number, comment, acknowledge=ack is not None)
-                if ack is not None:
-                    ack.queued(project, number, comment)
