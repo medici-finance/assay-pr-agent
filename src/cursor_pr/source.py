@@ -160,6 +160,7 @@ class Change:
     base_ref: str = ""  # base branch name reported by the forge
     title: str = ""
     description: str = ""
+    description_truncated: bool = False
 
 
 def forge_change(address, expected_url=None, *, project=None, with_description=False):
@@ -204,9 +205,11 @@ def forge_change(address, expected_url=None, *, project=None, with_description=F
                           row["patchAbsent"], row.get("previousFilename", "")))
     base_ref = first.get("baseRef")
     # The description is context, not evidence, so it is read once and never bracketed like the head.
+    title = bounded_text(last.get("title"), TITLE_LIMIT)
+    description = bounded_text(last.get("body"), DESCRIPTION_LIMIT)
+    truncated = last.get("descriptionTruncated") is True or any(text.endswith(TRUNCATED) for text in (title, description))
     return Change(head, files, first.get("url") or address, base_ref=base_ref if isinstance(base_ref, str) else "",
-                  title=bounded_text(last.get("title"), TITLE_LIMIT),
-                  description=bounded_text(last.get("body"), DESCRIPTION_LIMIT))
+                  title=title, description=description, description_truncated=truncated)
 
 
 def git(root, *args):

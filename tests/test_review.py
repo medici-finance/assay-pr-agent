@@ -141,7 +141,8 @@ class ReviewTest(unittest.TestCase):
                 code, result = self.check("--change", "org/repo#1", "--post")
                 self.assertEqual(code, 0, result)
                 self.assertEqual(result["source"], project.change_url(1))
-                self.assertEqual([call.args[0] for call in read.call_args_list], ["change", "change-files", "change"])
+                self.assertEqual([call.args[0] for call in read.call_args_list],
+                                 ["change", "change-files", "change-with-description"])
                 self.assertTrue(all(call.args[1] == project and call.kwargs["numbers"] == [1]
                                     for call in read.call_args_list))
                 self.assertEqual(post.call_args.args[:3], (project, 1, self.head))

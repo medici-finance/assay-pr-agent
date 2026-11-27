@@ -118,7 +118,8 @@ class TierTests(unittest.TestCase):
         code, report = self.check()
         change = cli.local_change(self.root, "main", self.head)
         files = sorted(change.files, key=lambda f: f.path)
-        prompt = engine.pack(files, [], title=change.title, description=change.description)[0]
+        prompt = engine.pack(files, [], title=change.title, description=change.description,
+                             commit_messages=True)[0]
         self.assertEqual(self.prompts(), [["review", prompt]])
         self.assertEqual((code, report["state"], report["tier"], report["delivered"]), (0, "reviewed", "regular", "regular"))
         self.assertEqual(report["verification"], {"state": "not-needed"})
