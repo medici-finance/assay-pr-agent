@@ -348,6 +348,35 @@ class TierTests(unittest.TestCase):
         disclosed = comment.count("- Not reviewed (token limit):")
         self.assertIn(f"{len(skipped) - disclosed} files skipped by the token limit omitted", comment)
 
+    def test_compaction_uses_spare_space_for_all_coverage_paths(self):
+        report = self.check("--tier", "max", "--estimate")[1]
+        directory = "long/" * 30
+        skipped = [f"{directory}skip_{n}.py" for n in range(35)]
+        outside = [f"{directory}outside_{n}.py" for n in range(25)]
+        findings = [dict(path="app.py", line=1, end_line=1, title="Issue", message="多" * 3000)]
+        report.update(state="degraded", provider="cursor", findings=findings, degraded=skipped, omitted=outside)
+        with patch.object(cli, "post_comment") as post:
+            cli.publish("org/repo#1", self.head, report)
+        comment = post.call_args.args[3]
+        self.assertIn("shortened to fit the forge comment", comment)
+        for path in skipped + outside:
+            self.assertIn(path, comment)
+        self.assertNotIn("paths omitted", comment)
+
+    def test_compact_comment_preserves_summaries_when_all_exact_paths_will_not_fit(self):
+        report = self.check("--tier", "max", "--estimate")[1]
+        findings = [dict(path="long_dir/" * 190 + f"module_{n}.py", line=1, end_line=1,
+                         title=f"Finding {n}", message="Details" * 100) for n in range(10)]
+        report.update(state="reviewed", provider="cursor", findings=findings)
+        with patch.object(cli, "post_comment") as post:
+            cli.publish("org/repo#1", self.head, report)
+        comment = post.call_args.args[3]
+        self.assertLessEqual(len(comment.encode("utf-8")), cli.FORGE_COMMENT_BYTES)
+        for n in range(10):
+            self.assertIn(f"Finding {n} ", comment)
+            self.assertIn(f"module_{n}.py", comment)
+        self.assertIn("…/", comment)
+
     def test_one_oversized_changed_file_does_not_remove_the_others_context(self):
         self.write("src/generated.py", "".join(f"TABLE_{n} = {n}\n" for n in range(context.MAX_BLOB // 10)))
         self.commit("add a large generated file")

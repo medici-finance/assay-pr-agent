@@ -1,6 +1,7 @@
 import argparse
 from collections import defaultdict
 import fcntl
+import hashlib
 from contextlib import ExitStack
 import json
 import os
@@ -146,12 +147,15 @@ def total_usage(passes):
     return totals or None
 
 
-def finding_line(issue, *, compact=False):
+def finding_line(issue, *, compact=False, shorten_path=False):
     # Fence displayed text after clipping so the shortened value stays literal.
-    path = fence(issue["path"])
+    path = issue["path"]
+    if shorten_path and len(path) > 80:
+        tag = hashlib.sha256(path.encode("utf-8")).hexdigest()[:12]
+        path = f"…/{path[-80:]} [{tag}]"
     title = fence(issue["title"], 60 if compact else None)
     message = fence(issue["message"], 140 if compact else None)
-    return f"- {path}:{issue['line']} — {title}. {message}"
+    return f"- {fence(path)}:{issue['line']} — {title}. {message}"
 
 
 def comment_text(rows):
@@ -159,42 +163,57 @@ def comment_text(rows):
     return "\n".join(" ".join(line.splitlines()) for line in rows) + "\n"
 
 
+def omission_notice(count, label):
+    return f"{count} {label} omitted from this comment.\n" if count else ""
+
+
 def fit_comment_rows(rows, allowance, label, *, already_omitted=0):
     """Fit whole rows and count entries that could not be shown."""
+    rendered = [comment_text([row]) for row in rows]
+    sizes = [len(row.encode("utf-8")) for row in rendered]
+    notice = omission_notice(already_omitted, label)
+    if sum(sizes) + len(notice.encode("utf-8")) <= allowance:
+        return "".join(rendered) + notice
     omitted = already_omitted + len(rows)
-    notice = f"{omitted} {label} omitted from this comment.\n"
-    remaining = allowance - len(notice.encode("utf-8"))
+    remaining = allowance - len(omission_notice(omitted, label).encode("utf-8"))
     included = []
-    for row in rows:
-        rendered = comment_text([row])
-        size = len(rendered.encode("utf-8"))
+    for row, size in zip(rendered, sizes, strict=True):
         if size <= remaining:
-            included.append(rendered)
+            included.append(row)
             remaining -= size
             omitted -= 1
-    if omitted:
-        included.append(f"{omitted} {label} omitted from this comment.\n")
-    return "".join(included)
+    return "".join(included) + omission_notice(omitted, label)
 
 
 def fit_tier_comment(header, findings, coverage, extra_coverage, outside, details, footer):
-    """Reserve room for coverage and use remaining space for findings and evidence."""
+    """Keep finding summaries and coverage before spending space on optional evidence."""
     body = comment_text(header + ["Some review details were shortened to fit the forge comment."])
     end = comment_text(footer)
     space = FORGE_COMMENT_BYTES - len((body + end).encode("utf-8"))
 
-    skipped = fit_comment_rows(coverage, space // 4, "files skipped by the token limit",
-                               already_omitted=extra_coverage)
+    exact = [comment_text([finding_line(issue, compact=True)]) for issue in findings]
+    abbreviated = [comment_text([finding_line(issue, compact=True, shorten_path=True)]) for issue in findings]
+    model = [min((full, short), key=lambda row: len(row.encode("utf-8")))
+             for full, short in zip(exact, abbreviated, strict=True)]
+    space -= sum(len(row.encode("utf-8")) for row in model)
+
+    evidence_label = "check and history rows"
+    outside_label = "files outside review coverage"
+    evidence_notice = len(omission_notice(len(details), evidence_label).encode("utf-8"))
+    outside_notice = len(omission_notice(len(outside), outside_label).encode("utf-8"))
+    skipped = fit_comment_rows(coverage, space - evidence_notice - outside_notice,
+                               "files skipped by the token limit", already_omitted=extra_coverage)
     space -= len(skipped.encode("utf-8"))
-    outside_text = fit_comment_rows(outside, space // 6, "files outside review coverage")
+    outside_text = fit_comment_rows(outside, space - evidence_notice, outside_label)
     space -= len(outside_text.encode("utf-8"))
 
-    evidence_reserve = min(space, 512) if details else 0
-    model = fit_comment_rows([finding_line(issue, compact=True) for issue in findings],
-                             space - evidence_reserve, "model findings")
-    space -= len(model.encode("utf-8"))
-    evidence = fit_comment_rows(details, space, "check and history rows")
-    return body + model + skipped + outside_text + evidence + end
+    for index, full in enumerate(exact):
+        cost = len(full.encode("utf-8")) - len(model[index].encode("utf-8"))
+        if cost <= space - evidence_notice:
+            model[index] = full
+            space -= cost
+    evidence = fit_comment_rows(details, space, evidence_label)
+    return body + "".join(model) + skipped + outside_text + evidence + end
 
 
 def publish(address, head, report, *, project=None, state=None):
