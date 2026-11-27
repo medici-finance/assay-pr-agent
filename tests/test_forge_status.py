@@ -106,7 +106,7 @@ class ForgeStatusRequestTests(unittest.TestCase):
         self.policy = self.start(patch.object(forge_status, "check_publication"))
         self.lookup = self.start(patch.object(forge_status, "reviewer_token", return_value="fixture"))
         self.requests, self.clients = [], []
-        self.status, self.location, self.error = 201, None, None
+        self.status, self.location, self.error, self.first = 201, None, None, []
         self.gitlab_source = dict(sha=HEAD, source_project_id=123, target_project_id=123, source_branch="topic/ref")
         client = httpx.Client
         transport = httpx.MockTransport(self.respond)
@@ -127,7 +127,8 @@ class ForgeStatusRequestTests(unittest.TestCase):
             return httpx.Response(302, headers={"Location": self.location})
         if request.method == "GET" and request.url.path.endswith("/merge_requests/7"):
             return httpx.Response(200, json=self.gitlab_source)
-        return httpx.Response(self.status, json={"id": 1})
+        # The answers to come first, one for each request, before the standing one.
+        return httpx.Response(self.first.pop(0) if self.first else self.status, json={"id": 1})
 
     def exercise(self, provider, *options, url=None, post=True, model=None, address=None, desk_error=None):
         change = source.Change(HEAD, [source.File("demo.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")], url or SITES[provider])
@@ -316,6 +317,23 @@ class ForgeStatusRequestTests(unittest.TestCase):
         self.assertEqual(report["forge_status"], "failed")
         self.assertIn("pipeline is not for the reviewed commit", logged.output[0])
         self.assertEqual([request.method for request in self.requests], ["GET"])
+
+    def test_gitlab_status_is_asked_again_while_another_one_is_being_written(self):
+        for conflicts, outcome, posts in ((1, "posted", 2), (2, "posted", 3), (3, "failed", 3)):
+            with self.subTest(conflicts=conflicts), patch.object(forge_status.time, "sleep") as sleep, \
+                    (self.assertLogs("cursor_pr.forge_status", level="WARNING") if outcome == "failed" else contextlib.nullcontext()):
+                self.requests.clear()
+                self.first[:] = [409] * conflicts
+                report, *_ = self.exercise("gitlab", "--forge-status")
+                self.assertEqual(report["forge_status"], outcome)
+                self.assertEqual([request.method for request in self.requests].count("POST"), posts)
+                self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2][:posts - 1])
+        # GitHub's 409 means something else and is not repeated.
+        self.requests.clear()
+        self.first[:] = [409]
+        with patch.object(forge_status.time, "sleep") as sleep, self.assertLogs("cursor_pr.forge_status", level="WARNING"):
+            report, *_ = self.exercise("github", "--forge-status")
+        self.assertEqual((report["forge_status"], sleep.call_count), ("failed", 0))
 
     def test_a_failed_summary_publication_leaves_the_status_unattempted(self):
         report, code, *_ = self.exercise("github", "--forge-status", desk_error=source.ReviewError("pr-agent-forge comment exited 1"))

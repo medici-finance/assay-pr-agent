@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import logging
 import os
 import re
+import time
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -16,6 +17,7 @@ NAME = "assay-pr-agent/review"
 # GitHub accepts 50 annotations per request and 64 KB per message; GitLab descriptions are 255 characters.
 ANNOTATIONS = 50
 DESCRIPTION = 255
+CONFLICT_PAUSES = (1, 2)
 COMPLETE = ("reviewed", "empty")
 SENTENCES = {
     "reviewed": "The review completed.",
@@ -164,7 +166,14 @@ def post(address, value, project):
     with connection(address, url, project.checkout) as (client, _, _, _, headers):
         if provider == "gitlab":
             body.update(gitlab_source_ref(client, headers, base, slug, number, head))
-        client.post(endpoint, headers=headers, json=body).raise_for_status()
+        # GitLab answers 409 while another status for this commit and ref is being written, as when
+        # CI reports at the same moment. That passes: asked again after one second, then after two.
+        for pause in (*CONFLICT_PAUSES, None):
+            response = client.post(endpoint, headers=headers, json=body)
+            if provider != "gitlab" or response.status_code != 409 or pause is None:
+                break
+            time.sleep(pause)
+        response.raise_for_status()
 
 
 def outcome(args, value):
