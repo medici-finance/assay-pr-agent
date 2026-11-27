@@ -118,6 +118,8 @@ class InlineTests(unittest.TestCase):
             self.assertEqual((request.method, str(request.url)), ("POST", REVIEW))
             comments = json.loads(request.content)["comments"]
             refused = (self.refuse_combined and len(comments) > 1) or any(c["path"] in self.refused for c in comments)
+            if refused and getattr(self, "push_on_refusal", False):
+                self.head = "b" * 40  # A contributor pushes just as the batch is refused.
             if self.fail_after is not None and len(comments) == 1 and not refused:
                 if self.fail_after == 0:
                     return httpx.Response(502)
@@ -133,8 +135,10 @@ class InlineTests(unittest.TestCase):
             page = int(request.url.params["page"]) if request.method == "GET" else None
             if page is not None:
                 self.assertEqual(dict(request.url.params), {"page": str(page), "per_page": "100"})
+                more = ({"Link": f'<{THREADS}?page={page + 1}&per_page=100>; rel="next"'} if getattr(self, "link_only", False)
+                        else {"X-Next-Page": str(page + 1)})
                 return httpx.Response(200, json=self.pages.get(page, self.discussions),
-                                      headers={"X-Next-Page": str(page + 1)} if page + 1 in self.pages else {})
+                                      headers=more if page + 1 in self.pages else {})
             refused = json.loads(request.content)["position"]["new_path"] in self.refused
             if self.fail_after is not None and not refused:
                 if self.fail_after == 0:
@@ -280,6 +284,11 @@ class InlineTests(unittest.TestCase):
         report, *_ = self.exercise("gitlab", "--post", "--inline-comments")
         self.assertEqual((report["inline_publication"], self.events[-2:]), ("already-present", [
             "http:GET " + THREADS + "?page=1&per_page=100", "http:GET " + THREADS + "?page=2&per_page=100"]))
+        # A next page named only in the Link header is read as well.
+        self.link_only, self.requests = True, []
+        report, *_ = self.exercise("gitlab", "--post", "--inline-comments")
+        self.assertEqual((report["inline_publication"], [r.method for r in self.requests].count("POST")), ("already-present", 0))
+        self.link_only = False
         # An unread page could hold an earlier post of ours, so the run stops instead of risking a duplicate.
         self.pages = dict.fromkeys(range(1, 24), [])
         with self.assertLogs(LOG, level="WARNING") as logs:
@@ -358,6 +367,14 @@ class InlineTests(unittest.TestCase):
         self.refused, self.refuse_combined = set(), False
         self.assertEqual(self.exercise("github", "--post", "--inline-comments")[0]["inline_publication"], "posted")
         self.assertEqual([len(r["comments"]) for r in self.posted()], [2, 1, 1, 2])
+
+    def test_a_push_between_a_refused_review_and_its_retries_stops_them(self):
+        self.refuse_combined = self.push_on_refusal = True
+        with self.assertLogs(LOG, level="WARNING") as logs:
+            report, *_ = self.exercise("github", "--post", "--inline-comments")
+        self.assertEqual((report["inline_publication"], report["inline_posted"]), ("stale", 0))
+        self.assertEqual([len(r["comments"]) for r in self.posted()], [2])  # No review of one finding followed.
+        self.assertIn("the change moved on since the review", logs.output[0])
 
     def test_it_runs_only_when_enabled_for_a_posted_forge_review(self):
         report, code, _ = self.exercise("github", "--post")

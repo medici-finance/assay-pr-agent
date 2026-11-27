@@ -106,9 +106,13 @@ def account(client, headers, base):
     return me
 
 
-def authorize(project, number, head, rows, previous):
+def unmoved(project, number, head):
     if run_forge("change", project, numbers=[number]).get("headSha") != head:
         raise Stale("the change moved on since the review")
+
+
+def authorize(project, number, head, rows, previous):
+    unmoved(project, number, head)
     checked = []
     for path, line, body in rows:
         old = previous.get(path) or path
@@ -149,6 +153,9 @@ def github(client, headers, project, slug, number, rows, me, head, progress):
         else:
             # The forge rejects a batch in full, so a singleton records only what it actually posted.
             for row in rows:
+                # Time has passed since the batch was authorized, and a push in it would put the
+                # rest of these on a commit that is no longer the head.
+                unmoved(project, number, head)
                 try:
                     submit([row])
                     progress.posted += 1
@@ -178,7 +185,8 @@ def gitlab(client, headers, project, base, slug, number, rows, me, head, previou
         # Only the first note of a diff discussion carries a marker of ours.
         found |= set().union(*(carried(head, d["notes"][0].get("body")) for d in response.json() if isinstance(d, dict) and d.get("notes")
                               and d["notes"][0].get("type") == "DiffNote" and (d["notes"][0].get("author") or {}).get("id") == me))
-        if not response.headers.get("X-Next-Page"):
+        # Either way GitLab has of saying there is more. The next request is still built here.
+        if not response.headers.get("X-Next-Page") and "next" not in response.links:
             break
         # An unread page could hold an earlier post of ours, so stop rather than risk a duplicate.
         if page >= PAGES:
