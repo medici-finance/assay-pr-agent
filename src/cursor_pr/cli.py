@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,7 @@ import time
 from unidiff.errors import UnidiffParseError
 import yaml
 
-from . import drift, history, providers, receipt, scanners
+from . import drift, history, outcomes, providers, receipt, scanners
 from .scanners import fence
 from .login import auth_mode, login_directory
 from .setup import locked, apply_saved_setup, load_provider_key, max_input_tokens, state_dir
@@ -140,6 +141,13 @@ def publish(address, head, report, *, project=None, state=None):
                     + ", ".join(fence(path) for path in report["not_reviewable"][:20]) + more + ".")
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {fence(path)}")
+    tracked = report.get("outcomes")
+    if tracked and tracked["fixed"] + tracked["unaddressed"] + tracked.get("gone", 0) + tracked["repeated"]:
+        # An accept rate needs a finding whose code the author either changed or left alone.
+        rate = f"{tracked['accept_rate']}%" if tracked["accept_rate"] is not None else "not available"
+        body.append(f"Tracked findings for this change: {tracked['fixed']} fixed and {tracked['unaddressed']} left unchanged "
+                    f"at a later review (accept rate {rate}); {tracked.get('gone', 0)} gone from the change with no "
+                    f"sign of a fix; {tracked['repeated']} raised again; {tracked['open']} awaiting a later review.")
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
     # A finding may quote a multiline source fragment, including forge quick actions.
     lines = [" ".join(line.splitlines()) for line in body]
@@ -280,38 +288,46 @@ def execute(args):
     if qualgen:
         report["qualgen"] = qualgen
     if estimated > args.max_input_tokens:
-        return dict(report, state="over-budget"), 2
+        return dict(report, state="over-budget"), 2, None
     if args.estimate:
-        return dict(report, state="estimate"), 2 if degraded or unavailable else 0
+        return dict(report, state="estimate"), 2 if degraded or unavailable else 0, None
     if has_text:
         try:
             answer, cached = review(prompt, args.model, anchors, args.cache_dir,
                                     change.identity)
         except CursorFailure as err:
             return dict(report, state="model-unavailable", error=str(err),
-                        cursor_invocations=err.invocations, cursor_usage=err.usage), 2
+                        cursor_invocations=err.invocations, cursor_usage=err.usage), 2, None
         except (ReviewError, OSError, ValueError, KeyError, TypeError, AttributeError,
                 subprocess.TimeoutExpired, yaml.YAMLError) as err:
             # Preserve deterministic diagnostics even if the model failed.
             return dict(report, state="model-unavailable", error=str(err) if isinstance(err, ReviewError)
-                        else type(err).__name__, cursor_invocations=None), 2
+                        else type(err).__name__, cursor_invocations=None), 2, None
         report.update(answer, cache_hit=cached, cursor_invocations=int(not cached))
         report["coverage"]["reviewed"] = prompt_files - len(degraded)
         if cached:
             report["cursor_usage"] = None
     if report.get("dropped") and not report["findings"]:
         # The model answered but nothing it said could be checked: as unusable as no answer, whatever the coverage.
-        return dict(report, state="findings-dropped"), 2
+        return dict(report, state="findings-dropped"), 2, (anchors, paths)
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
     if degraded:
         report["state"] = "degraded"
     else:
         report["state"] = "partial" if incomplete else ("reviewed" if has_text else "empty")
-    return report, 2 if incomplete or degraded else 0
+    return report, 2 if incomplete or degraded else 0, (anchors, paths)
+
+
+def track(report, tracking, *, persist):
+    # Tracking is best effort. A failure must never prevent a review from being posted.
+    try:
+        report["outcomes"] = outcomes.record(*tracking, persist=persist)
+    except (OSError, ValueError, KeyError, sqlite3.Error):
+        report.pop("outcomes", None)
 
 
 def run_request(args):
-    report, code = execute(args)
+    report, code, scope = execute(args)
     backend = report["provider"]
     if backend != "cursor":
         report["model_invocations"] = report["cursor_invocations"]
@@ -321,11 +337,18 @@ def run_request(args):
         report.update(model_invocations=report["cursor_invocations"], model_usage=report["cursor_usage"])
     report["receipt"] = receipt.build(report)
     if args.post:
+        tracking = None
+        if scope is not None and os.getenv("REVIEW_STATE_DIR") and state_dir().is_dir():
+            tracking = (state_dir(), report["source"], report["head"], report["findings"], *scope)
+            track(report, tracking, persist=False)
         try:
             publish(args.change, report["head"], report, project=getattr(args, "forge_project", None),
                     state=getattr(args, "forge_state", None))
         except (ReviewError, OSError, ValueError, subprocess.TimeoutExpired) as err:
+            report.pop("outcomes", None)
             return dict(report, publication="failed", publication_error=str(err) or type(err).__name__), 2
+        if tracking is not None:
+            track(report, tracking, persist=True)
         report["publication"] = "posted-or-already-present"
     return report, code
 
