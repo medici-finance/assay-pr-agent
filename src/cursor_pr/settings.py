@@ -55,6 +55,10 @@ LOCATION_HELP = {
     "none": "Not set."}
 
 
+class StaleSettings(ValueError):
+    """A different installer has saved since the settings view was read."""
+
+
 def from_environment(name, what="the saved value"):
     """Why a row is read-only: the page's own process environment sets it. Never includes the value."""
     # Only this process's environment is visible here; each service reads its own.
@@ -131,8 +135,10 @@ def cursor_team(value, config, state, old):
 
 
 def operator(value, config, state, old):
-    base, token, verify = gitlab_access(config, old)
     forges = {row["provider"] for row in setup.effective_projects(config)}
+    if forges != {"gitlab"} or ":" in value:
+        return validate_operator(accounts.resolve_operator(value, forges))
+    base, token, verify = gitlab_access(config, old)
     return validate_operator(accounts.resolve_operator(value, forges, base=base, token=token, verify=verify))
 
 
@@ -234,14 +240,15 @@ def project_rows(config):
 def view(state):
     """What the settings page shows. Credential values never leave the state volume."""
     with setup.locked(state, fcntl.LOCK_SH):
-        config = json.loads((setup.active_bundle(state) / "settings.json").read_text())
+        bundle = setup.active_bundle(state)
+        config = json.loads((bundle / "settings.json").read_text())
     sections = []
     for row in [*global_rows(config), *credential_rows(config)]:
         section = row.pop("section")
         if not sections or sections[-1]["title"] != section:
             sections.append({"title": section, "settings": []})
         sections[-1]["settings"].append(row)
-    return {"sections": sections, "projects": project_rows(config)}
+    return {"revision": bundle.name, "sections": sections, "projects": project_rows(config)}
 
 
 def edit_setting(config, state, old, name, value):
@@ -281,7 +288,9 @@ def edit_project(config, state, old, url, name, value):
     else:
         row.pop("go_analysis", None)
     setup.validate_rows(rows)
-    base, token, verify = gitlab_access(config, old)
+    token, verify = None, True
+    if accounts.pending(row for row in rows if row["provider"] == "gitlab"):
+        _, token, verify = gitlab_access(config, old)
     rows = accounts.resolve(rows, token=token, verify=verify)
     if accounts.pending(rows):
         raise ValueError("GitLab usernames need the reviewer token; enter numeric IDs for: " + ", ".join(accounts.pending(rows)))
@@ -314,7 +323,7 @@ def replace_credential(config, name, value, remove, written):
     config["secrets"][name] = setup.SECRETS[name]
 
 
-def save(state, change):
+def save(state, change, *, revision=None):
     """Change one setting, project field or credential of the saved setup."""
     name, value, project = change.get("name"), change.get("value", ""), change.get("project")
     if not isinstance(name, str) or not isinstance(value, str) or project is not None and not isinstance(project, str):
@@ -326,6 +335,8 @@ def save(state, change):
             old = setup.active_bundle(state)
             if not old:
                 raise ValueError("Run setup before changing its settings.")
+            if revision is not None and old.name != revision:
+                raise StaleSettings("The settings changed in another installer")
             config = json.loads((old / "settings.json").read_text())
         config = copy.deepcopy(config)
         written = {}

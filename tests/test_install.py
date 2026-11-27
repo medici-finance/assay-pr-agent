@@ -205,6 +205,7 @@ else:
         harness = """
 <script>
 const requests = [];
+let finishSave;
 const view = {id: 1, status: "settings", messages: [], projects: [], sections: [
   {title: "Settings", settings: [
     {name: "model", kind: "text", label: "Model", value: "auto", help: ""},
@@ -212,7 +213,10 @@ const view = {id: 1, status: "settings", messages: [], projects: [], sections: [
   ]}
 ]};
 window.fetch = async (path, options) => {
-  if (path === "/setting") requests.push(JSON.parse(options.body));
+  if (path === "/setting") {
+    requests.push(JSON.parse(options.body));
+    await new Promise(resolve => { finishSave = resolve; });
+  }
   return new Response(JSON.stringify(view));
 };
 document.addEventListener("DOMContentLoaded", async () => {
@@ -236,6 +240,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     lookup("key", ".change").click();
     lookup("key", ".input").value = "old draft";
     const save = lookup("key", ".save"), disk = lookup("key", ".file");
+    File.prototype.text = () => Promise.reject(Error("fixture read failure"));
+    select(disk, new File(["ignored"], "unreadable.txt"));
+    await tick();
+    check(lookup("key", ".input").value === "", "the failed import left the old value submittable");
+    check(lookup("key", ".error").textContent === "This file could not be read.", "the import error was hidden");
     let finish;
     File.prototype.text = () => new Promise(resolve => { finish = resolve; });
     select(disk, new File(["ignored"], "key.txt"));
@@ -249,9 +258,14 @@ document.addEventListener("DOMContentLoaded", async () => {
       observer.observe(document.querySelector("#groups"), {childList: true});
     });
     save.click();
+    check(document.querySelector("#quit").disabled && document.querySelector("#wizard").disabled,
+          "a navigation control stayed active while saving");
+    finishSave();
     await refreshed;
     check(requests.length === 1 && requests[0].value === "replacement", "save sent the wrong value");
     check(!lookup("model", ".change").disabled, "the next editor stayed disabled");
+    check(!document.querySelector("#quit").disabled && !document.querySelector("#wizard").disabled,
+          "a navigation control stayed disabled after saving");
     document.body.dataset.result = "passed";
   } catch (error) {
     document.body.dataset.result = error.message;

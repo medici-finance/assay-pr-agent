@@ -488,11 +488,14 @@ def configure_locked(state, force_login):
             {"projects": rows, "settings": settings, "secrets": secrets}, indent=2))
         commit(state, old, bundle)
         committed = True
-        for path in pending:
-            path.unlink(missing_ok=True)
-        if old:
-            shutil.rmtree(old)
-        retire_profiles(state, {settings.get("REVIEW_LOGIN_PROFILE"), previous.get("REVIEW_LOGIN_PROFILE")})
+        try:
+            for path in pending:
+                path.unlink(missing_ok=True)
+            if old:
+                shutil.rmtree(old)
+            retire_profiles(state, {settings.get("REVIEW_LOGIN_PROFILE"), previous.get("REVIEW_LOGIN_PROFILE")})
+        except OSError:
+            print("Settings were saved. Some previous installer files could not be removed.", file=sys.stderr)
     finally:
         if not committed:
             shutil.rmtree(bundle)

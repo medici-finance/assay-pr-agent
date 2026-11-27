@@ -118,6 +118,7 @@ function field(item, project) {
     const version = ++importVersion;
     disk.value = "";
     importing = true;
+    control.value = "";
     problem.textContent = "";
     updateControls();
     try {
@@ -140,6 +141,7 @@ function field(item, project) {
     if (importing || saving) return;
     saving = true;
     updateControls();
+    quit.disabled = wizard.disabled = true;
     try {
       const res = await fetch("/setting", {method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({id: step.id, name: item.name, ...(project ? {project: project.url} : {}), ...data}), cache: "no-store"});
@@ -154,7 +156,11 @@ function field(item, project) {
     } catch (error) {
       if (error.message === "key") show_unlock("Enter the setup key printed in the installer console.");
       else problem.textContent = "The installer could not be reached. Open http://127.0.0.1:8765/ in this browser and try again.";
-    } finally { saving = false; updateControls(); }
+    } finally {
+      saving = false;
+      updateControls();
+      quit.disabled = wizard.disabled = false;
+    }
   };
   submit.onclick = () => keep({value: control.value});
   drop.onclick = () => keep({remove: true});

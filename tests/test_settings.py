@@ -242,6 +242,23 @@ class SettingsTests(unittest.TestCase):
         self.assertIn(ssl.PEM_cert_to_DER_cert(CERTIFICATE), verify.get_ca_certs(binary_form=True))
         self.assertFalse(verify.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)
 
+    def test_gitlab_tls_is_only_loaded_for_edits_requiring_a_gitlab_lookup(self):
+        gitlab_checkout = self.root / "gitlab-checkout"
+        gitlab_checkout.mkdir()
+        gitlab = dict(provider="gitlab", url="https://gitlab.com/org/other", requester_ids=[13],
+                      checkout=str(gitlab_checkout))
+        github = dict(provider="github", url="https://github.com/org/repo", requester_ids=[14],
+                      checkout=str(self.checkout))
+        self.seed(projects=[gitlab, github], secrets={setup.TOKEN: "fixture-token"})
+        with patch.dict(os.environ, {setup.gitlab_tls.CA: NOT_A_CERTIFICATE}):
+            settings.save(self.state, {"project": github["url"], "name": "visibility", "value": "public"})
+            settings.save(self.state, {"project": gitlab["url"], "name": "requester_ids", "value": "15"})
+            settings.save(self.state, {"name": "REVIEW_OPERATOR", "value": "alice:16"})
+        rows = {row["provider"]: row for row in self.document()["projects"]}
+        self.assertEqual(rows["github"]["visibility"], "public")
+        self.assertEqual(rows["gitlab"]["requester_ids"], [15])
+        self.assertEqual(self.document()["settings"]["REVIEW_OPERATOR"], "alice:16")
+
     def test_github_ids_are_saved_in_runtime_format(self):
         self.seed()
         for name in (setup.APP_ID, setup.INSTALL_ID):
@@ -432,7 +449,18 @@ class SettingsTests(unittest.TestCase):
         bundle.write_text(json.dumps(config))
         setup.apply_saved_setup(self.state)
         self.assertEqual((os.environ["REVIEW_SYNC_SECONDS"], os.environ["REVIEW_OSV_DOWNLOAD_DATABASES"]), ("300", "0"))
-        wizard(self.state, ["y", "", "", "", "", "", "", "", "keep"], [])
+        old = setup.active_bundle(self.state)
+        remove = shutil.rmtree
+
+        def remove_bundle(path):
+            if path == old:
+                raise PermissionError("fixture cleanup error")
+            return remove(path)
+
+        with patch.object(shutil, "rmtree", side_effect=remove_bundle), contextlib.redirect_stderr(io.StringIO()) as warning:
+            wizard(self.state, ["y", "", "", "", "", "", "", "", "keep"], [])
+        self.assertIn("Settings were saved", warning.getvalue())
+        self.assertNotEqual(setup.active_bundle(self.state), old)
         kept = self.document()["settings"]
         self.assertEqual((kept["REVIEW_SYNC_SECONDS"], kept["REVIEW_OSV_DOWNLOAD_DATABASES"]), ("300", "0"))
         self.assertEqual(kept["REVIEW_MAX_FINDINGS_MID"], "4")
@@ -523,6 +551,18 @@ class SettingsSessionTests(unittest.TestCase):
         self.assertEqual(reply["messages"], [web_setup.SAVED])
         self.assertNotEqual(setup.active_bundle(self.state), old)
         self.assertEqual(item(reply, "REVIEW_MAX_INPUT_TOKENS")["value"], "9000")
+
+    def test_older_browser_view_cannot_overwrite_a_newer_saved_bundle(self):
+        session = Session()
+        session.show(settings.view(self.state))
+        stale = {"id": session.view["id"], "name": "REVIEW_MAX_INPUT_TOKENS", "value": "8000"}
+        settings.save(self.state, {"name": "REVIEW_MAX_INPUT_TOKENS", "value": "9000"})
+        self.assertEqual(change_setting(session, self.state, stale), (409, None))
+        session.reread(self.state)
+        self.assertEqual(item(session.view, "REVIEW_MAX_INPUT_TOKENS")["value"], "9000")
+        code, refreshed = change_setting(session, self.state, {**stale, "id": session.view["id"]})
+        self.assertEqual(code, 200)
+        self.assertEqual(item(refreshed, "REVIEW_MAX_INPUT_TOKENS")["value"], "8000")
 
     def test_a_save_that_fails_is_reported_unsaved(self):
         session = Session()

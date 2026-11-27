@@ -178,10 +178,14 @@ def change_setting(session, state, data):
     with session.editing:
         with session.cv:
             current = session.view["status"] == "settings" and session.view["id"] == data.get("id")
-        if not current:
+            revision = session.view.get("revision")
+        if not current or revision is None:
             return 409, None
         try:
-            settings.save(state, data)
+            settings.save(state, data, revision=revision)
+        except settings.StaleSettings:
+            session.unread("The settings changed in another installer. Review the refreshed settings.")
+            return 409, None
         except (ValueError, OSError) as err:
             return 400, {"error": str(err)}
         except Exception:
