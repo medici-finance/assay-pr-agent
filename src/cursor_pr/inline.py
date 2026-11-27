@@ -88,7 +88,7 @@ def reviewer(client, headers, slug, number, value):
     endpoint = f"https://api.github.com/repos/{slug}/issues/{number}/comments"
     for row in github_comments(client, headers, endpoint):
         integration, author = row.get("performed_via_github_app") or {}, row.get("user") or {}
-        if (integration.get("id") == int(app_id) and author.get("type") == "Bot"
+        if (type(integration.get("id")) is int and integration["id"] == int(app_id) and author.get("type") == "Bot"
                 and type(author.get("id")) is int and author["id"] > 0
                 and str(row.get("body") or "").split("\n", 1)[0] == first):
             return author["id"]
@@ -99,8 +99,9 @@ def account(client, headers, base):
     """The reviewer's own user on GitLab: a project access token acts as its bot user."""
     response = client.get(base + "/user", headers=headers)
     response.raise_for_status()
-    me = response.json().get("id") if isinstance(response.json(), dict) else None
-    if type(me) is not int:
+    user = response.json()
+    me = user.get("id") if isinstance(user, dict) else None
+    if type(me) is not int or me < 1:
         raise ReviewError("Could not identify the reviewer identity on the change")
     return me
 
@@ -231,12 +232,14 @@ def outcome(args, value):
     if not (args.change and args.post and not args.estimate and value.get("publication") == "posted-or-already-present"
             and (getattr(args, "inline_comments", False) or os.getenv("REVIEW_INLINE_COMMENTS") == "1")):
         return {"inline_publication": "skipped"}
-    rows, left = comments(value)
-    progress = Progress(refused=left)
-    previous = getattr(args, "inline_previous_paths", {})
+    progress = Progress()
     try:
-        state = getattr(args, "forge_state", None) or state_dir()
-        result = post(args.change, value, getattr(args, "forge_project", None), state, rows, previous, progress) if rows else "skipped"
+        rows, progress.refused = comments(value)
+        result = "skipped"
+        if rows:
+            state = getattr(args, "forge_state", None) or state_dir()
+            previous = getattr(args, "inline_previous_paths", {})
+            result = post(args.change, value, getattr(args, "forge_project", None), state, rows, previous, progress)
     except Stale as error:
         log.warning("Inline comments for %s were not posted (%s)", args.change, error)
         result = "stale"

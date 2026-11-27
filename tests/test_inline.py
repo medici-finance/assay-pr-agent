@@ -1,4 +1,6 @@
 import contextlib
+import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,6 +12,7 @@ from unittest.mock import patch
 import httpx
 
 from cursor_pr import cli, engine, forge_status, inline, source
+from cursor_pr.config import project_from
 from cursor_pr.scanners import fence
 
 HEAD = "a" * 40
@@ -31,6 +34,7 @@ THREADS = MR + "/discussions"
 REVIEW = "https://api.github.com/repos/org/project/pulls/7/reviews"
 NOTES = "https://api.github.com/repos/org/project/pulls/7/comments"
 LISTED = NOTES + "?page=1&per_page=100"
+SUMMARIES = "https://api.github.com/repos/org/project/issues/7/comments?page=1&per_page=100"
 LOG = "cursor_pr.inline"
 
 
@@ -39,11 +43,9 @@ def outside_code_spans(text):
     return re.sub(r"(`+).*?\1", "", text, flags=re.S)
 
 
-def summary(head=HEAD, author=ME, ident=900, kind="Bot", prefix=""):
-    return {"authorLogin": "reviewer[bot]", "authorId": author, "createdAt": "2026-11-25T12:00:00Z",
-            "body": prefix + f"Cursor review of {head}\nreviewed\n- ` src/app.py `:3 — ` Unchecked input `. ` Validate it. `",
-            "databaseId": ident, "authorType": kind, "url": SITES["github"] + "#issuecomment-900",
-            "updatedAt": "2026-11-25T12:00:00Z"}
+def summary(head=HEAD, author=ME, kind="Bot", app=85):
+    return {"user": {"id": author, "type": kind}, "performed_via_github_app": {"id": app},
+            "body": f"Cursor review of {head}\nreviewed\n- Input finding"}
 
 
 def discussion(body, author=ME, kind="DiffNote"):
@@ -61,7 +63,7 @@ class InlineTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
-        self.start(patch.dict(os.environ, {"GITLAB_API_BASE": "https://gitlab.example/api/v4",
+        self.start(patch.dict(os.environ, {"GITLAB_API_BASE": "https://gitlab.example/api/v4", "REVIEW_FORGE_APP_ID": "85",
                                            "REVIEW_STATE_DIR": str(self.root / "state")}))
         os.environ.pop("REVIEW_INLINE_COMMENTS", None)
         self.lookup = self.start(patch.object(forge_status, "reviewer_token", return_value="fixture"))
@@ -78,6 +80,7 @@ class InlineTests(unittest.TestCase):
         transport = httpx.MockTransport(self.respond)
         self.start(patch.object(forge_status.httpx, "Client", side_effect=lambda **opts: client(transport=transport, **opts)))
         self.start(patch.object(inline, "run_forge", side_effect=self.forge))
+        self.policy = self.start(patch.object(inline, "check_publication", side_effect=self.check_policy))
         # No forge helper may run for real, whatever a later change to the mocks.
         self.start(patch("cursor_pr.source.subprocess.run", side_effect=AssertionError("a real forge helper was executed")))
 
@@ -88,10 +91,16 @@ class InlineTests(unittest.TestCase):
     def forge(self, verb, project, *, numbers=(), **kwargs):
         self.assertEqual((project, list(numbers)), (self.project, [7]))
         self.events.append("forge:" + verb)
-        if verb == "comments":
-            return {"items": [{"number": 7, "comments": self.comments}], "partial": []}
         self.assertEqual(verb, "change")
         return {"url": SITES["github"], "state": "open", "headSha": self.head}
+
+    def check_policy(self, project, number, head, body):
+        self.assertEqual((project, number, head), (self.project, 7, HEAD))
+        self.events.append("policy")
+        directory = self.root / "state" / "inline-publications"
+        key = hashlib.sha256(json.dumps([project.key, number, head]).encode()).hexdigest()
+        with (directory / (key + ".lock")).open("a") as competing, self.assertRaises(BlockingIOError):
+            fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def respond(self, request):
         self.requests.append(request)
@@ -101,6 +110,8 @@ class InlineTests(unittest.TestCase):
         if request.url.host == "api.github.com":
             self.assertEqual(request.headers["Authorization"], "Bearer fixture")
             if request.method == "GET":
+                if str(request.url) == SUMMARIES:
+                    return httpx.Response(200, json=self.comments)
                 page = int(request.url.params["page"])
                 self.assertEqual(str(request.url), NOTES + f"?page={page}&per_page=100")
                 return httpx.Response(200, json=self.review_pages.get(page, self.reviews if page == 1 else []))
@@ -125,13 +136,21 @@ class InlineTests(unittest.TestCase):
                 return httpx.Response(200, json=self.pages.get(page, self.discussions),
                                       headers={"X-Next-Page": str(page + 1)} if page + 1 in self.pages else {})
             refused = json.loads(request.content)["position"]["new_path"] in self.refused
+            if self.fail_after is not None and not refused:
+                if self.fail_after == 0:
+                    return httpx.Response(502)
+                self.fail_after -= 1
         return httpx.Response(422 if request.url.host == "api.github.com" and refused else 400 if refused else self.status, json={"id": 5})
 
-    def exercise(self, provider, *options, findings=FINDINGS, model=None, desk_error=None, cache=None):
-        change = source.Change(HEAD, [source.File("demo.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")], SITES[provider])
+    def exercise(self, provider, *options, findings=FINDINGS, model=None, desk_error=None, cache=None, previous=None):
+        files = [source.File("demo.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")]
+        if previous:
+            files.append(source.File("src/app.py", "", "renamed", previous=previous))
+        change = source.Change(HEAD, files, SITES[provider])
         args = cli.parser().parse_args(["--change", ADDRESS, "--repo", str(self.root), *options,
                                          "--cache-dir", str(cache or self.root / "cache"), "--max-input-tokens", "6000"])
-        self.project = object()
+        site = SITES[provider].removesuffix("/pull/7" if provider == "github" else "/-/merge_requests/7")
+        self.project = project_from(dict(provider=provider, url=site, checkout=str(self.root), requester_ids=[7]))
         args.forge_project = self.project
         with patch.object(cli, "forge_change", return_value=change), \
              patch.object(cli, "post_comment", side_effect=desk_error or (lambda *call: self.events.append("summary"))) as desk, \
@@ -154,7 +173,7 @@ class InlineTests(unittest.TestCase):
         self.assertEqual([c["body"].split("\n\n")[:2] for c in self.posted()[0]["comments"]],
                          [["` Unchecked input `", "` Validate it. `"], ["` Off by one `", "` Start at zero. `"]])
         # The summary is posted first, and the head is the last thing read before the write.
-        self.assertEqual(self.events, ["summary", "forge:comments", "http:GET " + LISTED, "forge:change", "http:POST " + REVIEW])
+        self.assertEqual(self.events, ["summary", "http:GET " + SUMMARIES, "http:GET " + LISTED, "forge:change", "policy", "http:POST " + REVIEW])
         self.assertEqual((posts, self.lookup.call_args.args), (1, ("github", SLUG, self.root)))
         self.assertNotIn("fixture", json.dumps(report))
 
@@ -165,26 +184,31 @@ class InlineTests(unittest.TestCase):
                                               position={"position_type": "text", **REFS, "new_path": path, "old_path": path, "new_line": line})
                                          for path, line, body in inline.comments(report)[0]])
         self.assertEqual(self.events, ["summary", "http:GET " + USER, "http:GET " + MR, "http:GET " + THREADS + "?page=1&per_page=100",
-                                      "forge:change", *(["http:POST " + THREADS] * 2)])
+                                      "forge:change", "policy", *(["http:POST " + THREADS] * 2)])
         self.assertEqual((posts, self.lookup.call_args.args), (1, ("gitlab", SLUG, self.root)))
 
-    def test_the_reviewer_identity_is_the_newest_bot_summary_on_github_and_the_token_on_gitlab(self):
-        # A person quoting the summary line is not the reviewer; the newest bot summary names it.
-        self.comments = [summary(ident=900), summary(ident=902, author=7, kind="User"), summary(ident=901, author=99)]
+    def test_github_binds_review_identity_to_configured_app(self):
+        self.comments = [summary(author=99, app=99), summary(), summary(author=7, kind="User")]
         self.assertEqual(self.exercise("github", "--post", "--inline-comments")[0]["inline_publication"], "posted")
         bodies = [c["body"] for c in self.posted()[0]["comments"]]
-        self.reviews, self.requests = [note(ME, body) for body in bodies], []
-        self.assertEqual(self.exercise("github", "--post", "--inline-comments")[0]["inline_publication"], "posted")
         self.reviews, self.requests = [note(99, body) for body in bodies], []
-        self.assertEqual(self.exercise("github", "--post", "--inline-comments")[0]["inline_publication"], "already-present")
-        # Lines the publication adds may sit above or below the summary's first line.
-        self.comments, self.reviews, self.requests = [summary(author=99, ident=903, prefix="<!-- audit -->\n")], [], []
         self.assertEqual(self.exercise("github", "--post", "--inline-comments")[0]["inline_publication"], "posted")
-        # On GitLab the token's own user is the reviewer, whoever posted before it.
-        self.user = {"id": 77, "username": "project_1_bot_x"}
-        self.discussions = [discussion(f"` t `\n\n` m `\n\n{inline.marker(HEAD, row)}") for row in inline.comments({"findings": FINDINGS})[0]]
-        report, *_ = self.exercise("gitlab", "--post", "--inline-comments")
-        self.assertEqual((report["inline_publication"], report["inline_posted"]), ("posted", 2))
+        self.reviews, self.requests = [note(ME, body) for body in bodies], []
+        self.assertEqual(self.exercise("github", "--post", "--inline-comments")[0]["inline_publication"], "already-present")
+
+    def test_gitlab_rename_uses_the_old_path_from_the_reviewed_diff(self):
+        report, *_ = self.exercise("gitlab", "--post", "--inline-comments", previous="src/old.py")
+        self.assertEqual(report["inline_posted"], 2)
+        self.assertEqual([item["position"]["old_path"] for item in self.posted()], ["src/old.py", "src/util.py"])
+        self.assertIn("src/old.py", self.policy.call_args.args[-1])
+
+    def test_rendered_content_is_checked_before_any_inline_post(self):
+        self.policy.side_effect = source.ReviewError("publication policy refused the rendered comment")
+        with self.assertLogs(LOG, level="WARNING"):
+            report, code, _ = self.exercise("github", "--post", "--inline-comments")
+        self.assertEqual((report["inline_publication"], code, self.posted()), ("failed", 0, []))
+        self.assertIn("Validate it.", self.policy.call_args.args[-1])
+        self.assertIn("<!-- assay-pr-agent:inline:", self.policy.call_args.args[-1])
 
     def test_a_repeat_of_the_reviewer_identical_findings_is_skipped_on_github(self):
         rows, _ = inline.comments({"findings": FINDINGS})
@@ -206,14 +230,14 @@ class InlineTests(unittest.TestCase):
         with self.assertNoLogs(LOG, level="WARNING"):
             report, code, posts = self.exercise("github", "--post", "--inline-comments")
         self.assertEqual((code, report["inline_publication"], report["publication"], posts), (0, "already-present", "posted-or-already-present", 1))
-        self.assertEqual(([r.method for r in self.requests], self.events[-1]), (["GET"], "http:GET " + LISTED))
+        self.assertEqual(([r.method for r in self.requests], self.events[-1]), (["GET", "GET"], "http:GET " + LISTED))
 
     def test_a_split_review_that_stops_partway_is_finished_by_the_next_run(self):
         # The combined review is refused, the first single one lands, and the next fails in transit.
         self.refuse_combined, self.fail_after = True, 1
         with self.assertLogs(LOG, level="WARNING"):
             report, *_ = self.exercise("github", "--post", "--inline-comments")
-        self.assertEqual(report["inline_publication"], "failed")
+        self.assertEqual((report["inline_publication"], report["inline_posted"]), ("failed", 1))
         landed = self.posted()[1]["comments"]
         self.assertEqual([c["path"] for c in landed], ["src/app.py"])
         self.refuse_combined, self.fail_after, self.requests = False, None, []
@@ -221,6 +245,15 @@ class InlineTests(unittest.TestCase):
         report, *_ = self.exercise("github", "--post", "--inline-comments")
         self.assertEqual((report["inline_publication"], report["inline_posted"]), ("posted", 1))
         self.assertEqual([c["path"] for r in self.posted() for c in r["comments"]], ["src/util.py"])
+
+    def test_a_gitlab_transport_failure_keeps_earlier_successes_and_refusals(self):
+        self.fail_after = 1
+        self.refused = {"src/util.py"}
+        last = dict(FINDINGS[0], line=4, end_line=4)
+        with self.assertLogs(LOG, level="WARNING"):
+            report, *_ = self.exercise("gitlab", "--post", "--inline-comments", findings=FINDINGS + [last])
+        self.assertEqual((report["inline_publication"], report["inline_posted"], report["inline_refused"]),
+                         ("failed", 1, 1))
 
     def test_a_repeat_of_the_reviewer_identical_findings_is_skipped_on_gitlab(self):
         rows, _ = inline.comments({"findings": FINDINGS})
@@ -262,12 +295,12 @@ class InlineTests(unittest.TestCase):
         self.review_pages, self.requests = {1: [note(7, "other")] * 100, 2: ours}, []
         report, *_ = self.exercise("github", "--post", "--inline-comments")
         self.assertEqual((report["inline_publication"], [str(r.url) for r in self.requests]),
-                         ("already-present", [NOTES + "?page=1&per_page=100", NOTES + "?page=2&per_page=100"]))
+                         ("already-present", [SUMMARIES, NOTES + "?page=1&per_page=100", NOTES + "?page=2&per_page=100"]))
         self.review_pages, self.requests = dict.fromkeys(range(1, 24), [note(7, "other")] * 100), []
         with self.assertLogs(LOG, level="WARNING") as logs:
             report, *_ = self.exercise("github", "--post", "--inline-comments")
         self.assertEqual(report["inline_publication"], "failed")
-        self.assertIn("Too many review comments", logs.output[0])
+        self.assertIn("Too many GitHub comments", logs.output[0])
         self.assertFalse(any(r.method == "POST" for r in self.requests))
 
     def test_a_moved_head_refuses_to_post(self):
@@ -275,7 +308,7 @@ class InlineTests(unittest.TestCase):
         with self.assertLogs(LOG, level="WARNING") as logs:
             report, code, posts = self.exercise("github", "--post", "--inline-comments")
         self.assertEqual((code, report["inline_publication"], report["publication"], posts), (0, "stale", "posted-or-already-present", 1))
-        self.assertEqual(([str(r.url) for r in self.requests], logs.output), ([LISTED], [
+        self.assertEqual(([str(r.url) for r in self.requests], logs.output), ([SUMMARIES, LISTED], [
             "WARNING:cursor_pr.inline:Inline comments for org/project#7 were not posted (the change moved on since the review)"]))
         # GitLab learns the head from the merge request's diff refs and, last, from the same forge read.
         for merge_request, head, reads in ((REFS | {"head_sha": "b" * 40}, HEAD, [USER, MR]),
@@ -321,7 +354,7 @@ class InlineTests(unittest.TestCase):
         self.assertEqual((report["inline_publication"], report["inline_posted"], report["inline_refused"]), ("posted", 1, 1))
         sent = self.posted()
         self.assertEqual([len(r["comments"]) for r in sent], [2, 1, 1])
-        self.assertEqual(sent[0]["body"], sent[1]["body"])
+        self.assertNotEqual(sent[0]["body"], sent[1]["body"])
         self.refused, self.refuse_combined = set(), False
         self.assertEqual(self.exercise("github", "--post", "--inline-comments")[0]["inline_publication"], "posted")
         self.assertEqual([len(r["comments"]) for r in self.posted()], [2, 1, 1, 2])
@@ -352,7 +385,7 @@ class InlineTests(unittest.TestCase):
         with self.assertLogs(LOG, level="WARNING") as logs:
             report, code, posts = self.exercise("github", "--post", "--inline-comments")
         self.assertEqual((code, report["inline_publication"], report["publication"], posts), (0, "failed", "posted-or-already-present", 1))
-        self.assertEqual(logs.output, ["WARNING:cursor_pr.inline:Inline comments for org/project#7 were not posted (HTTP 403)"])
+        self.assertEqual(logs.output, ["WARNING:cursor_pr.inline:Inline comment publication for org/project#7 stopped (HTTP 403)"])
         self.status = 201
         # A failed model leaves no finding to place, with or without the flag.
         for options in (("--post",), ("--post", "--inline-comments")):
@@ -361,7 +394,7 @@ class InlineTests(unittest.TestCase):
             self.assertEqual((code, report["inline_publication"], report["publication"], posts),
                              (2, "skipped", "posted-or-already-present", 1))
         # Without a reviewer identity nothing is posted, rather than a duplicate.
-        for provider, key, value in (("github", "comments", []), ("github", "comments", [summary(ident="900")]),
+        for provider, key, value in (("github", "comments", []), ("github", "comments", [summary(author="42")]),
                                      ("github", "comments", [summary(kind="User")]), ("gitlab", "user", {"message": "401"}),
                                      ("gitlab", "user", {"id": True})):
             self.comments, self.user, self.requests = [summary()], {"id": ME}, []
@@ -370,25 +403,25 @@ class InlineTests(unittest.TestCase):
                 report, code, posts = self.exercise(provider, "--post", "--inline-comments")
             self.assertEqual((code, report["inline_publication"], posts), (0, "failed", 1))
             self.assertEqual([r.getMessage() for r in logs.records],
-                             ["Inline comments for org/project#7 were not posted (Could not identify the reviewer identity on the change)"])
+                             ["Inline comment publication for org/project#7 stopped (Could not identify the reviewer identity on the change)"])
             self.assertFalse(any(r.method == "POST" for r in self.requests))
         self.comments, self.user = [summary()], {"id": ME}
         self.error = httpx.ConnectError("https://gitlab.example/api/v4/private?token=fixture")
         with self.assertLogs(LOG, level="WARNING") as logs:
             report, *_ = self.exercise("github", "--post", "--inline-comments")
         self.assertEqual((report["inline_publication"], logs.output), ("failed", [
-            "WARNING:cursor_pr.inline:Inline comments for org/project#7 were not posted (ConnectError)"]))
+            "WARNING:cursor_pr.inline:Inline comment publication for org/project#7 stopped (ConnectError)"]))
         # A permission failure on a discussion is not a refused line: nothing is counted as placed.
         self.error, self.status, self.requests = None, 403, []
         with self.assertLogs(LOG, level="WARNING") as logs:
             report, *_ = self.exercise("gitlab", "--post", "--inline-comments")
-        self.assertEqual(({k: v for k, v in report.items() if k.startswith("inline")}, logs.output), ({"inline_publication": "failed"}, [
-            "WARNING:cursor_pr.inline:Inline comments for org/project#7 were not posted (HTTP 403)"]))
+        self.assertEqual(({k: v for k, v in report.items() if k.startswith("inline")}, logs.output), ({"inline_publication": "failed", "inline_posted": 0, "inline_refused": 0}, [
+            "WARNING:cursor_pr.inline:Inline comment publication for org/project#7 stopped (HTTP 403)"]))
         self.assertEqual([r.method for r in self.requests], ["GET", "GET", "GET", "POST"])
         self.status, self.requests = 302, []
         with self.assertLogs(LOG, level="WARNING"):
             report, *_ = self.exercise("github", "--post", "--inline-comments")
-        self.assertEqual((report["inline_publication"], [r.method for r in self.requests]), ("failed", ["GET", "POST"]))
+        self.assertEqual((report["inline_publication"], [r.method for r in self.requests]), ("failed", ["GET", "GET", "POST"]))
 
     def test_the_poller_child_inherits_the_environment_variable(self):
         from cursor_pr.config import project_from
