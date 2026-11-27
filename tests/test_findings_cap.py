@@ -69,6 +69,13 @@ class RegularCommentSizeTests(unittest.TestCase):
     def finding(n, message):
         return dict(path="src/app.py", line=n, end_line=n, title=f"Finding {n}", message=message)
 
+    def test_prepared_review_from_before_the_setting_keeps_its_original_cap(self):
+        report = self.report([self.finding(n, "A finding") for n in range(1, 11)], scanner_rows=0)
+        report.update(tier="max", delivered="max", context=[], passes=[], omitted_findings=2,
+                      verification={"state": "not-needed"}, max_input_tokens=60000, base_input_tokens=6000,
+                      estimated_input_tokens=2000)
+        self.assertIn("2 findings omitted by the 10-finding tier limit.", self.post(report))
+
     def test_realistic_six_findings_post_unchanged(self):
         findings = [self.finding(n, "x" * 600) for n in range(1, 7)]
         comment = self.post(self.report(findings))

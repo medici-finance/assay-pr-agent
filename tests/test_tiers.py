@@ -119,7 +119,8 @@ class TierTests(unittest.TestCase):
         code, report = self.check()
         change = cli.local_change(self.root, "main", self.head)
         files = sorted(change.files, key=lambda f: f.path)
-        prompt = engine.pack(files, [], title=change.title, description=change.description)[0]
+        prompt = engine.pack(files, [], title=change.title, description=change.description,
+                             commit_messages=True)[0]
         self.assertEqual(self.prompts(), [["review", prompt]])
         self.assertEqual((code, report["state"], report["tier"], report["delivered"]), (0, "reviewed", "regular", "regular"))
         self.assertEqual(report["verification"], {"state": "not-needed"})
@@ -202,6 +203,16 @@ class TierTests(unittest.TestCase):
         self.assertEqual([f["title"] for f in report["findings"]], ["Real"])
         # A max review's first pass is the mid prompt, under the mid cap, and reuses the cached mid answer.
         self.assertEqual(report["passes"][0]["state"], "cached")
+
+    def test_cli_override_replaces_an_invalid_configured_cap(self):
+        os.environ.update(REVIEW_MAX_FINDINGS="13", REVIEW_MAX_FINDINGS_MID="invalid")
+        code, report = self.check("--estimate", "--max-findings", "5")
+        self.assertEqual((code, report["max_findings"]), (0, 5))
+
+        os.environ.update(REVIEW_MAX_FINDINGS_MID="4", REVIEW_MAX_FINDINGS_MAX="invalid")
+        code, report = self.check("--tier", "max", "--max-findings", "2")
+        self.assertEqual((code, report["max_findings"]), (0, 2))
+        self.assertIn("A concise list (0-4 issues)", self.prompts()[0][1])
 
     def test_cli_rejects_a_cap_outside_the_bound(self):
         for value in ("0", "13", "x"):
@@ -615,10 +626,9 @@ class TierRequestTests(unittest.TestCase):
         self.assertEqual(Jobs(self.state).tier((self.gh.key, 3, 83)), "max")  # Survives a restart.
 
     def test_poller_passes_the_tier_to_the_review_command(self):
-        done = subprocess.CompletedProcess([], 0, stdout=json.dumps({"state": "reviewed",
-                                                                     "publication": "posted-or-already-present"}))
+        done = json.dumps({"state": "reviewed", "publication": "posted-or-already-present"}).encode()
         for tier, expected in (("regular", False), ("mid", True), ("max", True)):
-            with patch("cursor_pr.poll.subprocess.run", return_value=done) as run, \
+            with patch("cursor_pr.poll.supervised", return_value=done) as run, \
                  patch("cursor_pr.poll.history.interval", return_value=0):
                 self.assertEqual(run_review(self.gh, 3, self.state, tier), "reviewed")
             argv = run.call_args.args[0]
@@ -627,17 +637,16 @@ class TierRequestTests(unittest.TestCase):
                 self.assertEqual(argv[argv.index("--tier") + 1], tier)
 
     def test_poller_passes_the_cap_of_the_requested_tier(self):
-        done = subprocess.CompletedProcess([], 0, stdout=json.dumps({"state": "reviewed",
-                                                                     "publication": "posted-or-already-present"}))
-        os.environ.update(REVIEW_MAX_FINDINGS="2", REVIEW_MAX_FINDINGS_MID="5")
-        for tier, expected in (("regular", "2"), ("mid", "5"), ("max", None)):
-            with patch("cursor_pr.poll.subprocess.run", return_value=done) as run, \
-                 patch("cursor_pr.poll.history.interval", return_value=0):
-                self.assertEqual(run_review(self.gh, 3, self.state, tier), "reviewed")
-            argv = run.call_args.args[0]
-            self.assertEqual(argv[argv.index("--max-findings") + 1] if "--max-findings" in argv else None, expected)
-            # The child inherits the other tiers' caps, which a max review's first pass needs.
-            self.assertEqual(run.call_args.kwargs["env"]["REVIEW_MAX_FINDINGS_MID"], "5")
+        done = json.dumps({"state": "reviewed", "publication": "posted-or-already-present"}).encode()
+        with patch.dict(os.environ, {"REVIEW_MAX_FINDINGS": "2", "REVIEW_MAX_FINDINGS_MID": "5"}):
+            os.environ.pop("REVIEW_MAX_FINDINGS_MAX", None)
+            for tier, expected in (("regular", "2"), ("mid", "5"), ("max", None)):
+                with patch("cursor_pr.poll.supervised", return_value=done) as run, \
+                     patch("cursor_pr.poll.history.interval", return_value=0):
+                    self.assertEqual(run_review(self.gh, 3, self.state, tier), "reviewed")
+                argv = run.call_args.args[0]
+                self.assertEqual(argv[argv.index("--max-findings") + 1] if "--max-findings" in argv else None, expected)
+                self.assertEqual(run.call_args.kwargs["env"]["REVIEW_MAX_FINDINGS_MID"], "5")
 
 
 if __name__ == "__main__":

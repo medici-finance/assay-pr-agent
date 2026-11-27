@@ -154,10 +154,12 @@ def max_input_tokens(state):
     return saved_integer(state, "REVIEW_MAX_INPUT_TOKENS", DEFAULT_MAX_INPUT_TOKENS)
 
 
-def max_findings(state):
-    """Effective findings cap of each review tier."""
-    return {tier: saved_integer(state, name, DEFAULT_MAX_FINDINGS, MAX_FINDINGS_LIMIT)
-            for tier, name in FINDINGS_SETTINGS.items()}
+def max_findings(state, *, tier=None, override=None):
+    """Resolve the caps used by one request, or check every tier at poller startup."""
+    requested = FINDINGS_SETTINGS if tier is None else (("mid", "max") if tier == "max" else (tier,))
+    return {name: override if name == tier and override is not None else
+            saved_integer(state, FINDINGS_SETTINGS[name], DEFAULT_MAX_FINDINGS, MAX_FINDINGS_LIMIT)
+            for name in requested}
 
 
 def ask(label, default=""):
