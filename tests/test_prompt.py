@@ -2,18 +2,19 @@ import fcntl
 import os
 import resource
 import subprocess
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from cursor_pr import cli, engine, source
+from cursor_pr import cli, engine, history, source
 
 
 def fixture_repo():
     """Two commits after a base, each with a message: what a local review reads."""
     tmp = tempfile.TemporaryDirectory()
-    root = Path(tmp.name)
+    root = Path(tmp.name).resolve()
 
     def git(*args):
         return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.org",
@@ -210,6 +211,130 @@ class ChangeDescriptionTests(unittest.TestCase):
             report, code = cli.run_request(args)
         self.assertEqual((code, report["state"]), (0, "reviewed"))
         self.assertIn('"title": "", "description": "Add the script', shown[0])
+
+
+    def test_prompt_carries_bounded_history_advisories(self):
+        files = [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")]
+        detail = "historically coupled to partner.py " + "x" * 400
+        notices = [{"path": "not-shown.py", "kind": "co-change", "detail": "skip"}] * 12
+        notices += [{"path": "a.sh", "kind": "co-change", "detail": detail} for _ in range(15)]
+        described = engine.pack(files, [], title="Title", description="Body")
+        self.assertEqual(engine.pack(files, [], title="Title", description="Body", advisories=()), described)
+        prompt = engine.pack(files, [], title="Title", description="Body", advisories=notices)[0]
+        self.assertEqual(prompt.count('"kind": "co-change"'), 12)
+        self.assertIn(json.dumps(detail[:300] + "…", ensure_ascii=False), prompt)
+        order = [prompt.index(mark) for mark in ("Change description (untrusted data):", "History advisories (untrusted data):",
+                                                 "Scanner evidence (untrusted data):", "Patch (untrusted data):")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("Use only the supplied change description, history advisories, patch and scanner evidence.", prompt)
+        self.assertIn("hints to check against the patch, not findings", prompt)
+        alone = engine.pack(files, [], title="", description="", advisories=notices[-1:])[0]
+        self.assertNotIn("Change description", alone)
+        self.assertIn("Use only the supplied history advisories, patch and scanner evidence. History advisories are notices", alone)
+
+    def test_fit_drops_excess_history_before_it_discards_a_patch(self):
+        files = [source.File(name, "@@ -0,0 +1 @@\n+x = 1\n", "added")
+                 for name in ("src/a.py", "tests/test_a.py")]
+        notices = [{"path": files[0].path, "kind": "co-change", "detail": "coupled to partner.py"}]
+        wanted = engine.pack(files, [])
+        limit = engine.tokens(wanted[0])
+        original_size = engine.tokens(engine.pack(files, [], advisories=notices)[0])
+        self.assertGreater(original_size, limit)
+        self.assertEqual(cli.fit(files, [], limit, advisories=notices), (wanted, limit, original_size, []))
+
+    def test_fit_does_not_charge_files_for_advisories_hidden_by_the_cap(self):
+        def added(path, count):
+            body = "".join(f"+VALUE_{n} = {n}\n" for n in range(count))
+            return source.File(path, f"@@ -0,0 +1,{count} @@\n" + body, "added")
+
+        first = added("src/first.py", 5)
+        hidden = added("tests/test_hidden.py", 8)
+        oversized = added("src/oversized.py", 100)
+        notices = [
+            {"path": file.path, "kind": "co-change", "detail": detail}
+            for file, detail in ((first, "coupled"), (hidden, "coupled to another file " * 12))
+            for _ in range(12)
+        ]
+        wanted = engine.pack([first, hidden], [], advisories=notices)
+        wanted_size = engine.tokens(wanted[0])
+        limit = wanted_size
+        self.assertGreater(engine.tokens(engine.pack([hidden], [], advisories=notices)[0]), limit)
+        self.assertGreater(engine.tokens(engine.pack([oversized], [])[0]), limit)
+
+        packed, estimate, _, degraded = cli.fit([first, hidden, oversized], [], limit, advisories=notices)
+        self.assertEqual((estimate, degraded), (wanted_size, [oversized.path]))
+        self.assertEqual(packed[0], wanted[0])
+        self.assertTrue(packed[1][hidden.path])
+
+    def test_fit_rechecks_exact_batch_savings_before_skipping_another_file(self):
+        files = [source.File(name, "@@ -0,0 +1 @@\n+" + line + "\n", "added")
+                 for name, line in (("deps.lock", "x"), ("src/a.py", "a"), ("src/b.py", "b"))]
+        notices = [{"path": files[0].path, "kind": "co-change", "detail": "Frequently changes with pyproject.toml."}]
+        wanted = engine.pack(files[1:], [])
+        limit = engine.tokens(wanted[0])
+
+        packed, estimate, _, degraded = cli.fit(files, [], limit, advisories=notices)
+        self.assertEqual((estimate, degraded), (limit, [files[0].path]))
+        self.assertEqual(packed[0], wanted[0])
+
+    def test_fit_refills_advisory_space_from_files_the_prompt_keeps(self):
+        def added(path, count):
+            body = "".join(f"+VALUE_{n} = {n}\n" for n in range(count))
+            return source.File(path, f"@@ -0,0 +1,{count} @@\n" + body, "added")
+
+        lock = added("uv.lock", 300)
+        hidden = added("src/history.py", 8)
+        kept = added("tests/test_keep.py", 20)
+        notices = [
+            {"path": file.path, "kind": "co-change", "detail": detail}
+            for file, detail in ((lock, "coupled"), (hidden, "coupled to another file " * 12))
+            for _ in range(12)
+        ]
+        wanted = engine.pack([hidden, kept], [], advisories=notices[12:13])
+        wanted_size = engine.tokens(wanted[0])
+        limit = wanted_size + 5
+        self.assertGreater(engine.tokens(engine.pack([hidden, kept], [], advisories=notices)[0]), limit)
+
+        packed, estimate, _, degraded = cli.fit([lock, hidden, kept], [], limit, advisories=notices)
+        self.assertEqual((estimate, degraded), (wanted_size, [lock.path]))
+        self.assertEqual(packed[0], wanted[0])
+
+    def test_advisories_are_kept_only_for_files_with_shown_lines(self):
+        shown = source.File("shown.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")
+        skipped = source.File("skipped.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")
+        absent = source.File("absent.py", "", "added", absent=True)
+        notices = [{"path": f.path, "kind": "co-change", "detail": f"Notice for {f.path}"}
+                   for f in [shown, skipped, absent]]
+        prompt = engine.pack([shown, skipped, absent], [], frozenset({skipped.path}), advisories=notices)[0]
+        self.assertIn("Notice for shown.py", prompt)
+        self.assertNotIn("Notice for skipped.py", prompt)
+        self.assertNotIn("Notice for absent.py", prompt)
+
+    def test_review_shows_advisories_to_the_model_and_keeps_reporting_them(self):
+        root, tmp = fixture_repo()
+        self.addCleanup(tmp.cleanup)
+        advisory = {"state": "complete", "advisories": [{"path": "a.sh", "kind": "co-change", "detail": "coupled"}],
+                    "unscreened": []}
+        shown = []
+
+        def invoke(prompt, model, anchors):
+            shown.append(prompt)
+            return {"findings": [], "cursor_usage": None}
+        change = source.Change("a" * 40, [source.File("a.sh", "@@ -0,0 +1 @@\n+echo hi\n", "added")], "org/repo#1", "T", "D")
+        args = cli.parser().parse_args(["--change", "org/repo#1", "--repo", str(root), "--cache-dir", str(root / "cache"),
+                                        "--qualgen-store", str(root / "store"), "--max-input-tokens", "6000"])
+        with patch.object(cli, "forge_change", return_value=change), patch.object(cli, "scan_files", return_value=[]), \
+             patch.object(history, "screen", return_value=advisory) as screen, \
+             patch.object(engine, "invoke", side_effect=invoke):
+            report, code = cli.run_request(args)
+            self.assertEqual((code, report["state"]), (0, "reviewed"))
+            screen.assert_called_once_with(root, args.qualgen_store, {"a.sh"}, "a" * 40)
+            args.max_input_tokens = 1
+            bounded, code = cli.run_request(args)
+            self.assertEqual((code, bounded["state"]), (2, "over-budget"))
+        self.assertEqual((report["qualgen"], bounded["qualgen"]), (advisory, advisory))
+        self.assertEqual(len(shown), 1)
+        self.assertIn('"detail": "coupled"', shown[0])
 
 
 if __name__ == "__main__":

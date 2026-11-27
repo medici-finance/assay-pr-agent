@@ -210,6 +210,62 @@ class TierTests(unittest.TestCase):
                 cli.parser().parse_args(["--base", "main", "--max-findings", value])
         self.assertEqual(cli.parser().parse_args(["--base", "main", "--max-findings", "12"]).max_findings, 12)
 
+    def test_qualgen_reaches_both_max_passes_without_replacing_tier_context(self):
+        _, baseline = self.check("--tier", "max", "--estimate")
+        qualgen = {"state": "complete", "advisories": [
+            {"path": "src/app.py", "kind": "co-change", "detail": "Review the callers."},
+            {"path": "not-in-the-patch.py", "kind": "co-change", "detail": "Unrelated advice."},
+        ], "unscreened": []}
+        with patch.object(cli.history, "screen", return_value=qualgen) as screen:
+            code, report = self.check("--tier", "max", "--qualgen-store", str(self.root / "qualgen"))
+        screen.assert_called_once()
+        self.assertEqual((code, report["delivered"], report["qualgen"]), (0, "max", qualgen))
+        for original, advised in zip(baseline["passes"], report["passes"][:2], strict=True):
+            self.assertLessEqual(advised["estimated_input_tokens"], original["estimated_input_tokens"])
+        calls = self.prompts()
+        self.assertEqual([kind for kind, _ in calls], ["review", "deep", "verification"])
+        for _, prompt in calls[:2]:
+            self.assertIn("History advisories (untrusted data)", prompt)
+            self.assertIn("Review the callers.", prompt)
+            self.assertIn("Context from outside the patch", prompt)
+            self.assertNotIn("Unrelated advice.", prompt)
+        self.assertNotIn("History advisories", calls[-1][1])
+
+    def test_first_pass_history_never_displaces_max_patch_coverage(self):
+        small, large = "tests/test_small.py", "src/large.py"
+        for path, count in ((small, 5), (large, 780)):
+            self.write(path, "".join(f"VALUE_{n} = {n}\n" for n in range(count)))
+        self.commit("add fixtures with different patch sizes")
+        self.answers(review=answer(), deep=answer())
+        qualgen = {"state": "complete", "advisories": [
+            {"path": small, "kind": "co-change", "detail": "Callers need review " * 14}
+            for _ in range(6)
+        ], "unscreened": []}
+        raw = {"change description": "Check how the new values are used.",
+               "whole changed files": "These values come from the fixtures."}
+        args = ("--tier", "max", "--max-input-tokens", "1000", "--path", small, "--path", large)
+        with patch.object(context, "gather", return_value=raw), patch.object(cli.history, "screen", return_value=qualgen):
+            _, plain = self.check(*args)
+            _, advised = self.check(*args, "--qualgen-store", str(self.root / "qualgen"))
+        self.assertEqual(plain["degraded"], [])
+        self.assertEqual((advised["delivered"], advised["degraded"]), ("max", []))
+
+    def test_history_leaves_room_to_verify_a_mid_finding(self):
+        issue = dict(finding(42, "Check the returned value"), issue_content="behavior " * 1330 + "here")
+        self.answers(review=answer(issue), verification=answer(issue))
+        qualgen = {"state": "complete", "advisories": [
+            {"path": "src/app.py", "kind": "co-change", "detail": "Check prior use of this path. " * 9},
+        ], "unscreened": []}
+        args = ("--tier", "mid", "--max-input-tokens", "1400")
+        with patch.object(context, "gather", return_value={"change description": "The patch adjusts a returned value."}), \
+             patch.object(cli.history, "screen", return_value=qualgen):
+            _, plain = self.check(*args)
+            code, advised = self.check(*args, "--qualgen-store", str(self.root / "qualgen"))
+        self.assertEqual(plain["verification"]["state"], "filtered")
+        self.assertGreater(plain["passes"][-1]["estimated_input_tokens"], plain["base_input_tokens"])
+        self.assertEqual((code, advised["verification"]["state"]), (0, "filtered"))
+        self.assertEqual(advised["qualgen"], qualgen)
+
     def test_max_retains_deep_findings_and_reports_the_cap(self):
         # The cap PR #43 gave the max tier, now set through its environment override.
         os.environ["REVIEW_MAX_FINDINGS_MAX"] = "10"
