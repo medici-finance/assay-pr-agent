@@ -30,7 +30,8 @@ class ProviderNeutralNamesTests(unittest.TestCase):
                 self.assertEqual((report["provider"], report["model_invocations"], report["model_usage"]),
                                  (provider, 1, {"input_tokens": 5}))
                 self.assertEqual(report["receipt"]["usage"], {"input": 5})
-                self.assertEqual([key for key in report if key.startswith("cursor_")], [])
+                self.assertEqual((report["cursor_invocations"], report["cursor_usage"]),
+                                 (1, {"input_tokens": 5}) if provider == "cursor" else (0, None))
 
     def test_a_cursor_team_keeps_its_own_name(self):
         report = self.review("cursor", team="42")

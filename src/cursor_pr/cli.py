@@ -281,6 +281,10 @@ def execute(args):
 
 def run_request(args):
     report, code = execute(args)
+    # Preserve the legacy JSON fields for consumers that have not migrated to model_*.
+    cursor = report["provider"] == "cursor"
+    report["cursor_invocations"] = report["model_invocations"] if cursor else 0
+    report["cursor_usage"] = report["model_usage"] if cursor else None
     report["receipt"] = receipt.build(report)
     if args.post:
         try:
