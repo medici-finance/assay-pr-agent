@@ -23,6 +23,8 @@ from unittest.mock import patch
 from cursor_pr import cli, engine
 
 DEFAULT_BUDGET = "200000"
+# How the directory a capture writes its files in, before moving them into place, is named.
+STAGING = ".capture-"
 # The only cursor-review options a capture takes. Every other one is refused: it would select a
 # source other than a local change, publish, or run a mode this script does not stand in for.
 ALLOWED = ("--base", "--head", "--repo", "--path", "--max-input-tokens", "--cache-dir", "--go-report", "--qualgen-store")
@@ -85,7 +87,23 @@ def main(argv):
     except OSError as err:
         return fail(f"could not use the output directory ({err}); choose another OUT_PREFIX")
     try:
-        fcntl.flock(held, fcntl.LOCK_EX)
+        locked = True
+        try:
+            try:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(f"capture-prompt: waiting for another capture using {prompt_file.parent}", file=sys.stderr, flush=True)
+                fcntl.flock(held, fcntl.LOCK_EX)
+        except OSError as err:
+            # Some filesystems cannot lock a directory (NFS on Linux). The capture is still good;
+            # only two at once with one prefix are not kept apart.
+            locked = False
+            print(f"capture-prompt: warning: could not lock {prompt_file.parent} ({err}); "
+                  "do not run two captures with this OUT_PREFIX at once", file=sys.stderr)
+        if locked:
+            # What a capture that was killed while writing left here. Nobody else is writing now.
+            for stale in prompt_file.parent.glob(STAGING + "*"):
+                shutil.rmtree(stale, ignore_errors=True)
         return capture_to(prompt_file, anchors_file, options)
     finally:
         os.close(held)
@@ -157,12 +175,13 @@ def capture_to(prompt_file, anchors_file, options):
     # move replaces a link at the final name instead of following it. The prompt is moved last: it
     # is what gets reviewed, so it appears only complete and only when all else is in place.
     # Whatever stops this, a failed write, a prompt that cannot be encoded or an interrupt, nothing
-    # is left behind.
+    # is left behind. Only a capture that is killed outright can leave its directory, and never a
+    # prompt; the next capture here removes that directory.
     contents = {anchors_file: json.dumps({path: sorted(lines) for path, lines in anchors.items()}, indent=1),
                 prompt_file: prompt}
     staging = None
     try:
-        staging = Path(tempfile.mkdtemp(prefix=".capture-", dir=prompt_file.parent))
+        staging = Path(tempfile.mkdtemp(prefix=STAGING, dir=prompt_file.parent))
         for target, text in contents.items():
             (staging / target.name).write_text(text, encoding="utf-8")
         for target in contents:

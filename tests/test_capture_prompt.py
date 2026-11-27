@@ -326,7 +326,11 @@ class CapturePromptTest(unittest.TestCase):
         import fcntl
         out = self.root / "out"
         self.assertEqual(self.capture().returncode, 0)
-        first = (out / "branch.prompt.txt").read_text()
+        files = [out / "branch.prompt.txt", out / "branch.anchors.json"]
+        first = [path.stat().st_ino for path in files]
+        # What a capture that was killed while writing left behind.
+        (out / ".capture-killed").mkdir()
+        (out / ".capture-killed" / "branch.prompt.txt").write_text("half")
         # This test stands in for a capture that is still running there.
         held = os.open(out, os.O_RDONLY)
         self.addCleanup(os.close, held)
@@ -337,13 +341,31 @@ class CapturePromptTest(unittest.TestCase):
         self.addCleanup(second.kill)
         with self.assertRaises(subprocess.TimeoutExpired):
             second.wait(timeout=5)
-        # It has neither removed nor replaced what the running capture owns.
-        self.assertEqual((out / "branch.prompt.txt").read_text(), first)
-        self.assertTrue((out / "branch.anchors.json").exists())
+        # It has neither removed nor replaced what the running capture owns: these are the same files.
+        self.assertEqual([path.stat().st_ino for path in files], first)
+        self.assertTrue((out / ".capture-killed").exists())
         fcntl.flock(held, fcntl.LOCK_UN)
         _, err = second.communicate(timeout=120)
         self.assertEqual(second.returncode, 0, err)
-        self.assertEqual((out / "branch.prompt.txt").read_text(), first)
+        self.assertIn("capture-prompt: waiting for another capture using", err)
+        # Then it ran: both files are new ones, and the killed capture's directory is gone.
+        self.assertTrue(all(path.stat().st_ino != before for path, before in zip(files, first)))
+        self.assertEqual(sorted(path.name for path in out.iterdir()), ["branch.anchors.json", "branch.prompt.txt"])
+
+    def test_a_directory_that_cannot_be_locked_is_captured_with_a_warning(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("capture_prompt_unlocked", SCRIPT)
+        script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(script)
+        err = io.StringIO()
+        with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stderr(err), \
+                patch.object(script.fcntl, "flock", side_effect=OSError(9, "Bad file descriptor")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = script.main(["capture-prompt.py", str(self.root / "out" / "branch"), "--repo", str(self.repo),
+                                "--base", self.base, "--cache-dir", str(self.root / "cache")])
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("capture-prompt: warning: could not lock", err.getvalue())
+        self.assertTrue((self.root / "out" / "branch.prompt.txt").exists())
 
     def test_warns_about_untracked_files_the_developer_configured_status_to_hide(self):
         self.git("config", "status.showUntrackedFiles", "no")
