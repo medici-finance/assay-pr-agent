@@ -140,6 +140,8 @@ class Change:
     head: str
     files: list[File]
     identity: str
+    base: str = ""      # tip of the base as a commit, when the caller named one
+    base_ref: str = ""  # base branch name reported by the forge
 
 
 def forge_change(address, expected_url=None, *, project=None):
@@ -174,7 +176,8 @@ def forge_change(address, expected_url=None, *, project=None):
             raise ReviewError("Missing patch coverage")
         files.append(File(row["filename"], row.get("patch", ""), row.get("status", ""),
                           row["patchAbsent"], row.get("previousFilename", "")))
-    return Change(head, files, first.get("url") or address)
+    base_ref = first.get("baseRef")
+    return Change(head, files, first.get("url") or address, base_ref=base_ref if isinstance(base_ref, str) else "")
 
 
 def git(root, *args):
@@ -188,7 +191,8 @@ def commit(root, ref):
 def local_change(root, base, head):
     from pr_agent.algo.git_patch_processing import to_hunk_only_patch
     head = commit(root, head)
-    base = git(root, "merge-base", commit(root, base), head).decode().strip()
+    tip = commit(root, base)
+    base = git(root, "merge-base", tip, head).decode().strip()
     flags = ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-color"]
     names = git(root, *flags, "--name-status", "-z", base, head, "--").decode().split("\0")
     files = []
@@ -199,7 +203,7 @@ def local_change(root, base, head):
         except UnicodeDecodeError:
             patch = ""
         files.append(File(path, patch, status, not bool(patch)))
-    return Change(head, files, str(root.resolve()))
+    return Change(head, files, str(root.resolve()), base=tip)
 
 
 def ci_refs():

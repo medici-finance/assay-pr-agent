@@ -4,6 +4,7 @@ from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -12,23 +13,82 @@ import time
 from unidiff.errors import UnidiffParseError
 import yaml
 
-from . import history, providers, scanners
+from . import drift, history, providers, scanners
 from .scanners import fence
 from .login import auth_mode, login_directory
 from .setup import locked, apply_saved_setup, load_provider_key, max_input_tokens, state_dir
 from .config import DEFAULT_MAX_INPUT_TOKENS, load_config, project_from
 from .credentials import forge_credentials
 from .artifacts import forge_go_report
-from .checks import go_report, scan_files, scanner
+from .checks import go_report, scan_files
 from .sync import scan_checkout
 from .engine import CursorFailure, pack, review, tokens
-from .source import ReviewError, ci_refs, forge_change, local_change, post_comment
+from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
+
+
+LOCKS = {"package-lock.json", "pnpm-lock.yaml", "go.sum", "npm-shrinkwrap.json"}
+MAX_DEGRADED_ROWS = 50
+
+
+def rank(path):
+    """Order in which whole files leave an oversized prompt: the least reviewable first."""
+    parts = path.lower().split("/")
+    name = parts[-1]
+    if name in LOCKS or name.endswith((".lock", ".min.js", ".min.css")):
+        return 0
+    if (set(parts[:-1]) & {"test", "tests", "__tests__", "testdata", "spec"} or name.startswith("test_")
+            or re.search(r"(_test|\.test|\.spec)\.[a-z0-9]+$", name)):
+        return 1
+    if "docs" in parts[:-1] or name.endswith((".md", ".rst", ".txt", ".adoc")):
+        return 2
+    return 3
+
+
+def fit(files, checks, limit):
+    """Pack the prompt, leaving out whole files until it fits the input budget.
+
+    Returns the prompt parts, the estimate of what will be sent, the estimate of the full
+    prompt, and the paths left out. Nothing is left out when even one file cannot fit.
+    """
+    prompt, anchors, unseen, has_text = full_pack = pack(files, checks)
+    estimated = full = tokens(prompt) if has_text else 0
+    if full <= limit:
+        return full_pack, full, full, []
+    # Measure each file with its scanner evidence before choosing what to leave out.
+    # A file that cannot fit alone leaves first, so a smaller file can still be reviewed.
+    overhead = tokens(pack([], [])[0])
+    sizes = {}
+    for file in files:
+        if file.path not in unseen:
+            standalone, _, _, _ = pack([file], checks)
+            sizes[file.path] = tokens(standalone) - overhead
+    queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
+    dropped = []
+    while estimated > limit and queue:
+        # Per-file sizes are approximate, so the last file only leaves after a real recount.
+        dropped.append(queue.pop(0))
+        freed = sizes[dropped[-1]]
+        while len(queue) > 1 and freed < estimated - limit:
+            dropped.append(queue.pop(0))
+            freed += sizes[dropped[-1]]
+        prompt, anchors, unseen, has_text = pack(files, checks, frozenset(dropped))
+        estimated = tokens(prompt) if has_text else 0
+    if not has_text or estimated > limit:
+        return full_pack, full, full, []
+    return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped)
 
 
 def publish(address, head, report, *, project=None, state=None):
     _, number = address.rsplit("#", 1)
     label = providers.LABELS[report.get("provider", "cursor")]
     body = [f"{label} review of {head}", report["state"]]
+    degraded = report.get("degraded") or []
+    if degraded:
+        body.append(f"Degraded review: the full prompt is an estimated {report['full_input_tokens']} tokens, "
+                    f"over the limit of {report['max_input_tokens']}. {label} did not review these files:")
+        body.extend(f"- Not reviewed (token limit): {fence(path)}" for path in degraded[:MAX_DEGRADED_ROWS])
+        if len(degraded) > MAX_DEGRADED_ROWS:
+            body.append(f"- Not reviewed (token limit): {len(degraded) - MAX_DEGRADED_ROWS} more files")
     # Paths come from the PR and titles/messages from the model: quote them as code
     # so the reviewer identity never posts a Markdown link or @mention for an attacker.
     for issue in report["findings"]:
@@ -50,6 +110,8 @@ def publish(address, head, report, *, project=None, state=None):
         body.extend(["", *scanners.summary(report["static_checks"]), ""])
     if "qualgen" in report:
         body.extend(["", *history.summary(report["qualgen"]), ""])
+    if "drift" in report:
+        body.extend(["", *drift.summary(report["drift"]), ""])
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {fence(path)}")
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
@@ -95,6 +157,11 @@ def execute(args):
     else:
         base, head = ci_refs() if args.ci else (args.base, args.head or "HEAD")
         change = local_change(root, base, head)
+        drift_base = change.base
+        github_pr = os.getenv("GITHUB_ACTIONS") == "true" and os.getenv("GITHUB_EVENT_NAME") == "pull_request"
+        if args.ci and not github_pr and os.getenv("CI_PIPELINE_SOURCE") == "merge_request_event":
+            target = os.getenv("CI_MERGE_REQUEST_TARGET_BRANCH_SHA")
+            drift_base = target if valid_sha(target) else None
 
     paths = {f.path for f in change.files}
     selected = set(args.path) if args.path else paths
@@ -105,11 +172,10 @@ def execute(args):
     wanted = scanners.inputs(files) if args.change else set()
     static = scanners.ci_results(args.expected_change_url, change.head, root, wanted, args.scanner_ci or {})
     missing = sorted(wanted - static.keys())
-    needs_checkout = missing or any(scanner(f.path) and not f.absent and f.status not in ("removed", "deleted", "D")
-                                    for f in files)
     with ExitStack() as stack:
         checkout = root
-        if project and needs_checkout:
+        # A managed checkout holds only the default branch: fetch the head for scans and base drift.
+        if project:
             number = args.change.rsplit("#", 1)[1]
             if args.expected_change_url != project.change_url(number):
                 raise ReviewError("Managed checkout and reviewed project differ")
@@ -124,6 +190,10 @@ def execute(args):
             else:
                 static[tool, path] = {"tool": tool, "path": path, "source": "local", "state": "could-not-check",
                                       "findings": [], "reason": "static check time budget exhausted"}
+        if args.change:
+            drifted = drift.forge(root, checkout, change, bool(project), files)
+        else:
+            drifted = drift.check(root, change.head, drift_base, files)
     go = None
     if args.go_report:
         go = go_report(args.go_report, change.head)
@@ -133,14 +203,14 @@ def execute(args):
         go["findings"] = [row for row in go["findings"] if row["path"] in selected]
         checks.append(go)
 
-    prompt, anchors, unseen, has_text = pack(files, checks)
-    estimated = tokens(prompt) if has_text else 0
+    (prompt, anchors, unseen, has_text), estimated, full, degraded = fit(files, checks, args.max_input_tokens)
     omitted = sorted(set(unseen) | (paths - selected))
     backend = providers.provider()
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
               "estimated_input_tokens": estimated, "max_input_tokens": args.max_input_tokens,
               "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
-              "findings": [], "cursor_usage": None}
+              "findings": [], "cursor_usage": None, "full_input_tokens": full, "degraded": degraded,
+              "drift": drifted}
     if static:
         report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
@@ -150,7 +220,7 @@ def execute(args):
     if estimated > args.max_input_tokens:
         return dict(report, state="over-budget"), 2
     if args.estimate:
-        return dict(report, state="estimate"), 0
+        return dict(report, state="estimate"), 2 if degraded else 0
     if has_text:
         try:
             answer, cached = review(prompt, args.model, anchors, args.cache_dir,
@@ -167,8 +237,11 @@ def execute(args):
         if cached:
             report["cursor_usage"] = None
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
-    report["state"] = "partial" if incomplete else ("reviewed" if has_text else "empty")
-    return report, 2 if incomplete else 0
+    if degraded:
+        report["state"] = "degraded"
+    else:
+        report["state"] = "partial" if incomplete else ("reviewed" if has_text else "empty")
+    return report, 2 if incomplete or degraded else 0
 
 
 def run_request(args):
