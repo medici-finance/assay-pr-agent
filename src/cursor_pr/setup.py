@@ -21,8 +21,11 @@ from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secr
 
 CURSOR = "CURSOR_API_KEY"
 SECRETS = {CURSOR: "cursor.key", "ANTHROPIC_API_KEY": "claude.key", "CODEX_API_KEY": "codex.key", KEY: "github.pem", TOKEN: "gitlab.token", **gitlab_tls.NAMES}
+# Carry saved settings that the wizard does not ask for into the next bundle.
+PRESERVED_SETTINGS = (*FINDINGS_SETTINGS.values(), "REVIEW_SYNC_SECONDS", "REVIEW_OSV_DOWNLOAD_DATABASES")
 SETTINGS = ("REVIEW_OPERATOR", APP_ID, INSTALL_ID, "REVIEW_MODEL", "REVIEW_MAX_INPUT_TOKENS",
-            *FINDINGS_SETTINGS.values(), "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER", "REVIEW_CURSOR_TEAM_ID", "REVIEW_AUTH_MODE", "REVIEW_LOGIN_PROFILE")
+            "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER",
+            "REVIEW_CURSOR_TEAM_ID", "REVIEW_AUTH_MODE", "REVIEW_LOGIN_PROFILE", *PRESERVED_SETTINGS)
 
 
 def state_dir():
@@ -84,6 +87,17 @@ def load_provider_key(selected):
         del os.environ[name + "_FILE"]
 
 
+def effective_backend(saved):
+    configured = saved.get("REVIEW_PROVIDER", "cursor")
+    selected = providers.provider(os.getenv("REVIEW_PROVIDER", configured))
+    default_mode = saved.get("REVIEW_AUTH_MODE", "api-key") if selected == configured else "api-key"
+    return selected, auth_mode(selected, os.getenv("REVIEW_AUTH_MODE", default_mode))
+
+
+def effective_projects(config):
+    return json.loads(os.environ["REVIEW_PROJECTS"]) if "REVIEW_PROJECTS" in os.environ else config["projects"]
+
+
 def apply_saved_setup(state, *, sync_only=False):
     """Snapshot one complete setup; explicitly supplied container settings win."""
     if not (state / "setup").is_symlink():
@@ -95,13 +109,12 @@ def apply_saved_setup(state, *, sync_only=False):
         config = json.loads((bundle / "settings.json").read_text())
         values = {k: config["settings"][k] for k in SETTINGS if k in config["settings"]}
         values["REVIEW_PROJECTS"] = json.dumps(config["projects"])
-        effective = json.loads(os.getenv("REVIEW_PROJECTS", values["REVIEW_PROJECTS"]))
+        effective = effective_projects(config)
         forges = {row["provider"] for row in effective}
-        selected = providers.provider(os.environ.get("REVIEW_PROVIDER", values.get("REVIEW_PROVIDER", "cursor")))
+        selected, mode = effective_backend(values)
         if selected != values.get("REVIEW_PROVIDER", "cursor"):
             values.pop("REVIEW_AUTH_MODE", None)
             values.pop("REVIEW_LOGIN_PROFILE", None)
-        mode = auth_mode(selected, os.getenv("REVIEW_AUTH_MODE", values.get("REVIEW_AUTH_MODE", "api-key")))
         if not sync_only and mode == "api-key":
             load_provider_key(selected)
         for name, location in config["secrets"].items():
@@ -171,6 +184,10 @@ def number(value):
     if not value.isascii() or not value.isdecimal() or int(value) <= 0:
         raise ValueError("Enter a positive integer")
     return value
+
+
+def nonnegative(value):
+    return "0" if value == "0" else number(value)
 
 
 def retry(reader):
@@ -289,8 +306,8 @@ def pick_cursor_team(teams):
         dialog.notice("Enter one of the displayed team IDs.")
 
 
-def configure(state, *, force_login=False):
-    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+@contextmanager
+def installer_lock(state):
     # One operator can perform remote credential creation at a time. Runtime
     # readers only take the short state lock during activation.
     with (state / ".configure.lock").open("a") as writer:
@@ -298,6 +315,26 @@ def configure(state, *, force_login=False):
             fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError("Another installer is active on this volume.") from None
+        yield
+
+
+def commit(state, old, bundle):
+    """Activate a finished bundle unless another save finished first."""
+    link = state / (".setup-link-" + uuid.uuid4().hex)
+    with locked(state, fcntl.LOCK_EX):
+        if active_bundle(state) != old:
+            raise ValueError("Another setup finished first; run setup again to edit its settings")
+        link.symlink_to(bundle.name)
+        try:
+            os.replace(link, state / "setup")
+        except BaseException:
+            link.unlink(missing_ok=True)
+            raise
+
+
+def configure(state, *, force_login=False):
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with installer_lock(state):
         configure_locked(state, force_login)
 
 
@@ -321,7 +358,7 @@ def configure_locked(state, force_login):
     projects = parse_projects(accounts.shape(rows))
     forges = {p.provider for p in projects.values()}
     previous = prev.get("settings", {})
-    settings = {}
+    settings = {name: previous[name] for name in PRESERVED_SETTINGS if name in previous}
 
     def setting(name, label, validate, default=""):
         settings[name] = retry(lambda: validate(ask(label, previous.get(name, default))))
@@ -348,7 +385,7 @@ def configure_locked(state, force_login):
         setting("REVIEW_POLL_SECONDS", "Seconds between polls", number, "120")
         setting("REVIEW_MAX_INPUT_TOKENS", "Maximum estimated input tokens per review", number, default_limit)
         setting("REVIEW_QUALGEN_INTERVAL_SECONDS", "Seconds between Qualgen history refreshes (0 disables)",
-                lambda value: "0" if value == "0" else number(value), "86400")
+                nonnegative, "86400")
     backend = retry(lambda: providers.provider(ask("Review provider (cursor/claude/codex)", previous.get("REVIEW_PROVIDER", "cursor"))))
     settings["REVIEW_PROVIDER"] = backend
     model = ask(providers.LABELS[backend] + " model (auto for default)",
@@ -361,7 +398,6 @@ def configure_locked(state, force_login):
     mode = retry(lambda: auth_mode(backend, ask("Authentication method (login/api-key)", default_mode)))
     settings["REVIEW_AUTH_MODE"] = mode
     bundle = Path(tempfile.mkdtemp(dir=state, prefix=".review-setup-"))
-    link = state / (".setup-link-" + uuid.uuid4().hex)
     committed = False
     pending = []
     staged_login = None
@@ -451,19 +487,17 @@ def configure_locked(state, force_login):
         projects = parse_projects(rows)
         private_file(bundle / "settings.json", json.dumps(
             {"projects": rows, "settings": settings, "secrets": secrets}, indent=2))
-        with locked(state, fcntl.LOCK_EX):
-            if active_bundle(state) != old:
-                raise ValueError("Another setup finished first; run setup again to edit its settings")
-            link.symlink_to(bundle.name)
-            os.replace(link, state / "setup")
-            committed = True
+        commit(state, old, bundle)
+        committed = True
+        try:
             for path in pending:
                 path.unlink(missing_ok=True)
             if old:
                 shutil.rmtree(old)
             retire_profiles(state, {settings.get("REVIEW_LOGIN_PROFILE"), previous.get("REVIEW_LOGIN_PROFILE")})
+        except OSError:
+            print("Settings were saved. Some previous installer files could not be removed.", file=sys.stderr)
     finally:
-        link.unlink(missing_ok=True)
         if not committed:
             shutil.rmtree(bundle)
             if staged_login:

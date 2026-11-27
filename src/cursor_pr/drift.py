@@ -4,9 +4,8 @@ import re
 import subprocess
 import threading
 
-from .engine import hunks
 from .scanners import fence
-from .source import ReviewError, child_env, run
+from .source import ReviewError, hunks, child_env, run, valid_sha
 
 DOCS = (".md", ".rst", ".txt", ".adoc")
 SPAN = re.compile(r"`+([^`\n]+)`+")
@@ -25,6 +24,18 @@ def git(repo, *args, alternates=None, strip=True):
 
 def commit(repo, ref):
     return git(repo, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}")
+
+
+def patch_base(root, checkout, change):
+    """Resolve the comparison preimage from immutable change metadata, never a branch name."""
+    if change.patch_base or not change.base:
+        return change.patch_base
+    try:
+        objects = None if root == checkout else git(root, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+        bases = git(checkout, "merge-base", "--all", change.base, change.head, alternates=objects).split()
+    except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    return bases[0] if len(bases) == 1 and valid_sha(bases[0]) else ""
 
 
 def names(files):

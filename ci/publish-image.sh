@@ -27,11 +27,11 @@ docker build --platform linux/amd64 \
     --build-arg "REVIEW_BUILD_TAGS=$aliases" \
     --build-arg "REVIEW_BUILD_TIMESTAMP=$built_at" \
     -t "$image" .
-# Stream the tests and the k8s manifest they assert on into the running image so this
-# also works with a remote Docker daemon.
+# Stream the tests, the k8s manifest and the prompt-capture script they exercise into the
+# running image so this also works with a remote Docker daemon.
 test_archive=$(mktemp)
 trap 'rm -f "$test_archive"' EXIT
-tar --exclude='__pycache__' -cf "$test_archive" tests k8s
+tar --exclude='__pycache__' -cf "$test_archive" tests k8s ci/capture-prompt.py
 # Test the hardened runtime with networking disabled. Forge fixtures use loopback.
 docker run -i --rm --platform linux/amd64 --network none --read-only --cap-drop ALL \
     --security-opt no-new-privileges:true --tmpfs /tmp:mode=1777,size=1g,exec \
