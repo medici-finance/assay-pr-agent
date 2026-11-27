@@ -127,22 +127,19 @@ def log(report, source=None):
         if type(line) is int and line > 0:
             extent = end if type(end) is int and end >= line else None
             location["region"] = {"startLine": line, **({"endLine": extent} if extent is not None else {})}
-            # Use source context and its occurrence count so absolute line offsets do not enter the hash.
+            # Prefer source context and its occurrence count to the absolute line offset.
             if path not in lines:
                 blob = source(path) if source else None
                 lines[path] = line_hashes(blob, requested[path]) if blob is not None else {}
-            # Without the line's text there is no value: the upload-sarif action computes it instead.
-            fingerprint = lines[path].get(line)
-            if fingerprint:
-                # The finding keeps its own identity when other findings appear on that line.
-                span = extent - line if extent is not None else None
-                key = hashlib.sha256(json.dumps([span, text]).encode()).hexdigest()
-                fingerprint = f"{fingerprint}:{key}"
+            source_key = lines[path].get(line, f"line:{line}")
+            # Preserve distinct results even when the required source line is unavailable.
+            span = extent - line if extent is not None else None
+            key = hashlib.sha256(json.dumps([span, text]).encode()).hexdigest()
+            fingerprint = f"{source_key}:{key}"
         else:
             # An OSV-Scanner vulnerability has only the path, rule and message to identify it.
             fingerprint = hashlib.sha256(json.dumps([path, name, text]).encode()).hexdigest()
-        if fingerprint:
-            result["partialFingerprints"] = {"primaryLocationLineHash": fingerprint}
+        result["partialFingerprints"] = {"primaryLocationLineHash": fingerprint}
         rules.setdefault(name, describe(tool, name))
         results.append(result)
     return {"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0", "runs": [{

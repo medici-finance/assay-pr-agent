@@ -147,18 +147,24 @@ class SarifLogTests(unittest.TestCase):
         self.assertEqual(prints(results(dict(alone, findings=alone["findings"] + [
             dict(alone["findings"][0], path="copy.py", message="elsewhere")]), head_text)),
             keys[:1] + prints(results(model(("elsewhere", 3)), head_text)))
-        self.assertEqual(prints(results(model(("first", 3), ("second", 3)), None)), [None, None])
+        first, second = prints(results(model(("first", 3), ("second", 3))))
+        self.assertNotEqual(first, second)
+        self.assertEqual(prints(results(model(("second", 3), ("first", 3)))), [second, first])
+        self.assertEqual(prints(results(model(("first", 3)))), [first])
 
-    def test_unreadable_lines_carry_no_fingerprint_and_lineless_ones_keep_one(self):
-        # Without the line's text there is no value: the upload-sarif action computes it from its checkout.
-        for reader in (None, lambda path: None):
-            self.assertEqual([bool(value) for value in prints(results(report(), reader))],
-                             [False, False, False, False, False, True])
-        self.assertEqual([bool(value) for value in prints(results(report(), head_text))], [True] * 6)
+    def test_unreadable_source_falls_back_to_line_numbers(self):
+        values = prints(results(report()))
+        self.assertEqual(values, prints(results(report(), lambda path: None)))
+        # The two shellcheck results have the same rule and message on different lines.
+        self.assertNotEqual(values[1], values[2])
+        self.assertTrue(values[1]["primaryLocationLineHash"].startswith("line:2:"))
+        self.assertTrue(values[2]["primaryLocationLineHash"].startswith("line:5:"))
         past_end = report(findings=[{"path": "src/app.py", "line": 13, "end_line": 13, "title": "T", "message": "m"}],
                           checks=[], static_checks=[])
-        self.assertEqual(prints(results(past_end, head_text)), [None])
-        # A finding without a line is identified by its path, rule and message.
+        fingerprint = prints(results(past_end, head_text))[0]["primaryLocationLineHash"]
+        self.assertTrue(fingerprint.startswith("line:13:"))
+
+    def test_lineless_results_are_identified_by_path_rule_and_message(self):
         advisories = [("GHSA-1234-5678-9abc", "requests 2.25.1"), ("GHSA-1234-5678-9abc", "urllib3 1.26.5"),
                       ("GHSA-0000-1111-2222", "requests 2.25.1")]
         value = report(findings=[], checks=[], static_checks=[
@@ -339,7 +345,7 @@ class SarifFlagTests(unittest.TestCase):
         self.assertEqual([r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for r in rows], ["example.sh", "ghost.sh"])
         self.assertTrue(rows[0]["partialFingerprints"]["primaryLocationLineHash"].startswith(
             sarif.line_hashes(EXAMPLE.encode())[2] + ":"))
-        self.assertNotIn("partialFingerprints", rows[1])
+        self.assertTrue(rows[1]["partialFingerprints"]["primaryLocationLineHash"].startswith("line:2:"))
         head = self.git("rev-parse", "HEAD")
         self.assertEqual(blob(self.root, head, "example.sh"), EXAMPLE.encode())
         self.assertIsNone(blob(self.root, head, "ghost.sh"))
