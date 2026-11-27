@@ -1,5 +1,5 @@
 import argparse
-from contextlib import closing, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 import errno
 import io
 import json
@@ -384,6 +384,59 @@ class RequestRowTests(unittest.TestCase):
                 patch("sys.stderr", new_callable=io.StringIO) as err:
             code = cli.main()
         return code, request, err.getvalue()
+
+    def armed(self, *options, failing=None):
+        # Whether the time limit was still in force when the review wrote its last output and when it
+        # settled its row. The limit itself is replaced by one that only says when it is in force.
+        seen, state = {}, {"armed": False}
+
+        @contextmanager
+        def limit():
+            state["armed"] = True
+            try:
+                yield
+            finally:
+                state["armed"] = False
+
+        class Output(io.StringIO):
+            def __init__(self, name):
+                super().__init__()
+                self.name_ = name
+
+            def write(self, text):
+                seen.setdefault(self.name_, state["armed"])
+                return super().write(text)
+
+        settle = cli.settle
+
+        def settled(args, status):
+            seen["settled"] = state["armed"]
+            return settle(args, status)
+
+        project = dict(provider="github", url="https://github.com/acme/api", checkout=str(self.state),
+                       requester_ids=[7])
+        argv = ["cursor-review", "--change", "acme/api#3", "--expected-change-url",
+                project_from(project).change_url(3), "--max-input-tokens", "6000", *options]
+        with patch("sys.argv", argv), patch("cursor_pr.cli.time_limit", side_effect=limit) as limited, \
+                patch("cursor_pr.cli.settle", side_effect=settled), \
+                patch("cursor_pr.cli.run_request", side_effect=failing, return_value=(
+                    {"state": "reviewed", "publication": "posted-or-already-present"}, 0)), \
+                patch.dict(os.environ, {"CURSOR_REVIEW_POLLER_CHILD": "1", "REVIEW_STATE_DIR": str(self.state),
+                                        "REVIEW_FORGE_PROJECT": json.dumps(project)}), \
+                patch("sys.stdout", Output("report")), patch("sys.stderr", Output("error")):
+            code = cli.main()
+        return code, seen, limited.call_count, state["armed"]
+
+    def test_time_limit_covers_the_report_of_a_queued_review(self):
+        # A report written to a pipe nobody reads must not be able to hold the lock for good.
+        self.assertEqual(self.armed(*self.options), (0, {"settled": True, "report": True}, 1, False))
+
+    def test_time_limit_covers_the_failure_of_a_queued_review(self):
+        self.assertEqual(self.armed(*self.options, failing=ReviewError("Forge is down")),
+                         (2, {"error": True, "settled": True}, 1, False))
+
+    def test_review_outside_the_queue_is_not_limited(self):
+        self.assertEqual(self.armed(), (0, {"report": False}, 0, False))
 
     def test_review_settles_its_row_before_its_report_can_fail(self):
         class Gone:

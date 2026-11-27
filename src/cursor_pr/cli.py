@@ -409,6 +409,15 @@ def run_request(args):
 
 def main():
     args = parser().parse_args()
+    if not args.request:
+        return run(args)
+    # Armed until the report is written and a failure is reported and settled: a review that blocks
+    # on its last output would otherwise hold the poller's lock with nothing left to end it.
+    with time_limit():
+        return run(args)
+
+
+def run(args):
     # Load PR-Agent settings only from an empty directory, independent of the target repo.
     args.repo = args.repo.resolve()
     args.cache_dir = args.cache_dir.resolve()
@@ -419,8 +428,6 @@ def main():
     old = Path.cwd()
     try:
         with ExitStack() as stack:
-            if args.request:
-                stack.enter_context(time_limit())
             state = state_dir().resolve()
             if args.change and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
                 apply_saved_setup(state)
