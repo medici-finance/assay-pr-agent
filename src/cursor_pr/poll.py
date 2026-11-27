@@ -199,10 +199,14 @@ class Jobs:
                 WHERE project=? AND number=? AND comment=?""", (at, *job))
 
     def record_acknowledgement(self, job, part):
-        """The part is done with: carried out, or given up."""
+        """The part is done with: carried out, or given up. With nothing left owed, the record goes
+        in the same transaction, so that no poller stopping here leaves one nobody looks at again."""
         assert part in self.PARTS
         with closing(sqlite3.connect(self.path)) as db, db:
             db.execute(f"UPDATE acknowledgements SET {part}=1 WHERE project=? AND number=? AND comment=?", job)
+            db.execute("""DELETE FROM acknowledgements WHERE project=?1 AND number=?2 AND comment=?3 AND cleared=1
+                AND (notice_sent=1 OR EXISTS (SELECT 1 FROM requests WHERE project=?1 AND number=?2 AND comment=?3
+                                              AND status NOT IN ('queued','started','failed')))""", job)
 
     def waiting_acknowledgements(self):
         """Requests that are waiting for their review and are to be marked on the forge."""
