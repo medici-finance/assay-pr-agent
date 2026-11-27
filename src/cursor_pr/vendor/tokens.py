@@ -27,14 +27,16 @@ def prepare():
     global _ready
     if _ready:
         return
-    _ready = True
     if "TIKTOKEN_CACHE_DIR" in os.environ or "DATA_GYM_CACHE_DIR" in os.environ:
+        _ready = True
         return
     for name, (key, expected) in FILES.items():
         path = DIRECTORY / key
         if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            # Not marked ready: every later call is refused too, instead of falling back to a download.
             raise ValueError(f"The vendored {name} encoding file is missing or altered")
     os.environ["TIKTOKEN_CACHE_DIR"] = str(DIRECTORY)
+    _ready = True
 
 
 def encoding(model):

@@ -77,14 +77,24 @@ class VendoredTests(unittest.TestCase):
                 tokens._ready = False
                 with self.assertRaisesRegex(ValueError, "cl100k_base encoding file is missing or altered"):
                     encoding("gpt-4")
+                # A second call is refused as well; it must not fall through to a download.
+                with self.assertRaisesRegex(ValueError, "cl100k_base encoding file is missing or altered"):
+                    encoding("gpt-4")
+                self.assertNotIn("TIKTOKEN_CACHE_DIR", os.environ)
             # The host's own choice of cache directory stands.
+            # cl100k_base is already loaded above, so this reads no file from the host's directory.
             with mock.dict(os.environ, {"TIKTOKEN_CACHE_DIR": "/elsewhere"}):
                 tokens._ready = False
-                encoding("gpt-4o")
+                encoding("gpt-4")
                 self.assertEqual(os.environ["TIKTOKEN_CACHE_DIR"], "/elsewhere")
         finally:
-            os.environ["TIKTOKEN_CACHE_DIR"] = str(tokens.DIRECTORY)
-            tokens._ready = True
+            # Put back what the run started with; the next count prepares the bundled files again.
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            tokens._ready = False
 
     def test_the_license_travels_with_the_code(self):
         text = files("cursor_pr.vendor").joinpath("LICENSE.pr-agent").read_text(encoding="utf-8")
