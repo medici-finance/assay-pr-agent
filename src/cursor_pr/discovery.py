@@ -21,10 +21,11 @@ def open_changes(project):
             or any(type(number) is not int or number < 1 for number in numbers)
             or len(set(numbers)) != len(numbers)):
         raise ReviewError("Invalid open change list")
-    if result.get("capped") is not False:
+    complete = result.get("capped") is False
+    if not complete:
         # Keep polling the returned changes, and surface the coverage limit.
         log.warning("Open change list capped for %s", project.key)
-    return numbers
+    return numbers, complete
 
 
 def comment_threads(project, numbers):
@@ -95,15 +96,18 @@ def poll_project(project, jobs, since, ack=None, idle=None):
     idle is (poll interval, cap). A change whose complete read found nothing new waits twice as long
     before its next read, up to the cap. New comments or a request return it to the poll interval.
     """
-    numbers = open_changes(project)
-    waiting = jobs.waiting(project.key, numbers, time.time(), idle[1]) if idle is not None else set()
+    numbers, listing_complete = open_changes(project)
+    waiting = (jobs.waiting(project.key, numbers, time.time(), idle[1], listing_complete)
+               if idle is not None else set())
     due = [number for number in numbers if number not in waiting]
+    read = 0
     for numbers in batched(due, 16):
         try:
             threads, complete = comment_threads(project, numbers)
         except Exception:
             log.exception("Comment read failed for %s changes %s", project.key, numbers)
             continue
+        read += len(threads)
         active = set()
         for number, notes in threads.items():
             for note in notes:
@@ -131,4 +135,4 @@ def poll_project(project, jobs, since, ack=None, idle=None):
             now = time.time()
             for number, notes in threads.items():
                 jobs.observed(project.key, number, *signature(notes), number in active, now, *idle)
-    return len(due), len(waiting)
+    return read, len(waiting)

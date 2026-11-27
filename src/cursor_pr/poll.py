@@ -107,15 +107,18 @@ class Jobs:
             return db.execute("SELECT 1 FROM requests WHERE project=? AND number=? AND status IN ('queued','started')",
                               (project, number)).fetchone() is not None
 
-    def waiting(self, project, numbers, now, cap):
+    def waiting(self, project, numbers, now, cap, listing_complete):
         """Open changes whose saved read is not due yet. A change no longer open is forgotten."""
+        numbers = set(numbers)
         with closing(sqlite3.connect(self.path)) as db, db:
             saved = {number: (wait, seen) for number, wait, seen in db.execute(
                 "SELECT number, wait, seen FROM schedule WHERE project=?", (project,))}
-            db.executemany("DELETE FROM schedule WHERE project=? AND number=?",
-                           [(project, number) for number in saved if number not in numbers])
+            if listing_complete:
+                db.executemany("DELETE FROM schedule WHERE project=? AND number=?",
+                               [(project, number) for number in saved if number not in numbers])
         # A clock that moved back past the last read makes the saved times meaningless, so read now.
-        return {number for number, (wait, seen) in saved.items() if now >= seen and seen + min(wait, cap) > now}
+        return {number for number, (wait, seen) in saved.items()
+                if number in numbers and now >= seen and seen + min(wait, cap) > now}
 
     def observed(self, project, number, comments, newest, active, now, interval, cap):
         """Keep one complete read of a change. A first look, new comments or a request read again after one
@@ -305,7 +308,7 @@ def main():
         # A cap no longer than the poll interval reads every change on every cycle, as before the schedule.
         idle = (args.interval, idle_max) if idle_max > args.interval else None
         if idle:
-            log.info("A quiet change is read again within %d seconds", idle_max)
+            log.info("A quiet change can wait up to %d seconds before it is due for another read", idle_max)
         if mine_seconds:
             threading.Thread(target=history.mine_periodically, args=(projects, state, mine_seconds),
                              name="qualgen-miner", daemon=True).start()

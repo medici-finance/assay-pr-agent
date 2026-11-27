@@ -657,6 +657,7 @@ class ReadScheduleTests(Offline):
                                     checkout=tmp.name))
         self.open, self.threads, self.partial, self.reads, self.reviews = [3], {3: [comment(81)]}, set(), [], []
         self.now = [START]
+        self.capped = False
         self.start(patch("cursor_pr.discovery.time")).time.side_effect = lambda: self.now[0]
         self.start(patch("cursor_pr.discovery.run_forge", side_effect=self.forge))
         self.jobs = Jobs(self.state)
@@ -664,7 +665,7 @@ class ReadScheduleTests(Offline):
 
     def forge(self, verb, project, *, numbers=(), timeout=45):
         if verb == "open":
-            return dict(numbers=list(self.open), capped=False)
+            return dict(numbers=list(self.open), capped=self.capped)
         self.assertEqual(verb, "comments")
         wanted = list(numbers)
         self.reads.append(wanted)
@@ -763,6 +764,31 @@ class ReadScheduleTests(Offline):
         self.assertEqual(logged.output, ["INFO:cursor_pr.poll:Read the comments of 0 open changes; "
                                          "3 quiet ones are due in a later cycle"])
         self.assertEqual(self.schedule()[-1][2:], (240, 120))
+
+    def test_cycle_counts_only_returned_threads_and_open_waiting_changes(self):
+        self.open = [3, 4, 5]
+        self.threads = {number: [comment(number)] for number in self.open}
+        self.tick(0)
+        self.tick()  # All three changes now wait until 360.
+        self.open = [4, 5, 6, 7]
+        self.threads[6] = []
+        self.partial = {7}
+        with self.assertLogs("cursor_pr.poll", level="INFO") as logged:
+            with self.assertLogs("cursor_pr.discovery", level="WARNING"):
+                self.assertEqual(self.tick(), [6, 7])
+        self.assertEqual(logged.output, ["INFO:cursor_pr.poll:Read the comments of 1 open changes; "
+                                         "2 quiet ones are due in a later cycle"])
+
+    def test_capped_open_change_list_does_not_discard_backoff(self):
+        self.assertEqual(self.tick(0), [3])
+        self.assertEqual(self.tick(), [3])  # Due next at 360.
+        self.open, self.capped = [], True
+        with self.assertLogs("cursor_pr.discovery", level="WARNING"):
+            self.assertEqual(self.tick(60), [])
+        self.assertEqual(self.schedule(), [(3, 1, 240, 120)])
+        self.open, self.capped = [3], False
+        self.assertEqual(self.tick(60), [])
+        self.assertEqual(self.tick(), [3])
 
     def test_setting_is_validated_at_startup_and_disables_itself_at_the_poll_interval(self):
         for value, idle in (("900", (120, 900)), ("120", None), ("60", None)):
