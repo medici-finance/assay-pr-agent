@@ -17,7 +17,7 @@ from .source import ReviewError
 from .login import auth_mode, login_directory, login_env
 from .setup import state_dir
 from .providers import KEYS, LABELS, provider
-from .vendor.patch import FilePatchInfo, decouple_and_convert_to_hunks_with_lines_numbers
+from .vendor.patch import numbered
 from .vendor.tokens import encoding
 
 VERSION = "1"
@@ -48,11 +48,12 @@ def section(f):
     if f.absent or not f.patch:
         return None, {}
     # The head-side text of each shown line, without its marker: what quoted code is checked against.
-    anchors = {line.target_line_no: line.value for hunk in hunks(f) for line in hunk if line.target_line_no is not None}
+    parsed = hunks(f)
+    anchors = {line.target_line_no: line.value for hunk in parsed for line in hunk if line.target_line_no is not None}
     if not anchors:
         return None, anchors
-    rendered = decouple_and_convert_to_hunks_with_lines_numbers(f.patch, FilePatchInfo("", "", f.patch, f.path))
-    return f"Change {f.status} {f.previous}\n{rendered}", anchors
+    # The text is built from the same parsed hunks, so every line it numbers is an anchor and the reverse.
+    return f"Change {f.status} {f.previous}\n{numbered(f.path, parsed)}", anchors
 
 
 def pack(files, checks, skip=frozenset(), title="", description="", advisories=(), scoped=False):
