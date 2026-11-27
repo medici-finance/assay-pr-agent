@@ -203,6 +203,26 @@ class TierTests(unittest.TestCase):
         self.assertGreater(report["passes"][-1]["estimated_input_tokens"], 5000 // 4)
         self.assertLessEqual(report["estimated_input_tokens"], report["max_input_tokens"])
 
+    def test_verification_rejects_a_rewritten_finding_and_can_retry(self):
+        real = finding(42, "Real")
+        self.answers(verification=answer(dict(real, issue_content="Rewritten detail.")))
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"]), (2, "degraded"))
+        self.assertEqual(report["verification"], {"state": "unavailable", "before": 2})
+        self.assertEqual([(row["title"], row["message"]) for row in report["findings"]],
+                         [("Real", "Real detail."), ("Spurious", "Spurious detail.")])
+        self.assertEqual(report["passes"][-1]["state"], "failed")
+        self.assertEqual(report["passes"][-1]["model_usage"]["input_tokens"], 15)
+        self.assertEqual(report["model_invocations"], 2)
+
+        self.answers(verification=answer(real))
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"]), (0, "reviewed"))
+        self.assertEqual(report["verification"], {"state": "filtered", "before": 2, "after": 1})
+        self.assertEqual([row["state"] for row in report["passes"]], ["cached", "called"])
+        self.assertEqual([row["title"] for row in report["findings"]], ["Real"])
+        self.assertEqual(report["model_invocations"], 1)
+
     def test_tier_falls_back_to_the_one_below_and_says_so(self):
         plain = self.check("--estimate")[1]["estimated_input_tokens"]
         # Twice the budget less the verification reserve leaves no room for context.

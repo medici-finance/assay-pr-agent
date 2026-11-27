@@ -132,15 +132,15 @@ def verification(findings, files, radius=15):
                 number = line.target_line_no
                 if number is not None:
                     near = start <= number <= end
-                    if line.is_context:
-                        pending_removals.clear()
-                    elif near:
+                    if near:
                         rows.extend(pending_removals)
+                        pending_removals.clear()
+                    elif line.is_context:
                         pending_removals.clear()
                 if near:
                     rows.append(f"{number if number is not None else '-'} {line.line_type}{line.value.rstrip()}")
                 elif line.is_removed:
-                    # Keep the old side until a replacement line enters the window.
+                    # An old line can supply evidence for the next addition or context line.
                     pending_removals.append(f"- {line.line_type}{line.value.rstrip()}")
         shown.append(f"## {finding['path']} around lines {finding['line']}-{finding['end_line']}\n" + "\n".join(rows))
     listed = [{"relevant_file": f["path"], "start_line": f["line"], "end_line": f["end_line"],
@@ -157,8 +157,16 @@ def verification(findings, files, radius=15):
 
 
 def kept(findings, answer):
-    """The original findings a verification answer still cites, in their original order."""
-    return [finding for finding in findings if finding in answer["findings"]]
+    """Accept only unchanged findings from the original review, in their original order."""
+    remaining = list(answer["findings"])
+    verified = []
+    for finding in findings:
+        if finding in remaining:
+            remaining.remove(finding)
+            verified.append(finding)
+    if remaining:
+        raise ReviewError("Verifier returned findings outside the original review")
+    return verified
 
 
 def merge_findings(first, second):
@@ -305,7 +313,7 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120):
                             usage if isinstance(usage, dict) else None) from err
 
 
-def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout=120):
+def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout=120, originals=None):
     signature = json.dumps([VERSION, "pr-agent:0.50.0", model, source, prompt], ensure_ascii=False)
     if provider() != "cursor" or os.getenv("REVIEW_CURSOR_TEAM_ID"):
         signature = json.dumps([provider(), os.getenv("REVIEW_CURSOR_TEAM_ID") if provider() == "cursor" else None, signature])
@@ -315,10 +323,24 @@ def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout
     with (cache / (key + ".lock")).open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if path.exists():
-            return json.loads(path.read_text()), True
+            cached = json.loads(path.read_text())
+            if originals is None:
+                return cached, True
+            try:
+                cached["findings"] = kept(originals, cached)
+            except ReviewError:
+                # Older versions could cache a verdict that rewrote the findings.
+                path.unlink()
+            else:
+                return cached, True
         # The plain review keeps the call it always made.
         extra = {} if (limit, timeout) == (MAX_FINDINGS, 120) else {"limit": limit, "timeout": timeout}
         result = invoke(prompt, model, anchors, **extra)
+        if originals is not None:
+            try:
+                result["findings"] = kept(originals, result)
+            except ReviewError as err:
+                raise CursorFailure(str(err), result.get("cursor_usage")) from err
         with tempfile.NamedTemporaryFile(dir=cache, mode="w", delete=False) as file:
             json.dump(result, file)
         os.replace(file.name, path)

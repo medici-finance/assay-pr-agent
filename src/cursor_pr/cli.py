@@ -25,7 +25,7 @@ from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
 from .discovery import context_comments
-from .engine import MAX_FINDINGS, CursorFailure, kept, merge_findings, pack, rank, render_sections, review, tokens, verification
+from .engine import MAX_FINDINGS, CursorFailure, merge_findings, pack, rank, render_sections, review, tokens, verification
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
 
 
@@ -94,11 +94,12 @@ def with_context(files, checks, packed, estimated, dropped, limit, cap, names, r
     return packed, estimated, fates
 
 
-def run_pass(row, prompt, anchors, args, source, *, cap, timeout):
+def run_pass(row, prompt, anchors, args, source, *, cap, timeout, originals=None):
     """Run one pass and record billing data only for fresh provider calls."""
     before = engine.started
     try:
-        answer, cached = review(prompt, args.model, anchors, args.cache_dir, source, limit=cap, timeout=timeout)
+        answer, cached = review(prompt, args.model, anchors, args.cache_dir, source,
+                                limit=cap, timeout=timeout, originals=originals)
     except CursorFailure as err:
         row.update(state="failed", model_invocations=engine.started - before)
         if row["model_invocations"] and err.usage is not None:
@@ -430,9 +431,10 @@ def execute(args):
                 row = {"name": "verification", "estimated_input_tokens": size, "state": "planned"}
                 passes.append(row)
                 report["estimated_input_tokens"] += size
-                verdict, _ = run_pass(row, check, coverage, args, change.identity, cap=before, timeout=120)
+                verdict, _ = run_pass(row, check, coverage, args, change.identity,
+                                      cap=before, timeout=120, originals=findings)
                 if verdict is not None:
-                    findings = kept(findings, verdict)
+                    findings = verdict["findings"]
                     report["verification"] = {"state": "filtered", "before": before, "after": len(findings)}
                 break
     report.update(findings=findings[:CAPS[tier]], cursor_usage=total_usage(passes),

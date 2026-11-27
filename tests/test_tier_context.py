@@ -96,6 +96,13 @@ class TierContextTests(unittest.TestCase):
         self.assertIn("- -old_first()\n- -old_second()\n10 +new_first()\n11 +new_second()", wide)
         self.assertNotIn("distant_old()", wide)
 
+    def test_verification_keeps_deletion_adjacent_to_the_cited_context_line(self):
+        issue = dict(path="app.py", line=2, end_line=2, title="Removed step", message="Check the missing step.")
+        file = File("app.py", "@@ -1,3 +1,2 @@\n initialize()\n-check_config()\n finish()\n", "modified")
+
+        prompt = engine.verification([issue], [file], radius=0)
+        self.assertTrue(prompt.endswith("## app.py around lines 2-2\n- -check_config()\n2  finish()"))
+
 
 class CallSiteTests(unittest.TestCase):
     def setUp(self):
