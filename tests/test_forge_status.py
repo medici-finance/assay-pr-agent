@@ -281,6 +281,24 @@ class ForgeStatusRequestTests(unittest.TestCase):
                 self.assertEqual(report["forge_status"], "failed")
                 self.assertEqual([request.method for request in self.requests], ["GET"])
 
+    def test_gitlab_status_names_the_merge_request_pipeline_of_the_reviewed_commit(self):
+        own = dict(id=55, sha=HEAD, project_id=123, ref="refs/merge-requests/7/head")
+        cases = ((own, {"ref": "refs/merge-requests/7/head", "pipeline_id": 55}),
+                 (own | dict(sha="b" * 40), {"ref": "topic/ref"}),      # It ran an earlier commit.
+                 (own | dict(project_id=124), {"ref": "topic/ref"}),    # It is another project's.
+                 (own | dict(id="55"), {"ref": "topic/ref"}),
+                 (own | dict(ref=""), {"ref": "topic/ref"}),
+                 (None, {"ref": "topic/ref"}))
+        for pipeline, expected in cases:
+            with self.subTest(pipeline=pipeline):
+                self.requests.clear()
+                self.gitlab_source = dict(sha=HEAD, source_project_id=123, target_project_id=123,
+                                          source_branch="topic/ref", head_pipeline=pipeline)
+                report, *_ = self.exercise("gitlab", "--forge-status")
+                self.assertEqual(report["forge_status"], "posted")
+                body = json.loads(self.requests[-1].content)
+                self.assertEqual({name: body[name] for name in ("ref", "pipeline_id") if name in body}, expected)
+
     def test_a_failed_summary_publication_leaves_the_status_unattempted(self):
         report, code, *_ = self.exercise("github", "--forge-status", desk_error=source.ReviewError("pr-agent-forge comment exited 1"))
         self.assertEqual((code, report["publication"]), (2, "failed"))

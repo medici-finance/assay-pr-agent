@@ -118,7 +118,17 @@ def gitlab_source_ref(client, headers, base, slug, number, head):
         raise ReviewError("The GitLab status source project is outside the configured publication target")
     if not isinstance(ref, str) or not ref or not ref.isprintable():
         raise ReviewError("GitLab did not identify the reviewed source branch")
-    return ref
+    # A branch pipeline and a merge request pipeline can both exist for this commit, and a status
+    # sent with the branch alone can land on the one the merge request does not show. Name the
+    # merge request's own pipeline, with the ref GitLab keeps for it, when it is one of this
+    # project's and ran this commit. Otherwise the branch is all there is to go by.
+    pipeline = change.get("head_pipeline")
+    if isinstance(pipeline, dict):
+        number, own = pipeline.get("id"), pipeline.get("ref")
+        if (type(number) is int and number > 0 and pipeline.get("sha") == head and pipeline.get("project_id") == target
+                and isinstance(own, str) and own and own.isprintable()):
+            return {"ref": own, "pipeline_id": number}
+    return {"ref": ref}
 
 
 def post(address, value, project):
@@ -143,7 +153,7 @@ def post(address, value, project):
     check_publication(project, number, head, "\n\n".join(checked))
     with connection(address, url, project.checkout) as (client, _, _, _, headers):
         if provider == "gitlab":
-            body["ref"] = gitlab_source_ref(client, headers, base, slug, number, head)
+            body.update(gitlab_source_ref(client, headers, base, slug, number, head))
         client.post(endpoint, headers=headers, json=body).raise_for_status()
 
 
