@@ -662,8 +662,8 @@ class TierRequestTests(unittest.TestCase):
         self.assertEqual([discovery.is_request(self.gh, 3, note, self.since) for note in notes],
                          [True, True, True, False, False])
         jobs, ran = Jobs(self.state), []
-        with patch.object(discovery, "open_changes", return_value=[3]), \
-             patch.object(discovery, "comment_threads", return_value={3: notes}):
+        with patch.object(discovery, "open_changes", return_value=([3], True)), \
+             patch.object(discovery, "comment_threads", return_value=({3: notes}, True)):
             cycle({self.gh.key: self.gh}, self.state, jobs, {self.gh.key: self.since},
                   lambda project, number, state, *tier: ran.append(tier) or "reviewed")
         self.assertEqual(ran, [(), ("mid",), ("max",)])
