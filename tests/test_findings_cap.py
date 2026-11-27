@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from cursor_pr import cli, engine, source
+from cursor_pr import cli, engine
 
 
 def envelope(count):
@@ -22,11 +22,13 @@ class FindingsCapTests(unittest.TestCase):
         self.assertEqual(engine.MAX_FINDINGS, 6)
         self.assertEqual(cli.DEFAULT_MAX_FINDINGS, 6)
 
-    def test_answer_with_six_findings_is_accepted_and_seven_rejected(self):
-        answer = engine.parse_answer(envelope(6), self.anchors)
-        self.assertEqual([f["line"] for f in answer["findings"]], [1, 2, 3, 4, 5, 6])
-        with self.assertRaisesRegex(source.ReviewError, "Invalid Cursor finding list"):
-            engine.parse_answer(envelope(7), self.anchors)
+    def test_answer_with_seven_findings_keeps_six_and_records_the_excess(self):
+        for count in (6, 7):
+            with self.subTest(count=count):
+                answer = engine.parse_answer(envelope(count), self.anchors)
+                self.assertEqual([f["line"] for f in answer["findings"]], [1, 2, 3, 4, 5, 6])
+                self.assertEqual(answer["dropped"],
+                                 [{"path": "app.py", "line": 7, "reason": "over the finding limit"}] if count == 7 else [])
 
     def test_prompt_asks_for_zero_to_six_confident_issues(self):
         prompt = engine.pack([], [])[0]
@@ -36,6 +38,19 @@ class FindingsCapTests(unittest.TestCase):
 
 
 class CacheKeyTests(unittest.TestCase):
+    def test_a_cached_answer_from_the_previous_parser_is_reviewed_again(self):
+        old_answer = {"findings": [{"path": "app.py", "line": 1, "end_line": 1,
+                                    "title": "Old finding", "message": "Old details."}], "cursor_usage": None}
+        invalid = {"findings": [], "dropped": [{"path": "app.py", "line": 1, "reason": "malformed finding"}],
+                   "cursor_usage": None}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(engine, "provider", return_value="cursor"), \
+                patch.object(engine, "invoke", side_effect=[old_answer, invalid]) as model:
+            args = ("same prompt", None, {"app.py": {1}}, Path(tmp), "same source")
+            with patch.object(engine, "VERSION", "1"):
+                self.assertEqual(engine.review(*args), (old_answer, False))
+            self.assertEqual(engine.review(*args), (invalid, False))
+            self.assertEqual(model.call_count, 2)
+
     def test_an_answer_cached_under_another_cap_is_not_reused(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False), \
                 patch.object(engine, "provider", return_value="cursor"), \

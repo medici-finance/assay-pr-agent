@@ -22,8 +22,9 @@ from .setup import state_dir
 from .config import DEFAULT_MAX_FINDINGS
 from .providers import KEYS, LABELS, provider
 
-VERSION = "1"
+VERSION = "2"
 MAX_FINDINGS = DEFAULT_MAX_FINDINGS
+DROPPED_PATH_CHARS = 32_768
 LOCKS = {"package-lock.json", "pnpm-lock.yaml", "go.sum", "npm-shrinkwrap.json"}
 
 
@@ -302,6 +303,8 @@ def finding_key(finding):
 
 def kept(findings, answer):
     """Accept only unchanged findings from the original review, in their original order."""
+    if answer.get("dropped"):
+        raise ReviewError("Verifier returned invalid findings")
     remaining = {finding_key(finding): finding.get("verification_status") for finding in answer["findings"]}
     if len(remaining) != len(answer["findings"]):
         raise ReviewError("Verifier repeated a finding")
@@ -330,7 +333,132 @@ def tokens(prompt):
     return len(TokenEncoder.get_token_encoder("gpt-4o").encode(prompt, disallowed_special=()))
 
 
-def parse_answer(raw, anchors, limit=MAX_FINDINGS):
+YAML_TAG = "tag:yaml.org,2002:"
+YAML_VALUE_ERRORS = (ValueError, TypeError, LookupError, AttributeError, OverflowError, yaml.YAMLError)
+FINDING_TEXT_FIELDS = ("relevant_file", "issue_header", "issue_content")
+FINDING_LINE_FIELDS = ("start_line", "end_line")
+ANSWER_FIELDS = frozenset(("review", "key_issues_to_review", "verification_status",
+                           *FINDING_TEXT_FIELDS, *FINDING_LINE_FIELDS))
+
+
+def answer_mapping_fields(node, loader):
+    if not isinstance(node, yaml.MappingNode) or node.tag != YAML_TAG + "map":
+        raise ReviewError("Expected a YAML mapping in the review response")
+    parents, explicit = [], {}
+    for key, value in node.value:
+        if not isinstance(key, yaml.ScalarNode):
+            raise ReviewError("Expected a scalar key in the review response")
+        if key.tag == YAML_TAG + "merge":
+            if isinstance(value, yaml.SequenceNode) and value.tag == YAML_TAG + "seq":
+                parents.extend(reversed(value.value))
+            else:
+                parents.append(value)
+        elif key.tag == YAML_TAG + "str":
+            if key.value in ANSWER_FIELDS:
+                explicit[key.value] = value
+        elif key.tag != YAML_TAG + "value":
+            # Unknown keys need not be retained, but must still be valid YAML keys.
+            try:
+                hash(loader.construct_object(key))
+            except YAML_VALUE_ERRORS:
+                raise ReviewError("Invalid YAML mapping key in the review response") from None
+    return parents, explicit
+
+
+def answer_mapping(node, mappings, loader):
+    # A chain of YAML aliases can be deep even when the text itself is not nested.
+    pending, active = [(node, None)], set()
+    try:
+        while pending:
+            current, fields = pending.pop()
+            if current in mappings:
+                if mappings[current] is None:
+                    raise ReviewError("Invalid YAML merge in the review response")
+                continue
+            if fields is None:
+                if current in active:
+                    raise ReviewError("Cyclic YAML merge in the review response")
+                active.add(current)
+                fields = answer_mapping_fields(current, loader)
+                pending.append((current, fields))
+                pending.extend((parent, None) for parent in reversed(fields[0]))
+            else:
+                parents, explicit = fields
+                merged = {}
+                for parent in parents:
+                    merged.update(mappings[parent])
+                merged.update(explicit)
+                mappings[current] = merged
+                active.remove(current)
+    except ReviewError:
+        # Completed ancestors remain reusable; only mappings that depend on the failure are invalid.
+        mappings.update(dict.fromkeys(active))
+        raise
+    return mappings[node]
+
+
+def normalized_text(text):
+    # PyYAML leaves escaped UTF-16 surrogate pairs as two code units.
+    try:
+        return text.encode("utf-16", "surrogatepass").decode("utf-16").strip()
+    except UnicodeDecodeError:
+        return None
+
+
+def answer_finding(fields, loader, scalars):
+    item = {}
+    if (status := fields.get("verification_status")) is not None:
+        if not isinstance(status, yaml.ScalarNode):
+            return None
+        if status.tag != YAML_TAG + "null":
+            if status.tag != YAML_TAG + "str" or status.value not in ("confirmed", "unverified"):
+                return None
+            item["verification_status"] = status.value
+    for name in FINDING_TEXT_FIELDS:
+        value = fields.get(name)
+        if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "str":
+            if value not in scalars:
+                scalars[value] = normalized_text(value.value)
+            item[name] = scalars[value]
+    for name in FINDING_LINE_FIELDS:
+        value = fields.get(name)
+        if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "int":
+            if value not in scalars:
+                try:
+                    scalars[value] = loader.construct_yaml_int(value)
+                except (ValueError, IndexError):
+                    scalars[value] = None
+            item[name] = scalars[value]
+    return item
+
+
+def answer_findings(answer, anchors):
+    """Read the flat finding schema without constructing unrelated YAML values."""
+    loader = yaml.SafeLoader(answer)
+    try:
+        mappings = {}
+        document = answer_mapping(loader.get_single_node(), mappings, loader)
+        issues = answer_mapping(document.get("review"), mappings, loader).get("key_issues_to_review")
+        if not isinstance(issues, yaml.SequenceNode) or issues.tag != YAML_TAG + "seq":
+            raise ReviewError("Invalid Cursor finding list")
+        entries, scalars = {}, {}
+        for node in issues.value:
+            if node not in entries:
+                try:
+                    fields = answer_mapping(node, mappings, loader)
+                except ReviewError:
+                    item = None
+                else:
+                    item = answer_finding(fields, loader, scalars)
+                entries[node] = finding(item, anchors, normalized=True)
+            yield entries[node]
+    except RecursionError:
+        raise ReviewError("YAML nesting in the review response is too deep") from None
+    finally:
+        loader.dispose()
+
+
+def parse_answer(raw, anchors, limit=MAX_FINDINGS, *, verification=False):
     value = json.loads(raw)
     if value.get("type") != "result" or value.get("subtype") != "success" or value.get("is_error") is not False:
         raise ReviewError("Cursor did not return a successful terminal result")
@@ -342,31 +470,75 @@ def parse_answer(raw, anchors, limit=MAX_FINDINGS):
         answer = fenced.group(1)
     if len(answer) > 32_768:
         raise ReviewError("Cursor answer exceeds the review size limit")
-    issues = yaml.safe_load(answer)["review"]["key_issues_to_review"]
-    if not isinstance(issues, list) or len(issues) > limit:
-        raise ReviewError("Invalid Cursor finding list")
-    clean = []
-    for issue in issues:
-        path = issue["relevant_file"].strip()
-        start, end = issue["start_line"], issue["end_line"]
-        lines = anchors.get(path, set())
-        if (type(start) is not int or type(end) is not int or start > end
-                or start not in lines or end not in lines or end - start >= len(lines)
-                or not all(line in lines for line in range(start, end + 1))):
-            raise ReviewError("Cursor cited a line outside the reviewed patch")
-        header, body = issue["issue_header"].strip(), issue["issue_content"].strip()
-        if not header or not body:
-            raise ReviewError("Empty review finding")
-        finding = {"path": path, "line": start, "end_line": end, "title": header, "message": body}
-        status = issue.get("verification_status")
-        if status in ("confirmed", "unverified"):
-            finding["verification_status"] = status
-        clean.append(finding)
+    if verification:
+        # A verdict can remove original findings, so validate its entire YAML document.
+        try:
+            issues = yaml.safe_load(answer)["review"]["key_issues_to_review"]
+        except RecursionError:
+            raise ReviewError("YAML nesting in the review response is too deep") from None
+        except YAML_VALUE_ERRORS:
+            raise ReviewError("Invalid YAML verifier response") from None
+        if not isinstance(issues, list) or len(issues) > limit:
+            raise ReviewError("Invalid verifier finding list")
+        checked = (finding(issue, anchors) for issue in issues)
+    else:
+        checked = answer_findings(answer, anchors)
+    # A bad finding costs the others nothing: the call is already paid for and there is no retry.
+    clean, dropped = [], []
+    path_budget = DROPPED_PATH_CHARS
+    for valid, why in checked:
+        if not why and len(clean) < limit:
+            clean.append(dict(valid))
+            continue
+        why = why or {"path": valid["path"], "line": valid["line"], "reason": "over the finding limit"}
+        path_size = len(why["path"])
+        if path_size > path_budget:
+            why = dict(why, path="")
+        else:
+            path_budget -= path_size
+        dropped.append(why)
     usage = value.get("usage")
-    return {"findings": clean, "cursor_usage": usage if isinstance(usage, dict) else None}
+    return {"findings": clean, "dropped": dropped, "cursor_usage": usage if isinstance(usage, dict) else None}
 
 
-def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120):
+def finding(issue, anchors, *, normalized=False):
+    """One validated finding, or the record of why it was dropped. A reason is fixed text, never the model's."""
+    dropped = {"path": "", "line": None, "reason": "malformed finding"}
+    if not isinstance(issue, dict):
+        return None, dropped
+    path, start, end = issue.get("relevant_file"), issue.get("start_line"), issue.get("end_line")
+    header, body = issue.get("issue_header"), issue.get("issue_content")
+    if isinstance(path, str):
+        if not normalized:
+            path = normalized_text(path)
+        if path is not None and path in anchors:
+            dropped["path"] = path
+    if type(start) is int and 0 < start <= 2**31 - 1:
+        dropped["line"] = start
+    if not isinstance(path, str) or type(start) is not int or type(end) is not int:
+        return None, dropped
+    lines = anchors.get(path, set())
+    if (start > end or start not in lines or end not in lines or end - start >= len(lines)
+            or not all(line in lines for line in range(start, end + 1))):
+        return None, dict(dropped, reason="cited line outside the reviewed patch")
+    if not isinstance(header, str) or not isinstance(body, str):
+        return None, dropped
+    if not normalized:
+        header, body = normalized_text(header), normalized_text(body)
+        if header is None or body is None:
+            return None, dropped
+    if not header or not body:
+        return None, dict(dropped, reason="empty finding")
+    validated = {"path": path, "line": start, "end_line": end, "title": header, "message": body}
+    status = issue.get("verification_status")
+    if status is not None:
+        if status not in ("confirmed", "unverified"):
+            return None, dropped
+        validated["verification_status"] = status
+    return validated, None
+
+
+def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120, *, verification=False):
     global started
     backend = provider()
     label = LABELS[backend]
@@ -454,7 +626,7 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120):
                 break
         raise CursorFailure(f"{label} exited {response.returncode}: {reason}. No retry was made.")
     try:
-        return parse_answer(response.stdout, anchors, limit)
+        return parse_answer(response.stdout, anchors, limit, verification=verification)
     except (ReviewError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError) as err:
         try:
             usage = json.loads(response.stdout).get("usage")
@@ -466,6 +638,8 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120):
 
 def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout=120, originals=None):
     signature = json.dumps([VERSION, "pr-agent:0.50.0", model, source, prompt], ensure_ascii=False)
+    if originals is not None:
+        signature = json.dumps(["strict-verifier", signature])
     if provider() != "cursor" or os.getenv("REVIEW_CURSOR_TEAM_ID"):
         signature = json.dumps([provider(), os.getenv("REVIEW_CURSOR_TEAM_ID") if provider() == "cursor" else None, signature])
     key = hashlib.sha256(signature.encode()).hexdigest()
@@ -486,6 +660,8 @@ def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout
                 return cached, True
         # The plain review keeps the call it always made.
         extra = {} if (limit, timeout) == (MAX_FINDINGS, 120) else {"limit": limit, "timeout": timeout}
+        if originals is not None:
+            extra["verification"] = True
         result = invoke(prompt, model, anchors, **extra)
         if originals is None:
             for finding in result["findings"]:
@@ -496,6 +672,8 @@ def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout
                 result["findings"] = kept(originals, result)
             except ReviewError as err:
                 raise CursorFailure(str(err), result.get("cursor_usage")) from err
+        if result.get("dropped") and not result["findings"]:
+            return result, False  # A later request can retry a reply that yielded no usable findings.
         with tempfile.NamedTemporaryFile(dir=cache, mode="w", delete=False) as file:
             json.dump(result, file)
         os.replace(file.name, path)

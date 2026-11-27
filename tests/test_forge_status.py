@@ -45,6 +45,13 @@ def review(state="reviewed", findings=None):
 
 
 class ForgeStatusPayloadTests(unittest.TestCase):
+    def test_all_dropped_findings_publish_an_incomplete_review_on_both_forges(self):
+        value = review("findings-dropped", [])
+        title, detail, head = forge_status.facts(value)
+        self.assertIn("None of the model's findings passed validation.", detail)
+        self.assertEqual(forge_status.github(value, SITES["github"], title, detail, head)["conclusion"], "failure")
+        self.assertEqual(forge_status.gitlab(value, SITES["gitlab"], title, detail)["state"], "failed")
+
     def test_payloads_follow_the_report_state_on_both_forges(self):
         for state, result in STATES:
             with self.subTest(state=state):

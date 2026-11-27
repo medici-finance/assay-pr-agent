@@ -1,5 +1,5 @@
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 import fcntl
 import hashlib
 from contextlib import ExitStack, closing
@@ -400,13 +400,21 @@ def publish(address, head, report, *, project=None, state=None):
     # so the reviewer identity never posts a Markdown link or @mention for an attacker.
     header, body = body, []
     findings = [finding_line(issue) for issue in report["findings"]]
+    # Keep the counts even when the comment needs to shorten its evidence.
+    dropped_counts = Counter(item["reason"] for item in report.get("dropped", []))
+    for reason, count in sorted(dropped_counts.items()):
+        header.append(f"Dropped {count} model finding{'s' if count > 1 else ''}: {reason}.")
     if report["state"] == "over-budget":
         body.append(f"Skipped {label}. Estimated prompt {report['estimated_input_tokens']} tokens "
                     f"exceeds the limit of {report.get('prompt_limit', report['max_input_tokens'])}.")
     elif report["state"] == "model-unavailable":
         body.append(f"{label} could not complete the review.")
+    elif report["state"] == "findings-dropped":
+        body.append("No model finding passed the checks.")
     elif not report["findings"]:
-        body.append("No model findings in the reviewed scope.")
+        body.append("No model findings remained after verification."
+                    if report.get("verification", {}).get("state") == "filtered"
+                    else "No model findings in the reviewed scope.")
     summarize_matches = report["state"] == "reviewed"
     summarized = 0
     for check in report["checks"]:
@@ -769,6 +777,7 @@ def execute_review(args, verification_resources):
         return dict(report, state="estimate"), 2 if degraded or (has_text and planned_tier != tier) else 0
 
     completed, coverage, findings, deep_findings, last_error = [], {}, [], [], None
+    dropped_findings = []
     for row, pass_prompt, locations, blocks in plans:
         depth = "max" if row["name"] == "deep" else first_tier
         answer, error = run_pass(row, pass_prompt, locations, args, change.identity, cap=cap, timeout=TIMEOUTS[depth])
@@ -782,6 +791,8 @@ def execute_review(args, verification_resources):
         if depth == "max":
             deep_findings = answer["findings"]
         findings = merge_findings(findings, answer["findings"])
+        dropped_findings.extend(answer.get("dropped", []))
+    all_findings_dropped = bool(dropped_findings and not findings)
     for check in checks:
         for item in check["findings"]:
             if item.get("baseline_match") and item["line"] in coverage.get(item["path"], ()):
@@ -817,7 +828,7 @@ def execute_review(args, verification_resources):
         # A max cap below the mid cap can leave more deep findings than the cap allows.
         from_deep = from_deep[:cap]
         findings = from_first[:cap - len(from_deep)] + from_deep
-    report.update(findings=findings, cursor_usage=total_usage(passes),
+    report.update(findings=findings, dropped=dropped_findings, cursor_usage=total_usage(passes),
                   cache_hit=bool(passes) and all(row["state"] == "cached" for row in passes),
                   cursor_invocations=sum(row["model_invocations"] for row in passes))
     if has_text and not completed:
@@ -826,6 +837,8 @@ def execute_review(args, verification_resources):
     report["degraded"] = degraded
     if report["delivered"] == "max":
         report["prompt_limit"] = deep_limit
+    if all_findings_dropped:
+        return dict(report, state="findings-dropped"), 2
     unverified = tier != "regular" and any(f.get("verification_status") == "unverified" for f in findings)
     lowered = ((has_text and report["delivered"] != tier) or report["verification"]["state"] == "unavailable" or unverified
                or any(row["state"] == "failed" for row in passes))
