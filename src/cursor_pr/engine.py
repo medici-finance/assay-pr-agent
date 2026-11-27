@@ -20,10 +20,11 @@ from unidiff import PatchSet
 from .source import TRUNCATED, ReviewError
 from .login import auth_mode, login_directory, login_env
 from .setup import state_dir
+from .config import DEFAULT_MAX_FINDINGS
 from .providers import KEYS, LABELS, provider
 
 VERSION = "1"
-MAX_FINDINGS = 3
+MAX_FINDINGS = DEFAULT_MAX_FINDINGS
 LOCKS = {"package-lock.json", "pnpm-lock.yaml", "go.sum", "npm-shrinkwrap.json"}
 
 

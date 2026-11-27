@@ -364,7 +364,8 @@ class RequestRowTests(unittest.TestCase):
             with self.assertLogs("cursor_pr.poll", level="WARNING"):
                 jobs = Jobs(self.state)
             jobs.next()
-            with patch("cursor_pr.cli.pack", side_effect=AssertionError("review repeated")):
+            with patch("cursor_pr.cli.pack", side_effect=AssertionError("review repeated")), \
+                 patch.dict(os.environ, {"REVIEW_MAX_FINDINGS": "invalid"}):
                 self.assertEqual(cli.run_request(args), (first, code))
             self.assertEqual(publish.call_args_list[0], publish.call_args_list[1])
         cli.settle(args, "reviewed")
