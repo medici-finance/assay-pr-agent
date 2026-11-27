@@ -189,6 +189,25 @@ class TierTests(unittest.TestCase):
             "The deep pass did not complete.",
             "A verification pass kept 1 of 3 findings."])
 
+    def test_one_oversized_changed_file_does_not_remove_the_others_context(self):
+        self.write("src/generated.py", "".join(f"TABLE_{n} = {n}\n" for n in range(context.MAX_BLOB // 10)))
+        self.commit("add a large generated file")
+        head = self.git("rev-parse", "HEAD")
+        files = cli.local_change(self.root, "main", head).files
+        for text in (context.surrounding(self.root, head, files), context.whole_files(self.root, head, files)):
+            self.assertIsNotNone(text)
+            self.assertIn("## src/app.py", text)
+            self.assertNotIn("TABLE_1 ", text)
+
+    def test_binary_file_beside_the_tests_does_not_remove_the_existing_tests(self):
+        (self.root / "tests/app_logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe\x00binary")
+        self.commit("add a binary fixture")
+        head = self.git("rev-parse", "HEAD")
+        files = [f for f in cli.local_change(self.root, "main", head).files if f.path == "src/app.py"]
+        text = context.existing_tests(self.root, head, files)
+        self.assertIsNotNone(text)
+        self.assertIn("## tests/test_app.py at the head", text)
+
     def test_context_blocks_share_an_allowance_in_order(self):
         raw = {"a": "one\n" * 400, "b": None, "c": "", "d": "two\n" * 5}
         text, fates = context.assemble(("a", "b", "c", "d"), raw, 300)

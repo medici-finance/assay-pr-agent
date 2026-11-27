@@ -32,10 +32,14 @@ def guarded(gatherer):
 
 
 def blob(repo, head, path):
+    """A file's text at the head, or None when it is over the size limit or not text and is left out."""
     spec = f"{head}:{path}"
     if int(git(repo, "cat-file", "-s", spec)) > MAX_BLOB:
-        raise ReviewError("file exceeds the context size limit")
-    return git(repo, "cat-file", "blob", spec)
+        return None
+    try:
+        return git(repo, "cat-file", "blob", spec)
+    except UnicodeDecodeError:
+        return None
 
 
 def live(files):
@@ -53,7 +57,10 @@ def surrounding(repo, head, files, radius=25):
     """The head lines around each hunk, so a finding can rest on what encloses the change."""
     parts = []
     for f in live(files):
-        lines = blob(repo, head, f.path).splitlines()
+        text = blob(repo, head, f.path)
+        if text is None:
+            continue
+        lines = text.splitlines()
         spans = []
         for hunk in hunks(f):
             touched = [line.target_line_no for line in hunk if line.target_line_no is not None]
@@ -113,7 +120,10 @@ def call_sites(repo, head, files, radius=0):
             continue
         for path, number, _ in rows:
             if path not in cache:
-                cache[path] = blob(repo, head, path).splitlines()
+                text = blob(repo, head, path)
+                cache[path] = None if text is None else text.splitlines()
+            if cache[path] is None:
+                continue
             first, last = max(1, number - radius), min(len(cache[path]), number + radius)
             parts.append(f"## Use of {name} in {path} lines {first}-{last}\n"
                          + numbered(cache[path][first - 1:last], first))
@@ -146,8 +156,8 @@ def overlap(root, drifted):
 def whole_files(repo, head, files):
     parts = []
     for f in live(files):
-        if rank(f.path) == SOURCE_RANK:
-            parts.append(f"## {f.path} at the head\n{blob(repo, head, f.path)}")
+        if rank(f.path) == SOURCE_RANK and (text := blob(repo, head, f.path)) is not None:
+            parts.append(f"## {f.path} at the head\n{text}")
     return "\n\n".join(parts)
 
 
@@ -160,8 +170,9 @@ def existing_tests(repo, head, files):
     parts = []
     for path in git(repo, "ls-tree", "-r", "--name-only", head).splitlines():
         name = path.rsplit("/", 1)[-1].lower()
-        if path not in changed and rank(path) == 1 and any(stem in name for stem in stems) and len(parts) < 6:
-            parts.append(f"## {path} at the head\n{blob(repo, head, path)}")
+        if (path not in changed and rank(path) == 1 and any(stem in name for stem in stems) and len(parts) < 6
+                and (text := blob(repo, head, path)) is not None):
+            parts.append(f"## {path} at the head\n{text}")
     return "\n\n".join(parts)
 
 
