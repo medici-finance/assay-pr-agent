@@ -73,9 +73,11 @@ class DroppedSummaryTests(unittest.TestCase):
             cli.publish("org/repo#1", "a" * 40, self.report())
         self.assertIn("Dropped 2 model findings: cited line outside the reviewed patch.", posts[0])
         self.assertIn("Dropped 1 model finding: malformed finding.", posts[0])
-        self.assertIn("No model findings in the reviewed scope.", posts[0])
+        self.assertIn("No model finding passed the checks.", posts[0])
+        self.assertNotIn("No model findings in the reviewed scope.", posts[0])
         self.assertNotIn("@all", posts[0])
         self.assertNotIn("Dropped", posts[1])
+        self.assertIn("No model findings in the reviewed scope.", posts[1])
 
     def test_a_review_whose_findings_were_all_dropped_is_not_reported_as_clean(self):
         parsed = {"findings": [], "dropped": [{"path": "a.py", "line": 9, "reason": "cited line outside the reviewed patch"}],
@@ -92,6 +94,7 @@ class DroppedSummaryTests(unittest.TestCase):
             report, code = cli.run_request(args)
         self.assertEqual((code, report["state"], report["findings"], report["dropped"]), (0, "reviewed", [], parsed["dropped"]))
         self.assertIn("Dropped 1 model finding: cited line outside the reviewed patch.", posts[0])
+        self.assertNotIn("No model findings in the reviewed scope.", posts[0])
 
 PATCH = ["def total(items):", "    total = 0", "    for item in items:", "        total += item", "    return total"]
 
@@ -111,7 +114,12 @@ class QuotedEvidenceTests(unittest.TestCase):
                  ("return total\ntotal += item", 4, 5, "quoted code does not match the cited lines"),
                  ("return total", 2, 3, "quoted code does not match the cited lines"),
                  ("raise ValueError", 4, 5, "quoted code does not match the cited lines"),
-                 ("", 4, 5, "unverified"))
+                 ("", 4, 5, "unverified"),
+                 ("    for item in items:\n    ...\n    return total", 3, 5, "verified"),
+                 ("3 +    for item in items:\n# …\n5 +    return total", 3, 5, "verified"),
+                 ("__new hunk__\n4 +        total += item", 4, 4, "verified"),
+                 ("4 +\n5 +", 4, 5, "unverified"),
+                 ("...\nraise ValueError", 4, 5, "quoted code does not match the cited lines"))
         for quote, start, end, expected in cases:
             with self.subTest(quote=quote):
                 parsed = self.parse(dict(issue(start=start, end=end), relevant_code=quote))
@@ -130,6 +138,10 @@ class QuotedEvidenceTests(unittest.TestCase):
         self.assertEqual(self.parse(inline)["findings"][0]["evidence"], "unverified")
         both = dict(issue(start=4, end=4, body="```\nraise ValueError\n```"), relevant_code="total += item")
         self.assertEqual(self.parse(both)["findings"][0]["evidence"], "verified")
+        # Without relevant_code, a fenced block that does not match may be a suggested fix: kept, unverified.
+        fix = issue(start=4, end=4, body="It adds up.\n```\ntotal = sum(items)\n```\n")
+        parsed = self.parse(fix)
+        self.assertEqual(([f["evidence"] for f in parsed["findings"]], parsed["dropped"]), (["unverified"], []))
 
     def test_pack_records_the_text_of_every_shown_head_line(self):
         patch = "@@ -1,2 +1,2 @@\n first()\n-old\n+  third( x )\n"

@@ -45,19 +45,21 @@ def rank(path):
     return 3
 
 
-def fit(files, checks, limit, *, title="", description="", advisories=(), model=None):
+def fit(files, checks, limit, *, title="", description="", advisories=(), scoped=False, model=None):
     """Pack the prompt, leaving out whole files until it fits the input budget.
 
     Returns the prompt parts, the estimate of what will be sent, the estimate of the full
     prompt, and the paths left out. Nothing is left out when even one file cannot fit.
     """
     prompt, anchors, no_text, has_text = full_pack = pack(files, checks, title=title, description=description,
-                                                         advisories=advisories)
+                                                         advisories=advisories, scoped=scoped)
     estimated = full = tokens(prompt, model) if has_text else 0
     if full <= limit:
         return full_pack, full, full, []
     sizes = {f.path: tokens(text, model) for f in files if (text := section(f)[0])}
-    queue = sorted(sizes, key=lambda path: (rank(path), -sizes[path], path))
+    # A file that cannot fit even alone leaves first, so it never takes a file that fits with it.
+    overhead = tokens(pack(files, checks, frozenset(sizes), title, description, advisories, scoped)[0], model)
+    queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
     while estimated > limit and queue:
         # Per-file sizes are approximate, so the last file only leaves after a real recount.
@@ -66,7 +68,7 @@ def fit(files, checks, limit, *, title="", description="", advisories=(), model=
         while len(queue) > 1 and freed < estimated - limit:
             dropped.append(queue.pop(0))
             freed += sizes[dropped[-1]]
-        prompt, anchors, no_text, has_text = pack(files, checks, frozenset(dropped), title, description, advisories)
+        prompt, anchors, no_text, has_text = pack(files, checks, frozenset(dropped), title, description, advisories, scoped)
         estimated = tokens(prompt, model) if has_text else 0
     if not has_text or estimated > limit:
         return full_pack, full, full, []
@@ -101,7 +103,9 @@ def publish(address, head, report, *, project=None, state=None):
     elif report["state"] == "model-unavailable":
         body.append(f"{label} could not complete the review.")
     elif not report["findings"]:
-        body.append("No model findings in the reviewed scope.")
+        # With every model finding dropped, saying there were none would read as a clean review.
+        body.append("No model finding passed the checks." if report.get("dropped")
+                    else "No model findings in the reviewed scope.")
     for check in report["checks"]:
         if check["state"] != "complete":
             body.append(f"- {check['tool']}: could not check {fence(check.get('path') or check.get('reason', ''))}")
@@ -202,7 +206,7 @@ def execute(args):
                 static[tool, path] = {"tool": tool, "path": path, "source": "local", "state": "could-not-check",
                                       "findings": [], "reason": "static check time budget exhausted"}
         if args.change:
-            drifted = drift.forge(root, checkout, change, bool(project))
+            drifted = drift.forge(root, checkout, change, bool(project), files)
         else:
             drifted = drift.check(root, change.head, change.base, files)
     go = None
@@ -218,7 +222,7 @@ def execute(args):
     qualgen = history.screen(root, args.qualgen_store, selected, change.head) if args.qualgen_store else None
     (prompt, anchors, no_text, has_text), estimated, full, degraded = fit(
         files, checks, args.max_input_tokens, title=change.title, description=change.description,
-        advisories=qualgen["advisories"] if qualgen else (), model=args.model)
+        advisories=qualgen["advisories"] if qualgen else (), scoped=selected != paths, model=args.model)
     # Only what a review could have covered and did not is a loss of coverage.
     omitted = sorted(paths - selected)
     backend = providers.provider()
@@ -230,7 +234,8 @@ def execute(args):
               "drift": drifted}
     # What the review could cover and did: the denominators of the receipt.
     deselected, text = paths - selected, len(files) - len(no_text)
-    reviewed = 0 if full > args.max_input_tokens else text - len(degraded)
+    # A degraded review is over the limit in full but reviews what it kept; only a refusal reviews nothing.
+    reviewed = 0 if estimated > args.max_input_tokens else text - len(degraded)
     report["coverage"] = {"changed": len(paths), "text": text + len(deselected), "reviewed": reviewed,
                           "skipped": text - reviewed, "excluded": len(deselected), "no_text": len(no_text)}
     if static:

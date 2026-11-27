@@ -18,6 +18,9 @@ def usage_totals(usage):
 def build(report):
     coverage = report.get("coverage", {})
     reviewed, text = coverage.get("reviewed", 0), coverage.get("text", 0)
+    # The model never answered, so nothing it was sent counts as reviewed.
+    if report["state"] == "model-unavailable":
+        reviewed = 0
     checks = [*report["checks"], *(report.get("static_checks") or [])]
     return {
         "state": report["state"],
@@ -49,7 +52,7 @@ def render(receipt):
     # A budget refusal already reports the full estimate as its prompt size.
     if receipt["state"] != "over-budget" and receipt["full_input_tokens"] > receipt["max_input_tokens"]:
         head += f"; the complete change needs {receipt['full_input_tokens']:,}"
-    if usage:
+    if "input" in usage or "output" in usage:
         head += "; the CLI reported " + " and ".join(f"{usage[k]:,} {k}" for k in ("input", "output") if k in usage) + " tokens"
     coverage = receipt["coverage"]
     if coverage["percent"] is None:
