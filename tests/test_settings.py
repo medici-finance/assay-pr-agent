@@ -129,7 +129,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-codex")
 
     def test_an_absolute_credential_path_through_the_old_bundle_survives_a_save(self):
-        for reference in ("active symlink", "bundle directory", "external symlink", "external file within the bundle"):
+        for reference in ("active symlink", "bundle directory", "external symlink", "symlink chain"):
             with self.subTest(reference=reference):
                 self.seed()
                 old = setup.active_bundle(self.state)
@@ -140,10 +140,13 @@ class SettingsTests(unittest.TestCase):
                 elif reference == "external symlink":
                     path = self.root / "credential-alias"
                     path.symlink_to(old / "codex.key")
-                elif reference == "external file within the bundle":
+                elif reference == "symlink chain":
                     external = self.root / "actual-key"
                     path.rename(external)
                     path.symlink_to(external)
+                    alias = self.root / "chained-alias"
+                    alias.symlink_to(self.state / "setup" / "codex.key")
+                    path = alias
                 document = self.document()
                 document["secrets"]["CODEX_API_KEY"] = str(path)
                 (old / "settings.json").write_text(json.dumps(document))
@@ -157,6 +160,20 @@ class SettingsTests(unittest.TestCase):
                 self.assertEqual(self.document()["secrets"]["CODEX_API_KEY"], "codex.key")
                 self.assertEqual((setup.active_bundle(self.state) / "codex.key").stat().st_mode & 0o777, 0o600)
                 self.assertFalse(old.exists())
+
+    def test_an_absolute_mount_path_through_the_stable_link_keeps_reading_the_mount(self):
+        self.seed()
+        external = self.state / "mounted.key"
+        external.write_text("fixture-mounted")
+        reference = self.state / "setup" / ".." / external.name
+        document = self.document()
+        document["secrets"]["CODEX_API_KEY"] = str(reference)
+        (setup.active_bundle(self.state) / "settings.json").write_text(json.dumps(document))
+        settings.save(self.state, {"name": "REVIEW_POLL_SECONDS", "value": "60"})
+        self.assertEqual(self.document()["secrets"]["CODEX_API_KEY"], str(reference))
+        external.write_text("fixture-rotated")
+        setup.apply_saved_setup(self.state)
+        self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-rotated")
 
     def test_invalid_values_keep_the_active_setup(self):
         self.seed()
@@ -406,6 +423,19 @@ class SettingsTests(unittest.TestCase):
                 settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "8"})
             self.assertEqual(setup.active_bundle(self.state), old)
             self.assertEqual(self.document()["settings"]["REVIEW_CURSOR_TEAM_ID"], "7")
+            settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "7"})
+        self.assertEqual(self.document()["settings"]["REVIEW_CURSOR_TEAM_ID"], "7")
+
+    def test_cursor_team_change_reports_a_saved_key_unavailable_in_setup(self):
+        teams = [{"id": number, "name": str(number), "isSelectable": True} for number in (7, 8)]
+        self.seed(values={**SAVED, "REVIEW_PROVIDER": "cursor", "REVIEW_CURSOR_TEAM_ID": "7"},
+                  secrets={setup.CURSOR: str(self.root / "reviewer-only-mount")})
+        old = setup.active_bundle(self.state)
+        with patch.dict(os.environ, {setup.CURSOR: "fixture-overriding-key"}), \
+                patch.object(providers, "team_command", return_value={"teams": teams}):
+            with self.assertRaisesRegex(ValueError, "saved Cursor key is unavailable"):
+                settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "8"})
+            self.assertEqual(setup.active_bundle(self.state), old)
             settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "7"})
         self.assertEqual(self.document()["settings"]["REVIEW_CURSOR_TEAM_ID"], "7")
 

@@ -144,12 +144,15 @@ def cursor_team(value, config, state, old):
         effective = ((stored(config, old, setup.CURSOR), scratch) if mode == "api-key"
                      else (None, cursor_login_home(state, profile)))
         chosen = providers.eligible_team(effective[0], value, effective[1])
-        if saved_backend != "cursor":
+        if saved_backend != "cursor" or chosen == saved.get("REVIEW_CURSOR_TEAM_ID", ""):
             return chosen
         if saved.get("REVIEW_AUTH_MODE") == "login":
             fallback = (None, cursor_login_home(state, saved_profile))
         elif location := config["secrets"].get(setup.CURSOR):
-            fallback = ((old / location).read_text().strip(), scratch)
+            try:
+                fallback = ((old / location).read_text().strip(), scratch)
+            except OSError:
+                raise ValueError("The saved Cursor key is unavailable here. Make it readable before changing the shared team.") from None
         else:
             return chosen  # The saved API-key setup requires an environment-supplied key.
         if fallback != effective:
@@ -363,11 +366,39 @@ def replace_credential(config, name, value, remove, written):
     config["secrets"][name] = setup.SECRETS[name]
 
 
-def references_bundle(path, bundle):
-    """Whether an absolute reference depends on this bundle's files or symlinks."""
-    root = bundle.resolve()
-    # Check the target and its path prefixes. A symlink in the old bundle can point outside it.
-    return any(Path(os.path.realpath(part)).is_relative_to(root) for part in (path, *path.parents))
+def references_bundle(path, old, replacement):
+    """Would an absolute credential path lose part of its resolution after activation?"""
+    parent = old.parent.resolve()
+    retired, staged, active = parent / old.name, parent / replacement.name, parent / "setup"
+    directory = Path("/")
+    remaining = list(reversed(path.parts[1:]))
+    links = 0
+    while remaining:
+        name = remaining.pop()
+        if name == "..":
+            directory = directory.parent
+            continue
+        candidate = directory / name
+        if candidate == retired or directory == staged:
+            return True
+        if candidate == active:
+            # Substitute the new target so /setup/../secrets remains a live mount.
+            directory = staged
+            continue
+        try:
+            target = candidate.readlink()
+        except OSError:
+            directory = candidate
+            continue
+        links += 1
+        if links > 40:  # Bound traversal of broken references with link cycles.
+            return False
+        if target.is_absolute():
+            directory = Path("/")
+            remaining.extend(reversed(target.parts[1:]))
+        else:
+            remaining.extend(reversed(target.parts))
+    return False
 
 
 def save(state, change, *, revision=None):
@@ -400,7 +431,7 @@ def save(state, change, *, revision=None):
                     raise ValueError("Unknown credential in saved setup")
                 if secret in written:
                     private_file(bundle / setup.SECRETS[secret], written[secret])
-                elif not Path(location).is_absolute() or references_bundle(Path(location), old):
+                elif not Path(location).is_absolute() or references_bundle(Path(location), old, bundle):
                     # Copy credentials whose configured paths would break when the old bundle is removed.
                     destination = bundle / setup.SECRETS[secret]
                     shutil.copyfile(old / location, destination)
