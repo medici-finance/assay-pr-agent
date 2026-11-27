@@ -21,6 +21,7 @@ SENTENCES = {
     "reviewed": "The review completed.",
     "empty": "The review completed. The change has no files to review.",
     "partial": "The review covered only part of the change.",
+    "degraded": "The review completed with less than the requested coverage.",
     "over-budget": "The model was skipped because the estimated prompt is over the budget.",
     "model-unavailable": "The model could not complete the review.",
 }
@@ -124,8 +125,14 @@ def gitlab_source_ref(client, headers, base, slug, number, head):
     # project's and ran this commit. Otherwise the branch is all there is to go by.
     pipeline = change.get("head_pipeline")
     if isinstance(pipeline, dict):
+        if pipeline.get("sha") != head:
+            # A merged-results or merge-train pipeline runs a commit of its own, and one of an
+            # earlier head is out of date. A status sent with the branch could then start a new
+            # pipeline holding this check alone, which GitLab may show, and gate the merge on,
+            # in place of the real one. No status is better than that.
+            raise ReviewError("The GitLab merge request's pipeline is not for the reviewed commit")
         number, own = pipeline.get("id"), pipeline.get("ref")
-        if (type(number) is int and number > 0 and pipeline.get("sha") == head and pipeline.get("project_id") == target
+        if (type(number) is int and number > 0 and pipeline.get("project_id") == target
                 and isinstance(own, str) and own and own.isprintable()):
             return {"ref": own, "pipeline_id": number}
     return {"ref": ref}
