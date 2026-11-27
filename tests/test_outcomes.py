@@ -7,6 +7,9 @@ from unittest.mock import patch
 from cursor_pr import cli, engine, outcomes, source
 
 
+CHANGE_URL = "https://github.com/org/repo/pull/7"
+
+
 def finding(path, line, title="Possible Bug", end=None):
     return {"path": path, "line": line, "end_line": end or line, "title": title, "message": "Why it matters.",
             "evidence": "unverified"}
@@ -25,19 +28,24 @@ class OutcomeTests(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
 
-    def record(self, head, findings, shown, address="org/repo#7"):
-        return outcomes.record(self.tmp, address, head, findings, shown)
+    def record(self, head, findings, shown, address=CHANGE_URL, changed_paths=None):
+        return outcomes.record(self.tmp, address, head, findings, shown, changed_paths)
 
-    def review(self, head, lines, answer, *flags):
+    def review(self, head, lines, answer, *flags, fail_post=False):
         posts = []
         patch_text = "@@ -0,0 +1,%d @@\n" % len(lines) + "".join("+" + line + "\n" for line in lines)
         args = cli.parser().parse_args(["--change", "org/repo#7", "--repo", str(self.tmp), "--cache-dir", str(self.tmp / "cache"),
                                         "--max-input-tokens", "6000", *flags])
-        with patch.object(cli, "forge_change", return_value=source.Change(head, [source.File("app.py", patch_text, "added")], "org/repo#7")), \
+        files = [source.File("app.py", patch_text, "added")] if lines else []
+        def post(*args, **kwargs):
+            if fail_post:
+                raise source.ReviewError("Head moved")
+            posts.append(args[3])
+        with patch.object(cli, "forge_change", return_value=source.Change(head, files, CHANGE_URL)), \
              patch.object(cli, "scan_files", return_value=[]), \
              patch.object(engine, "invoke", return_value={"findings": answer, "dropped": [], "cursor_usage": None}), \
              patch.object(cli.drift, "forge", return_value={"state": "could-not-check", "behind": None, "both": [], "references": []}), \
-             patch.object(cli, "post_comment", side_effect=lambda *args: posts.append(args[3])):
+             patch.object(cli, "post_comment", side_effect=post):
             report, code = cli.run_request(args)
             if not args.post:
                 cli.publish("org/repo#7", head, report)
@@ -59,7 +67,7 @@ class OutcomeTests(unittest.TestCase):
         shown = anchors({"a.py": ["x = 1", "y = 2"]})
         self.record("a" * 40, [finding("a.py", 2)], shown)
         self.assertEqual(self.record("a" * 40, [], shown)["open"], 1)
-        self.assertEqual(self.record("b" * 40, [], shown, address="org/repo#8"),
+        self.assertEqual(self.record("b" * 40, [], shown, address="https://gitlab.com/org/repo/-/merge_requests/7"),
                          {"fixed": 0, "unaddressed": 0, "repeated": 0, "open": 0, "accept_rate": None})
 
     def test_a_finding_raised_again_is_counted_once_when_fixed(self):
@@ -81,6 +89,37 @@ class OutcomeTests(unittest.TestCase):
         # Left out for the budget, or served with no text: the file has no anchors at this head.
         later = self.record("b" * 40, [], {"a.py": {}})
         self.assertEqual((later["fixed"], later["open"]), (0, 1))
+
+    def test_reverting_the_whole_change_resolves_an_earlier_finding(self):
+        self.review("a" * 40, ["x = 1"], [finding("app.py", 1)], "--post")
+        later, body = self.review("b" * 40, [], [], "--post")
+        self.assertEqual((later["state"], later["outcomes"]["fixed"]), ("empty", 1))
+        self.assertIn("1 addressed", body)
+
+    def test_code_outside_the_new_hunks_is_unresolved(self):
+        self.record("a" * 40, [finding("a.py", 2)], anchors({"a.py": ["before()", "suspect()", "after()"]}))
+        shown = {"a.py": {20: "other_change()"}}
+        later = self.record("b" * 40, [], shown, changed_paths={"a.py"})
+        self.assertEqual((later["fixed"], later["open"]), (0, 1))
+
+    def test_another_identical_line_does_not_stand_in_for_the_fixed_occurrence(self):
+        self.record("a" * 40, [finding("a.py", 2)], anchors({
+            "a.py": ["before_first()", "suspect()", "after_first()", "before_second()", "suspect()", "after_second()"]}))
+        later = self.record("b" * 40, [], anchors({
+            "a.py": ["before_first()", "corrected()", "after_first()", "before_second()", "suspect()", "after_second()"]}))
+        self.assertEqual((later["fixed"], later["unaddressed"]), (1, 0))
+
+    def test_reworded_repeat_is_counted_once_and_shown_in_comment(self):
+        self.review("a" * 40, ["starter()", "suspect()"], [finding("app.py", 2)], "--post")
+        later, body = self.review("b" * 40, ["starter()", "suspect()", "extra()"],
+                                  [finding("app.py", 2, "Reworded finding")], "--post")
+        self.assertEqual((later["outcomes"]["repeated"], later["outcomes"]["unaddressed"]), (1, 0))
+        self.assertIn("accept rate not available", body)
+
+    def test_interior_whitespace_is_part_of_the_cited_code(self):
+        self.record("a" * 40, [finding("a.py", 2)], anchors({"a.py": ["before()", 'x = "a  b"']}))
+        later = self.record("b" * 40, [], anchors({"a.py": ["before()", 'x = "a b"']}))
+        self.assertEqual((later["fixed"], later["unaddressed"]), (1, 0))
 
     def test_blank_cited_lines_do_not_count_as_a_change(self):
         self.record("a" * 40, [finding("a.py", 1, end=2)], anchors({"a.py": ["", "y = 2"]}))
@@ -110,6 +149,16 @@ class OutcomeTests(unittest.TestCase):
         with patch.object(outcomes, "record", side_effect=OSError("read-only")):
             report, _ = self.review("b" * 40, ["x = 1"], [finding("app.py", 1)], "--post")
         self.assertEqual((report["state"], "outcomes" in report), ("reviewed", False))
+
+    def test_a_failed_publication_does_not_record_or_resolve_a_finding(self):
+        failed, _ = self.review("a" * 40, ["x = 1"], [finding("app.py", 1)], "--post", fail_post=True)
+        self.assertEqual(failed["publication"], "failed")
+        self.assertFalse((self.tmp / outcomes.NAME).exists())
+        self.review("b" * 40, ["x = 1"], [finding("app.py", 1)], "--post")
+        failed, _ = self.review("c" * 40, ["x = 2"], [], "--post", fail_post=True)
+        self.assertNotIn("outcomes", failed)
+        observed = outcomes.record(self.tmp, CHANGE_URL, "b" * 40, [], {}, persist=False)
+        self.assertEqual((observed["open"], observed["fixed"]), (1, 0))
 
 
 if __name__ == "__main__":
