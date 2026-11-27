@@ -150,8 +150,8 @@ class HistoryTests(unittest.TestCase):
             results = [history.screen(self.repo, self.store, {"partner.py"}, head) for _ in range(2)]
         self.assertEqual(results, [{"state": "unavailable", "advisories": [], "unscreened": [], "history_head": head,
                                     "reason": "unverified-release"}] * 2)
-        # Read once per process; its text is never parsed, and the release it reported is not logged.
-        release.assert_called_once_with(self.store / "current")
+        # An unchanged executable is probed once and its release is never logged.
+        release.assert_called_once_with(self.store / "current", Path(shutil.which("qualgen")).resolve())
         check.assert_not_called()
         self.assertEqual(len(logs.output), 1)
         self.assertNotIn("v1.0.95", logs.output[0])
@@ -169,6 +169,24 @@ class HistoryTests(unittest.TestCase):
                 result = history.screen(self.repo, self.store, {"partner.py"}, head)
         self.assertEqual((release.call_count, result["state"]), (2, "unavailable"))
         self.assertNotIn("reason", result)
+
+    def test_version_check_follows_paths_and_executable_replacements(self):
+        head = self.snapshot()
+        one, two = self.root / "first-qualgen", self.root / "second-qualgen"
+        one.touch()
+        two.touch()
+        with patch.object(history, "_verified", None), \
+                patch.object(history.shutil, "which", side_effect=[str(one), str(one), str(two), str(two)]), \
+                patch.object(history, "reported_release", side_effect=["v1.0.94", "v1.0.94", "v1.0.95"]) as release, \
+                patch.object(history, "qualgen", return_value="partner.py: no advisory signal in this screen") as check:
+            results = [history.screen(self.repo, self.store, {"partner.py"}, head) for _ in range(3)]
+            two.write_bytes(b"new executable")
+            with self.assertLogs(history.log, level="WARNING"):
+                after = history.screen(self.repo, self.store, {"partner.py"}, head)
+        self.assertEqual([row["state"] for row in results], ["complete"] * 3)
+        self.assertEqual(after["reason"], history.UNVERIFIED)
+        self.assertEqual([call.args[1] for call in release.call_args_list], [one.resolve(), two.resolve(), two.resolve()])
+        self.assertEqual([call.kwargs["executable"] for call in check.call_args_list], [one.resolve(), one.resolve(), two.resolve()])
 
     @unittest.skipUnless(shutil.which("qualgen"), "qualgen is included in the image")
     def test_real_check_prints_the_lines_the_parser_reads(self):

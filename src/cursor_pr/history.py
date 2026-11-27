@@ -22,7 +22,7 @@ DEFAULT_INTERVAL = 86400
 VERIFIED_RELEASES = frozenset({"v1.0.94"})
 LINE = re.compile(r"(.+?): (NOTICE ([\w-]+) — (.+)|could-not-screen — .+|no advisory signal in this screen)")
 UNVERIFIED = "unverified-release"
-_verified = None  # True or False once qualgen --version has been read in this process
+_verified = None  # The last executable identity and the result of its version probe
 
 
 def interval():
@@ -48,27 +48,38 @@ def tip(repo):
     return sha
 
 
-def qualgen(mode, repo, tracking, *args, timeout):
+def qualgen(mode, repo, tracking, *args, timeout, executable="qualgen"):
     # git-sync uses a relative gitdir in a linked worktree. go-git needs its physical path.
-    return subprocess.run(["qualgen", mode, "--repo", str(repo.resolve()), "--out", str(tracking), *args],
+    return subprocess.run([executable, mode, "--repo", str(repo.resolve()), "--out", str(tracking), *args],
                           cwd=tracking, env={"PATH": os.environ["PATH"]}, check=True, text=True,
                           encoding="utf-8", capture_output=True, timeout=timeout).stdout
 
 
-def reported_release(cwd):
+def reported_release(cwd, executable="qualgen"):
     # Run from the tracking root, as for check, and never from inside the repository.
-    return subprocess.run(["qualgen", "--version"], cwd=cwd, env={"PATH": os.environ["PATH"]}, check=True, text=True,
+    return subprocess.run([executable, "--version"], cwd=cwd, env={"PATH": os.environ["PATH"]}, check=True, text=True,
                           encoding="utf-8", capture_output=True, timeout=30).stdout.strip()
 
 
 def verified(cwd):
+    """Return the resolved Qualgen executable if this version is known to the parser."""
     global _verified
-    if _verified is None:
-        _verified = reported_release(cwd) in VERIFIED_RELEASES
-        if not _verified:
+    name = shutil.which("qualgen")
+    if not name:
+        raise FileNotFoundError("qualgen")
+    executable = Path(name).resolve(strict=True)
+    stat = executable.stat()
+    identity = (executable, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    cached = _verified
+    if cached is None or cached[0] != identity:
+        supported = reported_release(cwd, executable) in VERIFIED_RELEASES
+        _verified = (identity, supported)
+        if not supported:
             # The release qualgen reported is not echoed: it is unverified tool output.
             log.warning("Qualgen on PATH is not a verified release; history screening is unavailable")
-    return _verified
+    else:
+        supported = cached[1]
+    return executable if supported else None
 
 
 def mined_tip(snapshot):
@@ -127,7 +138,8 @@ def screen(repo, store, paths, head):
         with locked(store, fcntl.LOCK_SH):
             snapshot = store / "current"
             result["history_head"] = mined_tip(snapshot)
-            if not verified(snapshot):
+            executable = verified(snapshot)
+            if executable is None:
                 return dict(result, reason=UNVERIFIED)
             # check also consults checkout HEAD for live reference-rot notices.
             same_head = tip(repo) == head
@@ -144,7 +156,8 @@ def screen(repo, store, paths, head):
                         continue
                     path = re.sub(r"([\\*?\[])", r"\\\1", path)
                 literals.append(path)
-            output = qualgen("check", repo, snapshot, "--", *literals, timeout=60) if literals else ""
+            output = qualgen("check", repo, snapshot, "--", *literals, timeout=60,
+                             executable=executable) if literals else ""
             same_head = same_head and tip(repo) == head
         # Paths withheld above never reached Qualgen, so they say nothing about its output.
         sent = set(paths) - set(result["unscreened"])
