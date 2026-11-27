@@ -27,6 +27,7 @@ from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import blob, go_report, scan_files
 from .sync import scan_checkout
+from . import forge_status
 from .discovery import context_comments
 from .engine import (MAX_FINDINGS, CursorFailure, fit_verification, merge_findings, pack, prompt_advisories, rank,
                      render_sections, review, tokens, visible_advisories)
@@ -560,6 +561,8 @@ def parser():
     p.add_argument("--cache-dir", type=Path, default=Path(os.getenv("XDG_CACHE_HOME", Path.home()/".cache"))/"cursor-pr-review")
     p.add_argument("--post", action="store_true", help="Publish a head-bound summary with --change")
     p.add_argument("--sarif", type=Path, help="Also write the findings as a SARIF 2.1.0 log at this path")
+    p.add_argument("--forge-status", action="store_true",
+                   help="Report the review on the reviewed head as a GitHub check run or GitLab commit status")
     return p
 
 
@@ -852,6 +855,7 @@ def run_request(args):
         except (ReviewError, OSError, ValueError, subprocess.TimeoutExpired) as err:
             return dict(report, publication="failed", publication_error=str(err) or type(err).__name__), 2
         report["publication"] = "posted-or-already-present"
+    report["forge_status"] = forge_status.outcome(args, report)
     return report, code
 
 

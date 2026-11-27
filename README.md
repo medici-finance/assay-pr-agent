@@ -445,6 +445,20 @@ review:
 
 The test suite checks the log's contents and never uploads it to a forge. [Upload a SARIF file to GitHub](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/uploading-a-sarif-file-to-github) · [SARIF support for code scanning](https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning) · [GitLab SARIF reports](https://docs.gitlab.com/user/application_security/detect/sarif/)
 
+### Report a check on the head
+
+Add `--forge-status`, or set `REVIEW_FORGE_STATUS=1` in the reviewer's environment, to report a review of a `--change` on the commit it reviewed. It is off by default, works with or without `--post`, and never runs for `--estimate`. The poller passes its environment through to each review, so it needs no change to pick the variable up.
+
+GitHub receives one check run named `assay-pr-agent/review` on the reviewed head. Its conclusion follows the exit code: `success` when the review completed (`reviewed` or `empty`), and `failure` when the model could not complete the review, when the prompt was over budget or when coverage was partial or degraded. Findings alone never fail the check, because the CLI also exits 0 for a review with findings. The title and summary hold fixed sentences and counts. Each model finding with a line also becomes a `warning` annotation, with its title and message quoted as code so nothing a change author or the model wrote can render as a link or a mention.
+
+GitLab receives one commit status with the same name on the reviewed head: `success` or `failed` by the same rule, with a fixed description of at most 255 characters and the change as its target. The status targets the reviewed SHA. When the merge request's head pipeline belongs to the configured project and ran that SHA, the status names that pipeline, so it appears on the merge request even if a branch pipeline exists for the same commit. With no head pipeline it names the source branch and GitLab selects or creates the pipeline. When the head pipeline ran another commit, as merged-results and merge-train pipelines do, or cannot be named from the configured project, no status is sent and `forge_status` is `failed`: a status sent with the branch alone could start a new pipeline that GitLab shows in place of the real one. Status publication is limited to merge requests whose source and target use the configured project. When GitLab answers 409 because another status for the commit is being written at that moment, the reviewer asks twice more, after one and two seconds.
+
+The forge helper checks the current head, repository visibility and status text against the same publication policy used for comments before either status is sent. The outcome is in the JSON report as `forge_status`: `posted`, `failed` or `skipped`. A refusal, a missing permission included, logs one line without the credential and changes neither the exit code nor the summary comment. When `--post` itself fails, no status is attempted and the report has no `forge_status` key.
+
+The default reviewer credentials cannot post it, and setup still requests the least privilege. Creating a check run takes a GitHub App with **Checks** write permission (`checks: write`); the wizard requests only contents read, pull requests write and Actions read. A commit status takes a GitLab token with the `api` scope and the Developer role; the wizard creates a Reporter token. Add the permission to the reviewer credential before turning this on.
+
+GitHub identifies the check by commit SHA. Pull requests that share a head can share its result, and retargeting a pull request can change the diff without changing the check. Use it as a commit-level status. A merge gate that requires a review of the current pull request diff needs a separate check of the base and head. [REST API endpoints for check runs](https://docs.github.com/en/rest/checks/runs#create-a-check-run) · [GitLab commit statuses](https://docs.gitlab.com/api/commits/#set-commit-pipeline-status)
+
 ## Verification
 
 ```sh
