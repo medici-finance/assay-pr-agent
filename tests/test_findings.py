@@ -91,6 +91,40 @@ review:
         [finding] = engine.parse_answer(json.dumps(raw), ANCHORS)["findings"]
         self.assertEqual((finding["line"], finding["end_line"], finding["title"]), (2, 2, "Explicit Header"))
 
+    def test_bad_yaml_merge_in_the_envelope_is_rejected(self):
+        raw = json.loads(envelope([]))
+        for document in ("<<: invalid\nreview: {key_issues_to_review: []}",
+                         "review: {<<: 0, key_issues_to_review: []}",
+                         "review: {<<: [{key_issues_to_review: []}, null], key_issues_to_review: []}"):
+            with self.subTest(document=document):
+                raw["result"] = document
+                with self.assertRaises(source.ReviewError):
+                    engine.parse_answer(json.dumps(raw), ANCHORS)
+
+    def test_bad_yaml_merge_in_one_finding_leaves_valid_siblings(self):
+        raw = json.loads(envelope([]))
+        good, bad = issue(), dict(issue(header="Bad Merge"), **{"<<": "BAD_MERGE"})
+        raw["result"] = yaml.safe_dump({"review": {"key_issues_to_review": [good, bad, bad]}})
+        raw["result"] = raw["result"].replace("'<<': BAD_MERGE", "<<: invalid")
+        parsed = engine.parse_answer(json.dumps(raw), ANCHORS)
+        self.assertEqual([finding["title"] for finding in parsed["findings"]], ["Possible Bug"])
+        self.assertEqual([item["reason"] for item in parsed["dropped"]], ["malformed finding"] * 2)
+
+    def test_aliased_citation_is_decoded_once(self):
+        raw = json.loads(envelope([]))
+        raw["result"] = """
+citation: &line 2
+review:
+  key_issues_to_review:
+  - {relevant_file: a.py, start_line: *line, end_line: *line, issue_header: First, issue_content: Details.}
+  - {relevant_file: a.py, start_line: *line, end_line: *line, issue_header: Second, issue_content: Details.}
+"""
+        original = yaml.SafeLoader.construct_yaml_int
+        with patch.object(yaml.SafeLoader, "construct_yaml_int", autospec=True, side_effect=original) as decode:
+            parsed = engine.parse_answer(json.dumps(raw), ANCHORS)
+        self.assertEqual([finding["line"] for finding in parsed["findings"]], [2, 2])
+        decode.assert_called_once()
+
     def test_the_answer_itself_must_still_be_valid(self):
         base = {"type": "result", "subtype": "success", "is_error": False}
         bad = [json.dumps(dict(base, subtype="error", result="{}")),

@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import yaml
+
 from cursor_pr import cli, context, discovery, engine
 from cursor_pr.config import project_from
 from cursor_pr.poll import Jobs, cycle, run_review
@@ -436,6 +438,18 @@ class TierTests(unittest.TestCase):
         self.assertIn("Dropped 1 model finding: malformed finding.", body)
         self.assertIn("No model findings remained after verification.", body)
         self.assertNotIn("No model finding passed the checks.", body)
+
+    def test_malformed_yaml_cannot_filter_original_findings(self):
+        keep = dict(finding(42, "Real"), verification_status="INVALID_DATE")
+        malformed_status = yaml.safe_dump({"review": {"key_issues_to_review": [keep]}}).replace("INVALID_DATE", "2026-02-30")
+        for name, verdict in (("merge", "review: {<<: invalid, key_issues_to_review: []}"),
+                              ("status", malformed_status)):
+            with self.subTest(name=name):
+                self.answers(verification=verdict)
+                code, report = self.check("--tier", "mid", "--model", name)
+                self.assertEqual((code, report["state"]), (2, "degraded"))
+                self.assertEqual(report["verification"], {"state": "unavailable", "before": 2})
+                self.assertEqual([row["title"] for row in report["findings"]], ["Real", "Spurious"])
 
     def test_an_answer_with_only_invalid_findings_does_not_poison_a_retry(self):
         self.answers(review=answer(finding(60, "Outside")))

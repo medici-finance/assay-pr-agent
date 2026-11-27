@@ -333,27 +333,59 @@ def tokens(prompt):
 
 
 YAML_TAG = "tag:yaml.org,2002:"
-FINDING_TEXT_FIELDS = ("relevant_file", "issue_header", "issue_content", "verification_status")
+FINDING_TEXT_FIELDS = ("relevant_file", "issue_header", "issue_content")
 FINDING_LINE_FIELDS = ("start_line", "end_line")
-ANSWER_FIELDS = frozenset(("review", "key_issues_to_review", *FINDING_TEXT_FIELDS, *FINDING_LINE_FIELDS))
+ANSWER_FIELDS = frozenset(("review", "key_issues_to_review", "verification_status",
+                           *FINDING_TEXT_FIELDS, *FINDING_LINE_FIELDS))
 
 
 def answer_mapping(node, mappings):
     if not isinstance(node, yaml.MappingNode) or node.tag != YAML_TAG + "map":
-        return {}
-    if node not in mappings:
-        merged = mappings[node] = {}
-        explicit = {}
-        for key, value in node.value:
-            if isinstance(key, yaml.ScalarNode):
-                if key.tag == YAML_TAG + "merge":
-                    parents = value.value if isinstance(value, yaml.SequenceNode) else [value]
-                    for parent in reversed(parents):
-                        merged.update(answer_mapping(parent, mappings))
-                elif key.tag == YAML_TAG + "str" and key.value in ANSWER_FIELDS:
-                    explicit[key.value] = value
-        merged.update(explicit)
-    return mappings[node]
+        raise ReviewError("Expected a YAML mapping in the review response")
+    if node in mappings:
+        if mappings[node] is None:
+            raise ReviewError("Invalid YAML merge in the review response")
+        return mappings[node]
+    # Mark in-progress and failed nodes so aliases cannot hide a failed merge or create a cycle.
+    mappings[node] = None
+    merged, explicit = {}, {}
+    for key, value in node.value:
+        if not isinstance(key, yaml.ScalarNode):
+            raise ReviewError("Expected a scalar key in the review response")
+        if key.tag == YAML_TAG + "merge":
+            parents = value.value if isinstance(value, yaml.SequenceNode) and value.tag == YAML_TAG + "seq" else [value]
+            for parent in reversed(parents):
+                merged.update(answer_mapping(parent, mappings))
+        elif key.tag == YAML_TAG + "str" and key.value in ANSWER_FIELDS:
+            explicit[key.value] = value
+    merged.update(explicit)
+    mappings[node] = merged
+    return merged
+
+
+def answer_finding(fields, loader, citations):
+    item = {}
+    if (status := fields.get("verification_status")) is not None:
+        if not isinstance(status, yaml.ScalarNode):
+            return None
+        if status.tag != YAML_TAG + "null":
+            if status.tag != YAML_TAG + "str" or status.value not in ("confirmed", "unverified"):
+                return None
+            item["verification_status"] = status.value
+    for name in FINDING_TEXT_FIELDS:
+        value = fields.get(name)
+        if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "str":
+            item[name] = value.value
+    for name in FINDING_LINE_FIELDS:
+        value = fields.get(name)
+        if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "int":
+            if value not in citations:
+                try:
+                    citations[value] = loader.construct_yaml_int(value)
+                except (ValueError, IndexError):
+                    citations[value] = None
+            item[name] = citations[value]
+    return item
 
 
 def answer_findings(answer):
@@ -365,24 +397,18 @@ def answer_findings(answer):
         issues = answer_mapping(document.get("review"), mappings).get("key_issues_to_review")
         if not isinstance(issues, yaml.SequenceNode) or issues.tag != YAML_TAG + "seq":
             raise ReviewError("Invalid Cursor finding list")
-        entries = {}
+        entries, citations = {}, {}
         for node in issues.value:
             if node not in entries:
-                fields = answer_mapping(node, mappings)
-                item = {}
-                for name in FINDING_TEXT_FIELDS:
-                    value = fields.get(name)
-                    if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "str":
-                        item[name] = value.value
-                for name in FINDING_LINE_FIELDS:
-                    value = fields.get(name)
-                    if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "int":
-                        try:
-                            item[name] = loader.construct_yaml_int(value)
-                        except (ValueError, IndexError):
-                            pass  # An unconvertible citation makes this finding malformed.
-                entries[node] = item
+                try:
+                    fields = answer_mapping(node, mappings)
+                except (ReviewError, RecursionError):
+                    entries[node] = None
+                else:
+                    entries[node] = answer_finding(fields, loader, citations)
             yield entries[node]
+    except RecursionError:
+        raise ReviewError("YAML nesting in the review response is too deep") from None
     finally:
         loader.dispose()
 
