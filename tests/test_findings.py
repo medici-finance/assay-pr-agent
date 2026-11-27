@@ -31,16 +31,16 @@ class ParseAnswerTests(unittest.TestCase):
     def test_every_reason_and_the_finding_limit(self):
         issues = [issue(), "text", {"relevant_file": "a.py", "start_line": True, "end_line": 2}, issue("a.py", 4, 2),
                   issue(header=" "), dict(issue(), issue_header="x" * 5), issue(), issue(), issue()]
-        parsed = engine.parse_answer(envelope(issues), ANCHORS)
+        parsed = engine.parse_answer(envelope(issues), ANCHORS, limit=3)
         self.assertEqual([f["title"] for f in parsed["findings"]], ["Possible Bug", "xxxxx", "Possible Bug"])
         self.assertEqual(sorted(d["reason"] for d in parsed["dropped"]),
                          ["cited line outside the reviewed patch", "empty finding", "malformed finding",
                           "malformed finding", "over the finding limit", "over the finding limit"])
 
     def test_all_dropped_still_answers(self):
-        parsed = engine.parse_answer(envelope([issue("gone.py"), issue("a.py", 2, 2, body="")]), ANCHORS)
+        parsed = engine.parse_answer(envelope([issue("@team secret"), issue("a.py", 2, 2, body="")]), ANCHORS)
         self.assertEqual(parsed["findings"], [])
-        self.assertEqual(parsed["dropped"], [{"path": "gone.py", "line": 2, "reason": "cited line outside the reviewed patch"},
+        self.assertEqual(parsed["dropped"], [{"path": "", "line": 2, "reason": "cited line outside the reviewed patch"},
                                              {"path": "a.py", "line": 2, "reason": "empty finding"}])
 
     def test_a_dropped_record_holds_only_a_path_a_line_and_a_fixed_reason(self):
