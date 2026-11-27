@@ -7,6 +7,8 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -275,6 +277,73 @@ class MarkerTests(Offline):
         self.assertEqual((owed["cleared"], owed["cleared_tries"]), (0, 1))
         self.assertNotIn((*job, "reviewed"), ack.jobs.unfinished_acknowledgements(acknowledge.time.time()))  # It waits its minute.
 
+    def test_forge_that_keeps_a_response_open_holds_a_call_no_longer_than_its_time(self):
+        ack = self.ack()
+        job = self.gh.key, 3, 81
+        ack.jobs.next()
+        ack.jobs.finish(job, "reviewed")
+        with httpx.Client() as made:
+            client = type(made)
+        release, asked = threading.Event(), []
+        self.addCleanup(acknowledge.unanswered.clear)
+        self.addCleanup(release.set)
+
+        def open_ended(**options):
+            def hold(request):
+                # As a forge sending a few bytes inside every read timeout: no timeout of httpx's ends it.
+                asked.append(request.method)
+                if len(asked) == 1:
+                    release.wait(30)
+                return httpx.Response(200, json=dict(id=101, content="eyes"), request=request)
+            return client(transport=httpx.MockTransport(hold), **options)
+        with patch.object(acknowledge.httpx, "Client", side_effect=open_ended):
+            began = time.monotonic()
+            with self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
+                ack.finished(self.gh, 3, 81, "reviewed", began + 3)
+            self.assertLess(time.monotonic() - began, 15)  # Not the 30 seconds the forge would have taken.
+            self.assertIn("ReadTimeout", logged.output[0])
+            self.assertEqual(ack.jobs.owed(job)["cleared_tries"], 1)
+            # While that request is still open no other is started to that host: one thread at most is
+            # left behind. Nothing is sent, so it is no try and no line.
+            with self.assertNoLogs("cursor_pr.acknowledge", level="WARNING"):
+                ack.finished(self.gh, 3, 81, "reviewed")
+                ack.queued(self.gh, 3, 82)
+            self.assertEqual((asked, ack.jobs.owed(job)["cleared_tries"]), (["POST"], 1))
+            self.assertNotIn((self.gh.key, 3, 82), ack.marked)
+            # Another forge is not kept waiting for this one.
+            self.assertEqual(acknowledge.request(self.gl, "GET", "https://gitlab.com/api/v4/user", {}).status_code, 200)
+            self.assertEqual(asked, ["POST", "GET"])
+            del asked[1:]
+            release.set()
+            acknowledge.unanswered["api.github.com", 443].join(10)
+            ack.finished(self.gh, 3, 81, "reviewed")  # The forge answers again, and so the removal is made.
+        self.assertEqual(asked, ["POST", "POST", "DELETE"])
+        self.assertIsNone(ack.jobs.owed(job))
+
+    def test_request_whose_client_was_not_ready_in_time_sends_nothing_and_is_no_try(self):
+        with httpx.Client() as made:
+            client = type(made)
+        asked, ready = [], threading.Event()
+
+        def slow_to_prepare(**options):
+            time.sleep(1.6)  # As a TLS set-up that takes what is left of the time.
+            ready.set()
+            return client(transport=httpx.MockTransport(lambda request: asked.append(request) or httpx.Response(200)),
+                          **options)
+        before = acknowledge.started[0]
+        self.addCleanup(acknowledge.unanswered.clear)
+        with patch.object(acknowledge.httpx, "Client", side_effect=slow_to_prepare) as prepared:
+            with self.assertRaises(acknowledge.OutOfTime):
+                acknowledge.request(self.gh, "POST", GITHUB, {}, time.monotonic() + 1.2)
+            # While that client is still being prepared no second one is, also under another
+            # spelling of the same host.
+            with self.assertRaises(acknowledge.Busy):
+                acknowledge.request(self.gh, "POST", GITHUB.replace("api.github.com", "API.GitHub.com:443"), {})
+            self.assertEqual(prepared.call_count, 1)
+            self.assertTrue(ready.wait(10))
+            acknowledge.unanswered["api.github.com", 443].join(10)
+        self.assertEqual((asked, acknowledge.started[0] - before), ([], 0))
+
     def test_a_call_that_started_is_a_try_however_little_time_it_had(self):
         ack = self.ack()
         job = self.gh.key, 3, 81
@@ -294,7 +363,7 @@ class MarkerTests(Offline):
                 patch.object(acknowledge, "run_forge", side_effect=subprocess.TimeoutExpired("change", 2)), \
                 self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
             ack.finished(self.gh, 3, 81, "failed", 1002.0)  # Two seconds are left of the cycle's time.
-        self.assertEqual((waits, len(logged.output)), ([2.0], 2))
+        self.assertEqual((waits, len(logged.output)), ([1.5], 2))  # Half a second short of what was left.
         # Counted, each for itself: a forge that never answers in time cannot keep them due for ever.
         owed = ack.jobs.owed(job)
         self.assertEqual([owed[name] for name in ("cleared", "cleared_tries", "notice_sent", "notice_sent_tries")], [0, 1, 0, 1])
@@ -369,11 +438,12 @@ class MarkerTests(Offline):
                 patch.object(acknowledge.httpx, "Client", side_effect=silent), \
                 self.assertLogs("cursor_pr.acknowledge", level="WARNING"):
             ack.mark({self.gh.key: self.gh})
-            self.assertEqual((waits, clock[0] - 1000), ([15, 5], 20))  # The pass's budget, whatever the requests take.
+            # Each request stops half a second before its time is over; with under a second left none starts.
+            self.assertEqual((waits, clock[0] - 1000), ([14.5, 5.0], 19.5))  # Within the pass's budget of 20.
             # A request the pass did not get to, or got no answer for, has a short try when its review starts.
             del waits[:]
             ack.starting(self.gh, 3, 83)
-            self.assertEqual(waits, [5])
+            self.assertEqual(waits, [4.5])
             # Its removal and its notice right after the review share one limit as well.
             del waits[:]
             before = clock[0]
@@ -399,7 +469,7 @@ class MarkerTests(Offline):
             before = clock[0]
             clock[0] += 0  # Rows are due at once: none was tried yet, except the first, which waits a minute.
             ack.settle({self.gh.key: self.gh})
-            self.assertEqual((waits, clock[0] - before), ([15, 5], 20))
+            self.assertEqual((waits, clock[0] - before), ([14.5, 5.0], 19.5))
 
     def test_cycle_marks_before_the_reviews_and_again_at_a_review_the_pass_missed(self):
         jobs = Jobs(self.state)

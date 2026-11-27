@@ -1,8 +1,10 @@
 """Mark a queued review request on the forge, and tell the requester when nothing was posted."""
 import logging
 import os
+import queue
+import threading
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -33,6 +35,7 @@ START_SECONDS = 5
 # The removal and the notice of one request, right after its review:
 FINISH_SECONDS = 20
 TIMEOUT_SECONDS = 15
+SHORTEST_SECONDS = 1
 HELPER_SECONDS = 45
 PAGES = 5
 
@@ -57,16 +60,85 @@ def refused(response):
     return 300 <= response.status_code < 500 and not limited
 
 
+# For each forge host, the one request it has not answered within its time, still running in its thread.
+unanswered = {}
+
+
+class Busy(OutOfTime):
+    """The forge still has a request of ours open. Nothing was sent, so nothing was tried."""
+
+    def __init__(self):
+        ReviewError.__init__(self, "an earlier request to the forge is still unanswered")
+
+
 def request(project, method, url, headers, deadline=None, **options):
-    # The posture of the GitLab note lookup: no redirects, and a private CA only for its own instance.
-    # With a deadline, no request starts after it and none waits past it for the forge.
-    left = TIMEOUT_SECONDS if deadline is None else min(TIMEOUT_SECONDS, deadline - time.monotonic())
-    if left <= 0:
-        raise OutOfTime()
-    with httpx.Client(timeout=left, follow_redirects=False,
-                      **(client_options() if project.provider == "gitlab" else {})) as client:
-        started[0] += 1
-        return client.request(method, url, headers=headers, **options)
+    """One request to the forge API, over within its time whatever the forge does.
+
+    The posture of the GitLab note lookup: no redirects, and a private CA only for its own instance.
+    With a deadline, no request starts after it and none waits past it. httpx applies its timeout to
+    each connect, write and read by itself, so a forge that sends a few bytes just inside every read
+    could hold a call for as long as it liked. The request therefore runs in a thread of its own and
+    is waited for until the time is up, and no longer. A request left behind like that stays the only
+    one to its host: while it runs no other is started there, which is no try and is made up for in
+    a later cycle. So a forge that does this costs one thread and one connection, not one per call,
+    and no other forge's calls.
+
+    The limit of it: a thread cannot be stopped from outside. For as long as a forge keeps such a
+    response open, the markers and removals for that host wait, uncounted, and are made when it ends.
+    """
+    # One reading of the clock for both, so that nothing between them moves the cutoff past the deadline.
+    now = time.monotonic()
+    left = TIMEOUT_SECONDS if deadline is None else min(TIMEOUT_SECONDS, deadline - now)
+    cutoff = now + left
+    if left < SHORTEST_SECONDS:
+        raise OutOfTime()  # Too little is as good as none: no request is worth starting for it.
+    # One name for one host, however its URL is written: any case, the default port given or not.
+    site = urlsplit(url)
+    host = (site.hostname or "").lower(), site.port or 443
+    if host in unanswered and unanswered[host].is_alive():
+        raise Busy()
+    unanswered.pop(host, None)
+    answer = queue.SimpleQueue()
+    # A forge that is only slow runs into httpx's own timeout, just before the wait here is over:
+    # the error then names what was slow, and its thread has ended when the next call is made.
+    patience = left - SHORTEST_SECONDS / 2
+
+    # Whether the request is sent is settled once, between the thread and its caller: the thread
+    # commits to sending only within the time and while it is still waited for, and the caller
+    # that stops waiting learns whether it had. A call that sent nothing is no try.
+    settle, state = threading.Lock(), {"sending": False, "waited_for": True}
+
+    def send():
+        try:
+            with httpx.Client(timeout=patience, follow_redirects=False,
+                              **(client_options() if project.provider == "gitlab" else {})) as client:
+                with settle:  # After the client is ready, which can take its time: just before sending.
+                    if time.monotonic() >= cutoff or not state["waited_for"]:
+                        raise OutOfTime()
+                    state["sending"] = True
+                    started[0] += 1
+                response = client.request(method, url, headers=headers, **options)
+            # Said only when the client is closed, so that the next request to this host finds
+            # nothing of this one still open, and a close that fails is not lost behind the answer.
+            answer.put((response, None))
+        except BaseException as err:
+            answer.put((None, err))
+    thread = threading.Thread(target=send, name="forge-marker-request", daemon=True)
+    thread.start()
+    try:
+        response, error = answer.get(timeout=max(cutoff - time.monotonic(), 0))
+    except queue.Empty:
+        # Its thread is still running either way, be it only to prepare a client, and stays the
+        # one for this host until it ends.
+        unanswered[host] = thread
+        with settle:
+            state["waited_for"] = False
+            if not state["sending"]:
+                raise OutOfTime() from None  # It never got to send, and now will not.
+        raise httpx.ReadTimeout("The forge did not answer in time") from None
+    if error is not None:
+        raise error
+    return response
 
 
 def reviewer(project, number, comment):
