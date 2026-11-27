@@ -147,6 +147,31 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(calls, [head, old, head, old])
         self.assertEqual([check["existing_findings"] for check in results], [1, 1])
 
+    def test_baseline_stops_preparing_candidates_at_the_deadline(self):
+        file = source.File("script.sh", "@@ -1 +1,2 @@\n+#!/bin/sh\n echo $value\n", "modified")
+        warning = {"line": 2, "code": 2086, "message": "Quote the argument."}
+        elapsed = 0
+
+        def map_line(*args):
+            nonlocal elapsed
+            elapsed += 2
+            return 1
+
+        with patch.object(checks.time, "monotonic", side_effect=lambda: elapsed), \
+             patch.object(checks, "base_line", side_effect=map_line) as mapping, \
+             patch.object(checks, "scan_blob") as scan:
+            matches = checks.baseline_matches(file, [warning] * 10, b"#!/bin/sh\necho $value\n",
+                                              b"echo $value\n", "shellcheck", [], 3)
+        self.assertFalse(matches)
+        self.assertEqual(mapping.call_count, 2)
+        scan.assert_not_called()
+
+    def test_baseline_git_reads_share_the_remaining_budget(self):
+        with patch.object(checks.time, "monotonic", side_effect=[0, 3]), \
+             patch.object(checks, "git", side_effect=[b"4", b"text"]) as git:
+            self.assertEqual(checks.blob(self.root, "base", "file.sh", deadline=5), b"text")
+        self.assertEqual([call.kwargs["timeout"] for call in git.call_args_list], [5, 2])
+
     def test_actionlint_baseline_maps_related_locations(self):
         old = b"jobs:\n  build: {}\n  build: {}\n"
         head = b"# Shift the whole file\n" + old

@@ -263,8 +263,8 @@ def forge_change(address, expected_url=None, *, project=None, with_description=F
                   description_truncated=truncated, patch_base=patch_base if valid_sha(patch_base) else "")
 
 
-def git(root, *args):
-    return run(["git", "--literal-pathspecs", "-C", str(root), *args])
+def git(root, *args, timeout=45):
+    return run(["git", "--literal-pathspecs", "-C", str(root), *args], timeout=timeout)
 
 
 def commit(root, ref):

@@ -60,13 +60,21 @@ def scanner(path):
         return "actionlint", ["-shellcheck=", "-pyflakes=", "-format", "{{json .}}", "-"]
 
 
-def blob(root, head, path, limit=1_000_000):
+def blob(root, head, path, limit=1_000_000, *, deadline=None):
     """The immutable content of one path at the reviewed head, or None when Git cannot supply it."""
+    def read(*args):
+        if deadline is None:
+            return git(root, "cat-file", *args)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewError("blob read time budget exhausted")
+        return git(root, "cat-file", *args, timeout=remaining)
+
     try:
         spec = head + ":" + path
-        if int(git(root, "cat-file", "-s", spec)) > limit:
+        if int(read("-s", spec)) > limit:
             return None
-        return git(root, "cat-file", "blob", spec)
+        return read("blob", spec)
     except (ReviewError, OSError, ValueError, subprocess.TimeoutExpired):
         return None
 
@@ -96,6 +104,8 @@ def diagnostic(row, line, message=None):
 
 def baseline_matches(file, rows, head, base, tool, args, deadline):
     """Find equivalent tool diagnostics at unchanged locations on the base."""
+    if time.monotonic() >= deadline:
+        return set()
     try:
         patch = hunks(file)
         old_lines, head_lines = base.split(b"\n"), head.split(b"\n")
@@ -110,10 +120,13 @@ def baseline_matches(file, rows, head, base, tool, args, deadline):
 
         candidates = []
         for row in rows:
+            if time.monotonic() >= deadline:
+                return set()
             line, end = row["line"], row.get("endLine", row["line"])
             old = base_line(patch, line)
+            old_end = old if end == line else base_line(patch, end)
             if (old is not None and 0 < line <= end <= len(head_lines)
-                    and (old_end := base_line(patch, end)) == old + end - line
+                    and old_end == old + end - line
                     and 0 < old <= old_end <= len(old_lines)
                     and old_lines[old - 1:old_end] == head_lines[line - 1:end]):
                 message = RELATED_LOCATION.sub(related_location, row["message"]) if tool == "actionlint" else None
@@ -123,11 +136,17 @@ def baseline_matches(file, rows, head, base, tool, args, deadline):
         remaining = deadline - time.monotonic()
         if not any(candidates) or remaining <= 0:
             return set()
-        previous = Counter(diagnostic(row, row["line"]) for row in scan_blob(tool, args, base, min(20, remaining)))
+        previous = Counter()
+        for row in scan_blob(tool, args, base, min(20, remaining)):
+            if time.monotonic() >= deadline:
+                return set()
+            previous[diagnostic(row, row["line"])] += 1
     except (ReviewError, UnidiffParseError, ValueError, TypeError, KeyError, OSError, subprocess.TimeoutExpired):
         return set()
     matched = set()
     for index, key in enumerate(candidates):
+        if time.monotonic() >= deadline:
+            break
         if previous[key]:
             previous[key] -= 1
             matched.add(index)
@@ -158,11 +177,12 @@ def scan_files(root, head, files, *, base_root=None, base=""):
             matched = set()
             if rows and base and file.patch and file.status in ("modified", "M") and baseline_remaining > 0:
                 started = time.monotonic()
-                old = blob(base_root if base_root is not None else root, base, file.path)
+                deadline = started + baseline_remaining
+                old = blob(base_root if base_root is not None else root, base, file.path, deadline=deadline)
                 if old is None and base_root is not None and base_root != root:
-                    old = blob(root, base, file.path)
+                    old = blob(root, base, file.path, deadline=deadline)
                 if old is not None:
-                    matched = baseline_matches(file, rows, content, old, tool, args, started + baseline_remaining)
+                    matched = baseline_matches(file, rows, content, old, tool, args, deadline)
                 baseline_remaining -= time.monotonic() - started
             if tool == "shellcheck":
                 findings = [{"path": path, "rule": f"SC{r['code']}", "line": r["line"],
