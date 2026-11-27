@@ -5,7 +5,8 @@ from contextlib import closing
 import sqlite3
 
 NAME = "outcomes.sqlite3"
-OPEN = ("open", "repeated")
+# A finding raised again is tracked by its newer row, so only open and unaddressed rows are resolved again.
+OPEN = ("open", "unaddressed")
 
 
 def digest(finding):
@@ -36,7 +37,8 @@ def record(state, address, head, findings, anchors):
         earlier = db.execute("SELECT rowid, path, digest, cited FROM findings WHERE project=? AND number=? AND head<>? AND status IN (?,?)",
                              (project, int(number), head, *OPEN)).fetchall()
         for rowid, path, old, lines in earlier:
-            if path not in shown:
+            # Not in scope, or left out for the budget or with no text: this head says nothing about it.
+            if not anchors.get(path):
                 continue
             lines = json.loads(lines)
             if not lines:

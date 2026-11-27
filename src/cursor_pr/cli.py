@@ -263,8 +263,8 @@ def execute(args):
         report.update(answer, cache_hit=cached, cursor_invocations=int(not cached))
         if cached:
             report["cursor_usage"] = None
-        if args.change and os.getenv("REVIEW_STATE_DIR") and state_dir().is_dir():
-            # What became of earlier findings, and what this review adds to track. Never at the cost of the review.
+        if args.post and os.getenv("REVIEW_STATE_DIR") and state_dir().is_dir():
+            # What became of earlier findings, and what this review posts to track. Never at the cost of the review.
             try:
                 report["outcomes"] = outcomes.record(state_dir(), args.change, change.head, report["findings"], anchors)
             except (OSError, ValueError, KeyError, sqlite3.Error):
