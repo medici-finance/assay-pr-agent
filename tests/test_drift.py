@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from cursor_pr import cli, drift
-from cursor_pr.source import Change, local_change
+from cursor_pr.source import Change, File, local_change
 
 
 class DriftTests(unittest.TestCase):
@@ -67,12 +67,37 @@ class DriftTests(unittest.TestCase):
             "- Changed on both sides since the branch point: ` shared.py `",
             "- ` README.md `:3 — ` oldtool ` is quoted here but no longer appears on the base."])
 
+    def test_renamed_file_whose_old_path_changed_on_the_base_is_on_both_sides(self):
+        self.move_main()
+        renamed = File("moved.py", "", "renamed", True, "shared.py")
+        self.assertEqual(drift.check(self.root, self.head, "main", [renamed])["both"], ["shared.py"])
+
+    def test_forge_drift_covers_only_the_selected_files(self):
+        self.move_main()
+        change = Change(self.head, self.files(), "url", base_ref="main")
+        readme = [f for f in change.files if f.path == "README.md"]
+        self.assertEqual(drift.forge(self.root, self.root, change, False)["both"], ["shared.py"])
+        self.assertEqual(drift.forge(self.root, self.root, change, False, readme)["both"], [])
+
     def test_name_still_on_the_base_or_never_in_the_tree_is_not_reported(self):
         self.write("unrelated.py", "x = 1\n")
         self.commit("main moves without touching the tool")
         result = drift.check(self.root, self.head, "main", self.files())
         self.assertEqual((result["state"], result["behind"], result["both"], result["references"]),
                          ("complete", 1, [], []))
+
+    def test_name_only_inside_a_longer_quoted_name_is_not_reported(self):
+        self.write("cli.py", "# run drift-check\n")
+        self.commit("add the command")
+        self.git("switch", "-qc", "overlap")
+        self.write("README.md", "# Project\n\nUse `drift-check`, which runs `drift`.\n")
+        self.commit("quote both names")
+        head = self.git("rev-parse", "HEAD")
+        self.git("switch", "-q", "main")
+        self.write("unrelated.py", "x = 1\n")
+        self.commit("main moves without touching the command")
+        result = drift.check(self.root, head, "main", local_change(self.root, "main", head).files)
+        self.assertEqual((result["state"], result["behind"], result["references"]), ("complete", 1, []))
 
     def test_head_that_contains_the_base_tip_has_no_drift(self):
         result = drift.check(self.root, self.head, "main", self.files())

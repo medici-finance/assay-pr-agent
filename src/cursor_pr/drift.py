@@ -87,12 +87,15 @@ def check(root, head, base, files, *, head_repo=None):
         if behind:
             moved = set(git(root, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only",
                             fork, tip, "--").splitlines())
-            result["both"] = sorted(moved & {f.path for f in files})
+            # A renamed file's old path counts too: the base may have edited it there.
+            result["both"] = sorted(moved & {p for f in files for p in (f.path, f.previous) if p})
             wanted = names(files)
             gone = set(wanted) - present(root, tip, set(wanted))
             # Removed on the base means it was there when the change branched. A name that
             # was never in the tree is a new or external one and says nothing about drift.
-            removed = present(root, fork, gone)
+            # Search the branch point for the same names as the tip: grep -o reports one match
+            # where names overlap, so a smaller set there would find a name the tip pass hid.
+            removed = present(root, fork, set(wanted)) & gone
             result["references"] = sorted(({"path": wanted[n][0], "line": wanted[n][1], "name": n} for n in removed),
                                           key=lambda row: (row["path"], row["line"], row["name"]))
         result["state"] = "complete"
@@ -101,8 +104,11 @@ def check(root, head, base, files, *, head_repo=None):
     return result
 
 
-def forge(root, checkout, change, managed):
-    """Drift for a forge change: the base is a local ref named like the forge's base branch."""
+def forge(root, checkout, change, managed, files=None):
+    """Drift for a forge change: the base is a local ref named like the forge's base branch.
+
+    files is the reviewed scope, by default every file in the change.
+    """
     ref = change.base_ref
     candidates = []
     if re.fullmatch(r"[\w./-]+", ref) and ".." not in ref:
@@ -114,7 +120,8 @@ def forge(root, checkout, change, managed):
             base = commit(root, candidate)
         except (ReviewError, OSError, subprocess.SubprocessError):
             continue
-        return check(root, change.head, base, change.files, head_repo=None if checkout == root else checkout)
+        return check(root, change.head, base, change.files if files is None else files,
+                     head_repo=None if checkout == root else checkout)
     return {"state": "could-not-check", "behind": None, "both": [], "references": []}
 
 
