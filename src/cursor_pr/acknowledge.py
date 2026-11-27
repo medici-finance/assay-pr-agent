@@ -1,6 +1,7 @@
 """Mark a queued review request on the forge, and tell the requester when nothing was posted."""
 import logging
 import os
+import subprocess
 import time
 from urllib.parse import quote
 
@@ -62,7 +63,13 @@ def request(project, method, url, headers, deadline=None, **options):
         raise OutOfTime()
     with httpx.Client(timeout=left, follow_redirects=False,
                       **(client_options() if project.provider == "gitlab" else {})) as client:
-        return client.request(method, url, headers=headers, **options)
+        try:
+            return client.request(method, url, headers=headers, **options)
+        except httpx.TimeoutException:
+            if left < TIMEOUT_SECONDS:
+                # Cut short by the deadline, not by the forge: it had less than its usual time.
+                raise OutOfTime() from None
+            raise
 
 
 def reviewer(project, number, comment):
@@ -132,13 +139,14 @@ def add(project, number, comment, deadline=None):
         reaction_id(react(project, markers, headers, deadline))
 
 
-def remove(project, number, comment, deadline=None):
+def remove(project, number, comment, deadline=None, said=False):
     """Remove the reviewer's marker, wherever it came from. Nothing about it is kept here: the forge is asked.
 
     GitLab lists the awards with their owners. GitHub tells an account the ID of its reaction only
     in the answer to creating it, which returns the existing one, so the reaction is asked for and
     then deleted. An answer that is final ends it: there is nothing of ours left, or nothing this
-    credential may remove any longer, which gets a log line.
+    credential may remove any longer, which gets a log line unless `said`: the same refusal was
+    then logged already, when the request was to be marked.
     """
     root, markers, headers = reviewer(project, number, comment)
     try:
@@ -146,9 +154,11 @@ def remove(project, number, comment, deadline=None):
             ident = own_award(project, root, markers, headers, deadline)
         else:
             response = react(project, markers, headers, deadline)
-            # Refused the reaction, this credential has none there to remove: said once, when
-            # the request was to be marked.
-            ident = None if refused(response) else reaction_id(response)
+            if refused(response):
+                # Refused when the request was to be marked too, this credential has no reaction
+                # there. Refused only now, one written earlier may stay.
+                return None if said else left_in_place(project, number, comment, response)
+            ident = reaction_id(response)
     except httpx.HTTPStatusError as err:
         if not refused(err.response):
             raise
@@ -174,7 +184,12 @@ def notify(project, number, comment, state, deadline=None):
     left = HELPER_SECONDS if deadline is None else min(HELPER_SECONDS, deadline - time.monotonic())
     if left <= 0:
         raise OutOfTime()
-    head = run_forge("change", project, numbers=[number], timeout=left).get("headSha")
+    try:
+        head = run_forge("change", project, numbers=[number], timeout=left).get("headSha")
+    except subprocess.TimeoutExpired:
+        if left < HELPER_SECONDS:
+            raise OutOfTime() from None  # Stopped by the deadline before its usual time was up.
+        raise
     if not valid_sha(head):
         raise ReviewError("Forge did not identify the change head")
     if deadline is not None and deadline <= time.monotonic():
@@ -199,6 +214,8 @@ class Acknowledgement:
         self.state = state
         # Requests whose marker this process has settled: written, or refused for good.
         self.marked = set()
+        # Those of them it was refused for, which has been logged.
+        self.refused = set()
 
     def queued(self, project, number, comment, deadline=None):
         job = project.key, number, comment
@@ -209,6 +226,7 @@ class Acknowledgement:
             except httpx.HTTPStatusError as err:
                 if refused(err.response):
                     self.marked.add(job)  # Not to be asked for again. An answer for now only is.
+                    self.refused.add(job)
                 raise
             self.marked.add(job)
         self.attempt(mark, "mark", project, number, comment)
@@ -216,6 +234,8 @@ class Acknowledgement:
     def finished(self, project, number, comment, status, deadline=None):
         job = project.key, number, comment
         self.marked.discard(job)
+        said = job in self.refused
+        self.refused.discard(job)
         owed = self.jobs.acknowledgement(job)
         if owed is None:
             return
@@ -230,7 +250,7 @@ class Acknowledgement:
                 # Each of them gets a record for that, also one queued by a version that kept none.
                 self.jobs.acknowledge_pending(project.key, number)
             else:
-                remove(project, number, comment, deadline)
+                remove(project, number, comment, deadline, said)
             # Kept apart from the notice: while only the notice is owed, the marker is left alone.
             self.jobs.record_cleared(job)
 
