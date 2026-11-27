@@ -17,6 +17,7 @@ from .source import ReviewError, child_env, git as git_bytes, valid_sha
 MID = ("change description", "overlap with the base", "surrounding code", "call sites")
 DEEP = ("change description", "overlap with the base", "earlier comments", "whole changed files",
         "call sites in context", "existing tests")
+HEADED_BLOCKS = {*MID, *DEEP} - {"change description", "overlap with the base"}
 DEFINITION = re.compile(r"^\s*(?:export\s+)?(?:(?:public|private|protected|static|async|abstract)\s+)*"
                         r"(?:def|class|func|function|fn|interface|struct)\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w{3,})")
 MAX_BLOB = 200_000
@@ -36,14 +37,23 @@ def guarded(gatherer):
 
 
 def blob(repo, head, path):
-    """A file's text at the head, or None when it is over the size limit or not text and is left out."""
-    spec = f"{head}:{path}"
-    if int(git(repo, "cat-file", "-s", spec)) > MAX_BLOB:
+    """Read a small text blob, skipping non-blob entries such as submodule pointers."""
+    entry = git_bytes(repo, "ls-tree", "-l", "-z", head, "--", path)
+    if not entry:
+        return None
+    metadata, _, _ = entry.partition(b"\t")
+    _, kind, object_id, size = metadata.split()
+    if kind != b"blob" or int(size) > MAX_BLOB:
         return None
     try:
-        return git_bytes(repo, "cat-file", "blob", spec).decode()
+        return git_bytes(repo, "cat-file", "blob", object_id.decode("ascii")).decode()
     except UnicodeDecodeError:
         return None
+
+
+def file_lines(text):
+    """Split on the newline Git uses for line numbering."""
+    return text.removesuffix("\n").split("\n") if text else []
 
 
 def live(files, *, include_removed=False):
@@ -66,7 +76,7 @@ def surrounding(repo, head, files, radius=25):
         text = blob(repo, head, f.path)
         if text is None:
             continue
-        lines = text.splitlines()
+        lines = file_lines(text)
         spans = []
         for hunk in hunks(f):
             touched = [line.target_line_no for line in hunk if line.target_line_no is not None]
@@ -186,7 +196,7 @@ def call_sites(repo, head, files, radius=0):
         for path, number, _ in rows:
             if path not in cache:
                 text = blob(repo, head, path)
-                cache[path] = None if text is None else text.splitlines()
+                cache[path] = None if text is None else file_lines(text)
             if cache[path] is None:
                 continue
             first, last = max(1, number - radius), min(len(cache[path]), number + radius)
@@ -292,17 +302,19 @@ def gather(tier, root, checkout, change, files, drifted, notes):
     return raw
 
 
-def clip(text, allowance):
-    """Clip a headed block to complete lines, keeping at least one line of content."""
-    if tokens(text) <= allowance:
-        return text, False
-    lines = text.splitlines()
+def clip(text, allowance, *, headed=False):
+    """Clip a block to complete lines, keeping content beyond its generated headings."""
+    lines = file_lines(text)
     keep = len(lines)
-    while keep and tokens("\n".join(lines[:keep])) > allowance - 8:
-        keep = int(keep * 0.8)
-    if not any(line.strip() for line in lines[1:keep]):
+    cut = tokens(text) > allowance
+    if cut:
+        while keep and tokens("\n".join(lines[:keep])) > allowance - 8:
+            keep = int(keep * 0.8)
+    if not any(line.strip() and (not headed or not line.startswith("## ")) for line in lines[1:keep]):
         return "", True
-    return "\n".join(lines[:keep]) + "\n[truncated to fit the token budget]", True
+    if cut:
+        return "\n".join(lines[:keep]) + "\n[truncated to fit the token budget]", True
+    return text, False
 
 
 def assemble(names, raw, allowance):
@@ -317,7 +329,8 @@ def assemble(names, raw, allowance):
             fates.append({"name": name, "state": "empty"})
             continue
         share = max(0, left) // sum(1 for later in names[position:] if raw.get(later))
-        kept, cut = clip(f"# {name.capitalize()}\n{text}", share) if share > 16 else ("", True)
+        kept, cut = (clip(f"# {name.capitalize()}\n{text}", share, headed=name in HEADED_BLOCKS)
+                     if share > 16 else ("", True))
         if kept:
             parts.append(kept)
             left -= tokens(kept) + 2

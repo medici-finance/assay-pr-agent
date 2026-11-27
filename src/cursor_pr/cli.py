@@ -267,6 +267,9 @@ def publish(address, head, report, *, project=None, state=None):
             body.append("The findings could not be verified by a second pass.")
         elif check["state"] == "filtered":
             body.append(f"A verification pass kept {check['after']} of {check['before']} findings.")
+        if omitted_findings := report.get("omitted_findings"):
+            noun = "finding" if omitted_findings == 1 else "findings"
+            body.append(f"{omitted_findings} {noun} omitted by the {CAPS[tier]}-finding tier limit.")
     # Paths come from the PR and titles/messages from the model: quote them as code
     # so the reviewer identity never posts a Markdown link or @mention for an attacker.
     header, body = body, []
@@ -461,7 +464,7 @@ def execute(args):
     if args.estimate:
         return dict(report, state="estimate"), 2 if degraded or (has_text and planned_tier != tier) else 0
 
-    completed, coverage, findings, last_error = [], {}, [], None
+    completed, coverage, findings, deep_findings, last_error = [], {}, [], [], None
     for row, pass_prompt, locations, blocks in plans:
         depth = "max" if row["name"] == "deep" else first_tier
         answer, error = run_pass(row, pass_prompt, locations, args, change.identity, cap=cap, timeout=TIMEOUTS[depth])
@@ -470,6 +473,8 @@ def execute(args):
             continue
         completed.append((row["name"], blocks))
         coverage.update({path: lines for path, lines in locations.items() if lines})
+        if depth == "max":
+            deep_findings = answer["findings"]
         findings = merge_findings(findings, answer["findings"]) if findings else answer["findings"]
     # Report only what reached the model: a block of a pass that failed was not sent.
     sent = merged_fates(blocks for _, blocks in completed)
@@ -493,7 +498,13 @@ def execute(args):
                     findings = verdict["findings"]
                     report["verification"] = {"state": "filtered", "before": before, "after": len(findings)}
                 break
-    report.update(findings=findings[:CAPS[tier]], cursor_usage=total_usage(passes),
+    cap = CAPS[tier]
+    if len(findings) > cap:
+        report["omitted_findings"] = len(findings) - cap
+        from_deep = [issue for issue in findings if issue in deep_findings]
+        from_first = [issue for issue in findings if issue not in deep_findings]
+        findings = from_first[:cap - len(from_deep)] + from_deep
+    report.update(findings=findings, cursor_usage=total_usage(passes),
                   cache_hit=bool(passes) and all(row["state"] == "cached" for row in passes),
                   cursor_invocations=sum(row["model_invocations"] for row in passes))
     if has_text and not completed:

@@ -170,6 +170,22 @@ class TierTests(unittest.TestCase):
         self.assertEqual(report["verification"], {"state": "filtered", "before": 3, "after": 2})
         self.assertLessEqual(report["estimated_input_tokens"], report["max_input_tokens"])
 
+    def test_max_retains_deep_findings_and_reports_the_cap(self):
+        first = [finding(42, f"First {index}") for index in range(1, 7)]
+        deep = [finding(42, f"Deep {index}") for index in range(1, 7)]
+        self.answers(review=answer(*first), deep=answer(*deep))
+        for state, verdict in (("filtered", answer(*first, *deep)), ("unavailable", "fail")):
+            with self.subTest(verification=state):
+                self.answers(verification=verdict)
+                _, report = self.check("--tier", "max", "--model", state)
+                self.assertEqual(report["verification"]["state"], state)
+                self.assertEqual(report["omitted_findings"], 2)
+                self.assertEqual([row["title"] for row in report["findings"]],
+                                 [row["issue_header"] for row in first[:4] + deep])
+                with patch.object(cli, "post_comment") as post:
+                    cli.publish("org/repo#1", self.head, report)
+                self.assertIn("2 findings omitted by the 10-finding tier limit.", post.call_args.args[3])
+
     def test_deep_pass_can_review_a_file_the_first_pass_cannot_fit(self):
         self.write("src/data.py", "".join(f"VALUE_{n} = {n}  # generated row\n" for n in range(250)))
         self.commit("add data rows")
@@ -393,6 +409,31 @@ class TierTests(unittest.TestCase):
             self.assertIn("## src/app.py", text)
             self.assertNotIn("TABLE_1 ", text)
 
+    def test_gitlink_leaves_context_for_the_other_changed_files(self):
+        self.git("update-index", "--add", "--cacheinfo", "160000", "1" * 40, "dependency")
+        self.git("commit", "-qm", "add a submodule")
+        head = self.git("rev-parse", "HEAD")
+        files = cli.local_change(self.root, "main", head).files
+        self.assertTrue(any("Subproject commit" in file.patch for file in files))
+        for gather in (context.surrounding, context.whole_files):
+            with self.subTest(gather=gather):
+                text = gather(self.root, head, files)
+                self.assertIsNotNone(text)
+                self.assertIn("## src/app.py", text)
+                self.assertNotIn("## dependency", text)
+
+    def test_numbered_context_uses_the_same_line_breaks_as_git(self):
+        module = self.root / "src/app.py"
+        module.write_text(module.read_text().replace("# filler 0\n", "# filler 0 same Git line\n", 1))
+        self.write("src/caller.py", "from app import compute same Git line\n\nRESULT = compute(3)\n")
+        self.commit("add a Unicode separator inside each source line")
+        head = self.git("rev-parse", "HEAD")
+        files = cli.local_change(self.root, "main", head).files
+        surrounding = context.surrounding(self.root, head, files)
+        callers = context.call_sites(self.root, head, files, radius=1)
+        self.assertIn("1: # filler 0 same Git line\n2: # filler 1", surrounding)
+        self.assertIn("3: RESULT = compute(3)", callers)
+
     def test_binary_file_beside_the_tests_does_not_remove_the_existing_tests(self):
         (self.root / "tests/app_logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe\x00binary")
         self.commit("add a binary fixture")
@@ -428,6 +469,11 @@ class TierTests(unittest.TestCase):
         self.assertEqual((text, fates), ("", [{"name": name, "state": "dropped"}]))
         self.assertEqual(cli.reached([("review", [{"name": "change description", "state": "included"}]),
                                      ("deep", fates)]), "mid")
+
+        for block in ("## src/app.py at the head", "## src/app.py at the head\n" + long_line):
+            with self.subTest(block_size=len(block)):
+                self.assertEqual(context.assemble((name,), {name: block}, 30),
+                                 ("", [{"name": name, "state": "dropped"}]))
 
         text, fates = context.assemble((name,), {name: "Useful context\n" + long_line}, 100)
         self.assertIn("Useful context", text)
