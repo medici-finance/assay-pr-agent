@@ -186,23 +186,29 @@ def finding(issue, anchors):
     valid = {"path": path, "line": start, "end_line": end, "title": header, "message": body}
     quote, asked = quoted(issue)
     parts = checkable(quote)
-    if not parts:
+    if not any(part is not ELIDED for part in parts):
         # Nothing to check against the patch is not a mismatch: the finding is kept and marked.
         return dict(valid, evidence="unverified"), None
-    cited = ((line, lines[line].removesuffix("\n").removesuffix("\r")) for line in range(start, end + 1))
-    if not quoted_in_order(parts, cited):
+    cited = [(line, lines[line].removesuffix("\n").removesuffix("\r")) for line in range(start, end + 1)]
+    if not quoted_in_order([part for part in parts if part is not ELIDED], cited):
         if not asked:
             # A fenced block in the text may be a suggested fix rather than a quote.
             return dict(valid, evidence="unverified"), None
         return None, dict(dropped, reason="quoted code does not match the cited lines")
-    return dict(valid, evidence="verified"), None
+    # A true quote that leaves cited code out, or quotes only trivial lines, proves too little to count.
+    strong = any(substantive(line) for part in parts if part is not ELIDED
+                 for index, line in cited if matches(part, index, line))
+    return dict(valid, evidence="verified" if strong and covers(parts, cited) else "unverified"), None
 
 
 FENCED = re.compile(r"`{3,}[^\n]*\n(.*?)`{3,}", re.S)
 # A quoted line as the patch shows it: indented, numbered, and marked as added.
 SHOWN = re.compile(r"([1-9]\d*) (?:\+| )(.*)")
-# Lines that stand for no code: an elision such as "..." or "# …", and the patch's hunk markers.
-PLACEHOLDER = re.compile(r"(?:#|//)?(?:\.{3,}|…)|__(?:new|old)hunk__")
+# An explicit elision such as "..." or "# …": it stands for cited lines the quote leaves out.
+ELISION = re.compile(r"(?:#|//)?(?:\.{3,}|…)")
+# The patch display's hunk markers stand for no code at all.
+MARKER = re.compile(r"__(?:new|old)hunk__")
+ELIDED = "elided"
 
 
 def quoted(issue):
@@ -218,28 +224,65 @@ def quoted(issue):
 
 
 def checkable(quote):
-    """Ignore blank lines and elisions, retaining the raw and numbered forms of each quote line."""
+    """The quote's lines in order: each as its raw and numbered forms, or ELIDED for an explicit elision.
+
+    Blank lines and hunk markers are left out.
+    """
     parts = []
     for raw in quote.split("\n"):
         raw = raw.removesuffix("\r")
         text = raw.strip(" \t")
         shown = SHOWN.fullmatch(raw.lstrip(" \t"))
         content = shown[2] if shown else text
-        if content.strip(" \t") and not PLACEHOLDER.fullmatch("".join(content.split())):
+        squeezed = "".join(content.split())
+        if not content.strip(" \t") or MARKER.fullmatch(squeezed):
+            continue
+        if ELISION.fullmatch(squeezed):
+            if parts[-1:] != [ELIDED]:
+                parts.append(ELIDED)
+        else:
             parts.append((text, shown[1] if shown else None, content))
     return parts
 
 
+def matches(part, index, line):
+    text, number, content = part
+    return any(text == form.strip(" \t") or (number == str(index) and content == form)
+               for form in (line, one_line(line)))
+
+
 def quoted_in_order(parts, cited):
     """Match whole head lines in order, accepting either raw code or the prompt's line display."""
-    def matches(text, number, content, index, line):
-        return any(text == form.strip(" \t") or (number == str(index) and content == form)
-                   for form in (line, one_line(line)))
-
     remaining = iter(cited)
-    return all(any(matches(text, number, content, index, line)
-                   for index, line in remaining)
-               for text, number, content in parts)
+    return all(any(matches(part, index, line) for index, line in remaining) for part in parts)
+
+
+def covers(parts, cited):
+    """Whether the quote accounts for every non-blank cited line, each quoted or inside an explicit elision."""
+    reach = {0}  # the cited positions the quote so far can have accounted for exactly
+    for part in parts:
+        if part is ELIDED:
+            reach = set(range(min(reach), len(cited) + 1)) if reach else set()
+            continue
+        step = set()
+        for position in sorted(reach):
+            while position < len(cited):
+                if matches(part, *cited[position]):
+                    step.add(position + 1)
+                if cited[position][1].strip():
+                    break
+                position += 1
+        reach = step
+    return any(not any(line.strip() for _, line in cited[position:]) for position in reach)
+
+
+def substantive(content):
+    """A line specific enough to identify code: three or more visible characters, one a letter or digit.
+
+    `return x` or `x = 1` counts; `}` or `);` alone does not, since it would match almost any range.
+    """
+    visible = "".join(content.split())
+    return len(visible) >= 3 and any(char.isalnum() for char in visible)
 
 
 def invoke(prompt, model, anchors):

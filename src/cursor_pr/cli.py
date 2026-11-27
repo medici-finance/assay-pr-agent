@@ -1,6 +1,7 @@
 import argparse
 import fcntl
 from contextlib import ExitStack
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -23,7 +24,7 @@ from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
 from .engine import ModelFailure, pack, review, section, tokens
-from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
+from .source import ReviewError, ci_refs, classify_absent, forge_change, local_change, post_comment, valid_sha
 
 
 LOCKS = {"package-lock.json", "pnpm-lock.yaml", "go.sum", "npm-shrinkwrap.json"}
@@ -140,12 +141,12 @@ def publish(address, head, report, *, project=None, state=None):
     for path in report["omitted"]:
         body.append(f"- Outside review coverage: {fence(path)}")
     tracked = report.get("outcomes")
-    if tracked and tracked["fixed"] + tracked["unaddressed"] + tracked["repeated"]:
+    if tracked and tracked["fixed"] + tracked["unaddressed"] + tracked.get("gone", 0) + tracked["repeated"]:
         # An accept rate needs a finding whose code the author either changed or left alone.
         rate = f"{tracked['accept_rate']}%" if tracked["accept_rate"] is not None else "not available"
-        body.append(f"Tracked findings for this change: {tracked['fixed']} addressed and {tracked['unaddressed']} left unchanged "
-                    f"at a later review (accept rate {rate}); {tracked['repeated']} raised again; "
-                    f"{tracked['open']} awaiting a later review.")
+        body.append(f"Tracked findings for this change: {tracked['fixed']} fixed and {tracked['unaddressed']} left unchanged "
+                    f"at a later review (accept rate {rate}); {tracked.get('gone', 0)} gone from the change with no "
+                    f"sign of a fix; {tracked['repeated']} raised again; {tracked['open']} awaiting a later review.")
     body.extend(["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."])
     # A finding may quote a multiline source fragment, including forge quick actions.
     lines = [" ".join(line.splitlines()) for line in body]
@@ -229,6 +230,10 @@ def execute(args):
             if args.expected_change_url != project.change_url(number):
                 raise ReviewError("Managed checkout and reviewed project differ")
             checkout = stack.enter_context(scan_checkout(root, project, number, change.head))
+        if args.change:
+            # A local diff already tells binary from text; a forge's missing patch is checked against the head blob.
+            change = dataclasses.replace(change, files=classify_absent(checkout, change.head, change.files))
+            files = sorted((f for f in change.files if f.path in selected), key=lambda f: f.path)
         checks = scan_files(checkout, change.head, files)
         deadline = time.monotonic() + 180
         for tool, path in missing:
@@ -303,6 +308,9 @@ def execute(args):
         report.pop("cursor_usage", None)
         if cached:
             report["model_usage"] = None
+    if report.get("dropped") and not report["findings"]:
+        # The model answered but nothing it said could be checked: as unusable as no answer, whatever the coverage.
+        return dict(report, state="findings-dropped"), 2, (anchors, paths)
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
     if degraded:
         report["state"] = "degraded"

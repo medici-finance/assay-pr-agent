@@ -1,4 +1,10 @@
-"""What becomes of posted findings: addressed, left unchanged, or raised again at a later review."""
+"""What becomes of posted findings: fixed, left unchanged, gone from the change, or raised again at a later review.
+
+`fixed` needs evidence that the cited code changed: the later diff shows the cited place, next to a
+neighboring line recorded when the finding was posted, holding other code. Code that left the diff
+without such evidence (the change to that file or hunk was reverted, or a rebase moved it into the
+base) is `gone`, and does not count as fixed.
+"""
 import hashlib
 import json
 from contextlib import closing
@@ -26,40 +32,66 @@ def context(lines, start, end):
     return (lines[start - 1] if start else "", lines[end] if end < len(lines) else "")
 
 
+def contiguous(numbers, low, high):
+    return all(n in numbers for n in range(low, high + 1))
+
+
 def cited(finding, anchors):
-    """Keep the cited text and its neighboring lines to distinguish duplicate occurrences."""
-    shown = sorted((n, text) for n, value in anchors[finding["path"]].items()
-                   if (text := normalize(value)))
+    """Keep the cited text and its neighboring lines to distinguish duplicate occurrences.
+
+    `adjacent` says whether each neighbor sits in the same hunk as the cited lines, with nothing
+    unshown between them, so that a later diff can show the cited place itself.
+    """
+    numbers = anchors[finding["path"]]
+    shown = sorted((n, text) for n, value in numbers.items() if (text := normalize(value)))
     before = sum(n < finding["line"] for n, _ in shown)
     through = sum(n <= finding["end_line"] for n, _ in shown)
     lines = [text for _, text in shown]
     quoted = lines[before:through]
+    adjacent = [bool(quoted) and before > 0 and contiguous(numbers, shown[before - 1][0], shown[before][0]),
+                bool(quoted) and through < len(shown) and contiguous(numbers, shown[through - 1][0], shown[through][0])]
     return {"lines": quoted, "context": context(lines, before, through),
-            "duplicates": bool(quoted) and sum(1 for _ in occurrences(lines, quoted)) > 1}
+            "duplicates": bool(quoted) and sum(1 for _ in occurrences(lines, quoted)) > 1, "adjacent": adjacent}
+
+
+def replaced_in_diff(prior, anchors):
+    """Whether this diff shows the cited place holding other code: evidence that the code changed.
+
+    A recorded neighbor that was adjacent to the cited lines must appear exactly once, and the next
+    shown line on the cited side, in the same hunk, must not be the cited line.
+    """
+    adjacent = prior.get("adjacent") or [False, False]
+    shown = sorted((n, text) for n, value in anchors.items() if (text := normalize(value)))
+    texts = [text for _, text in shown]
+    for side, neighbor in enumerate(prior["context"]):
+        if not adjacent[side] or texts.count(neighbor) != 1:
+            continue
+        index = texts.index(neighbor)
+        other = index + 1 if side == 0 else index - 1
+        if not 0 <= other < len(shown):
+            continue
+        low, high = sorted((shown[index][0], shown[other][0]))
+        expected = prior["lines"][0] if side == 0 else prior["lines"][-1]
+        if contiguous(anchors, low, high) and texts[other] != expected:
+            return True
+    return False
 
 
 def same_context(old, current):
     return any(before and before == after for before, after in zip(old, current, strict=True))
 
 
-def still_shown(prior, anchors, start):
+def still_shown(prior, anchors):
+    """Whether this diff still shows the cited lines, at the cited place when they occur more than once."""
     if isinstance(prior, list):
-        # Rows written before context was recorded cannot establish where an absent line went.
         lines = {" ".join(text.split()) for text in anchors.values()}
-        return True if all(text in lines for text in prior) else None
+        return all(text in lines for text in prior)
     lines = [text for _, value in sorted(anchors.items()) if (text := normalize(value))]
     quoted = prior["lines"]
     matches = list(occurrences(lines, quoted))
     if not prior["duplicates"] or not any(prior["context"]):
-        if matches:
-            return True
-    elif any(same_context(prior["context"], context(lines, index, index + len(quoted))) for index in matches):
-        return True
-    known_context = [line for line in prior["context"] if line]
-    if any(line in lines for line in known_context) or (not known_context and start in anchors):
-        return False
-    # This head's diff may no longer show where the finding was cited.
-    return None
+        return bool(matches)
+    return any(same_context(prior["context"], context(lines, index, index + len(quoted))) for index in matches)
 
 
 def repeated_at(path, start, old, prior, evidence):
@@ -92,6 +124,11 @@ def record(state, address, head, findings, anchors, changed_paths=None, *, persi
             project TEXT NOT NULL, number INTEGER NOT NULL, head TEXT NOT NULL, path TEXT NOT NULL,
             start INTEGER NOT NULL, "end" INTEGER NOT NULL, digest TEXT NOT NULL, cited TEXT NOT NULL,
             status TEXT NOT NULL, later_head TEXT, PRIMARY KEY(project, number, head, path, start, digest))""")
+        if db.execute("PRAGMA user_version").fetchone()[0] < 1:
+            # Rows resolved before version 1 were `fixed` as soon as the cited line left the diff.
+            # That is what `gone` means now: no evidence that the code changed.
+            db.execute("UPDATE findings SET status='gone' WHERE status='fixed'")
+            db.execute("PRAGMA user_version=1")
         evidence = [(f, digest(f), cited(f, anchors)) for f in findings]
         unmatched = evidence.copy()
         earlier = db.execute("""SELECT rowid, path, start, digest, cited FROM findings
@@ -109,17 +146,23 @@ def record(state, address, head, findings, anchors, changed_paths=None, *, persi
             if repeated is not None:
                 unmatched.pop(repeated)
                 status = "repeated"
+            elif reverted:
+                # The change no longer touches the file: reverted or rebased away, not fixed.
+                status = "gone"
+            elif still_shown(prior, anchors[path]):
+                status = "unaddressed"
+            elif not isinstance(prior, list) and replaced_in_diff(prior, anchors[path]):
+                status = "fixed"
             else:
-                visible = False if reverted else still_shown(prior, anchors[path], start)
-                if visible is None:
-                    continue
-                status = "unaddressed" if visible else "fixed"
+                # The cited code left the diff and the diff does not show what replaced it: a revert or a
+                # rebase looks the same as a fix that restored the base's code, so none of them counts.
+                status = "gone"
             db.execute("UPDATE findings SET status=?, later_head=? WHERE rowid=?", (status, head, rowid))
         for f, key, current in evidence:
             db.execute("INSERT OR IGNORE INTO findings VALUES (?,?,?,?,?,?,?,?,?,?)",
                        (project, number, head, f["path"], f["line"], f["end_line"], key,
                         json.dumps(current), "open", None))
-        counts = dict.fromkeys(("fixed", "unaddressed", "repeated", "open"), 0)
+        counts = dict.fromkeys(("fixed", "unaddressed", "gone", "repeated", "open"), 0)
         for status, n in db.execute("SELECT status, COUNT(*) FROM findings WHERE project=? AND number=? GROUP BY status",
                                     (project, number)):
             counts[status] = n
