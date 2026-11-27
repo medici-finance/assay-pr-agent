@@ -25,6 +25,9 @@ TRIES = 12
 # How long one cycle spends on markers and notices before it goes on to the reviews. What is left
 # waits for the next cycle: a forge that answers slowly must not hold the queue back.
 BUDGET_SECONDS = 20
+# How long the marker of one request may take when it is written just before that request's review.
+START_SECONDS = 5
+TIMEOUT_SECONDS = 15
 PAGES = 5
 # Stored in place of a GitHub reaction's ID from just before the reaction is asked for until the
 # answer is recorded. A poller that stopped in between, or an answer that never arrived, leaves it:
@@ -43,9 +46,13 @@ def refused(response):
     return 300 <= response.status_code < 500 and not limited
 
 
-def request(project, method, url, headers, **options):
+def request(project, method, url, headers, deadline=None, **options):
     # The posture of the GitLab note lookup: no redirects, and a private CA only for its own instance.
-    with httpx.Client(timeout=15, follow_redirects=False,
+    # With a deadline, no request starts after it and none waits past it for the forge.
+    left = TIMEOUT_SECONDS if deadline is None else min(TIMEOUT_SECONDS, deadline - time.monotonic())
+    if left <= 0:
+        raise ReviewError("no time left for it in this cycle")
+    with httpx.Client(timeout=left, follow_redirects=False,
                       **(client_options() if project.provider == "gitlab" else {})) as client:
         return client.request(method, url, headers=headers, **options)
 
@@ -70,15 +77,15 @@ def reviewer(project, number, comment):
     return root, markers, {"PRIVATE-TOKEN": token}
 
 
-def own_award(project, root, markers, headers):
+def own_award(project, root, markers, headers, deadline=None):
     """ID of this credential's GitLab award, if present."""
-    response = request(project, "GET", root + "/user", headers)
+    response = request(project, "GET", root + "/user", headers, deadline)
     response.raise_for_status()
     account = response.json()
     if not isinstance(account, dict) or type(account.get("id")) is not int or account["id"] < 1:
         raise ReviewError("The forge did not identify the reviewer account")
     for page in range(1, PAGES + 1):
-        response = request(project, "GET", markers, headers, params={"per_page": 100, "page": page})
+        response = request(project, "GET", markers, headers, deadline, params={"per_page": 100, "page": page})
         response.raise_for_status()
         rows = response.json()
         if not isinstance(rows, list):
@@ -93,9 +100,9 @@ def own_award(project, root, markers, headers):
     raise ReviewError("Too many markers to search")
 
 
-def react(project, markers, headers):
+def react(project, markers, headers, deadline=None):
     """Ask GitHub for the reviewer's reaction and return the answer. It creates one only if there is none."""
-    return request(project, "POST", markers, headers, json={"content": MARK["github"][0]})
+    return request(project, "POST", markers, headers, deadline, json={"content": MARK["github"][0]})
 
 
 def reaction_id(response):
@@ -106,16 +113,18 @@ def reaction_id(response):
     return row["id"]
 
 
-def add(project, number, comment, sending=lambda: None):
+def add(project, number, comment, sending=lambda: None, deadline=None):
     """Mark the request. sending is called just before GitHub is asked to create the reaction."""
     root, markers, headers = reviewer(project, number, comment)
     if project.provider == "gitlab":
-        if own_award(project, root, markers, headers):
+        if own_award(project, root, markers, headers, deadline):
             return  # An account can award an emoji once, so this one already says a request is waiting.
-        request(project, "POST", markers, headers, params={"name": MARK["gitlab"][0]}).raise_for_status()
+        request(project, "POST", markers, headers, deadline, params={"name": MARK["gitlab"][0]}).raise_for_status()
         return
+    if deadline is not None and deadline <= time.monotonic():
+        raise ReviewError("no time left for it in this cycle")  # Before the note that a reaction may exist.
     sending()
-    return reaction_id(react(project, markers, headers))
+    return reaction_id(react(project, markers, headers, deadline))
 
 
 def recover(project, number, comment):
@@ -161,12 +170,12 @@ class Acknowledgement:
         self.jobs = jobs
         self.state = state
 
-    def queued(self, project, number, comment):
+    def queued(self, project, number, comment, deadline=None):
         job = project.key, number, comment
 
         def mark():
             try:
-                marker = add(project, number, comment, lambda: self.jobs.record_marker(job, UNKNOWN))
+                marker = add(project, number, comment, lambda: self.jobs.record_marker(job, UNKNOWN), deadline)
             except httpx.HTTPStatusError as err:
                 if err.response.status_code < 500:
                     self.jobs.record_marker(job, None)  # Answered and turned down: nothing was created.
@@ -225,11 +234,21 @@ class Acknowledgement:
                 self.finished(projects[key], number, comment, status)
 
     def mark(self, projects):
-        """Mark the waiting requests that have not been marked: the new ones, and those a stopped poller left."""
-        started = time.monotonic()
+        """Mark the waiting requests that have not been marked: the new ones, and those a stopped poller left.
+
+        All of it ends within the budget: no forge call waits past it. A request left unmarked is
+        marked when its review starts.
+        """
+        deadline = time.monotonic() + BUDGET_SECONDS
         for key, number, comment in self.jobs.unmarked():
-            if key in projects and time.monotonic() - started < BUDGET_SECONDS:
-                self.queued(projects[key], number, comment)
+            if key in projects and time.monotonic() < deadline:
+                self.queued(projects[key], number, comment, deadline)
+
+    def starting(self, project, number, comment):
+        """Mark a request whose review is about to start, if nothing has marked it yet. It is given a short time."""
+        acknowledgement = self.jobs.acknowledgement((project.key, number, comment))
+        if acknowledgement is not None and acknowledgement[0] == PENDING:
+            self.queued(project, number, comment, time.monotonic() + START_SECONDS)
 
     @staticmethod
     def attempt(action, verb, project, number, comment):

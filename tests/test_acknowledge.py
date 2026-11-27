@@ -301,19 +301,66 @@ class MarkerTests(Offline):
             self.assertEqual(len(mine()), 1 if comment == 81 else 0)
         self.assertEqual(jobs.unfinished_acknowledgements(), [])
 
-    def test_a_forge_that_answers_slowly_holds_the_queue_back_only_so_long(self):
+    def test_a_forge_that_does_not_answer_holds_the_queue_back_only_so_long(self):
         jobs = Jobs(self.state)
         for comment in range(81, 121):
             jobs.enqueue(self.gh.key, 3, comment, acknowledge=True)
-        clock, marked = [0.0], []
+        clock, waits = [1000.0], []
+        with httpx.Client() as made:  # setUp replaced the name; this is the class behind it.
+            client = type(made)
 
-        def slow(project, number, comment):
-            marked.append(comment)
-            clock[0] += 15  # Each marker waits for its timeout.
+        def silent(**options):
+            def wait(request):
+                waits.append(options["timeout"])
+                clock[0] += options["timeout"]  # The forge lets every request run into its timeout.
+                raise httpx.ReadTimeout("no answer", request=request)
+            return client(transport=httpx.MockTransport(wait), **options)
         ack = Acknowledgement(jobs, self.state)
-        with patch.object(acknowledge.time, "monotonic", side_effect=lambda: clock[0]), patch.object(ack, "queued", slow):
+        with patch.object(acknowledge.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(acknowledge.httpx, "Client", side_effect=silent), \
+                self.assertLogs("cursor_pr.acknowledge", level="WARNING"):
             ack.mark({self.gh.key: self.gh})
-        self.assertEqual(marked, [81, 82])  # Twenty seconds, and the reviews start.
+            self.assertEqual((waits, clock[0] - 1000), ([15, 5], 20))  # The budget, whatever the requests take.
+            self.assertEqual(len(jobs.unmarked()), 38)
+            # A request the pass did not get to is given a short try of its own when its review starts.
+            ack.starting(self.gh, 3, 83)
+            self.assertEqual(waits, [15, 5, 5])
+            ack.starting(self.gh, 3, 81)  # This one was tried.
+            self.assertEqual(waits, [15, 5, 5])
+        # Each try was noted before it was sent, so a reaction made without an answer is found later.
+        self.assertEqual([jobs.acknowledgement((self.gh.key, 3, comment))[0] for comment in (81, 82, 83, 84)],
+                         [acknowledge.UNKNOWN] * 3 + [acknowledge.PENDING])
+
+    def test_cycle_marks_a_request_before_its_review_when_the_pass_ran_out_of_time(self):
+        jobs = Jobs(self.state)
+        for comment in (81, 82):
+            jobs.enqueue(self.gh.key, 3, comment, acknowledge=True)
+        ack = Acknowledgement(jobs, self.state)
+        seen = []
+        with patch.object(ack, "mark"), patch("cursor_pr.poll.poll_project"):  # The pass marked nothing.
+            cycle({self.gh.key: self.gh}, self.state, jobs, {self.gh.key: None},
+                  lambda project, number, state: seen.append(len(self.eyes)) or "reviewed", ack=ack)
+        self.assertEqual(seen, [3, 3])  # Each review ran with its request marked, and the marker went after it.
+        self.assertEqual([row["id"] for row in self.eyes], [11, 13])
+
+    def test_requests_waiting_since_before_the_upgrade_are_told_when_they_fail(self):
+        with closing(sqlite3.connect(self.state / "requests.sqlite3")) as db, db:
+            db.execute("""CREATE TABLE requests (project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,
+                status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, head TEXT NOT NULL DEFAULT '', prepared TEXT,
+                PRIMARY KEY(project, number, comment))""")
+            db.executemany("INSERT INTO requests (project, number, comment, status) VALUES (?,?,?,?)",
+                           [(self.gh.key, 3, 81, "queued"), (self.gh.key, 3, 80, "reviewed")])
+        jobs = Jobs(self.state)
+        self.assertEqual(jobs.acknowledgement((self.gh.key, 3, 81))[:2], (None, 0))
+        self.assertIsNone(jobs.acknowledgement((self.gh.key, 3, 80)))
+        self.assertEqual(jobs.unmarked(), [])  # Not marked late; its review may be about to start.
+        jobs.enqueue(self.gh.key, 3, 82)
+        self.assertIsNone(Jobs(self.state).acknowledgement((self.gh.key, 3, 82)))  # Only at the upgrade.
+        jobs.next()
+        jobs.finish((self.gh.key, 3, 81), "failed")
+        with patch.object(acknowledge, "notify") as notify:
+            Acknowledgement(jobs, self.state).finished(self.gh, 3, 81, "failed")
+        notify.assert_called_once_with(self.gh, 3, 81, self.state)
 
     def test_gitlab_marker_lookup_stops_on_the_matching_award(self):
         ack = self.ack()
@@ -482,7 +529,7 @@ class NoticeTests(Offline):
             threads[self.gh.slug].append(request | dict(databaseId=83, url=self.gh.change_url(3) + "#issuecomment-83"))
             results[:] = ["reviewed", "failed"]
             cycle(self.projects, self.state, jobs, since, review, ack)
-            self.assertEqual([call.args for call in ack.queued.call_args_list],
+            self.assertEqual([call.args[:3] for call in ack.queued.call_args_list],
                              [(self.gh, 3, 83), (self.gl, 3, 82)])
             self.assertEqual(outcomes, [("acme/github", 3), ("acme/gitlab", 3)])
             self.assertEqual([call.args for call in ack.finished.call_args_list],

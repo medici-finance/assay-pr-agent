@@ -77,6 +77,7 @@ class Jobs:
                 db.execute("ALTER TABLE requests ADD COLUMN prepared TEXT")
             db.execute("""CREATE TABLE IF NOT EXISTS activations (
                 project TEXT PRIMARY KEY, since TEXT NOT NULL)""")
+            upgraded = db.execute("SELECT 1 FROM sqlite_master WHERE name='acknowledgements'").fetchone() is None
             db.execute("""CREATE TABLE IF NOT EXISTS acknowledgements (
                 project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL, marker_id INTEGER,
                 notice_sent INTEGER NOT NULL DEFAULT 0, tries INTEGER NOT NULL DEFAULT 0,
@@ -86,6 +87,11 @@ class Jobs:
             for column, kind in (("tries", "INTEGER"), ("retry_at", "REAL"), ("cleared", "INTEGER")):
                 if column not in columns:
                     db.execute(f"ALTER TABLE acknowledgements ADD COLUMN {column} {kind} NOT NULL DEFAULT 0")
+            if upgraded:
+                # Requests a version without acknowledgements left waiting. They get no marker now,
+                # but a record, so that one that fails is reported like any other.
+                db.execute("""INSERT INTO acknowledgements (project, number, comment)
+                    SELECT project, number, comment FROM requests WHERE status IN ('queued','started')""")
             # Only the process holding the instance lock opens the queue, and a review child holds
             # that lock until it exits and settles its own row before it does. So a row still started
             # belongs to a review that was cut off. It runs once more, held to the head in its row if
@@ -371,6 +377,8 @@ def cycle(projects, state, jobs, since, runner=None, ack=None):
         key, number, comment = job
         status = "failed"
         if key in projects:
+            if ack is not None:
+                ack.starting(projects[key], number, comment)
             try:
                 tier = jobs.tier(job)
                 extra = () if tier == "regular" else (tier,)
