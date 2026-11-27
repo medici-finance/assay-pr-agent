@@ -189,6 +189,8 @@ On an unconfigured interactive first start, the container runs setup before poll
 
 **Upgrading from v0.1.0.** Stop the old receiver and start the polling image with the same state volume. It reads the existing project settings, request queue and cache. You can remove the forge webhooks, reverse proxy, published port, `REVIEW_PUBLIC_URL` and webhook secrets. The polling container only needs outbound connections.
 
+After a rollback, the earlier polling image can resume regular reviews on the same state volume. Pending visual requests resume when the newer image starts again.
+
 ### Container CI
 
 Pushes to `main` or any Git tag build the linux/amd64 image, run the test suite inside it with networking disabled and publish the tested image. GitHub publishes to `ghcr.io/medici-finance/assay-pr-agent`; GitLab uses the project's container registry. Every build gets a `sha-<commit>` tag plus `main` and `latest` for the default branch, or the Git tag. Reserved or registry-incompatible Git tags map to `git-ref-<hash>`. The commit, tags and build time are baked into the image, and the container prints them as its first line at startup.

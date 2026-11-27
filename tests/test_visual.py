@@ -5,6 +5,7 @@ import os
 import re
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -195,6 +196,15 @@ class VisualTests(unittest.TestCase):
         self.assertIn("Treated as generated from its content, hunks not sent: ` pkg/query_string.go `", text)
         self.assertNotIn("vendor/x/y.go", text)
 
+    def test_dotted_document_names_classify_without_backtracking(self):
+        # Use an isolated process so a slow match cannot block the test runner.
+        program = ("import sys; from cursor_pr.visual import category; "
+                   "print(*(category(name) for name in sys.argv[1:]), sep='\\n')")
+        name = "LICENSE" + ".Edition" * 24
+        result = subprocess.check_output([sys.executable, "-c", program, name, name + "!"],
+                                         text=True, timeout=5)
+        self.assertEqual(result.splitlines(), ["Docs", "Logic"])
+
     def test_legal_text_is_counted_but_never_sent(self):
         files = [source.File("LICENSE", hunk(200, 0), "added"), source.File("app.py", hunk(2, 0), "added")]
         prompt, anchors, unseen, has_text = visual.pack(files)
@@ -268,6 +278,18 @@ class VisualTests(unittest.TestCase):
                           "go.sum | Dependencies | no text patch | modified",
                           "LICENSE | Docs | no text patch | modified", "huge.py | Logic | no text patch | modified"])
         self.assertEqual(visual.survey(files)["no_text"], ["LICENSE", "go.sum", "huge.py", "logo.png"])
+
+    def test_explicit_empty_rename_is_fully_counted(self):
+        renamed = source.File("app.py", "", "renamed", False, "old.py")
+        prompt, anchors, unseen, has_text = visual.pack([renamed])
+        self.assertEqual(anchors, {renamed.path: set()})
+        self.assertFalse(unseen)
+        self.assertFalse(has_text)
+        self.assertIn("app.py | Logic | +0 -0 | renamed, was old.py", prompt)
+        survey = visual.survey([renamed])
+        self.assertEqual(survey["lines"], 0)
+        self.assertEqual(survey["no_text"], [])
+        self.assertNotIn("line counts unavailable", visual.chart({"map": survey})[0])
 
     def test_a_modified_file_with_only_removed_lines_enters_the_prompt(self):
         empty = source.File("app.py", "@@ -1 +0,0 @@\n-OLD_SETTING = True\n", "modified")
@@ -579,6 +601,16 @@ class VisualCommentTests(unittest.TestCase):
         self.assertLessEqual(max(visual.width(line) for line in chart), 84)
         self.assertTrue(all(not line.endswith(" ") for line in chart[11:]))
 
+    def test_many_combining_marks_in_paths_cannot_exceed_the_comment_limit(self):
+        directory = "/".join("a" + "\N{COMBINING ACUTE ACCENT}" * 100 for _ in range(11))
+        files = [source.File(f"src/{directory}/example{index}.py", hunk(1, 0), "added")
+                 for index in range(10)]
+        report = dict(self.report, state="over-budget", visual=None, map=visual.survey(files),
+                      estimated_input_tokens=20_000, max_input_tokens=12_000)
+        text = self.text(report) + "\n"
+        self.assertLessEqual(len(text.encode("utf-8")), visual.MAX_COMMENT_BYTES)
+        self.assertIn("/example0.py", text)
+
     def test_comment_preserves_the_map_and_check_summary_within_the_forge_byte_limit(self):
         evidence = ["Static checks", "- osv-scanner: 1 CI, 0 local, 30 findings, 0 incomplete.",
                     *[f"- {visual.fence('測' * 450)}" for _ in range(30)]]
@@ -604,6 +636,14 @@ class VisualCommentTests(unittest.TestCase):
 
 
 class VisualPostTests(unittest.TestCase):
+    def test_publish_checks_the_complete_visual_comment_byte_limit(self):
+        report = {"map": {}, "checks": []}
+        with patch.object(visual, "comment", return_value=["x" * visual.MAX_COMMENT_BYTES]), \
+             patch.object(cli, "post_comment") as post:
+            with self.assertRaisesRegex(source.ReviewError, "forge comment limit"):
+                cli.publish("org/repo#7", "a" * 40, report, project=object())
+        post.assert_not_called()
+
     def test_publish_posts_the_visual_comment_as_one_body(self):
         bodies = []
         report = {"provider": "cursor", "state": "reviewed", "head": "a"*40, "omitted": [], "checks": [],

@@ -26,13 +26,16 @@ class Jobs:
     def __init__(self, state):
         self.path = state / "requests.sqlite3"
         with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
             db.execute("""CREATE TABLE IF NOT EXISTS requests (
                 project TEXT NOT NULL, number INTEGER NOT NULL, comment INTEGER NOT NULL,
-                status TEXT NOT NULL, command TEXT NOT NULL DEFAULT 'review',
-                PRIMARY KEY(project, number, comment))""")
-            # A state volume from before /visual-review holds reviews only.
-            if "command" not in {row[1] for row in db.execute("PRAGMA table_info(requests)")}:
-                db.execute("ALTER TABLE requests ADD COLUMN command TEXT NOT NULL DEFAULT 'review'")
+                status TEXT NOT NULL, PRIMARY KEY(project, number, comment))""")
+            # Preserve the original queue shape so an older image can still use this volume.
+            # Translate any queued visual requests from the initial visual-review schema.
+            if "command" in {row[1] for row in db.execute("PRAGMA table_info(requests)")}:
+                db.execute("""UPDATE requests SET status='visual-queued'
+                              WHERE command='visual-review' AND status='queued'""")
+                db.execute("ALTER TABLE requests DROP COLUMN command")
             db.execute("""CREATE TABLE IF NOT EXISTS activations (
                 project TEXT PRIMARY KEY, since TEXT NOT NULL)""")
 
@@ -49,20 +52,24 @@ class Jobs:
                               (project, number, comment)).fetchone() is not None
 
     def enqueue(self, project, number, comment, status="queued", command="review"):
+        if status == "queued" and command == "visual-review":
+            status = "visual-queued"  # An older poller claims only regular queued requests.
         with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("INSERT OR IGNORE INTO requests VALUES (?,?,?,?,?)",
-                       (project, number, comment, status, command))
+            db.execute("INSERT OR IGNORE INTO requests VALUES (?,?,?,?)", (project, number, comment, status))
 
     def next(self):
         with closing(sqlite3.connect(self.path)) as db, db:
-            return db.execute("""UPDATE requests SET status='started' WHERE rowid=(
-                SELECT rowid FROM requests WHERE status='queued' ORDER BY rowid LIMIT 1)
-                RETURNING project, number, comment, command""").fetchone()
+            return db.execute("""UPDATE requests SET status=
+                    CASE status WHEN 'visual-queued' THEN 'visual-started' ELSE 'started' END
+                WHERE rowid=(SELECT rowid FROM requests WHERE status IN ('queued', 'visual-queued')
+                             ORDER BY rowid LIMIT 1)
+                RETURNING project, number, comment,
+                    CASE status WHEN 'visual-started' THEN 'visual-review' ELSE 'review' END""").fetchone()
 
     def finish(self, job, status):
         with closing(sqlite3.connect(self.path)) as db, db:
-            db.execute("UPDATE requests SET status=? WHERE project=? AND number=? AND comment=? AND command=?",
-                       (status, *job))
+            db.execute("UPDATE requests SET status=? WHERE project=? AND number=? AND comment=?",
+                       (status, *job[:3]))
 
 
 def run_review(project, number, state, command="review"):

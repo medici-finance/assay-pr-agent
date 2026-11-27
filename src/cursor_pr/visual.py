@@ -37,8 +37,9 @@ SOURCE = r"(?i:" + "|".join(SOURCE_EXTENSIONS) + r")"
 # not match: after a dot, only a document extension or a token that starts with a capital or a
 # digit may follow, never a source extension in any case, and a token after - or _ holds no dot.
 def named(*names):
-    return ("(?:(?:" + "|".join(names) + r")(?:[-_][A-Za-z0-9]+"
-            r"|(?-i:\.(?!" + SOURCE + r"(?![A-Za-z0-9]))[A-Z0-9][A-Za-z0-9]*)|\.(?:md|txt|rst|html?))*)")
+    # Possessive throughout: a segment, once matched, is never repartitioned after a failed match.
+    return ("(?:(?:" + "|".join(names) + r")(?:[-_][A-Za-z0-9]++"
+            r"|(?-i:\.(?!" + SOURCE + r"(?![A-Za-z0-9]))[A-Z0-9][A-Za-z0-9]*+)|\.(?:md|txt|rst|html?))*+)")
 
 
 DOCUMENTS = named("README", "CHANGELOG", "CONTRIBUTING", "CODEOWNERS", "AUTHORS", "NOTICE", "SECURITY", "GOVERNANCE",
@@ -219,7 +220,7 @@ def survey(files):
                       "added": sum(row["added"] for row in mine), "deleted": sum(row["deleted"] for row in mine)})
     return {"lines": sum(row["added"] + row["deleted"] for row in rows),
             "to_read": sum(k["added"] + k["deleted"] for k in kinds if k["read"]),
-            "categories": kinds, "files": rows, "no_text": sorted(f.path for f in files if f.absent or not f.patch),
+            "categories": kinds, "files": rows, "no_text": sorted(f.path for f in files if f.absent),
             "generated": sorted(f.path for f in files if by_content(f.path, f.patch, f.status))}
 
 
@@ -235,10 +236,10 @@ def pack(files):
         kind, read = category(f.path, f.patch, f.status), narrated(f.path, f.patch, f.status)
         # A deletion, a binary or legal text is named in the inventory and counted in the map. Only
         # a file the model should have read, but the forge sent no patch for, is coverage lost.
-        if (f.absent or not f.patch) and read and not gone(f.status):
+        if f.absent and read and not gone(f.status):
             unseen.append(f.path)
         shown = shows_hunks(f)
-        row = f"{f.path} | {kind} | " + ("no text patch" if f.absent or not f.patch else f"+{added} -{deleted}")
+        row = f"{f.path} | {kind} | " + ("no text patch" if f.absent else f"+{added} -{deleted}")
         row += (f" | {f.status}" if f.status else "") + (f", was {f.previous}" if f.previous else "")
         inventory.append((shown, row))
         if shown:
@@ -310,17 +311,23 @@ def width(text):
 
 
 def clip(text, limit):
-    """One printable line, shortened from the left so the file name survives, at most `limit` columns."""
+    """Shorten a printable line from the left, bounding both its columns and UTF-8 size."""
     # Like fence(): a line break becomes a space rather than joining the two halves of a word.
     text = " ".join("".join(c if c.isprintable() or c.isspace() else " " for c in str(text)).split())
-    if width(text) <= limit:
+    max_bytes = 4 * limit
+    if width(text) <= limit and len(text.encode("utf-8")) <= max_bytes:
         return text
-    tail, used = "", 1
-    for c in reversed(text):
-        if used + width(c) > limit:
+    tail = []
+    columns, byte_count = 1, len("…".encode("utf-8"))
+    for char in reversed(text):
+        char_width = width(char)
+        char_bytes = len(char.encode("utf-8"))
+        if columns + char_width > limit or byte_count + char_bytes > max_bytes:
             break
-        tail, used = c + tail, used + width(c)
-    return "…" + tail
+        tail.append(char)
+        columns += char_width
+        byte_count += char_bytes
+    return "…" + "".join(reversed(tail))
 
 
 def fit(text, columns):
