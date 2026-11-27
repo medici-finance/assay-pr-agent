@@ -101,9 +101,9 @@ authorityKeyIdentifier=keyid
                                "REVIEW_GITLAB_TOKEN": "test-only", "REVIEW_GITLAB_CA_FILE": str(root/"gitlab-ca.pem"),
                                "REVIEW_GITLAB_CRL_FILE": str(root/"gitlab-crl.pem")}
                         before = len(seen)
-                        with patch.dict(os.environ, env, clear=True), forge_credentials({"gl": project}, root):
+                        with patch.dict(os.environ, env, clear=True), forge_credentials({"gl": project}):
                             try:
-                                source.run_desk(["deskread", "change", "--change", "org/project#1"], cwd=root)
+                                source.run_forge("change", project, numbers=[1])
                             except source.ReviewError:
                                 pass
                             paths = [path for _, path in seen[before:]]
