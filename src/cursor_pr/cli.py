@@ -1,6 +1,7 @@
 import argparse
 import fcntl
 from contextlib import ExitStack
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -23,7 +24,7 @@ from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
 from .engine import CursorFailure, pack, review, tokens
-from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
+from .source import ReviewError, ci_refs, classify_absent, forge_change, local_change, post_comment, valid_sha
 
 
 LOCKS = {"package-lock.json", "pnpm-lock.yaml", "go.sum", "npm-shrinkwrap.json"}
@@ -205,6 +206,10 @@ def execute(args):
             if args.expected_change_url != project.change_url(number):
                 raise ReviewError("Managed checkout and reviewed project differ")
             checkout = stack.enter_context(scan_checkout(root, project, number, change.head))
+        if args.change:
+            # A local diff already tells binary from text; a forge's missing patch is checked against the head blob.
+            change = dataclasses.replace(change, files=classify_absent(checkout, change.head, change.files))
+            files = sorted((f for f in change.files if f.path in selected), key=lambda f: f.path)
         checks = scan_files(checkout, change.head, files)
         deadline = time.monotonic() + 180
         for tool, path in missing:
