@@ -104,8 +104,6 @@ class Jobs:
                            [job for job, status, _ in settled if status == "failed"])
         for job, _, reason in settled:
             log.warning("Review of %s #%d comment %d was interrupted by a restart; %s", *job, reason)
-        # Requests this start gave up on, so the requester can be told.
-        self.abandoned = [tuple(job) for job, status, _ in settled if status == "failed"]
 
     def activated(self, project):
         with closing(sqlite3.connect(self.path)) as db, db:

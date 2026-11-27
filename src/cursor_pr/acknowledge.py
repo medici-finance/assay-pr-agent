@@ -14,8 +14,8 @@ log = logging.getLogger(__name__)
 MARK = {"github": ("eyes", "content"), "gitlab": ("hourglass", "name")}
 # Names its request, so that a second request failing at the same head gets a notice of its own:
 # the helper posts a given text once per head.
-NOTICE = ("The `/review` request {request} did not produce a posted review: the review could not be "
-          "completed or published. Post `/review` again to retry it.\n")
+NOTICE = ("The `/review` request {request} was not completed: the review could not be finished or "
+          "published. Post `/review` again to retry it.\n")
 NOTE = {"github": "#issuecomment-", "gitlab": "#note_"}
 # A removal or notice that failed is tried again after this long, then after twice as long each time
 # up to an hour, and given up after this many tries, about six hours in all.
@@ -35,6 +35,13 @@ HELPER_SECONDS = 45
 PAGES = 5
 
 
+class OutOfTime(ReviewError):
+    """A deadline passed before the call was made. Nothing was tried, so nothing failed."""
+
+    def __init__(self):
+        super().__init__("no time left for it in this cycle")
+
+
 def refused(response):
     """Whether the forge turned the request down for good, and not only for now."""
     limited = (response.status_code in (401, 408, 429) or "retry-after" in response.headers
@@ -48,7 +55,7 @@ def request(project, method, url, headers, deadline=None, **options):
     # With a deadline, no request starts after it and none waits past it for the forge.
     left = TIMEOUT_SECONDS if deadline is None else min(TIMEOUT_SECONDS, deadline - time.monotonic())
     if left <= 0:
-        raise ReviewError("no time left for it in this cycle")
+        raise OutOfTime()
     with httpx.Client(timeout=left, follow_redirects=False,
                       **(client_options() if project.provider == "gitlab" else {})) as client:
         return client.request(method, url, headers=headers, **options)
@@ -135,9 +142,9 @@ def remove(project, number, comment, deadline=None):
             ident = own_award(project, root, markers, headers, deadline)
         else:
             response = react(project, markers, headers, deadline)
+            # Refused the reaction, this credential has none there to remove: said once, when
+            # the request was to be marked.
             ident = None if refused(response) else reaction_id(response)
-            if ident is None:
-                left_in_place(project, number, comment, response)
     except httpx.HTTPStatusError as err:
         if not refused(err.response):
             raise
@@ -160,16 +167,18 @@ def left_in_place(project, number, comment, response):
 def notify(project, number, comment, state, deadline=None):
     # The helper publishes only on the change's current head. The notice is about the request, not a
     # head, so it goes on whatever head the change has now, once per head like any comment.
-    def left():
-        seconds = HELPER_SECONDS if deadline is None else min(HELPER_SECONDS, deadline - time.monotonic())
-        if seconds <= 0:
-            raise ReviewError("no time left for it in this cycle")
-        return seconds
-    head = run_forge("change", project, numbers=[number], timeout=left()).get("headSha")
+    left = HELPER_SECONDS if deadline is None else min(HELPER_SECONDS, deadline - time.monotonic())
+    if left <= 0:
+        raise OutOfTime()
+    head = run_forge("change", project, numbers=[number], timeout=left).get("headSha")
     if not valid_sha(head):
         raise ReviewError("Forge did not identify the change head")
+    if deadline is not None and deadline <= time.monotonic():
+        raise OutOfTime()
+    # Started within the deadline and then never cut short: a helper stopped just after the forge
+    # took the comment would leave no receipt, and the next try would post the notice again.
     request = f"{project.change_url(number)}{NOTE[project.provider]}{comment}"
-    post_comment(project, number, head, NOTICE.format(request=request), state, timeout=left())
+    post_comment(project, number, head, NOTICE.format(request=request), state)
 
 
 class Acknowledgement:
@@ -186,8 +195,6 @@ class Acknowledgement:
         self.state = state
         # Requests whose marker this process has settled: written, or refused for good.
         self.marked = set()
-        # Those of them it was refused for: there is no marker of theirs to remove.
-        self.unmarked = set()
 
     def queued(self, project, number, comment, deadline=None):
         job = project.key, number, comment
@@ -198,7 +205,6 @@ class Acknowledgement:
             except httpx.HTTPStatusError as err:
                 if refused(err.response):
                     self.marked.add(job)  # Not to be asked for again. An answer for now only is.
-                    self.unmarked.add(job)
                 raise
             self.marked.add(job)
         self.attempt(mark, "mark", project, number, comment)
@@ -206,8 +212,6 @@ class Acknowledgement:
     def finished(self, project, number, comment, status, deadline=None):
         job = project.key, number, comment
         self.marked.discard(job)
-        never_marked = job in self.unmarked and project.provider == "github"  # GitLab's is shared: look.
-        self.unmarked.discard(job)
         owed = self.jobs.acknowledgement(job)
         if owed is None:
             return
@@ -220,7 +224,7 @@ class Acknowledgement:
                 # GitLab's marker stays while another request is waiting; its last request clears it.
                 # Each of them gets a record for that, also one queued by a version that kept none.
                 self.jobs.acknowledge_pending(project.key, number)
-            elif not never_marked:
+            else:
                 remove(project, number, comment, deadline)
             # Kept apart from the notice: while only the notice is owed, the marker is left alone.
             self.jobs.record_cleared(job)
@@ -237,6 +241,8 @@ class Acknowledgement:
         if notified and cleared:
             self.jobs.clear_acknowledgement(job)
             return
+        if False not in (notified, cleared):
+            return  # Only out of time: nothing was tried, so no try is counted and it stays due.
         tries = self.jobs.acknowledgement_tries(job) + 1
         if tries >= TRIES:
             log.warning("Gave up on the queued marker or failure notice of %s#%d comment %d after %d tries",
@@ -270,9 +276,12 @@ class Acknowledgement:
 
     @staticmethod
     def attempt(action, verb, project, number, comment):
+        """True when it was done, False when it failed, None when there was no time left to try."""
         try:
             action()
             return True
+        except OutOfTime:
+            return None  # Not a failure, and not worth a line: it is done in a later cycle.
         except Exception as err:
             # httpx errors quote the request URL. Report the status, or the class, and nothing else.
             detail = f"HTTP {err.response.status_code}" if isinstance(err, httpx.HTTPStatusError) else (

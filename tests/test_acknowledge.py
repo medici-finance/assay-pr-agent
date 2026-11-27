@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -156,15 +157,28 @@ class MarkerTests(Offline):
                                        ("GET", GITLAB + "?per_page=100&page=1"), ("DELETE", GITLAB + "/105")])
         self.assertEqual([row["id"] for row in self.awards], [21, 23])
 
-    def test_marker_refused_for_good_is_neither_asked_for_again_nor_looked_for_at_finish(self):
+    def test_marker_refused_for_good_is_not_asked_for_again_and_its_removal_says_nothing(self):
         ack = self.ack()
-        self.refuse = {("POST", GITHUB): 403}
-        with self.assertLogs("cursor_pr.acknowledge", level="WARNING"):
+        self.refuse = {("POST", GITHUB): 403}  # As without the Issues permission.
+        with self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
             ack.queued(self.gh, 3, 81)
-        ack.starting(self.gh, 3, 81)
-        ack.finished(self.gh, 3, 81, "reviewed")
-        self.assertEqual(self.sent(), [("POST", GITHUB)])
+            ack.starting(self.gh, 3, 81)
+            # The removal asks, in case an earlier poller did mark it, and is refused the same way.
+            ack.finished(self.gh, 3, 81, "reviewed")
+        self.assertEqual(self.sent(), [("POST", GITHUB), ("POST", GITHUB)])
+        self.assertEqual(len(logged.output), 1)  # One line per request, from the marking.
         self.assertIsNone(ack.jobs.acknowledgement((self.gh.key, 3, 81)))
+
+    def test_no_time_left_is_not_a_failed_try(self):
+        ack = self.ack()
+        job = self.gh.key, 3, 81
+        ack.jobs.next()
+        ack.jobs.finish(job, "failed")
+        with self.assertNoLogs("cursor_pr.acknowledge", level="WARNING"):
+            ack.finished(self.gh, 3, 81, "failed", acknowledge.time.monotonic() - 1)
+        self.assertEqual(self.calls, [])
+        self.assertEqual((ack.jobs.acknowledgement(job), ack.jobs.acknowledgement_tries(job)), ((0, 0), 0))
+        self.assertIn((*job, "failed"), ack.jobs.unfinished_acknowledgements(acknowledge.time.time()))  # Still due.
 
     def test_marker_turned_away_for_now_is_asked_for_again_when_the_review_starts(self):
         ack = self.ack()
@@ -287,9 +301,17 @@ class MarkerTests(Offline):
             before = clock[0]
             jobs.next()
             jobs.finish((self.gh.key, 3, 81), "failed")
-            with patch.object(acknowledge, "run_forge", side_effect=AssertionError("no time is left for the notice")):
+            helper = []
+
+            def slow(verb, project, *, numbers=(), timeout=45):
+                helper.append((verb, timeout))
+                clock[0] += timeout
+                raise subprocess.TimeoutExpired(verb, timeout)
+            with patch.object(acknowledge, "run_forge", side_effect=slow), \
+                    patch.object(acknowledge, "post_comment", side_effect=lambda *args: helper.append("comment")):
                 ack.finished(self.gh, 3, 81, "failed")
-            self.assertEqual((waits, clock[0] - before), ([15], 15))
+            # The removal takes its timeout, the read of the change what is left, and no comment is started.
+            self.assertEqual((waits, helper, clock[0] - before), ([15], [("change", 5)], 20))
             self.assertEqual(jobs.acknowledgement((self.gh.key, 3, 81)), (0, 0))  # Both still owed, for a later cycle.
             # And so does the pass over what earlier requests still owe.
             for comment in (82, 83, 84):
@@ -456,8 +478,6 @@ class NoticeTests(Offline):
             self.assertEqual(read.call_count, 1)
             self.assertLessEqual(read.call_args.kwargs.pop("timeout"), 45)
             read.assert_called_once_with("change", self.gh, numbers=[3])
-            self.assertEqual(post.call_count, 1)
-            self.assertLessEqual(post.call_args.kwargs.pop("timeout"), 45)
             post.assert_called_once_with(self.gh, 3, head, NOTICE.format(request=self.gh.change_url(3) + "#issuecomment-81"),
                                          self.state)
             post.side_effect = ReviewError("pr-agent-forge comment exited 1: change is no longer open")
@@ -620,7 +640,7 @@ class NoticeTests(Offline):
         self.assertEqual([call.args[:4] for call in notify.call_args_list], [(self.gh, 3, 81, self.state.resolve())])
         self.assertIsNotNone(polled.call_args.args[3])  # The running poller marks too.
         reopened = Jobs(self.state)
-        self.assertEqual((reopened.abandoned, reopened.pending(self.gh.key, 3)), ([], False))
+        self.assertEqual((reopened.unfinished_acknowledgements(), reopened.pending(self.gh.key, 3)), ([], False))
 
     def test_restart_gives_up_on_a_review_whose_head_was_not_recorded(self):
         # A queue from a version that kept no head: its running review cannot be repeated safely.
@@ -631,7 +651,9 @@ class NoticeTests(Offline):
             db.execute("INSERT INTO requests VALUES (?, 3, 81, 'started', 1)", (self.gh.key,))
         with self.assertLogs("cursor_pr.poll", level="WARNING"):
             jobs = Jobs(self.state)
-        self.assertEqual(jobs.abandoned, [(self.gh.key, 3, 81)])
+        # It owes its requester the notice, like any review that failed.
+        self.assertEqual(jobs.acknowledgement((self.gh.key, 3, 81)), (0, 0))
+        self.assertEqual(jobs.unfinished_acknowledgements(), [(self.gh.key, 3, 81, "failed")])
 
 
 if __name__ == "__main__":
