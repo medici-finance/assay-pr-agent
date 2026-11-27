@@ -153,6 +153,96 @@ else:
                 child.wait(timeout=5)
                 child.stdout.close()
 
+    def settings_page(self, state):
+        """Start the installer on a saved setup and unlock its settings page."""
+        bundle = state / ".review-setup-1"
+        bundle.mkdir(mode=0o700)
+        (bundle / "codex.key").write_text("fixture-codex\n")
+        (bundle / "settings.json").write_text(json.dumps({"settings": {"REVIEW_PROVIDER": "codex", "REVIEW_AUTH_MODE": "api-key"},
+                                                          "projects": [], "secrets": {"CODEX_API_KEY": "codex.key"}}))
+        (state / "setup").symlink_to(bundle.name)
+        child = subprocess.Popen(["cursor-review-container", "setup", "--web", "--state-dir", str(state)],
+                                 stdout=subprocess.PIPE, text=True)
+        self.addCleanup(child.stdout.close)
+        self.addCleanup(child.wait, timeout=5)
+        self.addCleanup(child.terminate)
+        line = child.stdout.readline()
+        while not line.startswith("Setup key: "):  # the build banner is printed first
+            self.assertTrue(line, "installer exited before printing the setup key")
+            line = child.stdout.readline()
+
+        def request(method="GET", path="/step", headers=None, body=None):
+            conn = http.client.HTTPConnection("127.0.0.1", 8765, timeout=5)
+            try:
+                conn.request(method, path, headers=headers or {}, body=body)
+                res = conn.getresponse()
+                return res.status, res.read(), res.getheader("Set-Cookie")
+            finally:
+                conn.close()
+        origin = {"Origin": "http://127.0.0.1:8765", "Content-Type": "application/json"}
+        status, _, issued = request("POST", "/login", origin, json.dumps({"key": line.split(": ", 1)[1].strip()}))
+        self.assertEqual(status, 200)
+        return child, request, {"Cookie": issued.split(";")[0], **origin}
+
+    def current(self, request, headers, status):
+        """The view once it reaches the given status."""
+        for _ in range(50):
+            view = json.loads(request(headers=headers)[1])
+            if view["status"] == status:
+                return view
+            time.sleep(0.02)
+        self.fail(f"The page never reached {status}: {view}")
+
+    def test_browser_settings_page_saves_one_setting(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        state = Path(tmp.name)
+        child, request, headers = self.settings_page(state)
+        view = self.current(request, headers, "settings")
+        names = [row["name"] for section in view["sections"] for row in section["settings"]]
+        self.assertIn("REVIEW_MAX_INPUT_TOKENS", names)
+        self.assertIn("CODEX_API_KEY", names)
+        self.assertNotIn("fixture-codex", json.dumps(view))
+        change = json.dumps({"id": view["id"], "name": "REVIEW_MAX_INPUT_TOKENS", "value": "9000"})
+        # The wizard's guards apply: page origin, session cookie and the view the browser rendered.
+        stale = json.dumps({"id": view["id"] - 1, "name": "REVIEW_MAX_INPUT_TOKENS", "value": "9000"})
+        self.assertEqual(request("POST", "/setting", {k: v for k, v in headers.items() if k != "Origin"}, change)[0], 403)
+        self.assertEqual(request("POST", "/setting", {**headers, "Host": "other.invalid"}, change)[0], 403)
+        self.assertEqual(request("POST", "/setting", {"Origin": headers["Origin"], "Content-Type": "text/plain"}, change)[0], 403)
+        self.assertEqual(request("POST", "/setting", {k: v for k, v in headers.items() if k != "Cookie"}, change)[0], 401)
+        self.assertEqual(request("POST", "/setting", headers, stale)[0], 409)
+        rejected = json.dumps({"id": view["id"], "name": "REVIEW_MAX_INPUT_TOKENS", "value": "0"})
+        self.assertEqual(request("POST", "/setting", headers, rejected), (400, b'{"error": "Enter a positive integer"}', None))
+        bundle = (state / "setup").readlink()
+        status, body, _ = request("POST", "/setting", headers, change)
+        self.assertEqual(status, 200)
+        saved = json.loads(body)
+        self.assertEqual(saved["status"], "settings")
+        row = next(row for section in saved["sections"] for row in section["settings"] if row["name"] == "REVIEW_MAX_INPUT_TOKENS")
+        self.assertEqual((row["value"], row["source"]), ("9000", "saved"))
+        self.assertNotEqual((state / "setup").readlink(), bundle)
+        self.assertEqual(json.loads((state / "setup" / "settings.json").read_text())["settings"]["REVIEW_MAX_INPUT_TOKENS"], "9000")
+        # The view rendered before that save is now stale.
+        self.assertEqual(request("POST", "/setting", headers, change)[0], 409)
+        self.assertEqual(request("POST", "/step", headers, json.dumps({"id": saved["id"], "action": "quit"}))[0], 200)
+        self.assertEqual(child.wait(timeout=5), 0)
+
+    def test_browser_settings_page_starts_the_wizard(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        state = Path(tmp.name)
+        child, request, headers = self.settings_page(state)
+        view = self.current(request, headers, "settings")
+        self.assertEqual(request("POST", "/step", headers, json.dumps({"id": view["id"] - 1, "action": "wizard"}))[0], 409)
+        self.assertEqual(request("POST", "/step", headers, json.dumps({"id": view["id"], "action": "wizard"}))[0], 200)
+        question = self.current(request, headers, "question")
+        self.assertEqual(question["label"], "Forge (github/gitlab):")
+        # Nothing changes under a running wizard.
+        self.assertEqual(request("POST", "/setting", headers, json.dumps({"id": view["id"], "name": "REVIEW_MAX_INPUT_TOKENS", "value": "9000"}))[0], 409)
+        self.assertEqual(request("POST", "/step", headers, json.dumps({"id": question["id"], "action": "quit"}))[0], 200)
+        self.assertEqual(child.wait(timeout=5), 0)
+        self.assertEqual((state / "setup").readlink(), Path(".review-setup-1"))
+
     def test_managed_paths_and_external_checkouts(self):
         row = dict(provider="github", url="https://github.com/org/repo", requester_ids=[2], managed=True)
         project = project_from(row)

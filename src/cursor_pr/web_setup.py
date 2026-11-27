@@ -1,4 +1,4 @@
-"""One-shot local browser transport for the standard installer."""
+"""One-shot local browser transport for the standard installer and its settings page."""
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -12,7 +12,12 @@ import re
 import time
 from urllib.parse import parse_qs, urlsplit
 
-from . import dialog, setup
+from . import dialog, settings, setup
+
+
+SAVED = "Saved. The sync and reviewer services reload it between cycles."
+UNREADABLE = ("The saved settings could not be read to show them here. "
+              "Reload the page to try again, or run the setup wizard.")
 
 
 class Session:
@@ -22,6 +27,7 @@ class Session:
         self.messages = []
         self.answer = None
         self.nonce = None
+        self.editing = threading.Lock()  # one settings-page request against one rendered view at a time
 
     def message(self, text):
         self.messages.append(text)
@@ -49,13 +55,22 @@ class Session:
 
     def quit(self, step_id):
         with self.cv:
-            if self.view["status"] not in ("register", "question") or self.view["id"] != step_id:
+            if self.view["status"] not in ("register", "question", "settings") or self.view["id"] != step_id:
                 return False
             self.nonce = None
-            self.answer = dialog.QuitSetup
-            self.view = {"id": step_id, "status": "working"}
+            if self.view["status"] == "settings":
+                # No wizard is waiting on an answer here.
+                self.view = {"id": step_id, "status": "quit", "label": "Settings closed."}
+            else:
+                self.answer = dialog.QuitSetup
+                self.view = {"id": step_id, "status": "working"}
             self.cv.notify_all()
             return True
+
+    def terminal_quit(self):
+        # Use the same lock as the browser to let a save finish before closing.
+        with self.editing, self.cv:
+            return self.quit(self.view["id"])
 
     def callback(self, query):
         state, code = query.get("state", []), query.get("code", [])
@@ -90,7 +105,43 @@ class Session:
             self.cv.notify_all()
             return True
 
-    def run(self, state, force_login=False):
+    def show(self, page, *notices):
+        with self.cv:
+            if self.view["status"] == "quit":
+                return None
+            self.view = {"id": self.view["id"] + 1, "status": "settings", "messages": list(notices), **page}
+            self.cv.notify_all()
+            return self.view.copy()
+
+    def unread(self, *notices):
+        """Replace a settings page that can no longer be shown; the next load reads it again."""
+        return self.show({"sections": [], "projects": [], "unread": True}, *notices)
+
+    def reread(self, state):
+        """Read the settings again for a page that could not be read back after a save."""
+        with self.cv:
+            if not self.view.get("unread"):
+                return
+        with self.editing:
+            with self.cv:
+                if not self.view.get("unread"):
+                    return
+            try:
+                page = settings.view(state)
+            except Exception:
+                with self.cv:
+                    self.view["messages"] = [UNREADABLE]
+                return
+            self.show(page)
+
+    def launch(self, state, *, force_login=False, resume=False):
+        """Start the wizard; one started from the settings page returns to it afterwards."""
+        with self.cv:
+            self.view = {"id": self.view["id"] + 1, "status": "starting"}
+            self.cv.notify_all()
+        threading.Thread(target=self.run, args=(state, force_login, resume), daemon=True).start()
+
+    def run(self, state, force_login=False, resume=False):
         token = dialog.browser.set(self)
         try:
             setup.configure(state, force_login=force_login)
@@ -103,9 +154,49 @@ class Session:
             result = {"status": "error", "label": "Setup could not finish. Restart the installer and try again."}
         finally:
             dialog.browser.reset(token)
+        if resume and result["status"] != "quit":
+            # The settings page shows what the wizard saved, or why it failed.
+            try:
+                self.show(settings.view(state), "The setup wizard saved the configuration."
+                          if result["status"] == "complete" else result["label"])
+                return
+            except (ValueError, OSError, KeyError, TypeError):
+                pass
         with self.cv:
             self.view = {"id": self.view["id"] + 1, **result}
             self.cv.notify_all()
+
+
+def change_setting(session, state, data):
+    """Apply one settings-page change against the view the browser rendered.
+
+    Returns the HTTP status and the JSON reply: 409 for a stale view, 400 when
+    nothing was saved, and 200 with the new view once the save committed. If the
+    settings cannot be read back after a committed save, the 200 view says so
+    ("unread") rather than reporting the save as failed.
+    """
+    with session.editing:
+        with session.cv:
+            current = session.view["status"] == "settings" and session.view["id"] == data.get("id")
+        if not current:
+            return 409, None
+        try:
+            settings.save(state, data)
+        except (ValueError, OSError) as err:
+            return 400, {"error": str(err)}
+        except Exception:
+            # Like the wizard, never echo an unexpected failure's details.
+            return 400, {"error": "The setting could not be saved. Try again or use the setup wizard."}
+        # The save has committed: from here on, the reply must not say otherwise.
+        try:
+            page = settings.view(state)
+        except Exception:
+            view = session.unread(SAVED, UNREADABLE)
+        else:
+            view = session.show(page, SAVED)
+    if view is None:
+        return 409, None
+    return 200, view
 
 
 def serve(state, *, force_login=False):
@@ -184,6 +275,7 @@ def serve(state, *, force_login=False):
                 return self.reply(403)
             if not self.unlocked():
                 return self.reply(401)
+            session.reread(state)
             with session.cv:
                 view = session.view.copy()
             self.reply(200, json.dumps(view).encode())
@@ -211,32 +303,52 @@ def serve(state, *, force_login=False):
                 if not isinstance(candidate, str) or not secrets.compare_digest(candidate.encode(), key.encode()):
                     return self.reply(401)
                 return self.reply(200, headers=[("Set-Cookie", f"{cookie}={key}; Path=/; HttpOnly; SameSite=Strict")])
-            if url.path != "/step":
+            if url.path not in ("/step", "/setting"):
                 return self.reply(403)
             if not self.unlocked():
                 return self.reply(401)
-            accepted = session.quit(data.get("id")) if data.get("action") == "quit" else session.submit(data)
+            if url.path == "/setting":
+                return self.change(data)
+            with session.editing:
+                if data.get("action") == "wizard":
+                    with session.cv:
+                        accepted = session.view["status"] == "settings" and session.view["id"] == data.get("id")
+                    if accepted:
+                        session.launch(state, resume=True)
+                else:
+                    accepted = session.quit(data.get("id")) if data.get("action") == "quit" else session.submit(data)
             self.reply(200 if accepted else 409)
+
+        def change(self, data):
+            code, reply = change_setting(session, state, data)
+            self.reply(code, b"" if reply is None else json.dumps(reply).encode())
 
     class Server(ThreadingHTTPServer):
         def service_actions(self):
             with session.cv:
                 status = session.view["status"]
-                if status == "quit":
-                    threading.Thread(target=self.shutdown, daemon=True).start()
-                elif status in ("register", "question") and sys.stdin.isatty():
-                    # Provider login owns the terminal during a working step.
-                    if select.select([sys.stdin], [], [], 0)[0]:
-                        if sys.stdin.readline().strip().lower() in ("q", "quit", "/quit"):
-                            session.quit(session.view["id"])
+            if status == "quit":
+                threading.Thread(target=self.shutdown, daemon=True).start()
+            elif status in ("register", "question", "settings") and sys.stdin.isatty():
+                # Provider login owns the terminal during a working step.
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    if sys.stdin.readline().strip().lower() in ("q", "quit", "/quit"):
+                        threading.Thread(target=session.terminal_quit, daemon=True).start()
 
     bind = os.getenv("REVIEW_SETUP_BIND", "127.0.0.1")
     with Server((bind, port), Handler) as server:
-        worker = threading.Thread(target=session.run, args=(state, force_login), daemon=True)
-        worker.start()
+        try:
+            # A saved setup opens on its settings; the wizard stays one click away.
+            page = None if force_login or not (state / "setup").is_symlink() else settings.view(state)
+        except (ValueError, OSError, KeyError, TypeError):
+            page = None  # An unreadable setup gets the wizard that can replace it.
+        if page is None:
+            session.launch(state, force_login=force_login)
+        else:
+            session.show(page)
         print_key()
         if sys.stdin.isatty():
-            print("At a browser question, type q here or click Quit setup to return to your shell.", flush=True)
+            print("At a browser question or on the settings page, type q here to return to your shell.", flush=True)
         server.serve_forever()
     if session.view["status"] == "quit":
         raise dialog.QuitSetup
