@@ -16,7 +16,7 @@ from cursor_pr.config import DEFAULT_VISUAL_MAX_INPUT_TOKENS, project_from
 from cursor_pr.poll import Jobs, cycle, run_review
 from test_hardening import outside_code_spans
 
-CREDIT = "[visual-review](https://gitlab.com/thorchain/misc/visual-review)"
+ATTRIBUTION = "Review by [Assay PR Agent](https://pr-agent.assay.guide/)."
 HOSTILE = "@all [click](https://evil.example) `x`"
 ANSWER = {"visual": {
     "summary": "Gives the fee a floor of one.",
@@ -582,9 +582,11 @@ class VisualCommentTests(unittest.TestCase):
         self.assertIn("<details><summary>Static checks and history</summary>\n\n"
                       "- shellcheck: 0 CI, 1 local, 1 findings, 0 incomplete.\n</details>\n\n"
                       "- Outside review coverage: ` legacy.py `\n- Outside review coverage: ` logo.png `\n\n"
-                      "Visual review after THORChain's " + CREDIT + ". "
-                      "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent).", text)
-        self.assertEqual(text.count(CREDIT), 1)
+                      + ATTRIBUTION, text)
+        # One line of attribution, and it names this reviewer and nothing else.
+        self.assertEqual(text.count("pr-agent.assay.guide"), 1)
+        for other in ("the-pr-agent", "PR-Agent]", "THORChain", "thorchain"):
+            self.assertNotIn(other, text)
         self.assertNotIn("<details>", self.text())
 
     def test_a_small_share_stays_visible_and_an_empty_change_says_so(self):
@@ -681,7 +683,7 @@ class VisualCommentTests(unittest.TestCase):
         self.assertIn("30 findings", text)
         self.assertIn("omitted to fit the comment limit", text)
         self.assertIn("</details>", text)
-        self.assertIn(visual.CREDIT, text)
+        self.assertIn(ATTRIBUTION, text)
 
     def test_evidence_is_collapsed_and_quotes_hostile_tool_output(self):
         report = dict(self.report, checks=[
@@ -765,8 +767,7 @@ class VisualPostTests(unittest.TestCase):
         body = bodies[0][3]
         self.assertEqual(body, "\n".join(visual.comment(report)) + "\n")
         self.assertTrue(body.startswith("Cursor visual review of " + "a"*40 + "\nreviewed\n\n```\n"))
-        self.assertTrue(body.endswith("Visual review after THORChain's " + CREDIT + ". "
-                                       "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent).\n"))
+        self.assertTrue(body.endswith("\n\n" + ATTRIBUTION + "\n"))
 
 
 class VisualRequestTests(unittest.TestCase):

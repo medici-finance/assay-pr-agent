@@ -467,7 +467,7 @@ def publish(address, head, report, *, project=None, state=None):
         body.extend(["", *drift.summary(report["drift"]), ""])
     outside = [f"- Outside review coverage: {fence(path)}" for path in report["omitted"]]
     extra = [f"- Not reviewed (token limit): {extra_coverage} more files"] if extra_coverage else []
-    footer = ["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."]
+    footer = ["", providers.ATTRIBUTION]
     text = comment_text(intro + coverage + extra + header + findings + body + outside + footer)
     # The forge helper refuses a body over 16 KiB: shorten rather than lose the whole comment.
     if tier == "regular" and findings and size_of(text) > FORGE_COMMENT_BYTES:

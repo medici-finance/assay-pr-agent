@@ -9,7 +9,7 @@ import re
 import unicodedata
 
 from .engine import model_text
-from .providers import LABELS
+from .providers import ATTRIBUTION, LABELS
 from .scanners import fence
 from .source import File, ReviewError
 from .source import hunks as parsed
@@ -19,7 +19,6 @@ MAX_CHANGES = 8
 MAX_HOTSPOTS = 6
 MAX_COMMENT_BYTES = 16 * 1024  # pr-agent-forge publication limit
 SEVERITIES = ("verify", "careful", "look")
-CREDIT = "THORChain's [visual-review](https://gitlab.com/thorchain/misc/visual-review)"
 
 LOCKFILES = """go.sum go.work.sum Cargo.lock poetry.lock uv.lock Pipfile.lock Gemfile.lock gems.locked
 composer.lock Package.resolved Podfile.lock flake.lock pubspec.lock mix.lock gradle.lockfile
@@ -506,8 +505,7 @@ def comment(report, evidence=()):
         body += ["", f"{label} could not complete the review."]
     else:
         body += ["", "No changed file has text the model can read."]
-    footer = ["", f"Visual review after {CREDIT}. "
-                  "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."]
+    footer = ["", ATTRIBUTION]
     diff_map = report.get("map", {})
     # Each list names what was kept from the model or is named nowhere else: a file outside the
     # review, one its own header kept back, one sent without text and not known to be code, a
