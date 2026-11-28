@@ -15,13 +15,18 @@ import uuid
 
 from . import accounts, dialog, providers, provision, gitlab_tls
 from .login import auth_mode, ensure_session, login_directory, login_env
-from .config import DEFAULT_MAX_INPUT_TOKENS, parse_projects, project_base, prompt_config
+from .config import (DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, DEFAULT_VISUAL_MAX_INPUT_TOKENS, FINDINGS_SETTINGS,
+                     MAX_FINDINGS_LIMIT, parse_projects, project_base, prompt_config)
 from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secret, validate_pem, validate_token
 
 CURSOR = "CURSOR_API_KEY"
 SECRETS = {CURSOR: "cursor.key", "ANTHROPIC_API_KEY": "claude.key", "CODEX_API_KEY": "codex.key", KEY: "github.pem", TOKEN: "gitlab.token", **gitlab_tls.NAMES}
+# Carry saved settings that the wizard does not ask for into the next bundle.
+PRESERVED_SETTINGS = (*FINDINGS_SETTINGS.values(), "REVIEW_SYNC_SECONDS", "REVIEW_OSV_DOWNLOAD_DATABASES",
+                      "REVIEW_POLL_IDLE_MAX_SECONDS")
 SETTINGS = ("REVIEW_OPERATOR", APP_ID, INSTALL_ID, "REVIEW_MODEL", "REVIEW_MAX_INPUT_TOKENS",
-            "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER", "REVIEW_CURSOR_TEAM_ID", "REVIEW_AUTH_MODE", "REVIEW_LOGIN_PROFILE")
+            "REVIEW_VISUAL_MAX_INPUT_TOKENS", "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER",
+            "REVIEW_CURSOR_TEAM_ID", "REVIEW_AUTH_MODE", "REVIEW_LOGIN_PROFILE", *PRESERVED_SETTINGS)
 
 
 def state_dir():
@@ -83,6 +88,17 @@ def load_provider_key(selected):
         del os.environ[name + "_FILE"]
 
 
+def effective_backend(saved):
+    configured = saved.get("REVIEW_PROVIDER", "cursor")
+    selected = providers.provider(os.getenv("REVIEW_PROVIDER", configured))
+    default_mode = saved.get("REVIEW_AUTH_MODE", "api-key") if selected == configured else "api-key"
+    return selected, auth_mode(selected, os.getenv("REVIEW_AUTH_MODE", default_mode))
+
+
+def effective_projects(config):
+    return json.loads(os.environ["REVIEW_PROJECTS"]) if "REVIEW_PROJECTS" in os.environ else config["projects"]
+
+
 def apply_saved_setup(state, *, sync_only=False):
     """Snapshot one complete setup; explicitly supplied container settings win."""
     if not (state / "setup").is_symlink():
@@ -94,13 +110,12 @@ def apply_saved_setup(state, *, sync_only=False):
         config = json.loads((bundle / "settings.json").read_text())
         values = {k: config["settings"][k] for k in SETTINGS if k in config["settings"]}
         values["REVIEW_PROJECTS"] = json.dumps(config["projects"])
-        effective = json.loads(os.getenv("REVIEW_PROJECTS", values["REVIEW_PROJECTS"]))
+        effective = effective_projects(config)
         forges = {row["provider"] for row in effective}
-        selected = providers.provider(os.environ.get("REVIEW_PROVIDER", values.get("REVIEW_PROVIDER", "cursor")))
+        selected, mode = effective_backend(values)
         if selected != values.get("REVIEW_PROVIDER", "cursor"):
             values.pop("REVIEW_AUTH_MODE", None)
             values.pop("REVIEW_LOGIN_PROFILE", None)
-        mode = auth_mode(selected, os.getenv("REVIEW_AUTH_MODE", values.get("REVIEW_AUTH_MODE", "api-key")))
         if not sync_only and mode == "api-key":
             load_provider_key(selected)
         for name, location in config["secrets"].items():
@@ -123,29 +138,47 @@ def apply_saved_setup(state, *, sync_only=False):
             os.environ.setdefault(k, v)
 
 
-def max_input_tokens(state):
-    """Effective prompt budget: container environment, then saved setup, then the default.
+def saved_integer(state, name, default, upper=None):
+    """Effective integer setting: container environment, then saved setup, then the default.
 
     Environment values keep the int() syntax the CLI has always accepted, such as
     "6_000" or "+6000"; the saved setting is written by the wizard as plain digits.
     """
-    value = os.environ.get("REVIEW_MAX_INPUT_TOKENS")
+    value = os.environ.get(name)
     saved = value is None and (state / "setup").is_symlink()
     if saved:
         with locked(state, fcntl.LOCK_SH):
             settings = json.loads((active_bundle(state) / "settings.json").read_text())["settings"]
-        value = settings.get("REVIEW_MAX_INPUT_TOKENS")
+        value = settings.get(name)
     if value is None:
-        return DEFAULT_MAX_INPUT_TOKENS
+        return default
     if isinstance(value, str):
         value = value.strip()
         try:
             value = int(value) if not saved or (value.isascii() and value.isdecimal()) else None
         except ValueError:
             value = None
-    if type(value) is not int or value < 1:
-        raise ValueError("REVIEW_MAX_INPUT_TOKENS must be a positive integer")
+    if type(value) is not int or value < 1 or (upper is not None and value > upper):
+        raise ValueError(f"{name} must be " + (f"an integer from 1 to {upper}" if upper else "a positive integer"))
     return value
+
+
+def max_input_tokens(state):
+    """Effective prompt budget."""
+    return saved_integer(state, "REVIEW_MAX_INPUT_TOKENS", DEFAULT_MAX_INPUT_TOKENS)
+
+
+def visual_max_input_tokens(state):
+    """Effective prompt budget of a visual review, which is its own."""
+    return saved_integer(state, "REVIEW_VISUAL_MAX_INPUT_TOKENS", DEFAULT_VISUAL_MAX_INPUT_TOKENS)
+
+
+def max_findings(state, *, tier=None, override=None):
+    """Resolve the caps used by one request, or check every tier at poller startup."""
+    requested = FINDINGS_SETTINGS if tier is None else (("mid", "max") if tier == "max" else (tier,))
+    return {name: override if name == tier and override is not None else
+            saved_integer(state, FINDINGS_SETTINGS[name], DEFAULT_MAX_FINDINGS, MAX_FINDINGS_LIMIT)
+            for name in requested}
 
 
 def ask(label, default=""):
@@ -157,6 +190,20 @@ def number(value):
     if not value.isascii() or not value.isdecimal() or int(value) <= 0:
         raise ValueError("Enter a positive integer")
     return value
+
+
+def findings_cap(value):
+    """A findings cap as the settings page saves it: plain digits within the bound."""
+    # Leading zeros are dropped before the number is read, and what is left must be short: Python
+    # refuses to convert a very long run of digits, with a message of its own.
+    digits = value.lstrip("0") if value.isascii() and value.isdecimal() else ""
+    if not digits or len(digits) > 2 or not 1 <= int(digits) <= MAX_FINDINGS_LIMIT:
+        raise ValueError(f"Enter an integer from 1 to {MAX_FINDINGS_LIMIT}")
+    return digits
+
+
+def nonnegative(value):
+    return "0" if value == "0" else number(value)
 
 
 def retry(reader):
@@ -275,8 +322,8 @@ def pick_cursor_team(teams):
         dialog.notice("Enter one of the displayed team IDs.")
 
 
-def configure(state, *, force_login=False):
-    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+@contextmanager
+def installer_lock(state):
     # One operator can perform remote credential creation at a time. Runtime
     # readers only take the short state lock during activation.
     with (state / ".configure.lock").open("a") as writer:
@@ -284,6 +331,26 @@ def configure(state, *, force_login=False):
             fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError("Another installer is active on this volume.") from None
+        yield
+
+
+def commit(state, old, bundle):
+    """Activate a finished bundle unless another save finished first."""
+    link = state / (".setup-link-" + uuid.uuid4().hex)
+    with locked(state, fcntl.LOCK_EX):
+        if active_bundle(state) != old:
+            raise ValueError("Another setup finished first; run setup again to edit its settings")
+        link.symlink_to(bundle.name)
+        try:
+            os.replace(link, state / "setup")
+        except BaseException:
+            link.unlink(missing_ok=True)
+            raise
+
+
+def configure(state, *, force_login=False):
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with installer_lock(state):
         configure_locked(state, force_login)
 
 
@@ -307,7 +374,7 @@ def configure_locked(state, force_login):
     projects = parse_projects(accounts.shape(rows))
     forges = {p.provider for p in projects.values()}
     previous = prev.get("settings", {})
-    settings = {}
+    settings = {name: previous[name] for name in PRESERVED_SETTINGS if name in previous}
 
     def setting(name, label, validate, default=""):
         settings[name] = retry(lambda: validate(ask(label, previous.get(name, default))))
@@ -327,14 +394,19 @@ def configure_locked(state, force_login):
         setting(INSTALL_ID, "GitHub App installation ID", number)
     default_limit = str(DEFAULT_MAX_INPUT_TOKENS)
     defaults = {"REVIEW_POLL_SECONDS": "120", "REVIEW_MAX_INPUT_TOKENS": default_limit,
+                "REVIEW_VISUAL_MAX_INPUT_TOKENS": str(DEFAULT_VISUAL_MAX_INPUT_TOKENS),
                 "REVIEW_QUALGEN_INTERVAL_SECONDS": "86400"}
-    if session and not old and ask(f"Use recommended settings (2-minute polling, {DEFAULT_MAX_INPUT_TOKENS:,} input tokens, daily history refresh)? (y/n)", "y").lower() in ("y", "yes"):
+    if session and not old and ask(f"Use recommended settings (2-minute polling, {DEFAULT_MAX_INPUT_TOKENS:,} input tokens "
+                                   f"per review and {DEFAULT_VISUAL_MAX_INPUT_TOKENS:,} per visual review, daily history "
+                                   "refresh)? (y/n)", "y").lower() in ("y", "yes"):
         settings.update(defaults)
     else:
         setting("REVIEW_POLL_SECONDS", "Seconds between polls", number, "120")
         setting("REVIEW_MAX_INPUT_TOKENS", "Maximum estimated input tokens per review", number, default_limit)
+        setting("REVIEW_VISUAL_MAX_INPUT_TOKENS", "Maximum estimated input tokens per visual review", number,
+                str(DEFAULT_VISUAL_MAX_INPUT_TOKENS))
         setting("REVIEW_QUALGEN_INTERVAL_SECONDS", "Seconds between Qualgen history refreshes (0 disables)",
-                lambda value: "0" if value == "0" else number(value), "86400")
+                nonnegative, "86400")
     backend = retry(lambda: providers.provider(ask("Review provider (cursor/claude/codex)", previous.get("REVIEW_PROVIDER", "cursor"))))
     settings["REVIEW_PROVIDER"] = backend
     model = ask(providers.LABELS[backend] + " model (auto for default)",
@@ -347,7 +419,6 @@ def configure_locked(state, force_login):
     mode = retry(lambda: auth_mode(backend, ask("Authentication method (login/api-key)", default_mode)))
     settings["REVIEW_AUTH_MODE"] = mode
     bundle = Path(tempfile.mkdtemp(dir=state, prefix=".review-setup-"))
-    link = state / (".setup-link-" + uuid.uuid4().hex)
     committed = False
     pending = []
     staged_login = None
@@ -437,19 +508,17 @@ def configure_locked(state, force_login):
         projects = parse_projects(rows)
         private_file(bundle / "settings.json", json.dumps(
             {"projects": rows, "settings": settings, "secrets": secrets}, indent=2))
-        with locked(state, fcntl.LOCK_EX):
-            if active_bundle(state) != old:
-                raise ValueError("Another setup finished first; run setup again to edit its settings")
-            link.symlink_to(bundle.name)
-            os.replace(link, state / "setup")
-            committed = True
+        commit(state, old, bundle)
+        committed = True
+        try:
             for path in pending:
                 path.unlink(missing_ok=True)
             if old:
                 shutil.rmtree(old)
             retire_profiles(state, {settings.get("REVIEW_LOGIN_PROFILE"), previous.get("REVIEW_LOGIN_PROFILE")})
+        except OSError:
+            print("Settings were saved. Some previous installer files could not be removed.", file=sys.stderr)
     finally:
-        link.unlink(missing_ok=True)
         if not committed:
             shutil.rmtree(bundle)
             if staged_login:

@@ -1,8 +1,36 @@
 """The receipt at the end of every summary: what a review cost and what it covered. Numbers only."""
+from unidiff.errors import UnidiffParseError
+
+from .source import ReviewError, hunks
+
+
 USAGE_KEYS = (("input", ("input_tokens", "inputTokens")),
               ("cached", ("cache_read_input_tokens", "cached_input_tokens", "cacheReadTokens")),
               ("cache_write", ("cache_creation_input_tokens",)),
               ("output", ("output_tokens", "outputTokens")))
+
+
+def count_files(files, selected, rendered, *, visual):
+    """Count confirmed text across the change, including paths outside the selection."""
+    counts = dict(changed=len(files), text=0, reviewed=0, skipped=0, excluded=0, no_text=0, unavailable=0)
+    for file in files:
+        counts["excluded"] += file.path not in selected
+        if file.patch_unavailable:
+            counts["unavailable"] += 1
+            continue
+        if file.absent or not file.patch:
+            text = False
+        elif file.path in rendered:
+            text = bool(rendered[file.path][1])
+        else:
+            try:
+                patch = hunks(file)
+            except (ReviewError, UnidiffParseError):
+                counts["unavailable"] += 1
+                continue
+            text = visual or any(line.target_line_no is not None for hunk in patch for line in hunk)
+        counts["text" if text else "no_text"] += 1
+    return counts
 
 
 def usage_totals(usage):
@@ -17,8 +45,8 @@ def usage_totals(usage):
 
 
 def build(report):
-    coverage = report.get("coverage", {})
-    reviewed, text = coverage.get("reviewed", 0), coverage.get("text", 0)
+    coverage = report.get("coverage") or {}
+    reviewed, text = coverage.get("reviewed"), coverage.get("text")
     checks = [*report["checks"], *(report.get("static_checks") or [])]
     return {
         "state": report["state"],
@@ -29,9 +57,10 @@ def build(report):
         "max_input_tokens": report["max_input_tokens"],
         "full_input_tokens": report.get("full_input_tokens"),
         "usage": usage_totals(report.get("model_usage") or {}),
-        "coverage": {"reviewed": reviewed, "text": text, "percent": round(100 * reviewed / text) if text else None},
-        "skipped": coverage.get("skipped", 0), "no_text": coverage.get("no_text", 0), "excluded": coverage.get("excluded", 0),
-        "unavailable": coverage.get("unavailable", 0),
+        "coverage": {"reviewed": reviewed, "text": text,
+                     "percent": round(100 * reviewed / text) if reviewed is not None and text else None},
+        "skipped": coverage.get("skipped", 0), "no_text": coverage.get("no_text", 0),
+        "excluded": coverage.get("excluded", 0), "unavailable": coverage.get("unavailable", 0),
         "findings": {"model": len(report["findings"]), "static": sum(len(c["findings"]) for c in checks),
                      "dropped": len(report.get("dropped") or []),
                      "unchecked": sum(f.get("evidence") == "unverified" for f in report["findings"])},
@@ -50,22 +79,28 @@ def render(receipt):
         head = "Receipt: over budget, no model call"
     head += f". Prompt {receipt['estimated_input_tokens']:,} of {receipt['max_input_tokens']:,} estimated input tokens"
     # A budget refusal already reports the full estimate as its prompt size.
-    if receipt["state"] != "over-budget" and receipt["full_input_tokens"] > receipt["max_input_tokens"]:
-        head += f"; before budget trimming: {receipt['full_input_tokens']:,}"
+    full = receipt["full_input_tokens"]
+    if receipt["state"] != "over-budget" and full is not None and full > receipt["max_input_tokens"]:
+        head += f"; before budget trimming: {full:,}"
     input_label = "uncached input" if receipt["provider"] == "claude" and ("cached" in usage or "cache_write" in usage) else "input"
     usage_labels = (("input", input_label), ("cached", "cache read"),
                     ("cache_write", "cache write"), ("output", "output"))
     if usage:
         head += "; the CLI reported " + " and ".join(f"{usage[key]:,} {label}" for key, label in usage_labels if key in usage) + " tokens"
     coverage = receipt["coverage"]
-    if coverage["percent"] is None:
+    if coverage["reviewed"] is None:
+        foot = "Coverage: counts unavailable for this saved review."
+    elif coverage["percent"] is None and receipt["unavailable"]:
+        foot = "Coverage: no confirmed text files."
+    elif coverage["percent"] is None:
         foot = "Coverage: no text files to review."
     else:
         foot = f"Coverage: {coverage['reviewed']} of {coverage['text']} text files reviewed ({coverage['percent']}%)."
-    foot += (f" Skipped for budget: {receipt['skipped']}. Not reviewable: {receipt['no_text']}. "
-             f"Outside the selection: {receipt['excluded']}.")
-    if receipt["unavailable"]:
-        foot += f" Unavailable patches: {receipt['unavailable']}."
+    if coverage["reviewed"] is not None:
+        foot += (f" Skipped for budget: {receipt['skipped']}. Not reviewable: {receipt['no_text']}. "
+                 f"Outside the selection: {receipt['excluded']}.")
+        if receipt["unavailable"]:
+            foot += f" Unavailable patches: {receipt['unavailable']}."
     findings, checks = receipt["findings"], receipt["checks"]
     foot += (f" Findings: {findings['model']} model and {findings['static']} static; {findings['dropped']} dropped; "
              f"{findings['unchecked']} without a quote to check. Checks: {checks['complete']} of {checks['total']} complete.")

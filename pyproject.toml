@@ -9,13 +9,24 @@ description = "Single-pass Cursor reviewer for GitHub pull requests and GitLab m
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
-dependencies = ["pr-agent==0.50.0", "httpx"]
+dependencies = ["pr-agent==0.50.0", "httpx", "markdown-it-py==4.3.0"]
 
 [project.scripts]
 cursor-review-setup = "cursor_pr.setup:main"
 cursor-review-container = "cursor_pr.poll:container_main"
 cursor-review-poll = "cursor_pr.poll:main"
 cursor-review = "cursor_pr.cli:main"
+
+[tool.uv]
+# Match PR-Agent's upstream security updates until they ship in a release.
+# LiteLLM needs the newer pin to allow the patched filelock major version.
+override-dependencies = [
+    "litellm==1.110.1",
+    "opentelemetry-api==1.45.2",
+    "opentelemetry-sdk==1.45.2",
+    "opentelemetry-exporter-otlp-proto-http==1.45.2",
+]
+constraint-dependencies = ["filelock>=4.2.1,<5"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

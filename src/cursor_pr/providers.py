@@ -9,6 +9,9 @@ import tempfile
 
 KEYS = {"cursor": "CURSOR_API_KEY", "claude": "ANTHROPIC_API_KEY", "codex": "CODEX_API_KEY"}
 LABELS = {"cursor": "Cursor", "claude": "Claude", "codex": "Codex"}
+# The one line every posted review closes with, whichever kind of review it is. What this project
+# builds on and takes ideas from is credited in the README, not in each comment.
+ATTRIBUTION = "Review by [Assay PR Agent](https://pr-agent.assay.guide/)."
 
 
 def provider(value=None):
@@ -34,22 +37,35 @@ def team_command(args, key, directory):
         raise ValueError("Cursor could not verify team membership. Check the key and network access.") from None
 
 
+def memberships(key, directory):
+    data = team_command(["list"], key, directory)
+    if not isinstance(data, dict) or not isinstance(data.get("teams"), list):
+        raise ValueError("Cursor returned an unknown team list")
+    teams = {}
+    for team in data["teams"]:
+        if (not isinstance(team, dict) or type(team.get("id")) is not int
+                or not isinstance(team.get("name"), str) or type(team.get("isSelectable")) is not bool):
+            raise ValueError("Cursor returned invalid team details")
+        if team["isSelectable"]:
+            teams[str(team["id"])] = team
+    if data["teams"] and not teams:
+        raise ValueError("This Cursor account has no eligible team")
+    return teams
+
+
+def eligible_team(key, requested, directory):
+    """The team a saved setup may bill, checked without switching the active team."""
+    teams = memberships(key, directory)
+    if not requested and len(teams) > 1:
+        raise ValueError("Multiple Cursor teams. Set REVIEW_CURSOR_TEAM_ID to one of: "
+                         + ", ".join(f"{t['name']} ({i})" for i, t in teams.items()))
+    if requested and requested not in teams:
+        raise ValueError("The selected team ID is not eligible for this Cursor account")
+    return requested or next(iter(teams), "")
+
+
 def select_team(key, requested, directory, pick=None):
-    def memberships():
-        data = team_command(["list"], key, directory)
-        if not isinstance(data, dict) or not isinstance(data.get("teams"), list):
-            raise ValueError("Cursor returned an unknown team list")
-        teams = {}
-        for team in data["teams"]:
-            if (not isinstance(team, dict) or type(team.get("id")) is not int
-                    or not isinstance(team.get("name"), str) or type(team.get("isSelectable")) is not bool):
-                raise ValueError("Cursor returned invalid team details")
-            if team["isSelectable"]:
-                teams[str(team["id"])] = team
-        if data["teams"] and not teams:
-            raise ValueError("This Cursor account has no eligible team")
-        return teams
-    teams = memberships()
+    teams = memberships(key, directory)
     if not requested and len(teams) > 1:
         choices = ", ".join(f"{t['name']} ({i})" for i, t in teams.items())
         if not pick:
@@ -61,7 +77,7 @@ def select_team(key, requested, directory, pick=None):
             raise ValueError("The selected team ID is not eligible for this Cursor account")
         switched = team_command(["switch", chosen], key, directory)
         if (switched.get("status") != "switched" or str(switched.get("team", {}).get("id")) != chosen
-                or memberships().get(chosen, {}).get("isActive") is not True):
+                or memberships(key, directory).get(chosen, {}).get("isActive") is not True):
             raise ValueError("Cursor did not confirm the selected team")
     return chosen
 

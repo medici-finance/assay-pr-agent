@@ -1,18 +1,20 @@
 """Read a forge snapshot with Assay, or compare two immutable local Git revisions."""
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
 import os
-from .credentials import SECRET_INPUTS, private_file, validate_token
-from .providers import KEYS
-from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
-import select
+import selectors
 import subprocess
 import time
 
+from unidiff import PatchSet
+
+from .credentials import SECRET_INPUTS, private_file, validate_token
+from .providers import KEYS
 
 class ReviewError(Exception):
     pass
@@ -104,22 +106,31 @@ def run_forge(verb, project, *, numbers=(), publication=None, timeout=45):
     return json.loads(run(["pr-agent-forge", verb], data=json.dumps(request).encode(), env=env, timeout=timeout))
 
 
-def post_comment(project, number, head, body, state, dedupe_body=None):
+def publication(project, number, head, body, posted=False):
+    return dict(
+        Number=number, Head=head, Body=body, MaxVisibility=project.visibility, AlreadyPosted=posted,
+        HumanLogins=[os.environ["REVIEW_FORGE_OPERATOR"]] if os.getenv("REVIEW_FORGE_OPERATOR") else [],
+        PrivateRepositories=os.getenv("REVIEW_PRIVATE_REPOSITORIES", "").split(","),
+        WithheldIdentifiers=[item.strip().lower() for item in
+                             os.getenv("REVIEW_WITHHELD_IDENTIFIERS", "").split(",") if item.strip()])
+
+
+def check_publication(project, number, head, body):
+    run_forge("check-publication", project, publication=publication(project, number, head, body))
+
+
+def post_comment(project, number, head, body, state, *, dedupe_body=None):
     if project is None:
         raise ReviewError("Use a --change address from the configured review projects")
     directory = state / "publications"
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    key = hashlib.sha256(json.dumps([project.key, number, head, body if dedupe_body is None else dedupe_body]).encode()).hexdigest()
+    key_body = body if dedupe_body is None else dedupe_body
+    key = hashlib.sha256(json.dumps([project.key, number, head, key_body]).encode()).hexdigest()
     receipt = directory / (key + ".posted")
     with (directory / (key + ".lock")).open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         posted = receipt.is_file()
-        run_forge("comment", project, publication=dict(
-            Number=number, Head=head, Body=body, MaxVisibility=project.visibility, AlreadyPosted=posted,
-            HumanLogins=[os.environ["REVIEW_FORGE_OPERATOR"]] if os.getenv("REVIEW_FORGE_OPERATOR") else [],
-            PrivateRepositories=os.getenv("REVIEW_PRIVATE_REPOSITORIES", "").split(","),
-            WithheldIdentifiers=[item.strip().lower() for item in
-                                 os.getenv("REVIEW_WITHHELD_IDENTIFIERS", "").split(",") if item.strip()]))
+        run_forge("comment", project, publication=publication(project, number, head, body, posted))
         if not posted:
             private_file(receipt, "posted")
 
@@ -142,6 +153,50 @@ def bounded_text(value, limit):
     return value if len(value) <= limit else value[:limit].rstrip() + TRUNCATED
 
 
+def hunks(f):
+    """Parsed hunks of one file's patch."""
+    # Parse under a fixed synthetic name; the source envelope owns the actual filename.
+    parsed = PatchSet("--- a/file\n+++ b/file\n" + f.patch.rstrip("\n") + "\n")
+    if len(parsed) != 1 or not parsed[0]:
+        raise ReviewError("Incomplete or unrecognized patch in " + f.path)
+    return parsed[0]
+
+
+def base_line(patch, line, *, nearest=False):
+    """Find the corresponding base line, with an optional nearby anchor for insertions."""
+    offset = 0
+    for hunk in patch:
+        start = hunk.target_start + (hunk.target_length == 0)
+        end = start + hunk.target_length
+        if line < start:
+            break
+        if line < end:
+            previous = hunk.source_start
+            removed_start = None
+            inserted = 0
+            for row in hunk:
+                if row.target_line_no == line:
+                    if row.source_line_no is not None or not nearest:
+                        return row.source_line_no
+                    if removed_start is not None:
+                        # Pair a replacement line with its position in the removed block.
+                        return min(removed_start + inserted, previous)
+                    return max(1, previous)
+                if row.is_removed:
+                    previous = row.source_line_no
+                    if removed_start is None:
+                        removed_start = previous
+                elif row.is_added:
+                    inserted += 1
+                elif row.is_context:
+                    previous = row.source_line_no
+                    removed_start = None
+                    inserted = 0
+            return None
+        offset = hunk.source_start + hunk.source_length + (hunk.source_length == 0) - end
+    return line + offset
+
+
 @dataclass(frozen=True)
 class File:
     path: str
@@ -156,43 +211,6 @@ class File:
         return self.absent and not self.known_no_text and self.status not in ("removed", "deleted", "D")
 
 
-# Names that are almost always binary: the only signal left when the head blob cannot be read.
-BINARY_NAME = re.compile(r".*\.(?:png|jpe?g|gif|bmp|ico|icns|webp|tiff?|psd|pdf|zip|gz|tgz|bz2|xz|zst|7z|rar|jar|war|"
-                         r"class|so|dylib|dll|exe|o|a|lib|wasm|pyc|woff2?|ttf|otf|eot|mp[34]|m4a|mov|avi|mkv|webm|ogg|"
-                         r"wav|flac|sqlite3?|db|bin|dat|pkl|npy|parquet|keystore|p12)", re.I | re.S)
-
-
-def without_text(root, head, file):
-    """Whether a file the forge served without a patch has no text to review, so its absence loses nothing.
-
-    The forge does not say why a patch is missing, so this asks Git. A pure rename has nothing to review.
-    An empty head blob, or one with a NUL byte in its first 8000 bytes (Git's own binary test), has no
-    text. A readable text blob does, so its missing patch is lost coverage. When the head blob cannot be
-    read, only a binary file name counts as no text.
-    """
-    if file.status in ("renamed", "R"):
-        return True
-    spec = f"{head}:{file.path}"
-    try:
-        git(root, "cat-file", "-e", spec)
-    except (ReviewError, OSError, subprocess.SubprocessError):
-        return bool(BINARY_NAME.fullmatch(file.path))
-    try:
-        with subprocess.Popen(["git", "--literal-pathspecs", "-C", str(root), "cat-file", "blob", spec],
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=child_env()) as proc:
-            start = proc.stdout.read(8000)
-            proc.kill()
-    except OSError:
-        return bool(BINARY_NAME.fullmatch(file.path))
-    return not start or b"\0" in start
-
-
-def classify_absent(root, head, files):
-    """Mark each file whose missing forge patch hides no text, so that only lost text counts as unavailable."""
-    return [replace(f, known_no_text=True) if f.patch_unavailable and without_text(root, head, f) else f
-            for f in files]
-
-
 @dataclass(frozen=True)
 class Change:
     head: str
@@ -202,9 +220,11 @@ class Change:
     base_ref: str = ""  # base branch name reported by the forge
     title: str = ""
     description: str = ""
+    description_truncated: bool = False
+    patch_base: str = ""  # immutable preimage commit when the comparison supplies it
 
 
-def forge_change(address, expected_url=None, *, project=None):
+def forge_change(address, expected_url=None, *, project=None, with_description=False):
     if not re.fullmatch(r"[\w.\-]+/[\w.\-]+#[1-9][0-9]*", address):
         raise ReviewError("Use an owner/repo#number address from the configured projects")
     repo, number = address.rsplit("#", 1)
@@ -220,7 +240,15 @@ def forge_change(address, expected_url=None, *, project=None):
     result = run_forge("change-files", project, numbers=numbers)
     if result.get("headSha") != head:
         raise ReviewError("Forge files do not match the reviewed head")
-    last = run_forge("change", project, numbers=numbers)
+    last = None
+    if with_description:
+        try:
+            last = run_forge("change-with-description", project, numbers=numbers)
+        except (OSError, ReviewError, ValueError, subprocess.TimeoutExpired):
+            # A helper without optional metadata support can still confirm the change.
+            pass
+    if last is None:
+        last = run_forge("change", project, numbers=numbers)
     if any(first.get(k) != last.get(k) for k in ("headSha", "baseRef", "changedFiles", "url", "state")):
         raise ReviewError("Change moved during the forge read")
     rows = result.get("files")
@@ -238,17 +266,106 @@ def forge_change(address, expected_url=None, *, project=None):
                           row["patchAbsent"], row.get("previousFilename", "")))
     base_ref = first.get("baseRef")
     # The description is context, not evidence, so it is read once and never bracketed like the head.
-    return Change(head, files, first.get("url") or address, base_ref=base_ref if isinstance(base_ref, str) else "",
-                  title=bounded_text(last.get("title"), TITLE_LIMIT),
-                  description=bounded_text(last.get("body"), DESCRIPTION_LIMIT))
+    title = bounded_text(last.get("title"), TITLE_LIMIT)
+    description = bounded_text(last.get("body"), DESCRIPTION_LIMIT)
+    truncated = last.get("descriptionTruncated") is True or any(text.endswith(TRUNCATED) for text in (title, description))
+    # Evidence from the old side is usable only when both reads agree around the patch fetch.
+    base = first.get("baseSha") if first.get("baseSha") == last.get("baseSha") else None
+    patch_base = first.get("diffBaseSha") if first.get("diffBaseSha") == last.get("diffBaseSha") else None
+    return Change(head, files, first.get("url") or address, base=base if valid_sha(base) else "",
+                  base_ref=base_ref if isinstance(base_ref, str) else "", title=title, description=description,
+                  description_truncated=truncated, patch_base=patch_base if valid_sha(patch_base) else "")
 
 
-def git(root, *args):
-    return run(["git", "--literal-pathspecs", "-C", str(root), *args])
+def git(root, *args, timeout=45):
+    return run(["git", "--literal-pathspecs", "-C", str(root), *args], timeout=timeout)
 
 
 def commit(root, ref):
     return git(root, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}").decode().strip()
+
+
+def coverage_git(root, *args, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ReviewError("patch coverage time budget exhausted")
+    return git(root, "--no-replace-objects", *args, timeout=remaining)
+
+
+def git_metadata_path(root, path, deadline):
+    value = coverage_git(root, "rev-parse", "--path-format=absolute", "--git-path", path, deadline=deadline)
+    return Path(os.fsdecode(value.removesuffix(b"\n")))
+
+
+def blob_entry(root, revision, path, deadline):
+    """Read a blob's mode and object ID from an immutable tree."""
+    try:
+        entry = coverage_git(root, "ls-tree", "-z", "--full-tree", revision, "--", path,
+                             deadline=deadline).partition(b"\t")[0]
+    except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
+        return b""
+    return entry if b" blob " in entry else b""
+
+
+def blob_prefix(root, spec, limit, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    command = ["git", "--no-replace-objects", "--literal-pathspecs", "-C", str(root), "cat-file", "blob", spec]
+    return command_prefix(command, limit, timeout=remaining)
+
+
+def default_diff_applies(root, head, path, deadline):
+    """A NUL prefix proves binary only when Git can confirm the default diff rule."""
+    try:
+        # Git loads local overrides even with --source.
+        if git_metadata_path(root, "info/attributes", deadline).exists():
+            return False
+        attrs = [str(parent / ".gitattributes") for parent in PurePosixPath(path).parents]
+        entries = coverage_git(root, "ls-tree", "-z", "--full-tree", head, "--", *attrs, deadline=deadline)
+        for record in entries.split(b"\0")[:-1]:
+            mode, kind, oid = record.partition(b"\t")[0].split()
+            if kind == b"blob" and mode != b"120000":
+                # check-attr can silently ignore an attribute blob it cannot read.
+                content = blob_prefix(root, oid.decode(), 1_000_001, deadline)
+                if content is None or len(content) > 1_000_000:
+                    return False
+        attributes = coverage_git(root, "check-attr", f"--source={head}", "-z", "--all", "--", path,
+                                  deadline=deadline).split(b"\0")
+    except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return b"diff" not in attributes[1::3]
+
+
+def without_text(root, head, file, *, base_root, base, deadline):
+    """Prove that an absent forge patch has no changed head-side text."""
+    if base and file.previous and file.status in ("renamed", "R"):
+        old = blob_entry(base_root, base, file.previous, deadline)
+        if not old and base_root != root:
+            old = blob_entry(root, base, file.previous, deadline)
+        if old and old == blob_entry(root, head, file.path, deadline):
+            return True
+    prefix = blob_prefix(root, f"{head}:{file.path}", 8000, deadline)
+    return prefix is not None and (not prefix or b"\0" in prefix and default_diff_applies(root, head, file.path, deadline))
+
+
+def complete_history(root, deadline):
+    try:
+        shallow = coverage_git(root, "rev-parse", "--is-shallow-repository", deadline=deadline)
+        return shallow.strip() == b"false" and not git_metadata_path(root, "info/grafts", deadline).exists()
+    except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def classify_absent(root, head, files, *, base_root, base, supplied_base=False):
+    """Mark proven no-text files while keeping unverified patches unavailable."""
+    deadline = time.monotonic() + 45
+    if base and not supplied_base and any(f.patch_unavailable and f.previous for f in files):
+        if not all(complete_history(repo, deadline) for repo in {root, base_root}):
+            base = ""
+    return [replace(f, known_no_text=True)
+            if f.patch_unavailable and without_text(root, head, f, base_root=base_root, base=base, deadline=deadline)
+            else f for f in files]
 
 
 def local_change(root, base, head):
@@ -266,48 +383,70 @@ def local_change(root, base, head):
             patch = to_hunk_only_patch(raw.decode("utf8"))
             known_no_text = not patch
         except UnicodeDecodeError:
-            # Git can emit a textual hunk in another encoding. Count it as unavailable.
+            # A textual diff in another encoding is incomplete coverage.
             patch = ""
         files.append(File(path, patch, status, not bool(patch), known_no_text=known_no_text))
-    return Change(head, files, str(root.resolve()), base=tip, description=local_description(root, base, head))
+    return Change(head, files, str(root.resolve()), base=tip, description=local_description(root, base, head),
+                  patch_base=base)
+
+
+def command_prefix(args, limit, *, timeout=45):
+    """Read a bounded prefix, requiring success if the command emits fewer bytes."""
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        with selectors.DefaultSelector() as ready, \
+             subprocess.Popen(args, env=child_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+            try:
+                ready.register(process.stdout, selectors.EVENT_READ)
+                while len(output) < limit:
+                    remaining = max(0, deadline - time.monotonic())
+                    if not ready.select(remaining):
+                        return None
+                    chunk = os.read(process.stdout.fileno(), limit - len(output))
+                    if not chunk:
+                        if process.wait(timeout=max(0, deadline - time.monotonic())):
+                            return None
+                        break
+                    output.extend(chunk)
+            finally:
+                status = process.poll()
+                if status is None:
+                    process.kill()
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    return bytes(output) if status in (None, 0) else None
 
 
 def local_description(root, base, head):
     """Collect bounded optional context from the most recent commits in chronological order."""
     byte_limit = 4 * DESCRIPTION_LIMIT
-    output = bytearray()
-    deadline = time.monotonic() + 45
-    args = ["git", "--literal-pathspecs", "-C", str(root), "log", "--no-show-signature", "--reverse", f"-{DESCRIPTION_COMMITS + 1}",
-            "--format=%s%n%n%b%x00", base + ".." + head, "--"]
-    try:
-        with subprocess.Popen(args, env=child_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
-            try:
-                while len(output) <= byte_limit:
-                    remaining = max(0, deadline - time.monotonic())
-                    if not select.select([process.stdout], [], [], remaining)[0]:
-                        return ""
-                    chunk = os.read(process.stdout.fileno(), byte_limit + 1 - len(output))
-                    if not chunk:
-                        if process.wait(timeout=max(0, deadline - time.monotonic())):
-                            return ""
-                        break
-                    output.extend(chunk)
-            finally:
-                if process.poll() is None:
-                    process.kill()
-    except (OSError, subprocess.TimeoutExpired):
+    args = ["git", "--literal-pathspecs", "-C", str(root), "log", "--no-show-signature", "--encoding=UTF-8",
+            f"-{DESCRIPTION_COMMITS + 1}", "--format=%s%n%n%b%x00", base + ".." + head, "--"]
+    output = command_prefix(args, byte_limit + 1)
+    if output is None:
         return ""
-    # Preserve the newest commits when the count is capped. A final incomplete message
-    # from reaching the byte limit is useful as a prefix, with the truncation signalled.
+    # Spend the budget newest-first, then display the retained messages in chronological order.
     clipped = len(output) > byte_limit
     messages = output[:byte_limit].decode("utf8", "replace").split("\0")
-    if clipped:
-        chosen = messages[:DESCRIPTION_COMMITS]
-    else:
-        chosen = messages[:-1][-DESCRIPTION_COMMITS:]
-        clipped = len(messages) - 1 > DESCRIPTION_COMMITS
-    description = bounded_text("\n\n".join(m.strip() for m in chosen if m.strip()), DESCRIPTION_LIMIT)
-    return description + TRUNCATED if clipped and not description.endswith(TRUNCATED) else description
+    if not clipped:
+        messages.pop()  # Trailing separator after the last complete message.
+    clipped = clipped or len(messages) > DESCRIPTION_COMMITS
+    chosen, remaining = [], DESCRIPTION_LIMIT
+    for message in messages[:DESCRIPTION_COMMITS]:
+        if remaining <= 0:
+            clipped = True
+            break
+        text = bounded_text(message, len(message))
+        if not text:
+            continue
+        if len(text) > remaining:
+            clipped = True
+            text = text[:remaining].rstrip()
+        chosen.append(text)
+        remaining -= len(text) + 2
+    description = "\n\n".join(reversed(chosen))
+    return description + TRUNCATED if clipped else description
 
 
 def ci_refs():

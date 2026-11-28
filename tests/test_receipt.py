@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from cursor_pr import cli, engine, receipt, source
+from cursor_pr import cli, engine, providers, receipt, source
 
 
 APP = source.File("app.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")
@@ -108,9 +108,12 @@ class ReceiptTests(unittest.TestCase):
         args = cli.parser().parse_args(["--change", "org/repo#1", "--repo", tmp.name, "--cache-dir", str(Path(tmp.name) / "cache"),
                                         "--max-input-tokens", "6000", "--path", "app.py"])
 
-        def invoke(prompt, model, anchors):
+        def invoke(prompt, model, anchors, **kwargs):
             return {"findings": [], "dropped": [], "cursor_usage": {"input_tokens": 2900, "output_tokens": 120}}
-        with patch.object(cli, "forge_change", return_value=source.Change("a" * 40, [APP, LOGO, OTHER], "org/repo#1")), \
+        missing = source.File("big.py", "", "modified", absent=True)
+        malformed = source.File("truncated.py", "@@ -1,2 +1,2 @@\n+x\n", "modified")
+        change = source.Change("a" * 40, [APP, LOGO, OTHER, missing, malformed], "org/repo#1")
+        with patch.object(cli, "forge_change", return_value=change), \
              patch.object(cli, "scan_files", return_value=[]), patch.object(engine, "invoke", side_effect=invoke), \
              patch.object(cli.drift, "forge", return_value={"state": "could-not-check", "behind": None, "both": [], "references": []}), \
              patch.object(cli, "post_comment", side_effect=lambda *args, **kwargs: posts.append(args[3])):
@@ -119,9 +122,28 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual((code, report["state"]), (2, "partial"))
         self.assertEqual(report["receipt"]["coverage"], {"reviewed": 1, "text": 2, "percent": 50})
         self.assertEqual(report["receipt"]["usage"], {"input": 2900, "output": 120})
-        self.assertIn("Coverage: 1 of 2 text files reviewed (50%). Skipped for budget: 0. Not reviewable: 1. Outside the selection: 2.", posts[0])
+        self.assertIn("Coverage: 1 of 2 text files reviewed (50%). Skipped for budget: 0. Not reviewable: 1. Outside the selection: 4. "
+                      "Unavailable patches: 2.", posts[0])
         self.assertIn("; the CLI reported 2,900 input and 120 output tokens.", posts[0])
-        self.assertTrue(posts[0].endswith("Checks: 0 of 0 complete.\n\nReview tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent).\n"))
+        self.assertTrue(posts[0].endswith(f"Checks: 0 of 0 complete.\n\n{providers.ATTRIBUTION}\n"))
+
+    def test_visual_receipt_counts_hunks_shown_and_fits_in_the_comment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = cli.parser().parse_args(["--change", "org/repo#1", "--repo", tmp, "--cache-dir", tmp,
+                                            "--max-input-tokens", "6000", "--visual", "--post"])
+            license = source.File("LICENSE", "@@ -0,0 +1 @@\n+License text\n", "added")
+            change = source.Change("a" * 40, [APP, license], "org/repo#1")
+            result = {"visual": {"summary": "Adds configuration.", "changes": [], "hotspots": []}, "cursor_usage": None}
+            with patch.object(cli, "forge_change", return_value=change), \
+                 patch.object(cli, "scan_files", return_value=[]), patch.object(engine, "invoke", return_value=result), \
+                 patch.object(cli, "evidence", return_value=["line " + "x" * 300] * 100), \
+                 patch.object(cli, "post_comment") as post:
+                value, _ = cli.run_request(args)
+        self.assertEqual(value["receipt"]["coverage"], {"reviewed": 1, "text": 2, "percent": 50})
+        body = post.call_args.args[3]
+        self.assertLessEqual(len(body.encode()), cli.visual.MAX_COMMENT_BYTES)
+        self.assertIn("Coverage: 1 of 2 text files reviewed (50%).", body)
+        self.assertTrue(body.endswith(providers.ATTRIBUTION + "\n"))
 
     def test_cache_hit_does_not_republish_the_same_review(self):
         project = SimpleNamespace(key="github/org/repo", visibility="private")

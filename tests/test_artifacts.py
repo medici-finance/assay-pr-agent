@@ -106,8 +106,12 @@ class ArtifactTests(unittest.TestCase):
 
     def test_both_forges_import_and_publish_with_one_model_call(self):
         answer = {"findings": [], "cursor_usage": None}
+
+        def call(*args, **kwargs):  # Stands in for one started provider CLI.
+            engine.started += 1
+            return answer
         for forge in ("github", "gitlab"):
-            with self.subTest(forge=forge), patch.object(engine, "invoke", return_value=answer) as model:
+            with self.subTest(forge=forge), patch.object(engine, "invoke", side_effect=call) as model:
                 report, status, post = self.exercise(forge)
                 self.assertEqual((status, report["cursor_invocations"]), (0, 1))
                 self.assertIn("` logic.go `:1 — ` SA4006 `", post)

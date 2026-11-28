@@ -14,5 +14,22 @@
 <select id="choices" aria-labelledby="question" hidden></select>
 <label id="upload" hidden>Choose a local file<input id="file" type="file"></label>
 <div class="actions"><button type="submit">Continue <span aria-hidden="true">→</span></button></div></form>
+<section id="settings" hidden>
+<p>Change one setting at a time. Each save reloads the sync and reviewer services between cycles.
+To add or remove a repository, or to switch provider, run the setup wizard.</p>
+<div id="groups"></div>
+<div class="actions"><button type="button" id="wizard">Run the setup wizard</button></div>
+</section>
+<template id="setting"><div class="setting">
+<div class="line"><span class="label"></span><span class="value"></span><button type="button" class="change secondary">Change</button></div>
+<p class="help"></p>
+<div class="editor" hidden>
+<input class="input" autocomplete="off" spellcheck="false" hidden><textarea class="multi" rows="6" hidden></textarea>
+<select class="choice" hidden></select>
+<label class="import" hidden>Choose a local file<input class="file" type="file"></label>
+<p class="error" role="alert"></p>
+<div class="actions"><button type="button" class="save">Save</button><button type="button" class="remove secondary" hidden>Remove</button>
+<button type="button" class="cancel secondary">Cancel</button></div>
+</div></div></template>
 <button type="button" id="quit" hidden>Quit setup</button>
 </main></body></html>
