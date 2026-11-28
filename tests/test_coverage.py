@@ -125,6 +125,26 @@ class CoverageStateTests(unittest.TestCase):
         self.assertEqual((code, report["state"]), (2, "partial"))
         self.assertEqual((report["omitted"], report["not_reviewable"]), (["forced.dat"], ["ordinary.dat"]))
 
+    def test_checkout_local_diff_override_cannot_prove_a_binary_patch(self):
+        repo, head = self.head_repo({".gitattributes": b"forced.dat diff\n", "forced.dat": b"x\0y\n"})
+        (Path(repo) / ".git" / "info" / "attributes").write_text("forced.dat -diff\n")
+        files = [source.File("forced.dat", "", "modified", True)]
+        report, code, _, _ = self.run_review(files, repo=repo, head=head)
+        self.assertEqual((code, report["state"], report["omitted"]), (2, "partial", ["forced.dat"]))
+        self.assertEqual(report["not_reviewable"], [])
+
+    def test_local_replacement_commit_cannot_supply_head_blob_evidence(self):
+        repo, head = self.head_repo({"large.py": b"x = 1\n"})
+        root = Path(repo)
+        (root / "large.py").write_bytes(b"")
+        source.git(root, "add", ".")
+        source.git(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "replacement")
+        source.git(root, "replace", head, source.commit(root, "HEAD"))
+        files = [source.File("large.py", "", "modified", True)]
+        report, code, _, _ = self.run_review(files, repo=repo, head=head)
+        self.assertEqual((code, report["state"], report["omitted"]), (2, "partial", ["large.py"]))
+        self.assertEqual(report["not_reviewable"], [])
+
     def test_full_prefix_is_discarded_when_the_command_already_failed(self):
         command = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'a\\x00'); sys.exit(9)"]
         process = subprocess.Popen(command, stdout=subprocess.PIPE)

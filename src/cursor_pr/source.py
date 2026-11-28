@@ -290,7 +290,8 @@ def blob_entry(root, revision, path, deadline):
     if remaining <= 0:
         return b""
     try:
-        entry = git(root, "ls-tree", "-z", "--full-tree", revision, "--", path, timeout=remaining).partition(b"\t")[0]
+        entry = git(root, "--no-replace-objects", "ls-tree", "-z", "--full-tree", revision, "--", path,
+                    timeout=remaining).partition(b"\t")[0]
     except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
         return b""
     return entry if b" blob " in entry else b""
@@ -308,7 +309,8 @@ def without_text(root, head, file, *, base_root, base, deadline):
     if remaining <= 0:
         return False
     # Git treats a NUL in the first 8000 bytes as binary. An unreadable prefix is unknown.
-    command = ["git", "--literal-pathspecs", "-C", str(root), "cat-file", "blob", f"{head}:{file.path}"]
+    command = ["git", "--no-replace-objects", "--literal-pathspecs", "-C", str(root),
+               "cat-file", "blob", f"{head}:{file.path}"]
     start = command_prefix(command, 8000, timeout=remaining)
     if start is None:
         return False
@@ -317,10 +319,17 @@ def without_text(root, head, file, *, base_root, base, deadline):
     remaining = deadline - time.monotonic()
     if b"\0" not in start or remaining <= 0:
         return False
-    # A committed diff attribute can make a NUL-containing blob reviewable as text.
     try:
-        attribute = git(root, "check-attr", f"--source={head}", "-z", "diff", "--", file.path,
-                        timeout=remaining).split(b"\0")
+        # Git loads the local override even with --source, so it cannot prove forge coverage here.
+        info = git(root, "rev-parse", "--path-format=absolute", "--git-path", "info/attributes", timeout=remaining)
+        if Path(os.fsdecode(info.removesuffix(b"\n"))).exists():
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        # A committed diff attribute can make a NUL-containing blob reviewable as text.
+        attribute = git(root, "--no-replace-objects", "check-attr", f"--source={head}", "-z", "diff", "--",
+                        file.path, timeout=remaining).split(b"\0")
     except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
         return False
     return len(attribute) == 4 and attribute[1] == b"diff" and attribute[2] in (b"unspecified", b"unset")
