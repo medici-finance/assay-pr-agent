@@ -501,8 +501,9 @@ class VisualTests(unittest.TestCase):
     def test_each_command_has_its_own_prompt_and_cache_entry(self):
         self.answer.write_text(json.dumps({"review": {"key_issues_to_review": []}}))
         code, report = self.check(visual_mode=False)
-        # /review cannot cover a deleted file or a binary, so it reports partial coverage.
-        self.assertEqual((code, report["state"]), (2, "partial"))
+        # Defect reviews can finish with a binary and deletion in the no-text inventory.
+        self.assertEqual((code, report["state"], report["omitted"]), (0, "reviewed", []))
+        self.assertEqual(report["not_reviewable"], ["legacy.py", "logo.png"])
         self.assertNotIn("map", report)
         self.answer.write_text(json.dumps(ANSWER))
         code, report = self.check()
