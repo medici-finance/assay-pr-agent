@@ -628,9 +628,11 @@ def execute(args):
 def help_answer(args):
     """The report of a /help request. Only the head is read from the forge, to bind the comment to it:
     no file, scanner, history, budget or provider takes part, and nothing of the change is reported."""
-    if (not args.change or args.visual or args.tier != "regular" or args.max_findings is not None or args.sarif
-            or args.estimate or args.path or args.head):
-        raise ReviewError("--help-comment answers a forge change with fixed text: it takes --change and no review option")
+    if (not args.change or not args.post or args.visual or args.tier != "regular" or args.max_findings is not None
+            or args.sarif or args.estimate or args.path or args.head or args.go_report or args.go_analysis_producer
+            or args.qualgen_store or args.max_input_tokens is not None or getattr(args, "forge_status", False)):
+        raise ReviewError("--help-comment answers a forge change with fixed text: it takes --change with --post "
+                          "and no review option")
     if bool(args.queue) != bool(args.request):
         raise ReviewError("--queue and --request go together and require --change")
     _, change = open_change(args.change, args.expected_change_url, getattr(args, "forge_project", None))

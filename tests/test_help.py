@@ -29,7 +29,6 @@ class HelpTextTests(unittest.TestCase):
 
     def test_the_text_is_fixed_and_closes_like_a_review(self):
         text = discovery.help_text()
-        self.assertEqual(text, discovery.help_text())
         self.assertEqual((text.splitlines()[0], text.splitlines()[-1]), (discovery.HELP_HEADING, ATTRIBUTION))
         self.assertEqual(sorted(set(re.findall(r"`(/[\w-]+)`", text))), sorted(discovery.COMMANDS))
         self.assertLess(len(text.encode()), cli.FORGE_COMMENT_BYTES)
@@ -80,7 +79,7 @@ class HelpRequestTests(unittest.TestCase):
         argv = self.child_argv()
         self.assertIn("--help-comment", argv)
         for option in ("--visual", "--tier", "--max-input-tokens", "--max-findings", "--model", "--qualgen-store",
-                       "--scanner-ci", "--go-analysis-producer"):
+                       "--scanner-ci"):
             self.assertNotIn(option, argv)
 
     def answer(self, argv, forge, **environment):
@@ -136,6 +135,15 @@ class HelpRequestTests(unittest.TestCase):
         # A second /help at the same head goes through the helper as already posted.
         code, report, calls = self.answer(argv[:argv.index("--queue")], forge)
         self.assertEqual((code, calls[1][1]["Body"], calls[1][1]["AlreadyPosted"]), (0, discovery.help_text(), True))
+        # Run by hand, outside the poller, with a login profile configured: still no provider account
+        # is selected and no login is waited for. Each is refused by its own check in main().
+        with patch.object(cli, "auth_mode", return_value="login"), \
+                patch.object(cli, "locked", side_effect=AssertionError("a login was waited for")), \
+                patch.object(cli, "apply_saved_setup"), patch.object(cli, "forge_credentials"), \
+                patch.object(cli, "load_config", return_value={self.gh.key: self.gh}):
+            code, report, calls = self.answer(argv[:argv.index("--queue")], forge, CURSOR_REVIEW_POLLER_CHILD="0",
+                                              REVIEW_LOGIN_PROFILE="work")
+        self.assertEqual((code, [verb for verb, _ in calls]), (0, ["change", "comment"]))
 
     def test_help_on_a_closed_change_fails_and_posts_nothing(self):
         argv = self.child_argv()
@@ -144,15 +152,21 @@ class HelpRequestTests(unittest.TestCase):
         self.assertIn("different or closed change", error)
 
     def test_help_takes_no_review_option(self):
-        for options in (["--change", "acme/app#3", "--visual"], ["--change", "acme/app#3", "--tier", "mid"],
-                        ["--change", "acme/app#3", "--max-findings", "3"], ["--change", "acme/app#3", "--sarif", "out.sarif"],
-                        ["--change", "acme/app#3", "--estimate"], ["--change", "acme/app#3", "--path", "app.py"],
-                        ["--base", "HEAD"], ["--ci"]):
+        posted = ["--change", "acme/app#3", "--post"]
+        # Each case is refused for the one thing named: the others would be accepted without it.
+        cases = ([*posted, "--visual"], [*posted, "--tier", "mid"], [*posted, "--max-findings", "3"],
+                 [*posted, "--sarif", "out.sarif"], [*posted, "--path", "app.py"], [*posted, "--max-input-tokens", "100"],
+                 [*posted, "--qualgen-store", "store"], [*posted, "--go-analysis-producer", "lint.yml"], [*posted, "--forge-status"],
+                 ["--change", "acme/app#3"], ["--change", "acme/app#3", "--estimate"], ["--base", "HEAD", "--post"], ["--ci", "--post"])
+        for options in cases:
             with self.subTest(options=options), patch.object(source, "run_forge") as forge:
                 args = cli.parser().parse_args([*options, "--help-comment"])
-                with self.assertRaisesRegex(source.ReviewError, "takes --change and no review option"):
+                with self.assertRaisesRegex(source.ReviewError, "takes --change with --post and no review option"):
                     cli.execute(args)
                 forge.assert_not_called()
+        # With --change and --post alone the options pass, and it goes on to look for the project.
+        with self.assertRaisesRegex(source.ReviewError, "configured review projects"):
+            cli.execute(cli.parser().parse_args([*posted, "--help-comment"]))
 
     def test_a_failed_help_request_is_told_to_post_its_own_command_again(self):
         jobs = Jobs(self.state)

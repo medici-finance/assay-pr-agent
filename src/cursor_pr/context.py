@@ -13,7 +13,7 @@ import threading
 from .discovery import COMMANDS, HELP_HEADING
 from .drift import git
 from .engine import rank, tokens
-from .providers import LABELS
+from .providers import ATTRIBUTION, LABELS
 from .source import ReviewError, base_line, hunks, child_env, git as git_bytes, valid_sha
 
 MID = ("change description", "overlap with the base", "surrounding code", "call sites")
@@ -302,8 +302,10 @@ def existing_tests(repo, head, files):
 
 def is_review_summary(body):
     first, _, remainder = body.partition("\n")
-    if first == HELP_HEADING:
-        return True  # The answer to /help is the reviewer's own comment as well.
+    if first == HELP_HEADING and body.rstrip().endswith("\n" + ATTRIBUTION):
+        # The answer to /help is the reviewer's own comment as well: its heading and its closing
+        # line, in any version of the text. A comment that only quotes the heading is discussion.
+        return True
     label, _, head = first.partition(" review of ")
     label = label.removesuffix(" visual")  # A visual review opens "<provider> visual review of <head>".
     state = remainder.partition("\n")[0].strip()
