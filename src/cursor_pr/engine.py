@@ -814,8 +814,13 @@ def explain_rejection(issue, anchors, dropped):
         # keeps it after the first-column space is removed.
         first_column = re.sub(line_start + r"[+ ]", "", quote, flags=re.M)
         with_context_stripped = re.sub(line_start + r"(?:[ \t]*\+| )", "", quote, flags=re.M)
+        # The model can mix raw source rows with rows copied from the diff.
+        source_rows = {line.lstrip(" \t") for _, line in cited}
+        mixed = re.sub(line_start + r"[ \t]*\+([^\r\n]*)",
+                       lambda row: row[0] if row[0].lstrip(" \t") in source_rows else row[1],
+                       quote, flags=re.M)
         diff_markers = any(quoted_evidence(candidate, "", lines, start, end, EvidenceBudget()) == "verified"
-                           for candidate in (first_column, stripped, with_context_stripped))
+                           for candidate in dict.fromkeys((first_column, stripped, with_context_stripped, mixed)))
     return dict(dropped, unmatched_quote_row=numbered[kept][0], diff_markers=diff_markers)
 
 

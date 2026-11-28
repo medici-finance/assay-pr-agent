@@ -180,7 +180,7 @@ class UpperBoundCommentTests(unittest.TestCase):
                     cli.publish("org/repo#1", "a" * 40, report)
                 comment = post.call_args.args[3]
                 self.assertLessEqual(len(comment.encode("utf-8")), cli.FORGE_COMMENT_BYTES)
-                self.assertIn("Removing leading `+` diff markers", comment)
+                self.assertIn("Removing copied diff markers", comment)
 
 
 if __name__ == "__main__":

@@ -384,7 +384,7 @@ def rejection_rows(dropped):
                 where += f" through {end}"
         row = f"- {where} — {item['reason']}."
         if item.get("diff_markers"):
-            row += " Removing leading `+` diff markers makes the quote match the cited source."
+            row += " Removing copied diff markers (such as a leading `+` or space) makes the quote match the cited source."
         elif unmatched := item.get("unmatched_quote_row"):
             row += f" The first unmatched code row is line {unmatched} of the quoted snippet."
         rows.append(row)

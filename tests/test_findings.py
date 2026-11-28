@@ -83,6 +83,13 @@ class ParseAnswerTests(unittest.TestCase):
                 self.assertEqual(parsed["findings"], [])
                 self.assertTrue(parsed["dropped"][0]["diff_markers"])
 
+    def test_diff_marker_hint_detects_source_rows_mixed_with_diff_rows(self):
+        anchors = {"a.py": {2: "+value", 3: "next()"}}
+        raw = envelope([dict(issue(end=3), relevant_code="+value\n+next()")])
+        parsed = engine.parse_answer(raw, anchors, explain_dropped=True)
+        self.assertEqual(parsed["findings"], [])
+        self.assertTrue(parsed["dropped"][0]["diff_markers"])
+
     def test_engine_keeps_diagnostics_distinct_when_a_caller_uses_the_same_cache(self):
         raw = envelope([issue(), issue(start=81, end=82)])
 
@@ -327,7 +334,7 @@ class DroppedSummaryTests(unittest.TestCase):
         self.assertEqual(next_diagnostic["dropped"], [])
         _, rejection_post, no_drops_post, _ = [call.args[3] for call in post.call_args_list]
         self.assertIn("at line 1 through 2", rejection_post)
-        self.assertIn("Removing leading `+` diff markers", rejection_post)
+        self.assertIn("Removing copied diff markers (such as a leading `+` or space)", rejection_post)
         self.assertNotIn("@team", rejection_post)
         self.assertNotIn("+x = 1", rejection_post)
         self.assertIn("No findings failed the citation or quote checks in this rerun.", no_drops_post)
