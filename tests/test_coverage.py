@@ -28,7 +28,7 @@ class CoverageStateTests(unittest.TestCase):
         with patch.object(cli, "forge_change", return_value=source.Change(head, files, "org/repo#1", base=base_tip, patch_base=base)), \
              patch.object(cli.drift, "forge", return_value=NO_DRIFT), patch.object(cli, "scan_files", return_value=[]), \
              patch.object(engine, "invoke", side_effect=invoke), \
-             patch.object(cli, "post_comment", side_effect=lambda *args: posts.append(args[3])):
+             patch.object(cli, "post_comment", side_effect=lambda *args, **kwargs: posts.append(args[3])):
             report, code = cli.run_request(args)
             cli.publish("org/repo#1", report["head"], report)
         return report, code, shown, posts
@@ -37,6 +37,8 @@ class CoverageStateTests(unittest.TestCase):
         report, code, shown, posts = self.run_review([BINARY, ADDED, DELETED])
         self.assertEqual((code, report["state"], report["omitted"]), (0, "reviewed", []))
         self.assertEqual(report["not_reviewable"], ["logo.png", "old.py"])
+        self.assertEqual(report["receipt"]["coverage"], {"reviewed": 1, "text": 2, "percent": 50})
+        self.assertIn("Text counted only: 1.", posts[0])
         self.assertEqual(len(shown), 1)
         self.assertIn("- Not reviewed, no text to review: ` logo.png `, ` old.py `", posts[0])
         self.assertNotIn("Outside review coverage", posts[0])

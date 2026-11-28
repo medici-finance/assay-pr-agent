@@ -472,7 +472,7 @@ def limited_rows(rows, allowance):
     return kept
 
 
-def comment(report, evidence=()):
+def comment(report, evidence=(), *, receipt_lines=()):
     """The posted comment: the map, then the model's reading of it, then the zero-token evidence."""
     label = LABELS[report.get("provider", "cursor")]
     body = [f"{label} visual review of {report['head']}", report["state"], ""]
@@ -505,7 +505,7 @@ def comment(report, evidence=()):
         body += ["", f"{label} could not complete the review."]
     else:
         body += ["", "No changed file has text the model can read."]
-    footer = ["", ATTRIBUTION]
+    footer = ["", *receipt_lines, "", ATTRIBUTION] if receipt_lines else ["", ATTRIBUTION]
     diff_map = report.get("map", {})
     # Each list names what was kept from the model or is named nowhere else: a file outside the
     # review, one its own header kept back, one sent without text and not known to be code, a

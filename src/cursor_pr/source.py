@@ -119,12 +119,13 @@ def check_publication(project, number, head, body):
     run_forge("check-publication", project, publication=publication(project, number, head, body))
 
 
-def post_comment(project, number, head, body, state):
+def post_comment(project, number, head, body, state, *, dedupe_body=None):
     if project is None:
         raise ReviewError("Use a --change address from the configured review projects")
     directory = state / "publications"
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    key = hashlib.sha256(json.dumps([project.key, number, head, body]).encode()).hexdigest()
+    key_body = body if dedupe_body is None else dedupe_body
+    key = hashlib.sha256(json.dumps([project.key, number, head, key_body]).encode()).hexdigest()
     receipt = directory / (key + ".posted")
     with (directory / (key + ".lock")).open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)

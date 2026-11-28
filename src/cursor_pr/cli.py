@@ -18,7 +18,7 @@ import httpx
 from unidiff.errors import UnidiffParseError
 import yaml
 
-from . import context, drift, engine, history, providers, sarif, scanners
+from . import context, drift, engine, history, providers, receipt, sarif, scanners
 from .scanners import fence
 from .login import auth_mode, login_directory
 from .setup import (locked, apply_saved_setup, load_provider_key, max_findings, max_input_tokens, state_dir,
@@ -323,7 +323,7 @@ def fit_comment_rows(rows, allowance, label, *, already_omitted=0):
     return "".join(included) + omission_notice(omitted, label)
 
 
-def fit_tier_comment(header, findings, coverage, extra_coverage, outside, details, footer):
+def fit_tier_comment(header, findings, coverage, extra_coverage, outside, details, footer, *, coverage_label):
     """Keep finding summaries and coverage before spending space on optional evidence."""
     body = comment_text(header + ["Some review details were shortened to fit the forge comment."])
     end = comment_text(footer)
@@ -340,7 +340,7 @@ def fit_tier_comment(header, findings, coverage, extra_coverage, outside, detail
     evidence_notice = len(omission_notice(len(details), evidence_label).encode("utf-8"))
     outside_notice = len(omission_notice(len(outside), outside_label).encode("utf-8"))
     skipped = fit_comment_rows(coverage, space - evidence_notice - outside_notice,
-                               "files skipped by the token limit", already_omitted=extra_coverage)
+                               coverage_label, already_omitted=extra_coverage)
     space -= len(skipped.encode("utf-8"))
     outside_text = fit_comment_rows(outside, space - evidence_notice, outside_label)
     space -= len(outside_text.encode("utf-8"))
@@ -374,23 +374,33 @@ def evidence(report):
 
 def publish(address, head, report, *, project=None, state=None):
     _, number = address.rsplit("#", 1)
+    state = state if state is not None else state_dir()
+    receipt_lines = receipt.render(report["receipt"]) if "receipt" in report else []
     if "map" in report:
         # A visual review is a comment of its own shape, laid out and bounded by its module.
-        text = "\n".join(visual.comment(report, evidence(report))) + "\n"
+        details = evidence(report)
+        baseline = "\n".join(visual.comment(report, details)) + "\n"
+        text = ("\n".join(visual.comment(report, details, receipt_lines=receipt_lines)) + "\n"
+                if receipt_lines else baseline)
         if len(text.encode("utf-8")) > visual.MAX_COMMENT_BYTES:
             raise ReviewError("Visual review exceeded the forge comment limit")
-        post_comment(project, int(number), head, text, state if state is not None else state_dir())
+        options = {"dedupe_body": receipt.dedupe_body(baseline, report)} if receipt_lines else {}
+        post_comment(project, int(number), head, text, state, **options)
         return
     label = providers.LABELS[report.get("provider", "cursor")]
     body = [f"{label} review of {head}", report["state"]]
     degraded = report.get("degraded") or []
-    coverage = []
+    failed_coverage = set(report.get("failed_coverage", ()))
+    coverage_label = "unreviewed files" if failed_coverage else "files skipped by the token limit"
     extra_coverage = max(0, len(degraded) - MAX_DEGRADED_ROWS)
-    if degraded:
+    if any(path not in failed_coverage for path in degraded):
         body.append(f"Degraded review: the full prompt is an estimated {report['full_input_tokens']} tokens, "
                     f"over the limit of {report.get('prompt_limit', report['max_input_tokens'])}. "
                     f"{label} did not review these files:")
-        coverage.extend(f"- Not reviewed (token limit): {fence(path)}" for path in degraded[:MAX_DEGRADED_ROWS])
+    elif degraded:
+        body.append(f"{label} could not cover these files because a review pass failed.")
+    coverage = [f"- Not reviewed ({'pass failed' if path in failed_coverage else 'token limit'}): {fence(path)}"
+                for path in degraded[:MAX_DEGRADED_ROWS]]
 
     intro, body = body, []
     tier = report.get("tier", "regular")
@@ -471,22 +481,29 @@ def publish(address, head, report, *, project=None, state=None):
         more = f" and {extra_files} more" if extra_files > 0 else ""
         body.append(f"- Not reviewed, no text to review: {listed}{more}.")
     outside = [f"- Outside review coverage: {fence(path)}" for path in report["omitted"]]
-    extra = [f"- Not reviewed (token limit): {extra_coverage} more files"] if extra_coverage else []
-    footer = ["", providers.ATTRIBUTION]
-    text = comment_text(intro + coverage + extra + header + findings + body + outside + footer)
-    # The forge helper refuses a body over 16 KiB: shorten rather than lose the whole comment.
-    if tier == "regular" and findings and size_of(text) > FORGE_COMMENT_BYTES:
-        # Keep every other row whole and shorten the longest finding messages first.
-        before = comment_text(intro + coverage + extra + header + ["Some findings were shortened to fit the forge comment."])
-        after = comment_text(body + outside + footer)
-        rows = bounded_findings(report["findings"], FORGE_COMMENT_BYTES - size_of(before + after))
-        if rows is not None:
-            text = before + "".join(rows) + after
-    if size_of(text) > FORGE_COMMENT_BYTES:
-        text = fit_tier_comment(intro + header, report["findings"], coverage, extra_coverage, outside, body, footer)
+    extra_label = "Not reviewed" if failed_coverage else "Not reviewed (token limit)"
+    extra = [f"- {extra_label}: {extra_coverage} more files"] if extra_coverage else []
+    def format_comment(footer):
+        text = comment_text(intro + coverage + extra + header + findings + body + outside + footer)
+        # The forge helper refuses a body over 16 KiB: shorten rather than lose the whole comment.
+        if tier == "regular" and findings and size_of(text) > FORGE_COMMENT_BYTES:
+            before = comment_text(intro + coverage + extra + header + ["Some findings were shortened to fit the forge comment."])
+            after = comment_text(body + outside + footer)
+            rows = bounded_findings(report["findings"], FORGE_COMMENT_BYTES - size_of(before + after))
+            if rows is not None:
+                text = before + "".join(rows) + after
         if size_of(text) > FORGE_COMMENT_BYTES:
-            raise ReviewError("Review exceeded the forge comment limit")
-    post_comment(project, int(number), head, text, state if state is not None else state_dir())
+            text = fit_tier_comment(intro + header, report["findings"], coverage, extra_coverage, outside, body, footer,
+                                    coverage_label=coverage_label)
+        return text
+
+    footer = ["", providers.ATTRIBUTION]
+    baseline = format_comment(footer)
+    text = format_comment(["", *receipt_lines, *footer]) if receipt_lines else baseline
+    if size_of(text) > FORGE_COMMENT_BYTES:
+        raise ReviewError("Review exceeded the forge comment limit")
+    options = {"dedupe_body": receipt.dedupe_body(baseline, report)} if receipt_lines else {}
+    post_comment(project, int(number), head, text, state, **options)
 
 
 def findings_option(value):
@@ -659,6 +676,7 @@ def execute_review(args, verification_resources):
     if not selected <= paths:
         raise ReviewError("--path must name a file changed in this review")
     files = sorted((f for f in change.files if f.path in selected), key=lambda f: f.path)
+    all_files = files + [f for f in change.files if f.path not in selected]
     project = getattr(args, "managed_project", None)
     wanted = scanners.inputs(files) if args.change else set()
     static = scanners.ci_results(args.expected_change_url, change.head, root, wanted, args.scanner_ci or {})
@@ -675,9 +693,10 @@ def execute_review(args, verification_resources):
             if hasattr(args, "sarif_resources"):
                 args.sarif_checkout = checkout
         patch_base = drift.patch_base(root, checkout, change)
-        if args.change and not args.visual:
-            files = classify_absent(checkout, change.head, files, base_root=root, base=patch_base,
-                                    supplied_base=bool(change.patch_base))
+        if args.change:
+            all_files = classify_absent(checkout, change.head, all_files, base_root=root, base=patch_base,
+                                        supplied_base=bool(change.patch_base))
+            files = all_files[:len(files)]
         checks = scan_files(checkout, change.head, files, base_root=root, base=patch_base)
         deadline = time.monotonic() + 180
         for tool, path in missing:
@@ -714,7 +733,7 @@ def execute_review(args, verification_resources):
     advisories = qualgen["advisories"] if qualgen else ()
 
     if args.visual:
-        return visual_review(args, change, files, sorted(paths - selected), checks, static, qualgen, drifted)
+        return visual_review(args, change, files, all_files, checks, static, qualgen, drifted)
 
     tier, base = args.tier, args.max_input_tokens
     budget = base * TIERS[tier]
@@ -805,16 +824,19 @@ def execute_review(args, verification_resources):
     context_fates = merged_fates([fates, deep_fates])
     planned_tier = reached([(row["name"], blocks) for row, _, _, blocks in plans]) if plans else None
     reviewable = selected - set(unseen)
+    counts = receipt.count_files(all_files, selected, reviewable, validated=rendered)
     planned_paths = {path for _, _, locations, _ in plans for path, lines in locations.items() if lines}
     degraded = sorted(reviewable - planned_paths) if plans else []
+    counts["skipped"] = len(degraded) if plans else len(reviewable)
     unavailable = {f.path for f in files if f.patch_unavailable}
     omitted = sorted(unavailable | (paths - selected))
     not_reviewable = sorted(set(unseen) - unavailable)
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
               "estimated_input_tokens": sum(row["estimated_input_tokens"] for row in passes),
-              "max_input_tokens": budget, "base_input_tokens": base, "prompt_limit": limit, "tier": tier,
+              "max_input_tokens": budget, "base_input_tokens": base, "prompt_limit": limit,
+              "first_prompt_limit": limit, "tier": tier,
               "cursor_invocations": 0, "cache_hit": False, "omitted": omitted,
-              "not_reviewable": not_reviewable, "checks": checks,
+              "not_reviewable": not_reviewable, "checks": checks, "coverage": counts,
               "findings": [], "cursor_usage": None, "full_input_tokens": full, "degraded": degraded,
               "drift": drifted, "passes": passes, "context": list(context_fates.values()),
               "verification": {"state": "not-needed"}, "delivered": planned_tier, "max_findings": caps[tier]}
@@ -885,10 +907,13 @@ def execute_review(args, verification_resources):
     report.update(findings=findings, dropped=dropped_findings, cursor_usage=total_usage(passes),
                   cache_hit=bool(passes) and all(row["state"] == "cached" for row in passes),
                   cursor_invocations=sum(row["model_invocations"] for row in passes))
+    counts["reviewed"] = len(coverage)
+    degraded = sorted(reviewable - coverage.keys())
+    failed_coverage = sorted(planned_paths - coverage.keys())
+    counts["failed"] = len(failed_coverage)
+    report.update(degraded=degraded, failed_coverage=failed_coverage)
     if has_text and not completed:
         return dict(report, state="model-unavailable", error=last_error), 2
-    degraded = sorted(reviewable - coverage.keys())
-    report["degraded"] = degraded
     if report["delivered"] == "max":
         report["prompt_limit"] = deep_limit
     if all_findings_dropped:
@@ -904,7 +929,7 @@ def execute_review(args, verification_resources):
     return report, 2 if incomplete or degraded or lowered else 0
 
 
-def visual_review(args, change, files, unselected, checks, static, qualgen, drifted):
+def visual_review(args, change, files, all_files, checks, static, qualgen, drifted):
     """Explain the change in one prompt of its own: no tiers, no context beyond the patch, no findings.
 
     The scanners, history and drift are the same evidence a review gathers, and none of it enters
@@ -912,15 +937,18 @@ def visual_review(args, change, files, unselected, checks, static, qualgen, drif
     """
     prompt, anchors, unseen, has_text = visual.pack(files)
     estimated = tokens(prompt) if has_text else 0
-    omitted = sorted(set(unseen) | set(unselected))
+    selected = {f.path for f in files}
+    omitted = sorted(set(unseen) | {f.path for f in all_files if f.path not in selected})
+    shown = {f.path for f in files if visual.shows_hunks(f)}
+    counts = receipt.count_files(all_files, selected, shown, validated=selected)
     backend = providers.provider()
     limit = args.max_input_tokens
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
               "estimated_input_tokens": estimated, "max_input_tokens": limit, "prompt_limit": limit,
               "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
-              "findings": [], "cursor_usage": None, "drift": drifted,
+              "findings": [], "cursor_usage": None, "drift": drifted, "coverage": counts,
               # The map costs no tokens and stays in the report when the model is skipped or fails.
-              "map": dict(visual.survey(files), shown=sorted(file.path for file in files if visual.shows_hunks(file)))}
+              "map": dict(visual.survey(files), shown=sorted(shown))}
     if static:
         report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
@@ -928,6 +956,7 @@ def visual_review(args, change, files, unselected, checks, static, qualgen, drif
     if qualgen:
         report["qualgen"] = qualgen
     if estimated > limit:
+        counts["skipped"] = len(shown)
         return dict(report, state="over-budget"), 2
     if args.estimate:
         return dict(report, state="estimate"), 0
@@ -939,7 +968,9 @@ def visual_review(args, change, files, unselected, checks, static, qualgen, drif
         report.update(cursor_invocations=row["model_invocations"], cursor_usage=row.get("model_usage"))
         if answer is None:
             # The map and the deterministic evidence are kept even if the model failed.
+            counts["failed"] = len(shown)
             return dict(report, state="model-unavailable", error=error), 2
+        counts["reviewed"] = len(shown)
         report.update({name: value for name, value in answer.items() if name != "cursor_usage"}, cache_hit=row["state"] == "cached")
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
     report["state"] = "partial" if incomplete else ("reviewed" if has_text else "empty")
@@ -957,6 +988,7 @@ def run_request(args):
         report.update(cursor_invocations=0, cursor_usage=None)
     else:
         report.update(model_invocations=report["cursor_invocations"], model_usage=report["cursor_usage"])
+    report["receipt"] = receipt.build(report)
     if args.post:
         try:
             publish(args.change, report["head"], report, project=getattr(args, "forge_project", None),

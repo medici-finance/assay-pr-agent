@@ -147,7 +147,7 @@ class ForgeStatusRequestTests(unittest.TestCase):
                                                requester_ids=[7]))
         posts = []
         with patch.object(cli, "forge_change", return_value=change), \
-             patch.object(cli, "post_comment", side_effect=desk_error or (lambda *call: posts.append(call))) as desk, \
+             patch.object(cli, "post_comment", side_effect=desk_error or (lambda *call, **kwargs: posts.append(call))) as desk, \
              patch.object(engine, "invoke", return_value={"findings": [finding()], "cursor_usage": None}), \
              (patch.object(cli, "review", side_effect=model) if model else contextlib.nullcontext()):
             report, code = cli.run_request(args)

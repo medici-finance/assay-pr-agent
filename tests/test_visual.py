@@ -519,6 +519,7 @@ class VisualTests(unittest.TestCase):
         self.answer.write_text(json.dumps({"review": {"key_issues_to_review": []}}))
         code, report = self.check("--model", "another-model")
         self.assertEqual((code, report["state"], report["model_invocations"]), (2, "model-unavailable", 1))
+        self.assertEqual(report["receipt"]["failed"], len(report["map"]["shown"]))
         self.assertEqual(report["map"]["to_read"], 7)
         self.assertEqual(len(self.prompts()), 3)
 
@@ -842,7 +843,8 @@ class VisualRequestTests(unittest.TestCase):
 
     def test_a_visual_report_is_not_posted_as_the_review_check(self):
         report = {"provider": "cursor", "state": "reviewed", "head": "a" * 40, "omitted": [], "checks": [], "findings": [],
-                  "cursor_invocations": 1, "cursor_usage": None, "map": {}}
+                  "cursor_invocations": 1, "cursor_usage": None, "map": {},
+                  "estimated_input_tokens": 1200, "max_input_tokens": 6000}
         args = cli.parser().parse_args(["--change", "acme/app#3", "--visual", "--forge-status"])
         with patch.object(cli, "execute", return_value=(report, 0)), patch.object(cli.forge_status, "post") as post, \
                 patch.dict(os.environ, {"REVIEW_FORGE_STATUS": "1"}):

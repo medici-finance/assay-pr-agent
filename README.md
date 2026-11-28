@@ -417,6 +417,8 @@ GitHub uses a `pull_request` event and its recorded base and head SHAs. Fetch su
 
 Add `--post` to the `--change` command to post the reviewed commit and findings as a single ordinary comment. The helper checks visibility and the current head before publishing under the configured reviewer credential. The agent stores a receipt on its state volume to suppress identical retries for the same head, including after restart. A failed post can be retried with the same model and cache without paying again for an unchanged prompt. No write happens by default.
 
+Every posted summary includes a receipt with model calls, cache status, prompt estimates, reported token usage, and the counts of findings and completed checks. The coverage percentage uses confirmed text patches across the whole change. The receipt also reports unavailable patches and files skipped for budget, outside the path selection, or counted without showing their hunks. The same numbers are in the JSON report under `receipt`.
+
 The standalone poller supports `/review` and `/visual-review`. For additional upstream PR-Agent chat commands such as `/ask` and `/improve`, see [GitHub integration](https://docs.pr-agent.ai/installation/github/) and [GitLab integration](https://docs.pr-agent.ai/installation/gitlab/). GitLab pipeline jobs alone do not receive comment events. The upstream comment server and this CLI are separate entry points.
 
 ### Export SARIF

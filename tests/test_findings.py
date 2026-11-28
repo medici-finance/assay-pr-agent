@@ -217,7 +217,7 @@ class DroppedSummaryTests(unittest.TestCase):
         change = source.Change("a" * 40, [source.File("a.py", "@@ -0,0 +1,2 @@\n+x = 1\n+y = 2\n", "added")], "org/repo#1")
         with patch.object(cli, "forge_change", return_value=change), patch.object(cli, "scan_files", return_value=[]), \
              patch.object(engine, "invoke", return_value=parsed), \
-             patch.object(cli, "post_comment", side_effect=lambda *args: posts.append(args[3])):
+             patch.object(cli, "post_comment", side_effect=lambda *args, **kwargs: posts.append(args[3])):
             report, code = cli.run_request(args)
         self.assertEqual((code, report["state"], report["findings"], report["dropped"]), (2, "findings-dropped", [], parsed["dropped"]))
         self.assertIn("Dropped 1 model finding: cited line outside the reviewed patch.", posts[0])
