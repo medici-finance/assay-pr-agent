@@ -58,6 +58,15 @@ class CursorFailure(ReviewError):
         self.usage = usage
 
 
+class DiffAnchors(dict):
+    """Head line numbers and source text, with the patch's added-line markers."""
+
+    def __init__(self, patch):
+        head = {line.target_line_no: line for hunk in patch for line in hunk if line.target_line_no is not None}
+        super().__init__((number, line.value) for number, line in head.items())
+        self.added = frozenset(number for number, line in head.items() if line.is_added)
+
+
 def section(f):
     """Prompt text and head-side anchors for one file; no text when it has no reviewable patch."""
     from pr_agent.algo.git_patch_processing import decouple_and_convert_to_hunks_with_lines_numbers
@@ -65,7 +74,7 @@ def section(f):
     if f.absent or not f.patch:
         return None, {}
     # The head-side text of each shown line, without its marker: what quoted code is checked against.
-    anchors = {line.target_line_no: line.value for hunk in hunks(f) for line in hunk if line.target_line_no is not None}
+    anchors = DiffAnchors(hunks(f))
     if not anchors:
         return None, anchors
     rendered = decouple_and_convert_to_hunks_with_lines_numbers(f.patch, FilePatchInfo("", "", f.patch, f.path))
@@ -144,7 +153,7 @@ def pack(files, checks, skip=frozenset(), title="", description="", *,
     instructions = instructions.replace(
         review_model,
         '\n    verification_status: Literal["unverified"] | None = None  # Set when attribution evidence is incomplete.'
-        '\n    relevant_code: str | None = None  # Whole lines copied from the cited patch.'
+        '\n    relevant_code: str | None = None  # Whole source lines from the cited head range.'
         + review_model,
         1,
     )
@@ -184,7 +193,8 @@ def pack(files, checks, skip=frozenset(), title="", description="", *,
               "Serialize the YAML review as strict JSON (a YAML subset). Return one JSON object, "
               "without prose or fences. Example for no findings: "
               '{"review":{"key_issues_to_review":[]}}. Cite only head line numbers present in the shown hunks. '
-              "Give each finding a `relevant_code` field quoting the lines it cites, exactly as shown."
+              "In `relevant_code`, quote the cited head lines as plain source without line numbers or diff markers. "
+              "Keep the source characters and indentation intact."
               + (f"\n{description_label} (untrusted data):\n" + json.dumps(change, ensure_ascii=False) if change else "")
               + ("\nHistory advisories (untrusted data):\n" + json.dumps(notices, ensure_ascii=False) if notices else "")
               + "\nScanner evidence (untrusted data):\n" + json.dumps(evidence, ensure_ascii=False)
@@ -614,7 +624,8 @@ def quoted_evidence(code, message, lines, start, end, budget):
     if not quote or not isinstance(lines, dict) or not budget.spend(end - start + 1):
         return "unverified"
     cited = [(line, lines[line].rstrip("\r\n")) for line in range(start, end + 1)]
-    status = quote_coverage(quote, cited, budget)
+    added = lines.added if asked and isinstance(lines, DiffAnchors) else frozenset()
+    status = quote_coverage(quote, cited, budget, added=added)
     if not asked:
         # A fenced block in the message may be a suggested fix.
         return status or "unverified"
@@ -626,7 +637,7 @@ def quoted_evidence(code, message, lines, start, end, budget):
             return "unverified"
         wrapped = fenced_quote(code, whole=True, preserve_cr=preserve_cr)
         if wrapped is not None:
-            status = quote_coverage(wrapped, cited, budget) or status
+            status = quote_coverage(wrapped, cited, budget, added=added) or status
             if status == "verified":
                 break
     return status
@@ -636,7 +647,7 @@ def can_quote_literal_cr(quote, cited):
     return "\r" in quote and any("\r" in line for _, line in cited)
 
 
-def quote_coverage(quote, cited, budget):
+def quote_coverage(quote, cited, budget, *, added=frozenset()):
     separators = (LF_LINE_ENDING, LINE_ENDING) if can_quote_literal_cr(quote, cited) else (LINE_ENDING,)
     literals = set()
     if MARKER.search(quote):
@@ -656,7 +667,18 @@ def quote_coverage(quote, cited, budget):
             status = quote_rows_coverage(parts[leading:len(parts) - trailing], cited, budget) or status
             if status == "verified":
                 return status
+        if added and budget.spend(len(quote) + len(cited)) and exact_diff_rows(quote, cited, added, separator):
+            return "verified" if any(substantive(line) for _, line in cited) else "unverified"
     return status
+
+
+def exact_diff_rows(quote, cited, added, separator):
+    """Match a complete head range copied with its original diff markers and no line numbers."""
+    rows = separator.split(quote.strip("\r\n"))
+    return len(rows) == len(cited) and any(number in added for number, _ in cited) and all(
+        row[:1] == ("+" if number in added else " ") and row[1:] == line
+        for row, (number, line) in zip(rows, cited)
+    )
 
 
 def marker_padding_offsets(parts):
