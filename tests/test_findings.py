@@ -65,6 +65,32 @@ class ParseAnswerTests(unittest.TestCase):
         for rejected_text in ("@team", "start()", "never_shown_to_the_model", "untrusted filename"):
             self.assertNotIn(rejected_text, json.dumps(diagnosed["dropped"]))
 
+    def test_diagnostic_uses_snippet_line_numbers_and_requires_a_full_match_for_marker_hints(self):
+        anchors = {"a.py": {2: "first()", 3: "middle()", 4: "last()"}}
+        with_elision = dict(issue(end=4), relevant_code="first()\n...\nmissing()")
+        incomplete = dict(issue(end=4), relevant_code="+first()\n+last()")
+        diagnosed = engine.parse_answer(envelope([with_elision, incomplete]), anchors, explain_dropped=True)
+        first, second = diagnosed["dropped"]
+        self.assertEqual(first["unmatched_quote_row"], 3)
+        self.assertFalse(second["diff_markers"])
+
+    def test_engine_keeps_diagnostics_distinct_when_a_caller_uses_the_same_cache(self):
+        raw = envelope([issue(), issue(start=81, end=82)])
+
+        def invoke(prompt, model, anchors, **kwargs):
+            return engine.parse_answer(raw, anchors, **kwargs)
+
+        with tempfile.TemporaryDirectory() as cache, patch.object(engine, "invoke", side_effect=invoke) as call:
+            args = ("same prompt", None, ANCHORS, Path(cache), "org/repo#1")
+            ordinary, ordinary_cached = engine.review(*args)
+            debug, debug_cached = engine.review(*args, explain_dropped=True)
+            self.assertEqual(engine.review(*args, explain_dropped=True), (debug, True))
+        self.assertFalse(ordinary_cached)
+        self.assertFalse(debug_cached)
+        self.assertEqual(call.call_count, 2)
+        self.assertNotIn("end_line", ordinary["dropped"][0])
+        self.assertEqual(debug["dropped"][0]["end_line"], 82)
+
     def test_dropped_line_number_cannot_break_result_serialization(self):
         raw = json.loads(envelope([issue(), issue(start=123456)]))
         raw["result"] = raw["result"].replace("123456", "9" * 4500)
@@ -251,6 +277,16 @@ class DroppedSummaryTests(unittest.TestCase):
                 cli.publish("org/repo#1", "a" * 40, report)
                 self.assertIn(f"Post `/review-dropped {tier}`", posted.call_args.args[3])
 
+    def test_diagnostic_comment_distinguishes_rejections_from_later_verification(self):
+        report = self.report(explain_dropped=True, tier="mid", delivered="mid", context=[],
+                             base_input_tokens=6000, max_input_tokens=12000, estimated_input_tokens=1000,
+                             passes=[{"state": "called"}], verification={"state": "filtered", "before": 1, "after": 0})
+        with patch.object(cli, "post_comment") as post:
+            cli.publish("org/repo#1", "a" * 40, report)
+        body = post.call_args.args[3]
+        self.assertIn("No findings failed the citation or quote checks", body)
+        self.assertIn("No model findings remained after verification", body)
+
     def test_diagnostic_rerun_ignores_a_shared_cache_and_reports_the_fresh_result(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -285,7 +321,7 @@ class DroppedSummaryTests(unittest.TestCase):
         self.assertIn("Removing leading `+` diff markers", rejection_post)
         self.assertNotIn("@team", rejection_post)
         self.assertNotIn("+x = 1", rejection_post)
-        self.assertIn("This rerun discarded no findings.", no_drops_post)
+        self.assertIn("No findings failed the citation or quote checks in this rerun.", no_drops_post)
 
     def run_with(self, parsed, files=None, scan=()):
         tmp = tempfile.TemporaryDirectory()

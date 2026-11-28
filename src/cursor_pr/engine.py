@@ -796,17 +796,22 @@ def explain_rejection(issue, anchors, dropped):
     cited = [(line, lines[line].rstrip("\r\n")) for line in range(start, end + 1)]
     if "```" in quote or "~~~" in quote:
         quote = fenced_quote(quote, whole=True) or quote
-    parts = [part for part in checkable(quote) if part is not ELIDED]
+    # Keep the snippet's row numbers even when its elisions and hunk markers are skipped.
+    numbered = [(number, part) for number, line in enumerate(LINE_ENDING.split(quote), 1)
+                for part in checkable(line) if part is not ELIDED]
+    parts = [part for _, part in numbered]
     kept = quoted_prefix(parts, cited)
     if kept == len(parts):
         return dropped
-    stripped = [
-        (text.lstrip(" \t")[1:], None, "") if number is None and text.lstrip(" \t").startswith("+")
-        else (text, number, value)
-        for text, number, value in parts
-    ]
-    return dict(dropped, unmatched_quote_row=kept + 1,
-                diff_markers=quoted_in_order(stripped, cited))
+    stripped, count = re.subn(r"^[ \t]*\+", "", quote, flags=re.M)
+    diff_markers = False
+    if count:
+        # A diff may put a leading space on its unchanged rows. Require the same validator
+        # to verify a candidate after removing markers, including full citation coverage.
+        with_context_stripped = re.sub(r"^(?:[ \t]*\+| )", "", quote, flags=re.M)
+        diff_markers = any(quoted_evidence(candidate, "", lines, start, end, EvidenceBudget()) == "verified"
+                           for candidate in (stripped, with_context_stripped))
+    return dict(dropped, unmatched_quote_row=numbered[kept][0], diff_markers=diff_markers)
 
 
 def candidate_margins(parts, cited, budget):
@@ -1045,6 +1050,8 @@ def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout
     signature = json.dumps([version or VERSION, "pr-agent:0.50.0", model, source, prompt], ensure_ascii=False)
     if originals is not None:
         signature = json.dumps(["strict-verifier", signature])
+    elif explain_dropped and parse is None:
+        signature = json.dumps(["explain-dropped", signature])
     if provider() != "cursor" or os.getenv("REVIEW_CURSOR_TEAM_ID"):
         signature = json.dumps([provider(), os.getenv("REVIEW_CURSOR_TEAM_ID") if provider() == "cursor" else None, signature])
     key = hashlib.sha256(signature.encode()).hexdigest()
@@ -1067,7 +1074,7 @@ def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout
         extra = {} if (limit, timeout) == (MAX_FINDINGS, 120) else {"limit": limit, "timeout": timeout}
         if originals is not None:
             extra["verification"] = True
-        elif explain_dropped:
+        elif explain_dropped and parse is None:
             extra["explain_dropped"] = True
         if parse is not None:
             extra["parse"] = parse

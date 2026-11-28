@@ -266,7 +266,7 @@ print(json.dumps(dict(type='result',subtype='success',is_error=False,
         self.assertEqual(posts.read_text().count("historically coupled to partner.py"), 6)
         self.assertEqual(calls.read_text().splitlines(),["called"] * 6)
         self.assertEqual(posts.read_text().count("Rejection details for request 82."), 2)
-        self.assertEqual(posts.read_text().count("This rerun discarded no findings."), 2)
+        self.assertEqual(posts.read_text().count("No findings failed the citation or quote checks in this rerun."), 2)
         self.assertEqual(posts.read_text().count("Skipped Cursor"),2)
         self.assertEqual(posts.read_text().count("Review by [Assay PR Agent](https://pr-agent.assay.guide/)."), 8)
         self.assertNotIn("the-pr-agent", posts.read_text())

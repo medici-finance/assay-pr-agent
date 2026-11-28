@@ -384,9 +384,9 @@ def rejection_rows(dropped):
                 where += f" through {end}"
         row = f"- {where} — {item['reason']}."
         if item.get("diff_markers"):
-            row += " Removing leading `+` diff markers makes the quoted rows match the cited lines in order."
+            row += " Removing leading `+` diff markers makes the quote match the cited source."
         elif unmatched := item.get("unmatched_quote_row"):
-            row += f" The first unmatched code row is {unmatched} in the quote."
+            row += f" The first unmatched code row is line {unmatched} of the quoted snippet."
         rows.append(row)
     if len(dropped) > len(rows):
         rows.append(f"{len(dropped) - len(rows)} additional rejections omitted from these details.")
@@ -463,7 +463,7 @@ def publish(address, head, report, *, project=None, state=None):
             header.append(first)  # Keep one actionable detail even when other evidence has to be shortened.
             body.extend(more)
         elif any(row["state"] == "called" for row in report.get("passes", ())):
-            body.append("This rerun discarded no findings.")
+            body.append("No findings failed the citation or quote checks in this rerun.")
     unchecked = sum(entry.get("evidence") == "unverified" for entry in report["findings"])
     if unchecked:
         header.append(f"Could not verify quoted code for {unchecked} model finding{'s' if unchecked > 1 else ''}.")
