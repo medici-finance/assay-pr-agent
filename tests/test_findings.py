@@ -367,7 +367,7 @@ class QuotedEvidenceTests(unittest.TestCase):
         for marker in ("__new hunk__", "__old hunk__"):
             relevant = f"prepare()\n{marker}\nsend()"
             anchors = shown("prepare()", marker, "send()")
-            for quote in (relevant, f"{marker}\n{relevant}",
+            for quote in (relevant, f"{marker}\n{relevant}", f"{marker}\n\n{relevant}\n\n{marker}",
                           f"{marker}\n\n1 +prepare()\n2 +{marker}\n3 +send()",
                           f"...\nprepare()\n{marker}\nsend()\n..."):
                 with self.subTest(quote=quote):

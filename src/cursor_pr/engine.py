@@ -635,16 +635,35 @@ def quote_coverage(quote, cited, budget):
     literals = set()
     if MARKER.search(quote):
         literals = {line.lstrip(" \t") for _, line in cited if MARKER.fullmatch(line.strip(" \t"))}
-    marker_modes = (literals, ()) if literals else ((),)
     status = None
-    for attempt, (separator, markers) in enumerate(product(separators, marker_modes)):
-        if attempt and not budget.spend(len(quote) + len(cited)):
+    for separator in separators:
+        if separator is not separators[0] and not budget.spend(len(quote) + len(cited)):
             return "unverified"
-        parts = checkable(quote, separator=separator, literal_markers=markers)
-        status = quote_rows_coverage(parts, cited, budget) or status
-        if status == "verified":
-            break
+        parts = checkable(quote, separator=separator, literal_markers=literals)
+        padding = product(marker_padding_offsets(parts), marker_padding_offsets(reversed(parts)))
+        for leading, trailing in padding:
+            if leading or trailing:
+                if not budget.spend(len(parts)):
+                    return "unverified"
+                if leading + trailing >= len(parts):
+                    continue
+            status = quote_rows_coverage(parts[leading:len(parts) - trailing], cited, budget) or status
+            if status == "verified":
+                return status
     return status
+
+
+def marker_padding_offsets(parts):
+    """Try dropping an edge marker with its following blank padding as one unit."""
+    yield 0
+    marker_seen = False
+    for index, part in enumerate(parts):
+        if part is ELIDED or (part[1] is not OPTIONAL_MARKER and part[0].strip(" \t")):
+            break
+        if part[1] is OPTIONAL_MARKER:
+            marker_seen = True
+        elif marker_seen:
+            yield index + 1
 
 
 def quote_rows_coverage(parts, cited, budget):
