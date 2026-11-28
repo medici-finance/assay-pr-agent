@@ -30,10 +30,11 @@ from .artifacts import forge_go_report
 from .checks import blob, go_report, scan_files
 from .sync import scan_checkout
 from . import forge_status
-from .discovery import context_comments
+from .discovery import COMMANDS, context_comments, help_text
 from .engine import (MAX_FINDINGS, CursorFailure, fit_verification, merge_findings, pack, prompt_advisories, rank,
                      render_sections, review, tokens, visible_advisories)
-from .source import ReviewError, ci_refs, classify_absent, forge_change, local_change, post_comment, valid_sha
+from .source import (ReviewError, ci_refs, classify_absent, forge_change, local_change, open_change, post_comment,
+                     valid_sha)
 from . import visual
 
 
@@ -374,6 +375,10 @@ def evidence(report):
 
 def publish(address, head, report, *, project=None, state=None):
     _, number = address.rsplit("#", 1)
+    if "help" in report:
+        # Fixed text from the command table. A repeat at the same head finds it already posted.
+        post_comment(project, int(number), head, help_text(), state if state is not None else state_dir())
+        return
     if "map" in report:
         # A visual review is a comment of its own shape, laid out and bounded by its module.
         text = "\n".join(visual.comment(report, evidence(report))) + "\n"
@@ -590,6 +595,8 @@ def parser():
     p.add_argument("--path", action="append", default=[], help="Limit review to an exact changed path; repeatable")
     p.add_argument("--visual", action="store_true",
                    help="Map where the diff is worth reading and explain the change, instead of hunting for issues")
+    p.add_argument("--help-comment", action="store_true",
+                   help="Answer --change with the list of comment commands instead of a review, without any model call")
     evidence = p.add_mutually_exclusive_group()
     evidence.add_argument("--go-analysis-producer", help="Trusted CI producer for --expected-change-url")
     evidence.add_argument("--go-report", type=Path, help="Assay go-analysis/v1 JSON for this head")
@@ -618,7 +625,29 @@ def execute(args):
         return execute_review(args, verification_resources)
 
 
+def help_answer(args):
+    """The report of a /help request. Only the head is read from the forge, to bind the comment to it:
+    no file, scanner, history, budget or provider takes part, and nothing of the change is reported."""
+    if (not args.change or not args.post or args.visual or args.tier != "regular" or args.max_findings is not None
+            or args.sarif or args.estimate or args.path or args.head or args.go_report or args.go_analysis_producer
+            or args.qualgen_store or args.max_input_tokens is not None or getattr(args, "forge_status", False)):
+        raise ReviewError("--help-comment answers a forge change with fixed text: it takes --change with --post "
+                          "and no review option")
+    if bool(args.queue) != bool(args.request):
+        raise ReviewError("--queue and --request go together and require --change")
+    _, change = open_change(args.change, args.expected_change_url, getattr(args, "forge_project", None))
+    if args.request:
+        if not getattr(args, "own_row", False):
+            raise ReviewError("The request's row was not checked against the change")
+        # A prepared report is not looked for: the answer is the same text every time.
+        claim_head(args, change["headSha"])
+    return {"provider": providers.provider(), "source": change["url"], "head": change["headSha"], "state": "reviewed",
+            "help": sorted(COMMANDS), "findings": [], "cursor_invocations": 0, "cursor_usage": None}, 0
+
+
 def execute_review(args, verification_resources):
+    if args.help_comment:
+        return help_answer(args)
     if args.max_input_tokens < 1 or (args.head and not args.base) or (args.post and (not args.change or args.estimate)):
         raise ReviewError("Invalid budget or incompatible --head/--post options")
     if bool(args.queue) != bool(args.request) or (args.request and not args.change):
@@ -966,7 +995,8 @@ def run_request(args):
         report["publication"] = "posted-or-already-present"
     # The check says how a review for defects ended, and a visual review is none: posted under the
     # same name it would replace that review's findings, or pass for one that never ran.
-    report["forge_status"] = "skipped" if "map" in report else forge_status.outcome(args, report)
+    # The answer to /help is no review at all.
+    report["forge_status"] = "skipped" if "map" in report or "help" in report else forge_status.outcome(args, report)
     return report, code
 
 
@@ -1002,11 +1032,13 @@ def main():
                 apply_saved_setup(state)
             elif not args.change and auth_mode(providers.provider()) == "api-key":
                 load_provider_key(providers.provider())
-            if os.getenv("REVIEW_LOGIN_PROFILE") and auth_mode(providers.provider()) == "login":
+            # The answer to /help uses no provider: no login, account or budget is resolved for it.
+            if (os.getenv("REVIEW_LOGIN_PROFILE") and not args.help_comment
+                    and auth_mode(providers.provider()) == "login"):
                 stack.enter_context(locked(login_directory(state), fcntl.LOCK_SH))
-            if not args.estimate and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
+            if not args.estimate and not args.help_comment and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
                 stack.enter_context(providers.cursor_account())
-            if args.max_input_tokens is None:
+            if args.max_input_tokens is None and not args.help_comment:
                 args.max_input_tokens = visual_max_input_tokens(state) if args.visual else max_input_tokens(state)
             if args.model is None:
                 args.model = os.getenv("REVIEW_MODEL")

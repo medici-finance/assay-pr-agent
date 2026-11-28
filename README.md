@@ -39,7 +39,7 @@ The CLI receives an allow-listed environment: its own provider's key or sign-in 
 
 The regular prompt contains PR-Agent's review rubric, scanner diagnostics that fall on shown lines, and the diff hunks. It can include the forge's title and description when available, or recent commit messages in a local or CI review. Mid and max can add surrounding code and other bounded context. Max can also include eligible conversation comments, excluding internal GitLab notes and earlier review summaries. Qualgen advisories may appear for files shown in the prompt. Hadolint, zizmor and OSV-Scanner output stays in the report. The prompt labels the diagnostics, patch and context as `untrusted data` and instructs the model to work without tools. The reviewer checks the change before and after reading its file list and refuses it if the head moves.
 
-A finding is accepted only if it names a reviewed file and cites a contiguous range of head lines that the shown hunks contain. One failing finding rejects the whole answer: the review ends as `model-unavailable` and its scanner results are still posted. A file name containing a C0 control character (below U+0020), or a duplicate file name, stops the review before the model is called.
+A finding is accepted only if it names a reviewed file and cites a contiguous range of head lines that the shown hunks contain. A finding that fails this is dropped and counted in the summary, and the rest of the review stands; when none passes, the review ends as `findings-dropped`. An answer that is not a valid review as a whole ends it as `model-unavailable`, and its scanner results are still posted. A file name containing a C0 control character (below U+0020), or a duplicate file name, stops the review before the model is called.
 
 ### The posted comment
 
@@ -164,6 +164,10 @@ The reading of the diff is labelled AI-generated. Paths and model text are quote
 
 A visual review runs the same scanners, Qualgen history and head-bound publication as `/review`, and makes at most one provider call. The call has its own budget, `REVIEW_VISUAL_MAX_INPUT_TOKENS`: **12,000 estimated input tokens** by default, with the same precedence as the review budget (environment, saved setup, then the default) and the same `--max-input-tokens` override. Its instructions take about 470 tokens where the review rubric takes about 3,300, and each hunk is shown once instead of as a new-and-old pair, so the larger budget reads several times more of the change: a 342-line change that `/review` estimates at 13,300 tokens estimates about 11,100 as a visual prompt. Dependencies, generated code, fixtures and licence files are counted in the map and their hunks are never sent to the model; each costs only its one line in the prompt's file inventory. Over the limit the comment still carries the map and says the model was skipped. `--estimate` and the cache behave as for `/review`, and the two commands never share a cache entry. A visual review has no tiers, no context beyond the patch and no findings, so `--visual` takes neither `--tier` nor `--max-findings`; the queue records it beside the tiers, as the kind of review a request asked for.
 
+### List the commands
+
+Post a new comment containing just `/help`. The reviewer answers with one comment that lists the commands it accepts, `/review`, `/review-mid`, `/review-max`, `/visual-review` and `/help`, with a line on what each does and what it costs next to the others. The same accounts, polling, queue, marker and failure notice apply as for `/review`, and a comment that only starts with the command, such as `/help me`, is an ordinary comment. The answer is fixed text generated from the reviewer's command table: nothing from the change and nothing a requester wrote is in it. It makes no model call, runs no scanner and no Qualgen check, reads only the change's head from the forge, and needs no provider credential. It is published like a review, through the helper, on the change's current head and with the same visibility checks. It is not reported as the review check and writes no SARIF. The helper posts a given text once per head, so a second `/help` at the same head finds the comment already there and adds nothing; after a new commit `/help` posts it again. A later `/review-max` reads neither the command nor the answer as earlier discussion.
+
 ### Docker setup
 
 The image includes all three provider CLIs, git-sync, Qualgen, the Go forge helper, ShellCheck, actionlint, Hadolint, zizmor and OSV-Scanner. Use an **amd64 Linux** runner or Docker’s amd64 emulation. To build from source:
@@ -272,7 +276,7 @@ On an unconfigured interactive first start, the container runs setup before poll
 
 **Upgrading from v0.1.0.** Stop the old receiver and start the polling image with the same state volume. It reads the existing project settings, request queue and cache. You can remove the forge webhooks, reverse proxy, published port, `REVIEW_PUBLIC_URL` and webhook secrets. The polling container only needs outbound connections.
 
-After a rollback, the earlier polling image can resume regular reviews on the same state volume. A visual request still waiting then is not kept for the newer image: an image from before `/visual-review` marks it failed, and one from before the review tiers runs it as a plain `/review`. Post `/visual-review` again once the newer image is back.
+After a rollback, the earlier polling image can resume regular reviews on the same state volume. A visual request still waiting then is not kept for the newer image: an image from before `/visual-review` marks it failed, and one from before the review tiers runs it as a plain `/review`. Post `/visual-review` again once the newer image is back. A `/help` request still waiting fares the same on those two images. An image that has `/visual-review` and not `/help` marks it failed, and its notice names `/review`. Post `/help` again once the newer image is back.
 
 ### Container CI
 
@@ -417,7 +421,7 @@ GitHub uses a `pull_request` event and its recorded base and head SHAs. Fetch su
 
 Add `--post` to the `--change` command to post the reviewed commit and findings as a single ordinary comment. The helper checks visibility and the current head before publishing under the configured reviewer credential. The agent stores a receipt on its state volume to suppress identical retries for the same head, including after restart. A failed post can be retried with the same model and cache without paying again for an unchanged prompt. No write happens by default.
 
-The standalone poller supports `/review` and `/visual-review`. For additional upstream PR-Agent chat commands such as `/ask` and `/improve`, see [GitHub integration](https://docs.pr-agent.ai/installation/github/) and [GitLab integration](https://docs.pr-agent.ai/installation/gitlab/). GitLab pipeline jobs alone do not receive comment events. The upstream comment server and this CLI are separate entry points.
+The standalone poller supports `/review` with its tiers `/review-mid` and `/review-max`, `/visual-review` and `/help`. For additional upstream PR-Agent chat commands such as `/ask` and `/improve`, see [GitHub integration](https://docs.pr-agent.ai/installation/github/) and [GitLab integration](https://docs.pr-agent.ai/installation/gitlab/). GitLab pipeline jobs alone do not receive comment events. The upstream comment server and this CLI are separate entry points.
 
 ### Export SARIF
 

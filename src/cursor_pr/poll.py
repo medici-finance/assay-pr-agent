@@ -271,11 +271,8 @@ class Jobs:
             return row[0] if row else "regular"
 
 
-def run_review(project, number, state, tier="regular", comment=None):
-    address = f"{project.slug}#{number}"
-    argv = [sys.executable, "-I", "-m", "cursor_pr.cli", "--repo", str(project.checkout),
-            "--change", address, "--expected-change-url", project.change_url(number),
-            "--post", "--cache-dir", str(state / "cache")]
+def review_options(project, state, tier):
+    argv = []
     if history.interval():
         argv.extend(["--qualgen-store", str(history.store_for(state, project))])
     if project.scanner_ci:
@@ -296,6 +293,19 @@ def run_review(project, number, state, tier="regular", comment=None):
         argv.append("--visual")
     elif tier != "regular":
         argv.extend(["--tier", tier])
+    return argv
+
+
+def run_review(project, number, state, tier="regular", comment=None):
+    address = f"{project.slug}#{number}"
+    argv = [sys.executable, "-I", "-m", "cursor_pr.cli", "--repo", str(project.checkout),
+            "--change", address, "--expected-change-url", project.change_url(number),
+            "--post", "--cache-dir", str(state / "cache")]
+    if tier == "help":
+        # Answered from the command table: no history, scanner, budget, cap or model is its concern.
+        argv.append("--help-comment")
+    else:
+        argv.extend(review_options(project, state, tier))
     if comment is not None:
         # The child keeps the request's row itself: the head it resolves, which a repeat of the
         # request is held to, and how it ended, for a poller that stops before it can read the report.
@@ -493,7 +503,7 @@ def container_main():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Poll GitHub and GitLab for /review and /visual-review comments")
+    parser = argparse.ArgumentParser(description="Poll GitHub and GitLab for /review, /visual-review and /help comments")
     parser.add_argument("--state-dir", type=Path, default=setup.state_dir())
     parser.add_argument("--interval", type=int,
                         help="seconds to wait after each cycle (default 120)")
