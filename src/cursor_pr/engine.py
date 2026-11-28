@@ -416,6 +416,12 @@ def normalized_text(text, *, strip=True):
         return None
 
 
+def normalized_message(text):
+    """Preserve Markdown whitespace in the message used for evidence and reports."""
+    has_fence_marker = "```" in text or "~~~" in text
+    return normalized_text(text, strip=not has_fence_marker)
+
+
 def answer_finding(fields, loader, scalars):
     item = {}
     if (status := fields.get("verification_status")) is not None:
@@ -425,18 +431,18 @@ def answer_finding(fields, loader, scalars):
             if status.tag != YAML_TAG + "str" or status.value not in ("confirmed", "unverified"):
                 return None
             item["verification_status"] = status.value
+    quote = fields.get("relevant_code")
+    if quote is not None and not (isinstance(quote, yaml.ScalarNode) and quote.tag == YAML_TAG + "null"):
+        item["relevant_code"] = None  # Present but malformed unless decoded below.
     for name in FINDING_TEXT_FIELDS:
         value = fields.get(name)
         if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "str":
-            # The displayed message is trimmed, but leading spaces can change Markdown structure.
-            views = ((name, True), ("quote_message", False)) if name == "issue_content" else (
-                (name, name != "relevant_code"),
-            )
-            for field, strip in views:
-                key = (value, strip)
-                if key not in scalars:
-                    scalars[key] = normalized_text(value.value, strip=strip)
-                item[field] = scalars[key]
+            mode = name if name in ("issue_content", "relevant_code") else None
+            key = (value, mode)
+            if key not in scalars:
+                scalars[key] = (normalized_message(value.value) if mode == "issue_content"
+                                else normalized_text(value.value, strip=mode is None))
+            item[name] = scalars[key]
     for name in FINDING_LINE_FIELDS:
         value = fields.get(name)
         if isinstance(value, yaml.ScalarNode) and value.tag == YAML_TAG + "int":
@@ -542,7 +548,7 @@ def finding(issue, anchors, *, normalized=False, verification=False, evidence_bu
     if not isinstance(header, str) or not isinstance(body, str):
         return None, dropped
     if not normalized:
-        header, body = normalized_text(header), normalized_text(body)
+        header, body = normalized_text(header), normalized_message(body)
         if header is None or body is None:
             return None, dropped
     if not header or not body:
@@ -554,8 +560,10 @@ def finding(issue, anchors, *, normalized=False, verification=False, evidence_bu
             return None, dropped
         valid["verification_status"] = status
     if not verification:
-        evidence = quoted_evidence(issue.get("relevant_code"), issue.get("quote_message", body),
-                                   lines, start, end,
+        code = issue.get("relevant_code")
+        if code is None and "relevant_code" in issue:
+            return None, dict(dropped, reason="malformed quoted code")
+        evidence = quoted_evidence(code, body, lines, start, end,
                                    evidence_budget if evidence_budget is not None else EvidenceBudget())
         if evidence is None:
             return None, dict(dropped, reason="quoted code does not match the cited lines")
@@ -623,6 +631,9 @@ BLANK_GLYPHS = frozenset("\u115f\u1160\u2800\u3164\uffa0")
 
 
 def fenced_quote(message, *, whole=False):
+    if whole and "\x00" in message:
+        # CommonMark would silently replace NUL in an explicit quote.
+        return None
     tokens = MARKDOWN.parse(message)
     fence = next((token for token in tokens if token.type == "fence"), None)
     if fence is None:

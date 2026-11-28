@@ -499,11 +499,36 @@ class QuotedEvidenceTests(unittest.TestCase):
                 parsed = engine.parse_answer(envelope([issue(start=1, end=1, body=body)]), shown(source))
                 self.assertEqual(parsed["findings"][0]["evidence"], "verified")
 
-    def test_fence_indentation_matches_the_rendered_code(self):
+    def test_fence_indentation_matches_the_report_and_verifier_message(self):
         body = "  ```python\nif ready:\n      send()\n  ```"
-        parsed = engine.parse_answer(envelope([issue(start=1, end=2, body=body)]),
-                                     shown("if ready:", "    send()"))
-        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+        anchors = shown("if ready:", "    send()")
+        primary = envelope([issue(start=1, end=2, body=body)])
+        [finding] = engine.parse_answer(primary, anchors)["findings"]
+        self.assertEqual(finding["evidence"], "verified")
+        self.assertEqual(finding["message"], body)
+        self.assertEqual(engine.fenced_quote(finding["message"]), "if ready:\n    send()\n")
+        reply = envelope([dict(issue(start=1, end=2, body=finding["message"]), verification_status="confirmed")])
+        verifier = engine.parse_answer(reply, anchors, verification=True)
+        self.assertEqual(engine.kept([finding], verifier), [dict(finding, verification_status="confirmed")])
+
+    def test_malformed_explicit_quote_cannot_use_the_message_fallback(self):
+        fallback = issue(start=1, end=1, body="```python\nsend()\n```")
+        anchors = shown("send()")
+        for code in (["different()"], {"text": "different()"}, 123, False, "\ud800"):
+            with self.subTest(code=code):
+                reply = envelope([dict(fallback, relevant_code=code), fallback])
+                parsed = engine.parse_answer(reply, anchors)
+                self.assertEqual([item["evidence"] for item in parsed["findings"]], ["verified"])
+                self.assertEqual(parsed["dropped"], [{"path": "a.py", "line": 1, "reason": "malformed quoted code"}])
+        parsed = engine.parse_answer(envelope([dict(fallback, relevant_code=None)]), anchors)
+        self.assertEqual([item["evidence"] for item in parsed["findings"]], ["verified"])
+
+    def test_a_fenced_explicit_quote_cannot_normalize_nul_into_source_text(self):
+        quote = "```python\nvalue = '\x00'\n```"
+        parsed = engine.parse_answer(envelope([dict(issue(start=1, end=1), relevant_code=quote)]),
+                                     shown("value = '\ufffd'"))
+        self.assertEqual(parsed["findings"], [])
+        self.assertEqual(parsed["dropped"][0]["reason"], "quoted code does not match the cited lines")
 
     def test_fenced_quote_in_an_ordered_list(self):
         body = "10. Code:\n    ```python\n    send()\n    ```"
