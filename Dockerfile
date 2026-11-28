@@ -12,13 +12,13 @@ FROM rhysd/actionlint:1.7.7 AS actionlint
 FROM registry.k8s.io/git-sync/git-sync:v4.8.0 AS sync
 FROM node:22-bookworm-slim AS models
 RUN npm install --prefix /opt/model-clis @openai/codex@0.171.0 @anthropic-ai/claude-code@2.1.331
-# Build the pinned upstream release on the same Debian base as the runtime.
+# Build the pinned upstream release with Debian Git's GnuTLS-backed HTTP transport.
 FROM python:3.12-slim-trixie AS git-build
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG GIT_VERSION
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential ca-certificates cargo curl gettext libcurl4-openssl-dev libexpat1-dev \
+      build-essential ca-certificates cargo curl gettext libcurl4-gnutls-dev libexpat1-dev \
       libpcre2-dev libssl-dev perl xz-utils zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 RUN curl --fail --silent --show-error --location --retry 3 \
@@ -41,7 +41,7 @@ RUN test "$TARGETARCH" = amd64 || (echo 'Assay release requires --platform linux
 # exact versions matter are digest-pinned below.
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      bash ca-certificates curl gettext-base gzip haproxy libcurl4t64 libexpat1 libpcre2-8-0 \
+      bash ca-certificates curl gettext-base gzip haproxy libcurl3t64-gnutls libexpat1 libpcre2-8-0 \
       libssl3t64 openssl perl shellcheck tar zlib1g \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=git-build /git-root/usr/local/ /usr/local/
