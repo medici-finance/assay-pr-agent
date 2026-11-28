@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -111,6 +112,88 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(os.environ["REVIEW_MAX_INPUT_TOKENS"], "8000")
         self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-codex")
 
+    def test_an_existing_relative_credential_path_survives_an_unrelated_save(self):
+        self.seed()
+        old = setup.active_bundle(self.state)
+        location = "keys/provider.key"
+        (old / "keys").mkdir()
+        (old / "codex.key").rename(old / location)
+        document = self.document()
+        document["secrets"]["CODEX_API_KEY"] = location
+        (old / "settings.json").write_text(json.dumps(document))
+        with patch.dict(os.environ):
+            setup.apply_saved_setup(self.state)
+            self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-codex")
+        settings.save(self.state, {"name": "REVIEW_MAX_INPUT_TOKENS", "value": "8000"})
+        setup.apply_saved_setup(self.state)
+        self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-codex")
+
+    def test_an_absolute_credential_path_through_the_old_bundle_survives_a_save(self):
+        for reference in ("active symlink", "bundle directory", "external symlink", "symlink chain"):
+            with self.subTest(reference=reference):
+                self.seed()
+                old = setup.active_bundle(self.state)
+                path = old / "codex.key"
+                (old / "codex.key").chmod(0o644)
+                if reference == "active symlink":
+                    path = self.state / "setup" / "codex.key"
+                elif reference == "external symlink":
+                    path = self.root / "credential-alias"
+                    path.symlink_to(old / "codex.key")
+                elif reference == "symlink chain":
+                    external = self.root / "actual-key"
+                    path.rename(external)
+                    path.symlink_to(external)
+                    alias = self.root / "chained-alias"
+                    alias.symlink_to(self.state / "setup" / "codex.key")
+                    path = alias
+                document = self.document()
+                document["secrets"]["CODEX_API_KEY"] = str(path)
+                (old / "settings.json").write_text(json.dumps(document))
+                with patch.dict(os.environ):
+                    setup.apply_saved_setup(self.state)
+                    self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-codex")
+                settings.save(self.state, {"name": "REVIEW_MAX_INPUT_TOKENS", "value": "8000"})
+                with patch.dict(os.environ):
+                    setup.apply_saved_setup(self.state)
+                    self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-codex")
+                self.assertEqual(self.document()["secrets"]["CODEX_API_KEY"], "codex.key")
+                self.assertEqual((setup.active_bundle(self.state) / "codex.key").stat().st_mode & 0o777, 0o600)
+                self.assertFalse(old.exists())
+
+    def test_an_absolute_mount_path_through_the_stable_link_keeps_reading_the_mount(self):
+        self.seed()
+        external = self.state / "mounted.key"
+        external.write_text("fixture-mounted")
+        reference = self.state / "setup" / ".." / external.name
+        document = self.document()
+        document["secrets"]["CODEX_API_KEY"] = str(reference)
+        (setup.active_bundle(self.state) / "settings.json").write_text(json.dumps(document))
+        settings.save(self.state, {"name": "REVIEW_POLL_SECONDS", "value": "60"})
+        self.assertEqual(self.document()["secrets"]["CODEX_API_KEY"], str(reference))
+        external.write_text("fixture-rotated")
+        setup.apply_saved_setup(self.state)
+        self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-rotated")
+
+    def test_an_unreadable_bundle_credential_leaves_the_active_setup_intact(self):
+        self.seed()
+        old = setup.active_bundle(self.state)
+        credential = old / "codex.key"
+        credential.unlink()
+        mount = self.root / "reviewer-only-mount"
+        credential.symlink_to(mount)
+        document = self.document()
+        document["secrets"]["CODEX_API_KEY"] = str(credential)
+        (old / "settings.json").write_text(json.dumps(document))
+        with self.assertRaisesRegex(ValueError, "Could not preserve the configured CODEX_API_KEY"):
+            settings.save(self.state, {"name": "REVIEW_POLL_SECONDS", "value": "60"})
+        self.assertEqual(setup.active_bundle(self.state), old)
+        self.assertEqual(self.document(), document)
+        self.assertEqual(list(self.state.glob(".review-setup-*")), [old])
+        mount.write_text("fixture-mounted")
+        setup.apply_saved_setup(self.state)
+        self.assertEqual(os.environ["CODEX_API_KEY"], "fixture-mounted")
+
     def test_invalid_values_keep_the_active_setup(self):
         self.seed()
         link = (self.state / "setup").readlink()
@@ -128,31 +211,6 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual((self.state / "setup").readlink(), link)
         self.assertEqual((setup.active_bundle(self.state) / "settings.json").read_bytes(), document)
         self.assertEqual(len(list(self.state.glob(".review-setup-*"))), 1)
-
-    def test_findings_caps_are_edited_per_tier_within_the_bound(self):
-        self.seed()
-        view = settings.view(self.state)
-        for name in ("REVIEW_MAX_FINDINGS", "REVIEW_MAX_FINDINGS_MID", "REVIEW_MAX_FINDINGS_MAX"):
-            row = item(view, name)
-            self.assertEqual((row["kind"], row["source"], row["value"], row["locked"]), ("number", "default", "6", False))
-        settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS_MID", "value": " 09 "})
-        settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS_MAX", "value": "12"})
-        saved = self.document()["settings"]
-        self.assertEqual((saved["REVIEW_MAX_FINDINGS_MID"], saved["REVIEW_MAX_FINDINGS_MAX"]), ("9", "12"))
-        self.assertNotIn("REVIEW_MAX_FINDINGS", saved)
-        self.assertEqual((item(settings.view(self.state), "REVIEW_MAX_FINDINGS_MID")["source"]), "saved")
-        self.assertEqual(setup.max_findings(self.state), {"regular": 6, "mid": 9, "max": 12})
-        document = (setup.active_bundle(self.state) / "settings.json").read_bytes()
-        for value in ("0", "13", "six", "+6", "6_0", "-1", ""):
-            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "Enter an integer from 1 to 12"):
-                settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS", "value": value})
-        self.assertEqual((setup.active_bundle(self.state) / "settings.json").read_bytes(), document)
-        with patch.dict(os.environ, {"REVIEW_MAX_FINDINGS": "4"}):
-            row = item(settings.view(self.state), "REVIEW_MAX_FINDINGS")
-            self.assertEqual((row["locked"], row["source"], row["value"]), (True, "env", "4"))
-            self.assertIn("Set by REVIEW_MAX_FINDINGS in the environment", row["help"])
-            with self.assertRaisesRegex(ValueError, "container environment"):
-                settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS", "value": "5"})
 
     def test_another_installer_blocks_the_save(self):
         self.seed()
@@ -252,6 +310,72 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "different GitLab instance"):
                 settings.save(self.state, {"name": setup.TOKEN, "value": "replacement"})
 
+    def test_gitlab_override_loads_environment_tls_for_the_replacement_instance(self):
+        original = dict(provider="gitlab", url="https://gitlab.com/org/repo", requester_ids=[13])
+        self.seed(projects=[original], secrets={setup.TOKEN: "original-token", setup.gitlab_tls.CRL: REVOCATIONS})
+        replacement = dict(original, url="https://gitlab.example.org/org/repo")
+        certificate = self.state / "replacement-ca.pem"
+        certificate.write_text(CERTIFICATE)
+        with patch.dict(os.environ, {"REVIEW_PROJECTS": json.dumps([replacement]),
+                                     setup.TOKEN: "replacement-token", setup.gitlab_tls.CA + "_FILE": str(certificate)}):
+            site, token, verify = settings.gitlab_access(self.document(), setup.active_bundle(self.state))
+        self.assertEqual((site, token), ("https://gitlab.example.org", "replacement-token"))
+        self.assertIsInstance(verify, ssl.SSLContext)
+        self.assertIn(ssl.PEM_cert_to_DER_cert(CERTIFICATE), verify.get_ca_certs(binary_form=True))
+        self.assertFalse(verify.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)
+
+    def test_gitlab_tls_is_only_loaded_for_edits_requiring_a_gitlab_lookup(self):
+        gitlab_checkout = self.root / "gitlab-checkout"
+        gitlab_checkout.mkdir()
+        gitlab = dict(provider="gitlab", url="https://gitlab.com/org/other", requester_ids=[13],
+                      checkout=str(gitlab_checkout))
+        github = dict(provider="github", url="https://github.com/org/repo", requester_ids=[14],
+                      checkout=str(self.checkout))
+        self.seed(projects=[gitlab, github], secrets={setup.TOKEN: "fixture-token"})
+        with patch.dict(os.environ, {setup.gitlab_tls.CA: NOT_A_CERTIFICATE}):
+            settings.save(self.state, {"project": github["url"], "name": "visibility", "value": "public"})
+            settings.save(self.state, {"project": gitlab["url"], "name": "requester_ids", "value": "15"})
+            settings.save(self.state, {"name": "REVIEW_OPERATOR", "value": "alice:16"})
+        rows = {row["provider"]: row for row in self.document()["projects"]}
+        self.assertEqual(rows["github"]["visibility"], "public")
+        self.assertEqual(rows["gitlab"]["requester_ids"], [15])
+        self.assertEqual(self.document()["settings"]["REVIEW_OPERATOR"], "alice:16")
+
+    def test_gitlab_lookup_loads_mounted_ca_and_crl(self):
+        project = dict(provider="gitlab", url="https://gitlab.com/org/repo", requester_ids=[13])
+        certificate, revocations = self.root / "mounted-ca.pem", self.root / "mounted-crl.pem"
+        certificate.write_text(CERTIFICATE)
+        revocations.write_text(REVOCATIONS)
+        self.seed(projects=[project], secrets={setup.TOKEN: "fixture-token", setup.gitlab_tls.CA: str(certificate),
+                                              setup.gitlab_tls.CRL: str(revocations)})
+        _, _, verify = settings.gitlab_access(self.document(), setup.active_bundle(self.state))
+        self.assertIn(ssl.PEM_cert_to_DER_cert(CERTIFICATE), verify.get_ca_certs(binary_form=True))
+        self.assertTrue(verify.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF)
+
+    def test_gitlab_lookup_requires_an_unambiguous_instance_matching_environment(self):
+        gitlab = dict(provider="gitlab", url="https://gitlab.com/org/repo", requester_ids=[13],
+                      gitlab_base="https://gitlab.com")
+        other = dict(gitlab, url="https://gitlab.example.org/org/repo", gitlab_base="https://gitlab.example.org")
+        self.seed(projects=[gitlab], secrets={setup.TOKEN: "fixture-token"})
+        for overrides in ({"REVIEW_PROJECTS": json.dumps([gitlab, other])},
+                          {"REVIEW_PROJECTS": json.dumps([other]), "GITLAB_API_BASE": "https://gitlab.com/api/v4"},
+                          {"REVIEW_PROJECTS": json.dumps([other]), "REVIEW_GITLAB_BASE_URL": "https://gitlab.com"}):
+            with self.subTest(overrides=overrides), patch.dict(os.environ, {setup.TOKEN: "fixture-env", **overrides}):
+                with self.assertRaisesRegex(ValueError, "GitLab instance|must match"):
+                    settings.gitlab_access(self.document(), setup.active_bundle(self.state))
+
+    def test_operator_lookup_does_not_persist_an_id_from_an_overridden_forge(self):
+        gitlab = dict(provider="gitlab", url="https://gitlab.com/org/repo", requester_ids=[13])
+        other = dict(gitlab, url="https://gitlab.example.org/org/repo")
+        self.seed(projects=[gitlab], secrets={setup.TOKEN: "fixture-token"})
+        with patch.dict(os.environ, {"REVIEW_PROJECTS": json.dumps([other]), setup.TOKEN: "fixture-env"}), \
+                patch.object(accounts, "gitlab_id", return_value=94) as lookup:
+            with self.assertRaisesRegex(ValueError, "username:numeric-id"):
+                settings.save(self.state, {"name": "REVIEW_OPERATOR", "value": "bob"})
+            lookup.assert_not_called()
+            settings.save(self.state, {"name": "REVIEW_OPERATOR", "value": "bob:37"})
+        self.assertEqual(self.document()["settings"]["REVIEW_OPERATOR"], "bob:37")
+
     def test_github_ids_are_saved_in_runtime_format(self):
         self.seed()
         for name in (setup.APP_ID, setup.INSTALL_ID):
@@ -291,13 +415,49 @@ class SettingsTests(unittest.TestCase):
                 settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": ""})
         profile = "a" * 32
         self.seed(values={**SAVED, "REVIEW_PROVIDER": "cursor", "REVIEW_AUTH_MODE": "login", "REVIEW_LOGIN_PROFILE": profile})
-        with patch.object(providers, "team_command", return_value={"teams": teams}) as command:
+        with patch.object(providers, "team_command", return_value={"teams": teams}) as command, \
+                patch.object(settings.tempfile, "TemporaryDirectory", side_effect=PermissionError("no writable temp")):
             settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "1"})
             self.assertEqual([c.args[0] for c in command.call_args_list], [["list"]])
             # The live sign-in profile is listed, never switched.
             self.assertTrue(command.call_args.args[2].is_relative_to(self.state / "provider-login"))
         self.assertEqual(self.document()["settings"]["REVIEW_LOGIN_PROFILE"], profile)
         self.assertEqual(self.document()["settings"]["REVIEW_CURSOR_TEAM_ID"], "1")
+
+    def test_cursor_team_change_with_an_overriding_key_also_checks_the_saved_key(self):
+        team_seven = {"id": 7, "name": "Seven", "isSelectable": True}
+        team_eight = {"id": 8, "name": "Eight", "isSelectable": True}
+        env_key = self.root / "overriding-cursor-key"
+        env_key.write_text("another-key")
+        self.seed(values={**SAVED, "REVIEW_PROVIDER": "cursor", "REVIEW_CURSOR_TEAM_ID": "7"},
+                  secrets={setup.CURSOR: "working-key"})
+        old = setup.active_bundle(self.state)
+
+        def list_teams(args, key, _):
+            self.assertEqual(args, ["list"])
+            return {"teams": [team_seven] if key == "working-key" else [team_seven, team_eight]}
+
+        with patch.dict(os.environ, {setup.CURSOR + "_FILE": str(env_key)}), \
+                patch.object(providers, "team_command", side_effect=list_teams):
+            with self.assertRaisesRegex(ValueError, "saved Cursor account"):
+                settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "8"})
+            self.assertEqual(setup.active_bundle(self.state), old)
+            self.assertEqual(self.document()["settings"]["REVIEW_CURSOR_TEAM_ID"], "7")
+            settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "7"})
+        self.assertEqual(self.document()["settings"]["REVIEW_CURSOR_TEAM_ID"], "7")
+
+    def test_cursor_team_change_reports_a_saved_key_unavailable_in_setup(self):
+        teams = [{"id": number, "name": str(number), "isSelectable": True} for number in (7, 8)]
+        self.seed(values={**SAVED, "REVIEW_PROVIDER": "cursor", "REVIEW_CURSOR_TEAM_ID": "7"},
+                  secrets={setup.CURSOR: str(self.root / "reviewer-only-mount")})
+        old = setup.active_bundle(self.state)
+        with patch.dict(os.environ, {setup.CURSOR: "fixture-overriding-key"}), \
+                patch.object(providers, "team_command", return_value={"teams": teams}):
+            with self.assertRaisesRegex(ValueError, "saved Cursor key is unavailable"):
+                settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "8"})
+            self.assertEqual(setup.active_bundle(self.state), old)
+            settings.save(self.state, {"name": "REVIEW_CURSOR_TEAM_ID", "value": "7"})
+        self.assertEqual(self.document()["settings"]["REVIEW_CURSOR_TEAM_ID"], "7")
 
     def test_usernames_resolve_for_the_operator_and_requesters(self):
         self.seed()
@@ -366,8 +526,26 @@ class SettingsTests(unittest.TestCase):
         with patch.object(providers, "select_team", return_value="8") as select, \
              patch.dict(os.environ, {"REVIEW_CURSOR_TEAM_ID": "8"}):
             settings.save(self.state, {"name": setup.CURSOR, "value": "replacement"})
-        self.assertEqual(select.call_args.args[:2], ("replacement", "8"))
+        self.assertEqual([call.args[:2] for call in select.call_args_list], [("replacement", "8"), ("replacement", "7")])
         self.assertEqual((setup.active_bundle(self.state) / "cursor.key").read_text().strip(), "replacement")
+
+    def test_cursor_key_change_with_an_overriding_team_also_checks_the_saved_team(self):
+        self.seed(values={**SAVED, "REVIEW_PROVIDER": "cursor", "REVIEW_CURSOR_TEAM_ID": "7"},
+                  secrets={setup.CURSOR: "working-key"})
+        old = setup.active_bundle(self.state)
+
+        def only_overriding_team_available(key, team, _):
+            self.assertEqual(key, "only-team-eight")
+            if team != "8":
+                raise ValueError("The selected team ID is not eligible for this Cursor account")
+            return team
+
+        with patch.dict(os.environ, {"REVIEW_CURSOR_TEAM_ID": "8"}), \
+                patch.object(providers, "select_team", side_effect=only_overriding_team_available):
+            with self.assertRaisesRegex(ValueError, "setup wizard"):
+                settings.save(self.state, {"name": setup.CURSOR, "value": "only-team-eight"})
+        self.assertEqual(setup.active_bundle(self.state), old)
+        self.assertEqual((old / "cursor.key").read_text().strip(), "working-key")
 
     def test_optional_gitlab_tls_files_can_be_replaced_and_removed(self):
         gitlab = dict(provider="gitlab", url="https://gitlab.com/org/repo", checkout=str(self.checkout), requester_ids=[13])
@@ -431,19 +609,73 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown repository"):
             settings.save(self.state, {"project": "https://github.com/org/other", "name": "visibility", "value": "internal"})
 
+    def test_findings_caps_are_edited_per_tier_within_the_bound(self):
+        self.seed()
+        view = settings.view(self.state)
+        for name in ("REVIEW_MAX_FINDINGS", "REVIEW_MAX_FINDINGS_MID", "REVIEW_MAX_FINDINGS_MAX"):
+            row = item(view, name)
+            self.assertEqual((row["kind"], row["source"], row["value"], row["locked"]), ("number", "default", "6", False))
+        settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS_MID", "value": " 09 "})
+        settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS_MAX", "value": "12"})
+        saved = self.document()["settings"]
+        self.assertEqual((saved["REVIEW_MAX_FINDINGS_MID"], saved["REVIEW_MAX_FINDINGS_MAX"]), ("9", "12"))
+        self.assertNotIn("REVIEW_MAX_FINDINGS", saved)
+        self.assertEqual((item(settings.view(self.state), "REVIEW_MAX_FINDINGS_MID")["source"]), "saved")
+        self.assertEqual(setup.max_findings(self.state), {"regular": 6, "mid": 9, "max": 12})
+        document = (setup.active_bundle(self.state) / "settings.json").read_bytes()
+        for value in ("0", "13", "six", "+6", "6_0", "-1", ""):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "Enter an integer from 1 to 12"):
+                settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS", "value": value})
+        self.assertEqual((setup.active_bundle(self.state) / "settings.json").read_bytes(), document)
+        with patch.dict(os.environ, {"REVIEW_MAX_FINDINGS": "4"}):
+            row = item(settings.view(self.state), "REVIEW_MAX_FINDINGS")
+            self.assertEqual((row["locked"], row["source"], row["value"]), (True, "env", "4"))
+            self.assertIn("Set by REVIEW_MAX_FINDINGS in the environment", row["help"])
+            with self.assertRaisesRegex(ValueError, "container environment"):
+                settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS", "value": "5"})
+
+    def test_the_visual_budget_is_edited_beside_the_review_budget(self):
+        self.seed()
+        row = item(settings.view(self.state), "REVIEW_VISUAL_MAX_INPUT_TOKENS")
+        self.assertEqual((row["kind"], row["source"], row["value"], row["locked"]), ("number", "default", "12000", False))
+        settings.save(self.state, {"name": "REVIEW_VISUAL_MAX_INPUT_TOKENS", "value": " 20000 "})
+        self.assertEqual(self.document()["settings"]["REVIEW_VISUAL_MAX_INPUT_TOKENS"], "20000")
+        self.assertEqual(setup.visual_max_input_tokens(self.state), 20000)
+        # The review budget is another setting, and stays as it was.
+        self.assertEqual(setup.max_input_tokens(self.state), int(self.document()["settings"]["REVIEW_MAX_INPUT_TOKENS"]))
+        for value in ("0", "many", "-5", ""):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                settings.save(self.state, {"name": "REVIEW_VISUAL_MAX_INPUT_TOKENS", "value": value})
+        with patch.dict(os.environ, {"REVIEW_VISUAL_MAX_INPUT_TOKENS": "9000"}):
+            row = item(settings.view(self.state), "REVIEW_VISUAL_MAX_INPUT_TOKENS")
+            self.assertEqual((row["locked"], row["source"], row["value"]), (True, "env", "9000"))
+
     def test_a_wizard_rerun_keeps_what_only_the_settings_page_edits(self):
         wizard(self.state, ["gitlab", "", "https://gitlab.com/org/repo", str(self.checkout), "13,27", "public", "", "n",
-                            "owner:13", "", "", "", "codex", "", "", "paste"], ["fixture-forge"])
+                            "owner:13", "", "", "", "", "codex", "", "", "paste"], ["fixture-forge"])
         settings.save(self.state, {"name": "REVIEW_SYNC_SECONDS", "value": "300"})
         settings.save(self.state, {"name": "REVIEW_OSV_DOWNLOAD_DATABASES", "value": "0"})
-        settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS_MAX", "value": "10"})
+        bundle = setup.active_bundle(self.state) / "settings.json"
+        config = json.loads(bundle.read_text())
+        config["settings"]["REVIEW_MAX_FINDINGS_MID"] = "4"
+        bundle.write_text(json.dumps(config))
         setup.apply_saved_setup(self.state)
         self.assertEqual((os.environ["REVIEW_SYNC_SECONDS"], os.environ["REVIEW_OSV_DOWNLOAD_DATABASES"]), ("300", "0"))
-        self.assertEqual(os.environ["REVIEW_MAX_FINDINGS_MAX"], "10")
-        wizard(self.state, ["y", "", "", "", "", "", "", "", "keep"], [])
+        old = setup.active_bundle(self.state)
+        remove = shutil.rmtree
+
+        def remove_bundle(path):
+            if path == old:
+                raise PermissionError("fixture cleanup error")
+            return remove(path)
+
+        with patch.object(shutil, "rmtree", side_effect=remove_bundle), contextlib.redirect_stderr(io.StringIO()) as warning:
+            wizard(self.state, ["y", "", "", "", "", "", "", "", "", "keep"], [])
+        self.assertIn("Settings were saved", warning.getvalue())
+        self.assertNotEqual(setup.active_bundle(self.state), old)
         kept = self.document()["settings"]
         self.assertEqual((kept["REVIEW_SYNC_SECONDS"], kept["REVIEW_OSV_DOWNLOAD_DATABASES"]), ("300", "0"))
-        self.assertEqual(kept["REVIEW_MAX_FINDINGS_MAX"], "10")
+        self.assertEqual(kept["REVIEW_MAX_FINDINGS_MID"], "4")
 
 
 class SettingsSessionTests(unittest.TestCase):
@@ -499,6 +731,17 @@ class SettingsSessionTests(unittest.TestCase):
         thread.join(timeout=2)
         self.assertEqual(session.view["status"], "quit")
 
+    def test_wizard_save_recovers_from_failed_readback(self):
+        session = Session()
+        session.show(settings.view(self.state))
+        with patch.object(setup, "configure"), patch.object(settings, "view", side_effect=OSError("unreadable")):
+            session.launch(self.state, resume=True)
+            self.settled(session, "settings")
+        self.assertTrue(session.view["unread"])
+        self.assertEqual(session.view["messages"], ["The setup wizard saved the configuration.", web_setup.UNREADABLE])
+        session.reread(self.state)
+        self.assertNotIn("unread", session.view)
+
     def test_a_save_that_commits_is_reported_saved_even_if_the_page_cannot_be_read_back(self):
         session = Session()
         session.show(settings.view(self.state))
@@ -528,8 +771,47 @@ class SettingsSessionTests(unittest.TestCase):
         with patch.object(settings.shutil, "rmtree", side_effect=PermissionError("busy")):
             code, reply = change_setting(session, self.state, {"id": session.view["id"], "name": "REVIEW_MAX_INPUT_TOKENS", "value": "9000"})
         self.assertEqual(code, 200)
-        self.assertEqual(reply["messages"], [web_setup.SAVED])
+        self.assertEqual(reply["messages"], [web_setup.SAVED, "The previous settings bundle could not be removed from the state volume."])
         self.assertNotEqual(setup.active_bundle(self.state), old)
+        self.assertEqual(item(reply, "REVIEW_MAX_INPUT_TOKENS")["value"], "9000")
+
+    def test_older_browser_view_cannot_overwrite_a_newer_saved_bundle(self):
+        session = Session()
+        session.show(settings.view(self.state))
+        stale = {"id": session.view["id"], "name": "REVIEW_MAX_INPUT_TOKENS", "value": "8000"}
+        settings.save(self.state, {"name": "REVIEW_MAX_INPUT_TOKENS", "value": "9000"})
+        self.assertEqual(change_setting(session, self.state, stale), (409, None))
+        session.reread(self.state)
+        self.assertEqual(item(session.view, "REVIEW_MAX_INPUT_TOKENS")["value"], "9000")
+        code, refreshed = change_setting(session, self.state, {**stale, "id": session.view["id"]})
+        self.assertEqual(code, 200)
+        self.assertEqual(item(refreshed, "REVIEW_MAX_INPUT_TOKENS")["value"], "8000")
+
+    def test_reloading_settings_reads_the_latest_bundle(self):
+        session = Session()
+        first = session.show(settings.view(self.state))
+        session.reread(self.state)
+        self.assertEqual(session.view["id"], first["id"])
+        settings.save(self.state, {"name": "REVIEW_MAX_INPUT_TOKENS", "value": "9000"})
+        session.reread(self.state)
+        self.assertNotEqual(session.view["id"], first["id"])
+        self.assertEqual(item(session.view, "REVIEW_MAX_INPUT_TOKENS")["value"], "9000")
+
+    def test_activation_does_not_unlink_the_consumed_temporary_link(self):
+        session = Session()
+        session.show(settings.view(self.state))
+        unlink = Path.unlink
+
+        def failure_after_replace(path, *args, **kwargs):
+            if path.name.startswith(".setup-link-"):
+                raise PermissionError("cleanup failed")
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", failure_after_replace):
+            code, reply = change_setting(session, self.state, {"id": session.view["id"],
+                                         "name": "REVIEW_MAX_INPUT_TOKENS", "value": "9000"})
+        self.assertEqual(code, 200)
+        self.assertTrue(setup.active_bundle(self.state).is_dir())
         self.assertEqual(item(reply, "REVIEW_MAX_INPUT_TOKENS")["value"], "9000")
 
     def test_a_save_that_fails_is_reported_unsaved(self):

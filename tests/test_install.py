@@ -13,6 +13,9 @@ from unittest.mock import patch
 from cursor_pr import engine, history, providers, setup, sync
 from cursor_pr.config import Project, project_from
 
+BROWSER = (shutil.which("google-chrome") or shutil.which("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+           or shutil.which("chromium"))
+
 
 class InstallTests(unittest.TestCase):
     def test_membership_selection_and_verification(self):
@@ -192,6 +195,120 @@ else:
                 return view
             time.sleep(0.02)
         self.fail(f"The page never reached {status}: {view}")
+
+    @unittest.skipUnless(BROWSER, "requires a Chromium-based browser")
+    def test_settings_editor_keeps_a_single_draft_and_waits_for_import(self):
+        fixture = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        assets = Path(setup.__file__).parent
+        page = (assets / "setup.html").read_text().replace('src="/setup.js"', 'src="setup.js"')
+        (fixture / "setup.js").write_text((assets / "setup.js").read_text())
+        harness = """
+<script>
+const requests = [];
+let finishSave, finishNavigation;
+const view = {id: 1, status: "settings", messages: [], projects: [], sections: [
+  {title: "Settings", settings: [
+    {name: "model", kind: "text", label: "Model", value: "auto", help: ""},
+    {name: "key", kind: "secret", label: "API key", state: "stored", help: ""}
+  ]}
+]};
+window.fetch = async (path, options) => {
+  if (path === "/setting") {
+    requests.push(JSON.parse(options.body));
+    await new Promise(resolve => { finishSave = resolve; });
+  }
+  if (path === "/step" && options.method === "POST") {
+    requests.push(JSON.parse(options.body));
+    await new Promise(resolve => { finishNavigation = resolve; });
+    if (requests.at(-1).id !== view.id) return new Response(null, {status: 409});
+  }
+  return new Response(JSON.stringify(view));
+};
+document.addEventListener("DOMContentLoaded", async () => {
+  const tick = () => new Promise(resolve => setTimeout(resolve, 0));
+  const check = (condition, message) => { if (!condition) throw Error(message); };
+  const lookup = (key, selector) => document.querySelector('[data-key="' + key + '"] ' + selector);
+  const refreshed = () => new Promise(resolve => {
+    const observer = new MutationObserver(() => { observer.disconnect(); resolve(); });
+    observer.observe(document.querySelector("#groups"), {childList: true});
+  });
+  const select = (input, file) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    input.files = transfer.files;
+    input.dispatchEvent(new Event("change"));
+  };
+  try {
+    await tick();
+    lookup("model", ".change").click();
+    lookup("model", ".input").value = "draft";
+    lookup("key", ".change").click();
+    check(lookup("key", ".editor").hidden, "a second editor opened");
+    check(lookup("model", ".input").value === "draft", "the draft disappeared");
+    lookup("model", ".cancel").click();
+    lookup("key", ".change").click();
+    lookup("key", ".input").value = "old draft";
+    const save = lookup("key", ".save"), disk = lookup("key", ".file");
+    File.prototype.text = () => Promise.reject(Error("fixture read failure"));
+    select(disk, new File(["ignored"], "unreadable.txt"));
+    await tick();
+    check(lookup("key", ".input").value === "", "the failed import left the old value submittable");
+    check(lookup("key", ".error").textContent === "This file could not be read.", "the import error was hidden");
+    File.prototype.text = () => Promise.resolve(["one", "two"].join(String.fromCharCode(10)));
+    select(disk, new File(["ignored"], "multiline.txt"));
+    await tick();
+    check(lookup("key", ".input").value === "", "the token input silently removed an embedded line break");
+    check(lookup("key", ".error").textContent.includes("line break"), "the malformed token had no error");
+    let finish;
+    File.prototype.text = () => new Promise(resolve => { finish = resolve; });
+    select(disk, new File(["ignored"], "key.txt"));
+    save.click();
+    check(save.disabled && requests.length === 0, "save submitted while the import was pending");
+    finish("replacement" + String.fromCharCode(10));
+    await tick();
+    check(!save.disabled, "save stayed disabled after the import");
+    const saved = refreshed();
+    save.click();
+    check(document.querySelector("#quit").disabled && document.querySelector("#wizard").disabled,
+          "a navigation control stayed active while saving");
+    finishSave();
+    await saved;
+    check(requests.length === 1 && requests[0].value === "replacement", "save sent the wrong value");
+    check(!lookup("model", ".change").disabled, "the next editor stayed disabled");
+    check(!document.querySelector("#quit").disabled && !document.querySelector("#wizard").disabled,
+          "a navigation control stayed disabled after saving");
+    lookup("model", ".change").click();
+    document.querySelector("#wizard").click();
+    lookup("model", ".save").click();
+    check(document.querySelector("#groups").inert && document.querySelector("#quit").disabled,
+          "editing or closing stayed available after starting the wizard");
+    check(requests.length === 2 && requests[1].action === "wizard", "save submitted while navigation was pending");
+    const returned = refreshed();
+    finishNavigation();
+    await returned;
+    view.id = 2; // Another tab saved while this tab still shows the old page.
+    document.querySelector("#wizard").click();
+    const recovered = refreshed();
+    finishNavigation();
+    await Promise.race([recovered, new Promise(resolve => setTimeout(resolve, 500))]);
+    document.querySelector("#wizard").click();
+    check(requests.length === 4 && requests[3].id === 2, "the wizard kept retrying with the stale page ID");
+    finishNavigation();
+    document.body.dataset.result = "passed";
+  } catch (error) {
+    document.body.dataset.result = error.message;
+  }
+});
+</script>
+"""
+        (fixture / "index.html").write_text(page.replace("</head>", harness + "</head>"))
+        result = subprocess.run([BROWSER, "--headless", "--disable-gpu", "--disable-background-networking",
+                                 "--use-mock-keychain", "--no-first-run",
+                                 f"--user-data-dir={fixture / 'profile'}", "--virtual-time-budget=3000",
+                                 "--dump-dom", (fixture / "index.html").as_uri()],
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('data-result="passed"', next(line for line in result.stdout.splitlines() if "<body" in line))
 
     def test_browser_settings_page_saves_one_setting(self):
         tmp = tempfile.TemporaryDirectory()

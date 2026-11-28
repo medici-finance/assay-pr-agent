@@ -15,17 +15,17 @@ import uuid
 
 from . import accounts, dialog, providers, provision, gitlab_tls
 from .login import auth_mode, ensure_session, login_directory, login_env
-from .config import (DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, FINDINGS_SETTINGS, MAX_FINDINGS_LIMIT,
-                     parse_projects, project_base, prompt_config)
+from .config import (DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, DEFAULT_VISUAL_MAX_INPUT_TOKENS, FINDINGS_SETTINGS,
+                     MAX_FINDINGS_LIMIT, parse_projects, project_base, prompt_config)
 from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secret, validate_pem, validate_token
 
 CURSOR = "CURSOR_API_KEY"
 SECRETS = {CURSOR: "cursor.key", "ANTHROPIC_API_KEY": "claude.key", "CODEX_API_KEY": "codex.key", KEY: "github.pem", TOKEN: "gitlab.token", **gitlab_tls.NAMES}
+# Carry saved settings that the wizard does not ask for into the next bundle.
+PRESERVED_SETTINGS = (*FINDINGS_SETTINGS.values(), "REVIEW_SYNC_SECONDS", "REVIEW_OSV_DOWNLOAD_DATABASES")
 SETTINGS = ("REVIEW_OPERATOR", APP_ID, INSTALL_ID, "REVIEW_MODEL", "REVIEW_MAX_INPUT_TOKENS",
-            *FINDINGS_SETTINGS.values(), "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER", "REVIEW_CURSOR_TEAM_ID", "REVIEW_AUTH_MODE", "REVIEW_LOGIN_PROFILE",
-            "REVIEW_SYNC_SECONDS", "REVIEW_OSV_DOWNLOAD_DATABASES")
-# Only the settings page asks for these, so a wizard re-run keeps what it saved.
-PAGE_SETTINGS = ("REVIEW_SYNC_SECONDS", "REVIEW_OSV_DOWNLOAD_DATABASES", *FINDINGS_SETTINGS.values())
+            "REVIEW_VISUAL_MAX_INPUT_TOKENS", "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER",
+            "REVIEW_CURSOR_TEAM_ID", "REVIEW_AUTH_MODE", "REVIEW_LOGIN_PROFILE", *PRESERVED_SETTINGS)
 
 
 def state_dir():
@@ -167,10 +167,17 @@ def max_input_tokens(state):
     return saved_integer(state, "REVIEW_MAX_INPUT_TOKENS", DEFAULT_MAX_INPUT_TOKENS)
 
 
-def max_findings(state):
-    """Effective findings cap of each review tier."""
-    return {tier: saved_integer(state, name, DEFAULT_MAX_FINDINGS, MAX_FINDINGS_LIMIT)
-            for tier, name in FINDINGS_SETTINGS.items()}
+def visual_max_input_tokens(state):
+    """Effective prompt budget of a visual review, which is its own."""
+    return saved_integer(state, "REVIEW_VISUAL_MAX_INPUT_TOKENS", DEFAULT_VISUAL_MAX_INPUT_TOKENS)
+
+
+def max_findings(state, *, tier=None, override=None):
+    """Resolve the caps used by one request, or check every tier at poller startup."""
+    requested = FINDINGS_SETTINGS if tier is None else (("mid", "max") if tier == "max" else (tier,))
+    return {name: override if name == tier and override is not None else
+            saved_integer(state, FINDINGS_SETTINGS[name], DEFAULT_MAX_FINDINGS, MAX_FINDINGS_LIMIT)
+            for name in requested}
 
 
 def ask(label, default=""):
@@ -326,14 +333,15 @@ def installer_lock(state):
 def commit(state, old, bundle):
     """Activate a finished bundle unless another save finished first."""
     link = state / (".setup-link-" + uuid.uuid4().hex)
-    try:
-        with locked(state, fcntl.LOCK_EX):
-            if active_bundle(state) != old:
-                raise ValueError("Another setup finished first; run setup again to edit its settings")
-            link.symlink_to(bundle.name)
+    with locked(state, fcntl.LOCK_EX):
+        if active_bundle(state) != old:
+            raise ValueError("Another setup finished first; run setup again to edit its settings")
+        link.symlink_to(bundle.name)
+        try:
             os.replace(link, state / "setup")
-    finally:
-        link.unlink(missing_ok=True)
+        except BaseException:
+            link.unlink(missing_ok=True)
+            raise
 
 
 def configure(state, *, force_login=False):
@@ -362,7 +370,7 @@ def configure_locked(state, force_login):
     projects = parse_projects(accounts.shape(rows))
     forges = {p.provider for p in projects.values()}
     previous = prev.get("settings", {})
-    settings = {name: previous[name] for name in PAGE_SETTINGS if name in previous}
+    settings = {name: previous[name] for name in PRESERVED_SETTINGS if name in previous}
 
     def setting(name, label, validate, default=""):
         settings[name] = retry(lambda: validate(ask(label, previous.get(name, default))))
@@ -382,12 +390,17 @@ def configure_locked(state, force_login):
         setting(INSTALL_ID, "GitHub App installation ID", number)
     default_limit = str(DEFAULT_MAX_INPUT_TOKENS)
     defaults = {"REVIEW_POLL_SECONDS": "120", "REVIEW_MAX_INPUT_TOKENS": default_limit,
+                "REVIEW_VISUAL_MAX_INPUT_TOKENS": str(DEFAULT_VISUAL_MAX_INPUT_TOKENS),
                 "REVIEW_QUALGEN_INTERVAL_SECONDS": "86400"}
-    if session and not old and ask(f"Use recommended settings (2-minute polling, {DEFAULT_MAX_INPUT_TOKENS:,} input tokens, daily history refresh)? (y/n)", "y").lower() in ("y", "yes"):
+    if session and not old and ask(f"Use recommended settings (2-minute polling, {DEFAULT_MAX_INPUT_TOKENS:,} input tokens "
+                                   f"per review and {DEFAULT_VISUAL_MAX_INPUT_TOKENS:,} per visual review, daily history "
+                                   "refresh)? (y/n)", "y").lower() in ("y", "yes"):
         settings.update(defaults)
     else:
         setting("REVIEW_POLL_SECONDS", "Seconds between polls", number, "120")
         setting("REVIEW_MAX_INPUT_TOKENS", "Maximum estimated input tokens per review", number, default_limit)
+        setting("REVIEW_VISUAL_MAX_INPUT_TOKENS", "Maximum estimated input tokens per visual review", number,
+                str(DEFAULT_VISUAL_MAX_INPUT_TOKENS))
         setting("REVIEW_QUALGEN_INTERVAL_SECONDS", "Seconds between Qualgen history refreshes (0 disables)",
                 nonnegative, "86400")
     backend = retry(lambda: providers.provider(ask("Review provider (cursor/claude/codex)", previous.get("REVIEW_PROVIDER", "cursor"))))
@@ -493,11 +506,14 @@ def configure_locked(state, force_login):
             {"projects": rows, "settings": settings, "secrets": secrets}, indent=2))
         commit(state, old, bundle)
         committed = True
-        for path in pending:
-            path.unlink(missing_ok=True)
-        if old:
-            shutil.rmtree(old)
-        retire_profiles(state, {settings.get("REVIEW_LOGIN_PROFILE"), previous.get("REVIEW_LOGIN_PROFILE")})
+        try:
+            for path in pending:
+                path.unlink(missing_ok=True)
+            if old:
+                shutil.rmtree(old)
+            retire_profiles(state, {settings.get("REVIEW_LOGIN_PROFILE"), previous.get("REVIEW_LOGIN_PROFILE")})
+        except OSError:
+            print("Settings were saved. Some previous installer files could not be removed.", file=sys.stderr)
     finally:
         if not committed:
             shutil.rmtree(bundle)

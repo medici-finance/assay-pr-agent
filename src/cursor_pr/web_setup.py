@@ -1,4 +1,5 @@
 """One-shot local browser transport for the standard installer and its settings page."""
+import fcntl
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -16,6 +17,7 @@ from . import dialog, settings, setup
 
 
 SAVED = "Saved. The sync and reviewer services reload it between cycles."
+CLEANUP_WARNING = "The previous settings bundle could not be removed from the state volume."
 UNREADABLE = ("The saved settings could not be read to show them here. "
               "Reload the page to try again, or run the setup wizard.")
 
@@ -118,19 +120,23 @@ class Session:
         return self.show({"sections": [], "projects": [], "unread": True}, *notices)
 
     def reread(self, state):
-        """Read the settings again for a page that could not be read back after a save."""
+        """Refresh the settings view after an external save or a failed readback."""
         with self.cv:
-            if not self.view.get("unread"):
+            if self.view["status"] != "settings":
                 return
         with self.editing:
             with self.cv:
-                if not self.view.get("unread"):
+                if self.view["status"] != "settings":
                     return
+                revision = self.view.get("revision")
             try:
+                with setup.locked(state, fcntl.LOCK_SH):
+                    bundle = setup.active_bundle(state)
+                if bundle is not None and bundle.name == revision:
+                    return
                 page = settings.view(state)
             except Exception:
-                with self.cv:
-                    self.view["messages"] = [UNREADABLE]
+                self.unread(UNREADABLE)
                 return
             self.show(page)
 
@@ -156,12 +162,15 @@ class Session:
             dialog.browser.reset(token)
         if resume and result["status"] != "quit":
             # The settings page shows what the wizard saved, or why it failed.
+            completed = result["status"] == "complete"
+            notice = "The setup wizard saved the configuration." if completed else result["label"]
             try:
-                self.show(settings.view(state), "The setup wizard saved the configuration."
-                          if result["status"] == "complete" else result["label"])
+                self.show(settings.view(state), notice)
                 return
-            except (ValueError, OSError, KeyError, TypeError):
-                pass
+            except Exception:
+                if completed:
+                    self.unread(notice, UNREADABLE)
+                    return
         with self.cv:
             self.view = {"id": self.view["id"] + 1, **result}
             self.cv.notify_all()
@@ -178,22 +187,29 @@ def change_setting(session, state, data):
     with session.editing:
         with session.cv:
             current = session.view["status"] == "settings" and session.view["id"] == data.get("id")
-        if not current:
+            revision = session.view.get("revision")
+        if not current or revision is None:
             return 409, None
         try:
-            settings.save(state, data)
+            old_bundle_removed = settings.save(state, data, revision=revision)
+        except settings.StaleSettings:
+            session.unread("The settings changed in another installer. Review the refreshed settings.")
+            return 409, None
         except (ValueError, OSError) as err:
             return 400, {"error": str(err)}
         except Exception:
             # Like the wizard, never echo an unexpected failure's details.
             return 400, {"error": "The setting could not be saved. Try again or use the setup wizard."}
         # The save has committed: from here on, the reply must not say otherwise.
+        notices = [SAVED]
+        if not old_bundle_removed:
+            notices.append(CLEANUP_WARNING)
         try:
             page = settings.view(state)
         except Exception:
-            view = session.unread(SAVED, UNREADABLE)
+            view = session.unread(*notices, UNREADABLE)
         else:
-            view = session.show(page, SAVED)
+            view = session.show(page, *notices)
     if view is None:
         return 409, None
     return 200, view

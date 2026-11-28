@@ -1,12 +1,14 @@
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 import fcntl
 import hashlib
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 import json
 import os
 from pathlib import Path
 import re
+import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -16,28 +18,33 @@ import httpx
 from unidiff.errors import UnidiffParseError
 import yaml
 
-from . import context, drift, engine, history, providers, scanners
+from . import context, drift, engine, history, providers, sarif, scanners
 from .scanners import fence
 from .login import auth_mode, login_directory
-from .setup import locked, apply_saved_setup, load_provider_key, max_findings, max_input_tokens, state_dir
-from .config import DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, FINDINGS_SETTINGS, MAX_FINDINGS_LIMIT, load_config, project_from
+from .setup import (locked, apply_saved_setup, load_provider_key, max_findings, max_input_tokens, state_dir,
+                    visual_max_input_tokens)
+from .config import (DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, DEFAULT_VISUAL_MAX_INPUT_TOKENS, FINDINGS_SETTINGS,
+                     MAX_FINDINGS_LIMIT, load_config, project_from)
 from .credentials import forge_credentials
 from .artifacts import forge_go_report
-from .checks import go_report, scan_files
+from .checks import blob, go_report, scan_files
 from .sync import scan_checkout
+from . import forge_status
 from .discovery import context_comments
-from .engine import (MAX_FINDINGS, CursorFailure, merge_findings, pack, prompt_advisories, rank, render_sections,
-                     review, tokens, verification, visible_advisories)
+from .engine import (MAX_FINDINGS, CursorFailure, fit_verification, merge_findings, pack, prompt_advisories, rank,
+                     render_sections, review, tokens, visible_advisories)
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
+from . import visual
 
 
 MAX_DEGRADED_ROWS = 50
 FORGE_COMMENT_BYTES = 16 * 1024
+COMPACT_FINDING_MESSAGE = 140
 # Each tier's whole budget is this multiple of the configured input-token limit.
 TIERS = {"regular": 1, "mid": 2, "max": 10}
 TIMEOUTS = {"regular": 120, "mid": 240, "max": 480}
 DEEP_FOCUS = ("Look for what only this wider view shows: a caller the change breaks, behaviour the existing "
-              "tests do not cover, and a description or earlier comment the change contradicts or leaves unanswered.")
+              "tests do not cover, and earlier discussion that points to a concrete defect in the shown patch.")
 USED = ("included", "truncated")
 
 
@@ -60,11 +67,13 @@ def add_history(files, checks, packed, estimate, limit, dropped, advisories, **o
     return packed, estimate
 
 
-def fit(files, checks, limit, cap=MAX_FINDINGS, *, title="", description="", focus="", advisories=(), rendered=None):
+def fit(files, checks, limit, cap=MAX_FINDINGS, *, title="", description="", focus="", advisories=(), rendered=None,
+        scoped=False, commit_messages=False, description_truncated=False):
     """Fill the prompt with reviewable patches first and use spare space for history."""
     if rendered is None:
         rendered = render_sections(files)
-    options = dict(max_findings=cap, focus=focus, rendered=rendered)
+    options = dict(max_findings=cap, focus=focus, rendered=rendered, scoped=scoped,
+                   commit_messages=commit_messages, description_truncated=description_truncated)
     if advisories:
         original = pack(files, checks, title=title, description=description, advisories=advisories, **options)
         original_size = tokens(original[0]) if original[3] else 0
@@ -83,12 +92,11 @@ def fit(files, checks, limit, cap=MAX_FINDINGS, *, title="", description="", foc
     return packed, estimate, original_size, dropped
 
 
-def fit_patch(files, checks, limit, title, description, *, max_findings, focus, rendered):
+def fit_patch(files, checks, limit, title, description, **options):
     """Pack the prompt, leaving out whole files until it fits the input budget.
 
     Returns the prompt, token estimates, skipped paths and whether author context was kept.
     """
-    options = dict(max_findings=max_findings, focus=focus, rendered=rendered)
     prompt, anchors, unseen, has_text = full_pack = pack(
         files, checks, title=title, description=description, **options)
     estimated = full = tokens(prompt) if has_text else 0
@@ -105,12 +113,13 @@ def fit_patch(files, checks, limit, title, description, *, max_findings, focus, 
     for check in checks:
         for finding in check["findings"]:
             findings_by_path[finding["path"]].append(finding)
-    overhead = tokens(pack([], [], title=title, description=description, **options)[0])
+    singleton = dict(options, scoped=options["scoped"] or len(files) > 1)
+    overhead = tokens(pack([], [], title=title, description=description, **singleton)[0])
     sizes = {}
     for file in files:
-        if rendered[file.path][0] is not None:
+        if options["rendered"][file.path][0] is not None:
             file_checks = [{"findings": findings_by_path.get(file.path, ())}]
-            standalone, _, _, _ = pack([file], file_checks, title=title, description=description, **options)
+            standalone, _, _, _ = pack([file], file_checks, title=title, description=description, **singleton)
             sizes[file.path] = tokens(standalone) - overhead
     queue = sorted(sizes, key=lambda path: (overhead + sizes[path] <= limit, rank(path), -sizes[path], path))
     dropped = []
@@ -149,27 +158,43 @@ def fit_patch(files, checks, limit, title, description, *, max_findings, focus, 
     return (prompt, anchors, unseen, has_text), estimated, full, sorted(dropped), bool(title or description)
 
 
-def with_context(files, checks, packed, estimated, dropped, limit, cap, names, raw, *, rendered, focus=""):
+def shown_description(kind, fates):
+    state = next((row["state"] for row in fates if row["name"] == "change description"), "empty")
+    if state not in USED:
+        return ""
+    return "truncated" if kind == "author" and state == "truncated" else kind
+
+
+def with_context(files, checks, packed, estimated, dropped, limit, cap, names, raw, *, rendered, focus="",
+                 scoped=False, description_kind=""):
     """Fit tier-specific context to an already selected scope."""
     text, fates = context.assemble(names, raw, limit - estimated - (120 if focus else 80))
-    options = dict(max_findings=cap, focus=focus, rendered=rendered)
+    options = dict(max_findings=cap, focus=focus, rendered=rendered, scoped=scoped)
+    baseline = estimated
     if text:
-        wider = pack(files, checks, frozenset(dropped), context=text, **options)
+        skipped = frozenset(dropped)
+        wider = pack(files, checks, skipped, context=text, **options)
         size = tokens(wider[0])
         if size <= limit:
-            packed, estimated = wider, size
+            packed, estimated, baseline = wider, size, size
+            kind = shown_description(description_kind, fates)
+            if kind:
+                guided = pack(files, checks, skipped, context=text, context_description=kind, **options)
+                guided_size = tokens(guided[0])
+                if guided_size <= baseline:
+                    packed, estimated = guided, guided_size
         else:
             fates = [dict(row, state="dropped") if row["state"] in USED else row for row in fates]
             text = ""
-    return packed, estimated, fates, text
+    return packed, estimated, fates, text, baseline
 
 
-def run_pass(row, prompt, anchors, args, source, *, cap, timeout, originals=None):
+def run_pass(row, prompt, anchors, args, source, *, cap, timeout, originals=None, **options):
     """Run one pass and record billing data only for fresh provider calls."""
     before = engine.started
     try:
         answer, cached = review(prompt, args.model, anchors, args.cache_dir, source,
-                                limit=cap, timeout=timeout, originals=originals)
+                                limit=cap, timeout=timeout, originals=originals, **options)
     except CursorFailure as err:
         row.update(state="failed", model_invocations=engine.started - before)
         if row["model_invocations"] and err.usage is not None:
@@ -222,8 +247,11 @@ def finding_line(issue, *, compact=False, shorten_path=False, clip=None):
     if shorten_path and len(path) > 80:
         tag = hashlib.sha256(path.encode("utf-8")).hexdigest()[:12]
         path = f"…/{path[-80:]} [{tag}]"
-    title = fence(issue["title"], 60 if compact else None)
-    message = fence(issue["message"], 140 if compact else clip)
+    status = issue.get("verification_status")
+    prefix = {"confirmed": "Confirmed ", "unverified": "Unverified "}.get(status, "")
+    title_text = prefix + issue["title"]
+    title = fence(title_text, 60 if compact else None)
+    message = fence(issue["message"], COMPACT_FINDING_MESSAGE if compact else clip)
     return f"- {fence(path)}:{issue['line']} — {title}. {message}" + (" (shortened)" if clip else "")
 
 
@@ -233,7 +261,7 @@ def size_of(text):
 
 def shortened_finding(issue, allowance):
     """The finding row with the longest message that fits, keeping at least the compact 140 characters."""
-    low, high, best = 140, len(issue["message"]), None
+    low, high, best = COMPACT_FINDING_MESSAGE, len(issue["message"]), None
     while low <= high:
         middle = (low + high) // 2
         row = comment_text([finding_line(issue, clip=middle)])
@@ -245,18 +273,26 @@ def shortened_finding(issue, allowance):
 
 
 def bounded_findings(issues, space):
-    """Share space evenly among findings, shortening only the longest messages; None when they cannot fit."""
+    """Reserve the minimum for each row before sharing space for additional detail."""
     full = [comment_text([finding_line(issue)]) for issue in issues]
-    rows = list(full)
-    remaining = space
+    rows = full.copy()
+    for index, issue in enumerate(issues):
+        if len(issue["message"]) > COMPACT_FINDING_MESSAGE:
+            shortened = comment_text([finding_line(issue, clip=COMPACT_FINDING_MESSAGE)])
+            rows[index] = min((full[index], shortened), key=size_of)
+    minimum_sizes = [size_of(row) for row in rows]
+    remaining = space - sum(minimum_sizes)
+    if remaining < 0:
+        return None
+
     order = sorted(range(len(issues)), key=lambda index: size_of(full[index]))
     for position, index in enumerate(order):
-        share = remaining // (len(order) - position)
-        if size_of(rows[index]) > share:
-            rows[index] = shortened_finding(issues[index], share)
-            if rows[index] is None:
-                return None
-        remaining -= size_of(rows[index])
+        allowance = minimum_sizes[index] + remaining // (len(order) - position)
+        if size_of(full[index]) <= allowance:
+            rows[index] = full[index]
+        else:
+            rows[index] = shortened_finding(issues[index], allowance) or rows[index]
+        remaining -= size_of(rows[index]) - minimum_sizes[index]
     return rows
 
 
@@ -318,8 +354,33 @@ def fit_tier_comment(header, findings, coverage, extra_coverage, outside, detail
     return body + "".join(model) + skipped + outside_text + evidence + end
 
 
+def evidence(report):
+    """Scanner, history and drift rows. None of it comes from the model or enters a prompt."""
+    body = []
+    for check in report["checks"]:
+        if check["state"] != "complete":
+            body.append(f"- {check['tool']}: could not check {fence(check.get('path') or check.get('reason', ''))}")
+        for item in check["findings"]:
+            detail = " ".join(part for part in (fence(item["rule"]), fence(item.get("message", ""))) if part)
+            body.append(f"- {fence(item['path'])}:{item['line']} — {detail}")
+    if report.get("static_checks"):
+        body.extend(["", *scanners.summary(report["static_checks"]), ""])
+    if "qualgen" in report:
+        body.extend(["", *history.summary(report["qualgen"]), ""])
+    if "drift" in report:
+        body.extend(["", *drift.summary(report["drift"]), ""])
+    return body
+
+
 def publish(address, head, report, *, project=None, state=None):
     _, number = address.rsplit("#", 1)
+    if "map" in report:
+        # A visual review is a comment of its own shape, laid out and bounded by its module.
+        text = "\n".join(visual.comment(report, evidence(report))) + "\n"
+        if len(text.encode("utf-8")) > visual.MAX_COMMENT_BYTES:
+            raise ReviewError("Visual review exceeded the forge comment limit")
+        post_comment(project, int(number), head, text, state if state is not None else state_dir())
+        return
     label = providers.LABELS[report.get("provider", "cursor")]
     body = [f"{label} review of {head}", report["state"]]
     degraded = report.get("degraded") or []
@@ -356,26 +417,48 @@ def publish(address, head, report, *, project=None, state=None):
             body.append("The findings could not be verified by a second pass.")
         elif check["state"] == "filtered":
             body.append(f"A verification pass kept {check['after']} of {check['before']} findings.")
+            if any(finding.get("verification_status") == "unverified" for finding in report["findings"]):
+                body.append("Some retained findings are unverified.")
         if omitted_findings := report.get("omitted_findings"):
             noun = "finding" if omitted_findings == 1 else "findings"
-            body.append(f"{omitted_findings} {noun} omitted by the {report['max_findings']}-finding tier limit.")
+            # A prepared report from an older worker recorded the omitted count and the capped list.
+            finding_cap = report.get("max_findings", len(report["findings"]))
+            body.append(f"{omitted_findings} {noun} omitted by the {finding_cap}-finding tier limit.")
     # Paths come from the PR and titles/messages from the model: quote them as code
     # so the reviewer identity never posts a Markdown link or @mention for an attacker.
     header, body = body, []
     findings = [finding_line(issue) for issue in report["findings"]]
+    # Keep the counts even when the comment needs to shorten its evidence.
+    dropped_counts = Counter(item["reason"] for item in report.get("dropped", []))
+    for reason, count in sorted(dropped_counts.items()):
+        header.append(f"Dropped {count} model finding{'s' if count > 1 else ''}: {reason}.")
+    unchecked = sum(entry.get("evidence") == "unverified" for entry in report["findings"])
+    if unchecked:
+        header.append(f"Could not verify quoted code for {unchecked} model finding{'s' if unchecked > 1 else ''}.")
     if report["state"] == "over-budget":
         body.append(f"Skipped {label}. Estimated prompt {report['estimated_input_tokens']} tokens "
                     f"exceeds the limit of {report.get('prompt_limit', report['max_input_tokens'])}.")
     elif report["state"] == "model-unavailable":
         body.append(f"{label} could not complete the review.")
+    elif report["state"] == "findings-dropped":
+        body.append("No model finding passed the checks.")
     elif not report["findings"]:
-        body.append("No model findings in the reviewed scope.")
+        body.append("No model findings remained after verification."
+                    if report.get("verification", {}).get("state") == "filtered"
+                    else "No model findings in the reviewed scope.")
+    summarize_matches = report["state"] == "reviewed"
+    summarized = 0
     for check in report["checks"]:
         if check["state"] != "complete":
             body.append(f"- {check['tool']}: could not check {fence(check.get('path') or check.get('reason', ''))}")
         for item in check["findings"]:
+            if summarize_matches and item.get("baseline_match") and item.get("shown_to_model"):
+                summarized += 1
+                continue
             detail = " ".join(part for part in (fence(item["rule"]), fence(item.get("message", ""))) if part)
             body.append(f"- {fence(item['path'])}:{item['line']} — {detail}")
+    if summarized:
+        body.append(f"Scanner diagnostics also reported on the base: {summarized}.")
     if report.get("static_checks"):
         body.extend(["", *scanners.summary(report["static_checks"]), ""])
     if "qualgen" in report:
@@ -384,7 +467,7 @@ def publish(address, head, report, *, project=None, state=None):
         body.extend(["", *drift.summary(report["drift"]), ""])
     outside = [f"- Outside review coverage: {fence(path)}" for path in report["omitted"]]
     extra = [f"- Not reviewed (token limit): {extra_coverage} more files"] if extra_coverage else []
-    footer = ["", "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."]
+    footer = ["", providers.ATTRIBUTION]
     text = comment_text(intro + coverage + extra + header + findings + body + outside + footer)
     # The forge helper refuses a body over 16 KiB: shorten rather than lose the whole comment.
     if tier == "regular" and findings and size_of(text) > FORGE_COMMENT_BYTES:
@@ -409,6 +492,84 @@ def findings_option(value):
     return number
 
 
+class Stopped(SystemExit):
+    pass
+
+
+# Set once the supervisor has asked this review to stop.
+stopping = False
+
+
+def stopped(number, frame):
+    # The supervisor asks before it ends the review. Leaving like any exit removes the temporary
+    # files and ends the command being waited on. The row is not settled and stays started.
+    global stopping
+    if stopping:
+        return  # Asked again while already leaving. Raising a second time would cut the cleanup short.
+    stopping = True
+    raise Stopped("cursor-review: stopped by its supervisor")
+
+
+def request_row(args):
+    project, number, comment = args.request
+    return project, int(number), int(comment)
+
+
+def open_queue(args):
+    # The poller's queue as it is. A wrong path is an error, not a new empty database.
+    return closing(sqlite3.connect(args.queue.resolve().as_uri() + "?mode=rw", uri=True))
+
+
+def claim_head(args, head):
+    # The row of the request under review takes the head before any other work. A repeat of the
+    # request finds the head of its interrupted start there and is refused at another. Read and
+    # written in one transaction on the row the poller reads, so the two cannot disagree.
+    try:
+        with open_queue(args) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("""SELECT head, prepared FROM requests WHERE project=? AND number=? AND comment=?
+                AND status='started'""", request_row(args)).fetchone()
+            if row is None:
+                raise ReviewError("The queue has no running request for this review")
+            if row[0] and row[0] != head:
+                raise ReviewError(f"Change is at {head}, not at {row[0]}, the head of its interrupted start")
+            db.execute("UPDATE requests SET head=? WHERE project=? AND number=? AND comment=?",
+                       (head, *request_row(args)))
+            return row[1]
+    except sqlite3.Error as err:
+        raise ReviewError(f"Review queue: {err}") from err
+
+
+def prepare_publication(args, report, code):
+    # A restart can retry the same publication without repeating a model call or changing its text.
+    try:
+        with open_queue(args) as db, db:
+            db.execute("""UPDATE requests SET prepared=? WHERE project=? AND number=? AND comment=?
+                AND status='started' AND head=? AND prepared IS NULL""",
+                       (json.dumps([report, code]), *request_row(args), report["head"]))
+    except sqlite3.Error as err:
+        raise ReviewError(f"Review queue: {err}") from err
+
+
+def settle(args, status):
+    # How the review ended, on the request's row and before the lock is released, so that a poller
+    # that has stopped reading finds it there. The first one stands: a report that only failed to
+    # print did not fail. Never raises, because it also runs while a failure is being reported.
+    if not getattr(args, "own_row", False):
+        return  # Not shown to be this review's row. The failure being reported is what stands.
+    try:
+        with open_queue(args) as db, db:
+            db.execute("""UPDATE requests SET status=?, prepared=NULL WHERE project=? AND number=? AND comment=?
+                AND status='started'""", (status, *request_row(args)))
+    except (sqlite3.Error, ValueError, OSError) as err:
+        print(f"cursor-review: could not record how the review ended: {err}", file=sys.stderr)
+
+
+def review_outcome(report):
+    # What the poller keeps for a finished review: its state once its result is on the change.
+    return report["state"] if report.get("publication") == "posted-or-already-present" else "failed"
+
+
 def parser():
     p = argparse.ArgumentParser(description="Run one bounded code review and emit a JSON report.")
     mode = p.add_mutually_exclusive_group(required=True)
@@ -416,9 +577,14 @@ def parser():
     mode.add_argument("--base", help="Local base revision to compare against")
     mode.add_argument("--ci", action="store_true", help="Use provider CI event SHAs in the checkout")
     p.add_argument("--expected-change-url", help="Require this exact open forge change before reviewing")
+    p.add_argument("--queue", type=Path, help="The poller's request queue, with --request")
+    p.add_argument("--request", nargs=3, metavar=("PROJECT", "NUMBER", "COMMENT"),
+                   help="The queued request under review: its row takes the head and how the review ended")
     p.add_argument("--head", help="Local head revision (default HEAD with --base)")
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="Checkout for local Git and scanners")
     p.add_argument("--path", action="append", default=[], help="Limit review to an exact changed path; repeatable")
+    p.add_argument("--visual", action="store_true",
+                   help="Map where the diff is worth reading and explain the change, instead of hunting for issues")
     evidence = p.add_mutually_exclusive_group()
     evidence.add_argument("--go-analysis-producer", help="Trusted CI producer for --expected-change-url")
     evidence.add_argument("--go-report", type=Path, help="Assay go-analysis/v1 JSON for this head")
@@ -426,7 +592,8 @@ def parser():
     p.add_argument("--qualgen-store", type=Path, help="Read the poller’s mined Qualgen history for this project")
     p.add_argument("--model", help="Explicit provider model (otherwise the CLI default)")
     p.add_argument("--max-input-tokens", type=int,
-                   help=f"Preflight estimate limit (default {DEFAULT_MAX_INPUT_TOKENS}, or the saved REVIEW_MAX_INPUT_TOKENS setting)")
+                   help=f"Preflight estimate limit (default {DEFAULT_MAX_INPUT_TOKENS}, or the saved REVIEW_MAX_INPUT_TOKENS setting; "
+                        f"{DEFAULT_VISUAL_MAX_INPUT_TOKENS} or REVIEW_VISUAL_MAX_INPUT_TOKENS with --visual)")
     p.add_argument("--max-findings", type=findings_option,
                    help=f"Findings cap of the requested tier, 1 to {MAX_FINDINGS_LIMIT} (default {DEFAULT_MAX_FINDINGS}, or the "
                         "saved " + ", ".join(FINDINGS_SETTINGS.values()) + " setting for that tier)")
@@ -435,12 +602,26 @@ def parser():
     p.add_argument("--estimate", action="store_true", help="Prepare the inputs and report cost estimate without calling the model")
     p.add_argument("--cache-dir", type=Path, default=Path(os.getenv("XDG_CACHE_HOME", Path.home()/".cache"))/"cursor-pr-review")
     p.add_argument("--post", action="store_true", help="Publish a head-bound summary with --change")
+    p.add_argument("--sarif", type=Path, help="Also write the findings as a SARIF 2.1.0 log at this path")
+    p.add_argument("--forge-status", action="store_true",
+                   help="Report the review on the reviewed head as a GitHub check run or GitLab commit status")
     return p
 
 
 def execute(args):
+    with ExitStack() as verification_resources:
+        return execute_review(args, verification_resources)
+
+
+def execute_review(args, verification_resources):
     if args.max_input_tokens < 1 or (args.head and not args.base) or (args.post and (not args.change or args.estimate)):
         raise ReviewError("Invalid budget or incompatible --head/--post options")
+    if bool(args.queue) != bool(args.request) or (args.request and not args.change):
+        raise ReviewError("--queue and --request go together and require --change")
+    if args.visual and (args.tier != "regular" or args.max_findings is not None):
+        raise ReviewError("--visual has no tiers and reports no findings: it takes neither --tier nor --max-findings")
+    if args.visual and args.sarif:
+        raise ReviewError("--visual reports no findings, so there is nothing to write with --sarif")
     root = args.repo.resolve()
     if args.expected_change_url and not args.change:
         raise ReviewError("--expected-change-url requires --change")
@@ -448,7 +629,7 @@ def execute(args):
         raise ReviewError("--go-analysis-producer requires --expected-change-url")
     if args.change:
         change = forge_change(args.change, args.expected_change_url, project=getattr(args, "forge_project", None),
-                              with_description=args.tier != "regular")
+                              with_description=True)
     else:
         base, head = ci_refs() if args.ci else (args.base, args.head or "HEAD")
         change = local_change(root, base, head)
@@ -458,6 +639,16 @@ def execute(args):
             target = os.getenv("CI_MERGE_REQUEST_TARGET_BRANCH_SHA")
             drift_base = target if valid_sha(target) else None
 
+    if args.request:
+        if not getattr(args, "own_row", False):
+            raise ReviewError("The request's row was not checked against the change")
+        prepared = claim_head(args, change.head)
+        if prepared is not None:
+            report, code = json.loads(prepared)
+            return report, code
+
+    # A visual review reports no findings, so a cap that is set wrongly is not its problem.
+    caps = {} if args.visual else max_findings(state_dir().resolve(), tier=args.tier, override=args.max_findings)
     paths = {f.path for f in change.files}
     selected = set(args.path) if args.path else paths
     if not selected <= paths:
@@ -474,8 +665,12 @@ def execute(args):
             number = args.change.rsplit("#", 1)[1]
             if args.expected_change_url != project.change_url(number):
                 raise ReviewError("Managed checkout and reviewed project differ")
-            checkout = stack.enter_context(scan_checkout(root, project, number, change.head))
-        checks = scan_files(checkout, change.head, files)
+            resources = getattr(args, "sarif_resources", verification_resources if args.tier != "regular" else stack)
+            checkout = resources.enter_context(scan_checkout(root, project, number, change.head))
+            if hasattr(args, "sarif_resources"):
+                args.sarif_checkout = checkout
+        patch_base = drift.patch_base(root, checkout, change)
+        checks = scan_files(checkout, change.head, files, base_root=root, base=patch_base)
         deadline = time.monotonic() + 180
         for tool, path in missing:
             remaining = deadline - time.monotonic()
@@ -510,8 +705,10 @@ def execute(args):
     qualgen = history.screen(root, args.qualgen_store, selected, change.head) if args.qualgen_store else None
     advisories = qualgen["advisories"] if qualgen else ()
 
+    if args.visual:
+        return visual_review(args, change, files, sorted(paths - selected), checks, static, qualgen, drifted)
+
     tier, base = args.tier, args.max_input_tokens
-    caps = getattr(args, "findings_caps", None) or dict.fromkeys(TIERS, DEFAULT_MAX_FINDINGS)
     budget = base * TIERS[tier]
     backend = providers.provider()
     # Mid and max send the same first prompt, so a max review reuses a cached mid result.
@@ -519,8 +716,18 @@ def execute(args):
     first_tier = "regular" if tier == "regular" else "mid"
     cap = caps[first_tier]
     rendered = render_sections(files)
-    regular_options = {"title": change.title, "description": change.description, "advisories": advisories} if tier == "regular" else {}
-    first_pack, estimated, full, dropped = fit(files, checks, limit, cap, rendered=rendered, **regular_options)
+    scoped = selected != paths
+    if not args.change or not (change.title or change.description):
+        description_kind = "history"
+    elif change.description_truncated:
+        description_kind = "truncated"
+    else:
+        description_kind = "author" if change.description else "title"
+    regular_options = {}
+    if tier == "regular":
+        regular_options = dict(title=change.title, description=change.description, advisories=advisories,
+                               commit_messages=not args.change, description_truncated=change.description_truncated)
+    first_pack, estimated, full, dropped = fit(files, checks, limit, cap, rendered=rendered, scoped=scoped, **regular_options)
     prompt, anchors, unseen, has_text = first_pack
     plans = []
     fates = context.assemble(context.MID, raw, 0)[1] if tier != "regular" else []
@@ -528,8 +735,9 @@ def execute(args):
     first_paths = set()
     if has_text and estimated <= limit:
         if tier != "regular":
-            first_pack, estimated, fates, first_context = with_context(
-                files, checks, first_pack, estimated, dropped, limit, cap, context.MID, raw, rendered=rendered)
+            first_pack, estimated, fates, first_context, first_baseline = with_context(
+                files, checks, first_pack, estimated, dropped, limit, cap, context.MID, raw,
+                rendered=rendered, scoped=scoped, description_kind=description_kind)
             prompt = first_pack[0]
         plans.append(({"name": "review", "estimated_input_tokens": estimated, "state": "planned"}, prompt, anchors, fates))
         first_paths = {path for path, lines in anchors.items() if lines}
@@ -537,14 +745,14 @@ def execute(args):
     deep_limit = limit
     if tier == "max" and has_text:
         # The reserve is for planning. Verification may use any tokens left after actual prompts.
-        deep_limit = budget - (estimated if plans else 0) - base // 2
+        deep_limit = budget - (first_baseline if plans else 0) - base // 2
         deep_pack, deep_size, _, deep_dropped = fit(
-            files, checks, deep_limit, cap, focus=DEEP_FOCUS, rendered=rendered)
+            files, checks, deep_limit, cap, focus=DEEP_FOCUS, rendered=rendered, scoped=scoped)
         deep_anchors = deep_pack[1]
         if deep_size <= deep_limit:
-            deep_pack, deep_size, deep_fates, deep_context = with_context(
+            deep_pack, deep_size, deep_fates, deep_context, _ = with_context(
                 files, checks, deep_pack, deep_size, deep_dropped, deep_limit, cap, context.DEEP, raw,
-                rendered=rendered, focus=DEEP_FOCUS)
+                rendered=rendered, focus=DEEP_FOCUS, scoped=scoped, description_kind=description_kind)
             new_paths = any(lines and path not in first_paths for path, lines in deep_anchors.items())
             extra_context = any(row["name"] not in context.MID and row["state"] in USED for row in deep_fates)
             if new_paths or extra_context:
@@ -568,12 +776,17 @@ def execute(args):
             wider, fates_with_history = context.assemble(
                 (*names, history_name), {**raw, history_name: history_text}, tokens(original_context))
             replacements = fates_with_history[:-1]
+            previous_kind = shown_description(description_kind, blocks)
+            replacement_kind = shown_description(description_kind, replacements)
+            if previous_kind == "author" and replacement_kind != "author":
+                continue
             if fates_with_history[-1]["state"] not in USED or any(
                     old["state"] in USED and new["state"] not in USED
                     for old, new in zip(blocks, replacements, strict=True)):
                 continue
             candidate = pack(files, checks, frozenset(skipped), context=wider, max_findings=cap,
-                             focus=DEEP_FOCUS if is_deep else "", rendered=rendered)[0]
+                             focus=DEEP_FOCUS if is_deep else "", rendered=rendered, scoped=scoped,
+                             context_description=replacement_kind)[0]
             size = tokens(candidate)
             if size <= row["estimated_input_tokens"]:
                 row["estimated_input_tokens"] = size
@@ -606,6 +819,7 @@ def execute(args):
         return dict(report, state="estimate"), 2 if degraded or (has_text and planned_tier != tier) else 0
 
     completed, coverage, findings, deep_findings, last_error = [], {}, [], [], None
+    dropped_findings = []
     for row, pass_prompt, locations, blocks in plans:
         depth = "max" if row["name"] == "deep" else first_tier
         answer, error = run_pass(row, pass_prompt, locations, args, change.identity, cap=cap, timeout=TIMEOUTS[depth])
@@ -613,10 +827,18 @@ def execute(args):
             last_error = error
             continue
         completed.append((row["name"], blocks))
-        coverage.update({path: lines for path, lines in locations.items() if lines})
+        for path, lines in locations.items():
+            if lines:
+                coverage.setdefault(path, set()).update(lines)
         if depth == "max":
             deep_findings = answer["findings"]
-        findings = merge_findings(findings, answer["findings"]) if findings else answer["findings"]
+        findings = merge_findings(findings, answer["findings"])
+        dropped_findings.extend(answer.get("dropped", []))
+    all_findings_dropped = bool(dropped_findings and not findings)
+    for check in checks:
+        for item in check["findings"]:
+            if item.get("baseline_match") and item["line"] in coverage.get(item["path"], ()):
+                item["shown_to_model"] = True
     # Report only what reached the model: a block of a pass that failed was not sent.
     sent = merged_fates(blocks for _, blocks in completed)
     report["context"] = [sent.get(name) or (dict(row, state="not sent") if row["state"] in USED else row)
@@ -626,28 +848,29 @@ def execute(args):
         before = len(findings)
         left = budget - report["estimated_input_tokens"]
         report["verification"] = {"state": "unavailable", "before": before}
-        for radius in (15, 8, 3, 0):
-            check = verification(findings, files, radius)
-            size = tokens(check)
-            if size <= left:
-                row = {"name": "verification", "estimated_input_tokens": size, "state": "planned"}
-                passes.append(row)
-                report["estimated_input_tokens"] += size
-                verdict, _ = run_pass(row, check, coverage, args, change.identity,
-                                      cap=before, timeout=120, originals=findings)
-                if verdict is not None:
-                    findings = verdict["findings"]
-                    report["verification"] = {"state": "filtered", "before": before, "after": len(findings)}
-                break
+        comparison = context.verification_comparison(root, checkout, patch_base, change.head)
+        check, size = fit_verification(findings, files, left, comparison)
+        if check is not None:
+            row = {"name": "verification", "estimated_input_tokens": size, "state": "planned"}
+            passes.append(row)
+            report["estimated_input_tokens"] += size
+            verdict, _ = run_pass(row, check, coverage, args, change.identity,
+                                  cap=before, timeout=120, originals=findings)
+            if verdict is not None:
+                findings = verdict["findings"]
+                report["verification"] = {"state": "filtered", "before": before, "after": len(findings)}
+        if report["verification"]["state"] == "unavailable":
+            findings = [dict(finding, verification_status="unverified") for finding in findings]
     cap = caps[tier]
     if len(findings) > cap:
         report["omitted_findings"] = len(findings) - cap
-        from_deep = [issue for issue in findings if issue in deep_findings]
-        from_first = [issue for issue in findings if issue not in deep_findings]
+        deep_keys = {engine.finding_key(issue) for issue in deep_findings}
+        from_deep = [issue for issue in findings if engine.finding_key(issue) in deep_keys]
+        from_first = [issue for issue in findings if engine.finding_key(issue) not in deep_keys]
         # A max cap below the mid cap can leave more deep findings than the cap allows.
         from_deep = from_deep[:cap]
         findings = from_first[:cap - len(from_deep)] + from_deep
-    report.update(findings=findings, cursor_usage=total_usage(passes),
+    report.update(findings=findings, dropped=dropped_findings, cursor_usage=total_usage(passes),
                   cache_hit=bool(passes) and all(row["state"] == "cached" for row in passes),
                   cursor_invocations=sum(row["model_invocations"] for row in passes))
     if has_text and not completed:
@@ -656,7 +879,10 @@ def execute(args):
     report["degraded"] = degraded
     if report["delivered"] == "max":
         report["prompt_limit"] = deep_limit
-    lowered = ((has_text and report["delivered"] != tier) or report["verification"]["state"] == "unavailable"
+    if all_findings_dropped:
+        return dict(report, state="findings-dropped"), 2
+    unverified = tier != "regular" and any(f.get("verification_status") == "unverified" for f in findings)
+    lowered = ((has_text and report["delivered"] != tier) or report["verification"]["state"] == "unavailable" or unverified
                or any(row["state"] == "failed" for row in passes))
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
     if degraded or lowered:
@@ -666,8 +892,52 @@ def execute(args):
     return report, 2 if incomplete or degraded or lowered else 0
 
 
+def visual_review(args, change, files, unselected, checks, static, qualgen, drifted):
+    """Explain the change in one prompt of its own: no tiers, no context beyond the patch, no findings.
+
+    The scanners, history and drift are the same evidence a review gathers, and none of it enters
+    this prompt either.
+    """
+    prompt, anchors, unseen, has_text = visual.pack(files)
+    estimated = tokens(prompt) if has_text else 0
+    omitted = sorted(set(unseen) | set(unselected))
+    backend = providers.provider()
+    limit = args.max_input_tokens
+    report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
+              "estimated_input_tokens": estimated, "max_input_tokens": limit, "prompt_limit": limit,
+              "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
+              "findings": [], "cursor_usage": None, "drift": drifted,
+              # The map costs no tokens and stays in the report when the model is skipped or fails.
+              "map": dict(visual.survey(files), shown=sorted(file.path for file in files if visual.shows_hunks(file)))}
+    if static:
+        report["static_checks"] = [static[key] for key in sorted(static)]
+    if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
+        report["cursor_team_id"] = os.environ["REVIEW_CURSOR_TEAM_ID"]
+    if qualgen:
+        report["qualgen"] = qualgen
+    if estimated > limit:
+        return dict(report, state="over-budget"), 2
+    if args.estimate:
+        return dict(report, state="estimate"), 0
+    if has_text:
+        row = {"name": "visual", "estimated_input_tokens": estimated, "state": "planned"}
+        # The visual prompt has its own parser and cache namespace.
+        answer, error = run_pass(row, prompt, anchors, args, change.identity, cap=MAX_FINDINGS, timeout=TIMEOUTS["regular"],
+                                 parse=visual.parse_answer, version=visual.VERSION)
+        report.update(cursor_invocations=row["model_invocations"], cursor_usage=row.get("model_usage"))
+        if answer is None:
+            # The map and the deterministic evidence are kept even if the model failed.
+            return dict(report, state="model-unavailable", error=error), 2
+        report.update({name: value for name, value in answer.items() if name != "cursor_usage"}, cache_hit=row["state"] == "cached")
+    incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
+    report["state"] = "partial" if incomplete else ("reviewed" if has_text else "empty")
+    return report, 2 if incomplete else 0
+
+
 def run_request(args):
     report, code = execute(args)
+    if args.request and args.post:
+        prepare_publication(args, report, code)
     backend = report["provider"]
     if backend != "cursor":
         report["model_invocations"] = report["cursor_invocations"]
@@ -682,19 +952,37 @@ def run_request(args):
         except (ReviewError, OSError, ValueError, subprocess.TimeoutExpired) as err:
             return dict(report, publication="failed", publication_error=str(err) or type(err).__name__), 2
         report["publication"] = "posted-or-already-present"
+    # The check says how a review for defects ended, and a visual review is none: posted under the
+    # same name it would replace that review's findings, or pass for one that never ran.
+    report["forge_status"] = "skipped" if "map" in report else forge_status.outcome(args, report)
     return report, code
 
 
 def main():
-    args = parser().parse_args()
+    options = parser()
+    args = options.parse_args()
+    # Refused here, before this process may settle a row: a mistaken call must not end a request
+    # that another review is running.
+    if bool(args.queue) != bool(args.request) or (args.request and not args.change):
+        options.error("--queue and --request go together and require --change")
+    if args.request:
+        try:
+            request_row(args)
+        except ValueError:
+            options.error("--request takes a project, a change number and a comment number")
     # Load PR-Agent settings only from an empty directory, independent of the target repo.
     args.repo = args.repo.resolve()
     args.cache_dir = args.cache_dir.resolve()
+    if args.queue:
+        args.queue = args.queue.resolve()  # Before the working directory changes.
     if args.go_report:
         args.go_report = args.go_report.resolve()
     if args.qualgen_store:
         args.qualgen_store = args.qualgen_store.resolve()
     old = Path.cwd()
+    global stopping
+    stopping = False
+    asked = signal.signal(signal.SIGTERM, stopped) if args.request else None
     try:
         with ExitStack() as stack:
             state = state_dir().resolve()
@@ -707,10 +995,7 @@ def main():
             if not args.estimate and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
                 stack.enter_context(providers.cursor_account())
             if args.max_input_tokens is None:
-                args.max_input_tokens = max_input_tokens(state)
-            args.findings_caps = max_findings(state)
-            if args.max_findings is not None:
-                args.findings_caps[args.tier] = args.max_findings
+                args.max_input_tokens = visual_max_input_tokens(state) if args.visual else max_input_tokens(state)
             if args.model is None:
                 args.model = os.getenv("REVIEW_MODEL")
             if args.change:
@@ -732,6 +1017,12 @@ def main():
                 args.expected_change_url = project.change_url(number)
                 if args.scanner_ci is None:
                     args.scanner_ci = project.scanner_ci
+                if args.request:
+                    # The row is this review's own only if it is for this change. Until that is
+                    # known, nothing here settles it: it may be the row of another, running review.
+                    if request_row(args)[:2] != (project.key, int(number)):
+                        raise ReviewError("--request names another change than --change")
+                    args.own_row = True
                 args.forge_project = project
                 args.forge_state = state
                 args.managed_project = project if project.managed else None
@@ -740,14 +1031,34 @@ def main():
             from pr_agent.algo.git_patch_processing import to_hunk_only_patch  # noqa: F401
             from pr_agent.algo.token_handler import TokenEncoder  # noqa: F401
             os.chdir(args.repo)
+            if args.sarif:
+                args.sarif_resources = stack
             report, status = run_request(args)
-        print(json.dumps(report, ensure_ascii=True, indent=2))
+            if args.request:
+                # At once, before the cleanup or the report can fail.
+                settle(args, review_outcome(report))
+            if args.sarif:
+                # Print the report first, then export while the reviewed checkout is still available.
+                print(json.dumps(report, ensure_ascii=True, indent=2), flush=True)
+                checkout = getattr(args, "sarif_checkout", args.repo)
+                sarif.write(old / args.sarif, report, lambda path: blob(checkout, report["head"], path))
+                return status
+        print(json.dumps(report, ensure_ascii=True, indent=2), flush=True)
         return status
     except (ReviewError, OSError, ValueError, TypeError, KeyError, AttributeError,
             UnidiffParseError, yaml.YAMLError, subprocess.TimeoutExpired) as err:
+        if stopping:
+            # Something failed while leaving because the supervisor asked. That is still an interrupted
+            # review, whose row stays started, not one that ran and failed.
+            raise Stopped(f"cursor-review: stopped by its supervisor ({err})") from err
+        if args.request:
+            # Before the diagnostic, which fails when nobody reads it any more.
+            settle(args, "failed")
         print(f"cursor-review: {err}", file=sys.stderr)
         return 2
     finally:
+        if args.request:
+            signal.signal(signal.SIGTERM, asked)
         os.chdir(old)
 
 

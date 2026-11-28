@@ -4,15 +4,16 @@ Every block is plain text for the prompt's untrusted-data section. A gatherer re
 there is nothing to add and None when it could not look.
 """
 from contextlib import closing
+from functools import cache
 import os
 import re
 import subprocess
 import threading
 
 from .drift import git
-from .engine import hunks, rank, tokens
+from .engine import rank, tokens
 from .providers import LABELS
-from .source import ReviewError, child_env, git as git_bytes, valid_sha
+from .source import ReviewError, base_line, hunks, child_env, git as git_bytes, valid_sha
 
 MID = ("change description", "overlap with the base", "surrounding code", "call sites")
 DEEP = ("change description", "overlap with the base", "earlier comments", "whole changed files",
@@ -65,6 +66,35 @@ def live(files, *, include_removed=False):
 
 def numbered(lines, first):
     return "\n".join(f"{number}: {line}" for number, line in enumerate(lines, first))
+
+
+def verification_comparison(root, checkout, base, head):
+    """Read nearby source for cited locations on demand while both checkouts are available."""
+    @cache
+    @guarded
+    def excerpt_blob(repo, revision, path):
+        return blob(repo, revision, path)
+
+    def excerpt(file, start, end, radius):
+        if not radius:
+            return []
+        rows = []
+        old = base_line(hunks(file), start, nearest=True)
+        for label, repo, revision, path, line in (
+                ("Base source", root, base, file.previous or file.path, old),
+                ("Head source", checkout, head, file.path, start)):
+            text = excerpt_blob(repo, revision, path) if revision and line is not None else None
+            if text is None and label == "Base source" and revision and line is not None and root != checkout:
+                text = excerpt_blob(checkout, revision, path)
+            if text is not None:
+                lines = file_lines(text)
+                offset = max(0, line - radius - 1)
+                window = lines[offset:line + min(end - start, radius) + radius]
+                if window:
+                    rows.append(f"{label} ({path})\n" + numbered([line[:240] for line in window], offset + 1))
+        return rows
+
+    return excerpt
 
 
 @guarded
@@ -272,6 +302,7 @@ def existing_tests(repo, head, files):
 def is_review_summary(body):
     first, _, remainder = body.partition("\n")
     label, _, head = first.partition(" review of ")
+    label = label.removesuffix(" visual")  # A visual review opens "<provider> visual review of <head>".
     state = remainder.partition("\n")[0].strip()
     return (label in LABELS.values() and valid_sha(head)
             and state in ("reviewed", "partial", "empty", "degraded", "over-budget", "model-unavailable"))
@@ -281,7 +312,10 @@ def is_review_summary(body):
 def earlier_comments(notes):
     """The change's conversation so far, newest last, each comment bounded."""
     rows = [note["body"].strip() for note in notes if isinstance(note.get("body"), str)]
-    rows = [body for body in rows if body and not body.startswith("/review") and not is_review_summary(body)]
+    # Not the commands, and not what the reviewer itself answered them with.
+    # A comment that only starts like /visual-review is discussion, as it is to the poller.
+    rows = [body for body in rows if body and not body.startswith("/review") and body != "/visual-review"
+            and not is_review_summary(body)]
     return "\n\n".join(f"## Comment {index}\n{body[:1500]}" for index, body in enumerate(rows[-10:], 1))
 
 

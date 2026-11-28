@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from cursor_pr import cli, engine, source
+from cursor_pr import cli, engine
 
 
 def envelope(count):
@@ -22,11 +22,13 @@ class FindingsCapTests(unittest.TestCase):
         self.assertEqual(engine.MAX_FINDINGS, 6)
         self.assertEqual(cli.DEFAULT_MAX_FINDINGS, 6)
 
-    def test_answer_with_six_findings_is_accepted_and_seven_rejected(self):
-        answer = engine.parse_answer(envelope(6), self.anchors)
-        self.assertEqual([f["line"] for f in answer["findings"]], [1, 2, 3, 4, 5, 6])
-        with self.assertRaisesRegex(source.ReviewError, "Invalid Cursor finding list"):
-            engine.parse_answer(envelope(7), self.anchors)
+    def test_answer_with_seven_findings_keeps_six_and_records_the_excess(self):
+        for count in (6, 7):
+            with self.subTest(count=count):
+                answer = engine.parse_answer(envelope(count), self.anchors)
+                self.assertEqual([f["line"] for f in answer["findings"]], [1, 2, 3, 4, 5, 6])
+                self.assertEqual(answer["dropped"],
+                                 [{"path": "app.py", "line": 7, "reason": "over the finding limit"}] if count == 7 else [])
 
     def test_prompt_asks_for_zero_to_six_confident_issues(self):
         prompt = engine.pack([], [])[0]
@@ -36,6 +38,19 @@ class FindingsCapTests(unittest.TestCase):
 
 
 class CacheKeyTests(unittest.TestCase):
+    def test_a_cached_answer_from_the_previous_parser_is_reviewed_again(self):
+        old_answer = {"findings": [{"path": "app.py", "line": 1, "end_line": 1,
+                                    "title": "Old finding", "message": "Old details."}], "cursor_usage": None}
+        invalid = {"findings": [], "dropped": [{"path": "app.py", "line": 1, "reason": "malformed finding"}],
+                   "cursor_usage": None}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(engine, "provider", return_value="cursor"), \
+                patch.object(engine, "invoke", side_effect=[old_answer, invalid]) as model:
+            args = ("same prompt", None, {"app.py": {1}}, Path(tmp), "same source")
+            with patch.object(engine, "VERSION", "1"):
+                self.assertEqual(engine.review(*args), (old_answer, False))
+            self.assertEqual(engine.review(*args), (invalid, False))
+            self.assertEqual(model.call_count, 2)
+
     def test_an_answer_cached_under_another_cap_is_not_reused(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False), \
                 patch.object(engine, "provider", return_value="cursor"), \
@@ -68,6 +83,13 @@ class RegularCommentSizeTests(unittest.TestCase):
     @staticmethod
     def finding(n, message):
         return dict(path="src/app.py", line=n, end_line=n, title=f"Finding {n}", message=message)
+
+    def test_prepared_review_from_before_the_setting_keeps_its_original_cap(self):
+        report = self.report([self.finding(n, "A finding") for n in range(1, 11)], scanner_rows=0)
+        report.update(tier="max", delivered="max", context=[], passes=[], omitted_findings=2,
+                      verification={"state": "not-needed"}, max_input_tokens=60000, base_input_tokens=6000,
+                      estimated_input_tokens=2000)
+        self.assertIn("2 findings omitted by the 10-finding tier limit.", self.post(report))
 
     def test_realistic_six_findings_post_unchanged(self):
         findings = [self.finding(n, "x" * 600) for n in range(1, 7)]
@@ -104,6 +126,18 @@ class RegularCommentSizeTests(unittest.TestCase):
         size = len(comment.encode("utf-8"))
         self.assertLessEqual(size, cli.FORGE_COMMENT_BYTES)
         self.assertGreater(size, cli.FORGE_COMMENT_BYTES - 6 * 8)
+
+    def test_shortening_reserves_space_for_a_finding_with_a_long_path(self):
+        long_path = "p" * 1050 + ".py"
+        findings = [dict(self.finding(1, "short and whole"), path=long_path),
+                    self.finding(2, "y" * 3000)]
+        comment = self.post(self.report(findings, scanner_rows=141))
+
+        self.assertLessEqual(cli.size_of(comment), cli.FORGE_COMMENT_BYTES)
+        self.assertIn("Some findings were shortened to fit the forge comment.", comment)
+        self.assertIn(f"` {long_path} `:1", comment)
+        self.assertIn("` short and whole `\n", comment)
+        self.assertEqual(comment.count("SC2086"), 141)
 
     def test_falls_back_to_compact_rows_when_the_other_rows_leave_too_little_room(self):
         findings = [self.finding(n, "z" * 2000) for n in range(1, 7)]

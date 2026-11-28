@@ -18,8 +18,11 @@ const (
 
 type describedChange struct {
 	forgechange.Change
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty"`
+	Title                string `json:"title,omitempty"`
+	Body                 string `json:"body,omitempty"`
+	DescriptionTruncated bool   `json:"descriptionTruncated,omitempty"`
+	BaseSHA              string `json:"baseSha,omitempty"`
+	DiffBaseSHA          string `json:"diffBaseSha,omitempty"`
 }
 
 // Capture fields the pinned adapter reads and validates but does not export.
@@ -71,15 +74,29 @@ func (c *forgeCapture) describe(change forgechange.Change, forge string) describ
 		Title       string `json:"title"`
 		Body        string `json:"body"`
 		Description string `json:"description"`
+		Base        struct {
+			SHA string `json:"sha"`
+		} `json:"base"`
+		DiffRefs struct {
+			BaseSHA string `json:"base_sha"`
+			HeadSHA string `json:"head_sha"`
+		} `json:"diff_refs"`
 	}
 	if c.overflow || json.Unmarshal(c.payload, &fields) != nil {
 		return result
 	}
 	if forge == "gitlab" {
 		fields.Body = fields.Description
+		if fields.DiffRefs.HeadSHA == change.HeadSHA {
+			result.DiffBaseSHA = fields.DiffRefs.BaseSHA
+		}
+	} else {
+		result.BaseSHA = fields.Base.SHA
 	}
 	result.Title = boundedText(fields.Title, maxChangeTitle)
 	result.Body = boundedText(fields.Body, maxChangeBody)
+	result.DescriptionTruncated = len(strings.TrimSpace(fields.Title)) > maxChangeTitle ||
+		len(strings.TrimSpace(fields.Body)) > maxChangeBody
 	return result
 }
 

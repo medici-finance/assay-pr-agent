@@ -1,18 +1,20 @@
 """Read a forge snapshot with Assay, or compare two immutable local Git revisions."""
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
 import os
-from .credentials import SECRET_INPUTS, private_file, validate_token
-from .providers import KEYS
-from dataclasses import dataclass
 from pathlib import Path
 import re
 import selectors
 import subprocess
 import time
 
+from unidiff import PatchSet
+
+from .credentials import SECRET_INPUTS, private_file, validate_token
+from .providers import KEYS
 
 class ReviewError(Exception):
     pass
@@ -104,6 +106,19 @@ def run_forge(verb, project, *, numbers=(), publication=None, timeout=45):
     return json.loads(run(["pr-agent-forge", verb], data=json.dumps(request).encode(), env=env, timeout=timeout))
 
 
+def publication(project, number, head, body, posted=False):
+    return dict(
+        Number=number, Head=head, Body=body, MaxVisibility=project.visibility, AlreadyPosted=posted,
+        HumanLogins=[os.environ["REVIEW_FORGE_OPERATOR"]] if os.getenv("REVIEW_FORGE_OPERATOR") else [],
+        PrivateRepositories=os.getenv("REVIEW_PRIVATE_REPOSITORIES", "").split(","),
+        WithheldIdentifiers=[item.strip().lower() for item in
+                             os.getenv("REVIEW_WITHHELD_IDENTIFIERS", "").split(",") if item.strip()])
+
+
+def check_publication(project, number, head, body):
+    run_forge("check-publication", project, publication=publication(project, number, head, body))
+
+
 def post_comment(project, number, head, body, state):
     if project is None:
         raise ReviewError("Use a --change address from the configured review projects")
@@ -114,12 +129,7 @@ def post_comment(project, number, head, body, state):
     with (directory / (key + ".lock")).open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         posted = receipt.is_file()
-        run_forge("comment", project, publication=dict(
-            Number=number, Head=head, Body=body, MaxVisibility=project.visibility, AlreadyPosted=posted,
-            HumanLogins=[os.environ["REVIEW_FORGE_OPERATOR"]] if os.getenv("REVIEW_FORGE_OPERATOR") else [],
-            PrivateRepositories=os.getenv("REVIEW_PRIVATE_REPOSITORIES", "").split(","),
-            WithheldIdentifiers=[item.strip().lower() for item in
-                                 os.getenv("REVIEW_WITHHELD_IDENTIFIERS", "").split(",") if item.strip()]))
+        run_forge("comment", project, publication=publication(project, number, head, body, posted))
         if not posted:
             private_file(receipt, "posted")
 
@@ -142,6 +152,50 @@ def bounded_text(value, limit):
     return value if len(value) <= limit else value[:limit].rstrip() + TRUNCATED
 
 
+def hunks(f):
+    """Parsed hunks of one file's patch."""
+    # Parse under a fixed synthetic name; the source envelope owns the actual filename.
+    parsed = PatchSet("--- a/file\n+++ b/file\n" + f.patch.rstrip("\n") + "\n")
+    if len(parsed) != 1 or not parsed[0]:
+        raise ReviewError("Incomplete or unrecognized patch in " + f.path)
+    return parsed[0]
+
+
+def base_line(patch, line, *, nearest=False):
+    """Find the corresponding base line, with an optional nearby anchor for insertions."""
+    offset = 0
+    for hunk in patch:
+        start = hunk.target_start + (hunk.target_length == 0)
+        end = start + hunk.target_length
+        if line < start:
+            break
+        if line < end:
+            previous = hunk.source_start
+            removed_start = None
+            inserted = 0
+            for row in hunk:
+                if row.target_line_no == line:
+                    if row.source_line_no is not None or not nearest:
+                        return row.source_line_no
+                    if removed_start is not None:
+                        # Pair a replacement line with its position in the removed block.
+                        return min(removed_start + inserted, previous)
+                    return max(1, previous)
+                if row.is_removed:
+                    previous = row.source_line_no
+                    if removed_start is None:
+                        removed_start = previous
+                elif row.is_added:
+                    inserted += 1
+                elif row.is_context:
+                    previous = row.source_line_no
+                    removed_start = None
+                    inserted = 0
+            return None
+        offset = hunk.source_start + hunk.source_length + (hunk.source_length == 0) - end
+    return line + offset
+
+
 @dataclass(frozen=True)
 class File:
     path: str
@@ -160,6 +214,8 @@ class Change:
     base_ref: str = ""  # base branch name reported by the forge
     title: str = ""
     description: str = ""
+    description_truncated: bool = False
+    patch_base: str = ""  # immutable preimage commit when the comparison supplies it
 
 
 def forge_change(address, expected_url=None, *, project=None, with_description=False):
@@ -204,13 +260,19 @@ def forge_change(address, expected_url=None, *, project=None, with_description=F
                           row["patchAbsent"], row.get("previousFilename", "")))
     base_ref = first.get("baseRef")
     # The description is context, not evidence, so it is read once and never bracketed like the head.
-    return Change(head, files, first.get("url") or address, base_ref=base_ref if isinstance(base_ref, str) else "",
-                  title=bounded_text(last.get("title"), TITLE_LIMIT),
-                  description=bounded_text(last.get("body"), DESCRIPTION_LIMIT))
+    title = bounded_text(last.get("title"), TITLE_LIMIT)
+    description = bounded_text(last.get("body"), DESCRIPTION_LIMIT)
+    truncated = last.get("descriptionTruncated") is True or any(text.endswith(TRUNCATED) for text in (title, description))
+    # Evidence from the old side is usable only when both reads agree around the patch fetch.
+    base = first.get("baseSha") if first.get("baseSha") == last.get("baseSha") else None
+    patch_base = first.get("diffBaseSha") if first.get("diffBaseSha") == last.get("diffBaseSha") else None
+    return Change(head, files, first.get("url") or address, base=base if valid_sha(base) else "",
+                  base_ref=base_ref if isinstance(base_ref, str) else "", title=title, description=description,
+                  description_truncated=truncated, patch_base=patch_base if valid_sha(patch_base) else "")
 
 
-def git(root, *args):
-    return run(["git", "--literal-pathspecs", "-C", str(root), *args])
+def git(root, *args, timeout=45):
+    return run(["git", "--literal-pathspecs", "-C", str(root), *args], timeout=timeout)
 
 
 def commit(root, ref):
@@ -232,7 +294,8 @@ def local_change(root, base, head):
         except UnicodeDecodeError:
             patch = ""
         files.append(File(path, patch, status, not bool(patch)))
-    return Change(head, files, str(root.resolve()), base=tip, description=local_description(root, base, head))
+    return Change(head, files, str(root.resolve()), base=tip, description=local_description(root, base, head),
+                  patch_base=base)
 
 
 def local_description(root, base, head):

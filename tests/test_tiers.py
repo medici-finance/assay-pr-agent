@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import yaml
+
 from cursor_pr import cli, context, discovery, engine
 from cursor_pr.config import project_from
 from cursor_pr.poll import Jobs, cycle, run_review
@@ -39,6 +41,10 @@ def answer(*findings):
     return json.dumps({"review": {"key_issues_to_review": list(findings)}})
 
 
+def verified_answer(*findings):
+    return answer(*({"verification_status": "confirmed", **finding} for finding in findings))
+
+
 class TierTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -60,7 +66,7 @@ class TierTests(unittest.TestCase):
         (self.bin / "cursor-agent").write_text(SHIM)
         (self.bin / "cursor-agent").chmod(0o700)
         self.answers(review=answer(finding(42, "Real"), finding(41, "Spurious")), deep=answer(finding(42, "Real")),
-                     verification=answer(finding(42, "Real")))
+                     verification=verified_answer(finding(42, "Real")))
         env = patch.dict(os.environ, {"PATH": str(self.bin) + os.pathsep + os.environ["PATH"], "GH_TOKEN": "fixture",
                                       "REVIEW_STATE_DIR": str(Path(tmp.name) / "state")})
         env.start()
@@ -115,16 +121,23 @@ class TierTests(unittest.TestCase):
         self.assertEqual(self.prompts(), [])
 
     def test_regular_review_is_one_call_with_main_prompt_and_commit_context(self):
-        self.answers(review=answer(finding(42, "Real")))
+        self.answers(review=answer(dict(finding(42, "Real"), verification_status="unverified")))
         code, report = self.check()
         change = cli.local_change(self.root, "main", self.head)
         files = sorted(change.files, key=lambda f: f.path)
-        prompt = engine.pack(files, [], title=change.title, description=change.description)[0]
+        prompt = engine.pack(files, [], title=change.title, description=change.description,
+                             commit_messages=True)[0]
         self.assertEqual(self.prompts(), [["review", prompt]])
+        self.assertIn("observable behavior on base and head", prompt)
+        finding_schema = prompt.split("class KeyIssuesComponentLink(BaseModel):", 1)[1].split("class Review(BaseModel):", 1)[0]
+        self.assertIn('verification_status: Literal["unverified"] | None', finding_schema)
         self.assertEqual((code, report["state"], report["tier"], report["delivered"]), (0, "reviewed", "regular", "regular"))
         self.assertEqual(report["verification"], {"state": "not-needed"})
+        self.assertEqual(report["findings"][0]["verification_status"], "unverified")
+        self.assertIn("Unverified Real", cli.finding_line(report["findings"][0]))
 
     def test_mid_adds_context_to_the_plain_prompt_and_verifies_the_findings(self):
+        self.answers(verification=verified_answer(dict(finding(42, "Real"), verification_status="confirmed")))
         code, report = self.check("--tier", "mid")
         (first, prompt), (second, check) = self.prompts()
         self.assertEqual((first, second), ("review", "verification"))
@@ -138,8 +151,14 @@ class TierTests(unittest.TestCase):
             self.assertIn(expected, prompt)
         self.assertIn("42 +    return value * 2", check)
         self.assertIn('"issue_header": "Spurious"', check)
+        self.assertIn("Base source (src/app.py)", check)
+        self.assertIn("Head source (src/app.py)", check)
+        self.assertIn("compare the same concrete scenario on base and head", check)
         self.assertEqual((code, report["state"], report["delivered"]), (0, "reviewed", "mid"))
         self.assertEqual([(f["line"], f["title"]) for f in report["findings"]], [(42, "Real")])
+        self.assertEqual(report["findings"][0]["verification_status"], "confirmed")
+        self.assertIn("Confirmed Real", cli.finding_line(report["findings"][0]))
+        self.assertIn("Unverified Real", cli.finding_line(dict(report["findings"][0], verification_status="unverified")))
         self.assertEqual(report["verification"], {"state": "filtered", "before": 2, "after": 1})
         self.assertEqual({row["name"]: row["state"] for row in report["context"]},
                          {"change description": "included", "overlap with the base": "empty",
@@ -147,12 +166,23 @@ class TierTests(unittest.TestCase):
         self.assertEqual(report["cursor_invocations"], 2)
         self.assertLessEqual(report["estimated_input_tokens"], report["max_input_tokens"])
 
+    def test_a_completed_verifier_can_leave_the_review_degraded(self):
+        self.answers(verification=verified_answer(
+            finding(42, "Real"), dict(finding(41, "Spurious"), verification_status="unverified")))
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"], report["delivered"]), (2, "degraded", "mid"))
+        self.assertEqual(report["verification"], {"state": "filtered", "before": 2, "after": 2})
+        self.assertEqual([row["verification_status"] for row in report["findings"]], ["confirmed", "unverified"])
+        with patch.object(cli, "post_comment") as post:
+            cli.publish("org/repo#1", self.head, report)
+        self.assertIn("Some retained findings are unverified.", post.call_args.args[3])
+
     def test_max_reuses_the_mid_prompt_then_runs_a_deep_pass(self):
         self.check("--tier", "mid")
         mid_prompt = self.prompts()[0][1]
         (self.bin / "prompts").unlink()
         self.answers(deep=answer(finding(42, "Real"), finding(43, "From the deep pass")),
-                     verification=answer(finding(42, "Real"), finding(43, "From the deep pass")))
+                     verification=verified_answer(finding(42, "Real"), finding(43, "From the deep pass")))
         code, report = self.check("--tier", "max")
         self.assertEqual([kind for kind, _ in self.prompts()], ["deep", "verification"])  # The mid pass was cached.
         deep = self.prompts()[0][1]
@@ -175,7 +205,10 @@ class TierTests(unittest.TestCase):
         # The fixture's review answer has two findings.
         os.environ["REVIEW_MAX_FINDINGS"] = "1"
         code, report = self.check()
-        self.assertEqual((code, report["state"], report["max_findings"]), (2, "model-unavailable", 1))
+        self.assertEqual((code, report["state"], report["max_findings"]), (0, "reviewed", 1))
+        self.assertEqual([f["title"] for f in report["findings"]], ["Real"])
+        self.assertEqual(report["dropped"],
+                         [{"path": "src/app.py", "line": 41, "reason": "over the finding limit"}])
         self.assertIn("A concise list (0-1 issues)", self.prompts()[-1][1])
         os.environ["REVIEW_MAX_FINDINGS"] = "2"
         code, report = self.check()
@@ -195,13 +228,23 @@ class TierTests(unittest.TestCase):
         (self.bin / "prompts").unlink()
         os.environ["REVIEW_MAX_FINDINGS_MAX"] = "1"
         found = [finding(42, "Real"), finding(41, "Spurious"), finding(43, "Deep")]
-        self.answers(deep=answer(found[0], found[2]), verification=answer(*found))
+        self.answers(deep=answer(found[0], found[2]), verification=verified_answer(*found))
         code, report = self.check("--tier", "max")
         # Two deep findings and a cap of one: the report keeps one deep finding.
         self.assertEqual((report["max_findings"], report["omitted_findings"]), (1, 2))
         self.assertEqual([f["title"] for f in report["findings"]], ["Real"])
         # A max review's first pass is the mid prompt, under the mid cap, and reuses the cached mid answer.
         self.assertEqual(report["passes"][0]["state"], "cached")
+
+    def test_cli_override_replaces_an_invalid_configured_cap(self):
+        os.environ.update(REVIEW_MAX_FINDINGS="13", REVIEW_MAX_FINDINGS_MID="invalid")
+        code, report = self.check("--estimate", "--max-findings", "5")
+        self.assertEqual((code, report["max_findings"]), (0, 5))
+
+        os.environ.update(REVIEW_MAX_FINDINGS_MID="4", REVIEW_MAX_FINDINGS_MAX="invalid")
+        code, report = self.check("--tier", "max", "--max-findings", "2")
+        self.assertEqual((code, report["max_findings"]), (0, 2))
+        self.assertIn("A concise list (0-4 issues)", self.prompts()[0][1])
 
     def test_cli_rejects_a_cap_outside_the_bound(self):
         for value in ("0", "13", "x"):
@@ -243,7 +286,11 @@ class TierTests(unittest.TestCase):
         ], "unscreened": []}
         raw = {"change description": "Check how the new values are used.",
                "whole changed files": "These values come from the fixtures."}
-        args = ("--tier", "max", "--max-input-tokens", "1000", "--path", small, "--path", large)
+        files = [file for file in cli.local_change(self.root, "main", "HEAD").files if file.path in (small, large)]
+        mid_size = engine.tokens(engine.pack([file for file in files if file.path == small], [])[0])
+        deep_size = engine.tokens(engine.pack(files, [], focus=cli.DEEP_FOCUS)[0])
+        limit = (mid_size + deep_size + 200 + 8) // 9
+        args = ("--tier", "max", "--max-input-tokens", str(limit), "--path", small, "--path", large)
         with patch.object(context, "gather", return_value=raw), patch.object(cli.history, "screen", return_value=qualgen):
             _, plain = self.check(*args)
             _, advised = self.check(*args, "--qualgen-store", str(self.root / "qualgen"))
@@ -252,12 +299,19 @@ class TierTests(unittest.TestCase):
 
     def test_history_leaves_room_to_verify_a_mid_finding(self):
         issue = dict(finding(42, "Check the returned value"), issue_content="behavior " * 1330 + "here")
-        self.answers(review=answer(issue), verification=answer(issue))
+        self.answers(review=answer(issue), verification=verified_answer(issue))
         qualgen = {"state": "complete", "advisories": [
             {"path": "src/app.py", "kind": "co-change", "detail": "Check prior use of this path. " * 9},
         ], "unscreened": []}
-        args = ("--tier", "mid", "--max-input-tokens", "1400")
-        with patch.object(context, "gather", return_value={"change description": "The patch adjusts a returned value."}), \
+        raw = {"change description": "The patch adjusts a returned value."}
+        files = cli.local_change(self.root, "main", "HEAD").files
+        text, _ = context.assemble(context.MID, raw, 1000)
+        first_size = engine.tokens(engine.pack(files, [], context=text, context_description="history")[0])
+        row = dict(path="src/app.py", line=42, end_line=42, title=issue["issue_header"], message=issue["issue_content"])
+        verify_size = engine.tokens(engine.verification([row], files, radius=15))
+        limit = (first_size + verify_size + 1) // 2 + 8
+        args = ("--tier", "mid", "--max-input-tokens", str(limit))
+        with patch.object(context, "gather", return_value=raw), \
              patch.object(cli.history, "screen", return_value=qualgen):
             _, plain = self.check(*args)
             code, advised = self.check(*args, "--qualgen-store", str(self.root / "qualgen"))
@@ -272,7 +326,7 @@ class TierTests(unittest.TestCase):
         first = [finding(42, f"First {index}") for index in range(1, 7)]
         deep = [finding(42, f"Deep {index}") for index in range(1, 7)]
         self.answers(review=answer(*first), deep=answer(*deep))
-        for state, verdict in (("filtered", answer(*first, *deep)), ("unavailable", "fail")):
+        for state, verdict in (("filtered", verified_answer(*first, *deep)), ("unavailable", "fail")):
             with self.subTest(verification=state):
                 self.answers(verification=verdict)
                 _, report = self.check("--tier", "max", "--model", state)
@@ -288,7 +342,7 @@ class TierTests(unittest.TestCase):
         self.write("src/data.py", "".join(f"VALUE_{n} = {n}  # generated row\n" for n in range(250)))
         self.commit("add data rows")
         deep_only = finding(17, "Data issue", "src/data.py")
-        self.answers(deep=answer(deep_only), verification=answer(deep_only))
+        self.answers(deep=answer(deep_only), verification=verified_answer(deep_only))
         base = ["--max-input-tokens", "1000"]
         for deep_only_scope in (True, False):
             with self.subTest(deep_only_scope=deep_only_scope):
@@ -307,6 +361,18 @@ class TierTests(unittest.TestCase):
                 self.assertEqual([item["path"] for item in report["findings"]], ["src/data.py"])
                 self.assertLessEqual(report["estimated_input_tokens"], report["max_input_tokens"])
 
+    def test_max_collects_dropped_findings_from_both_review_passes(self):
+        real = finding(42, "Real")
+        self.answers(review=answer(finding(60, "Out of scope")), deep=answer(real, "malformed"),
+                     verification=verified_answer(real))
+        code, report = self.check("--tier", "max")
+        self.assertEqual((code, report["state"], report["delivered"]), (0, "reviewed", "max"))
+        self.assertEqual([row["title"] for row in report["findings"]], ["Real"])
+        self.assertEqual(report["dropped"], [
+            {"path": "src/app.py", "line": 60, "reason": "cited line outside the reviewed patch"},
+            {"path": "", "line": None, "reason": "malformed finding"},
+        ])
+
     def test_max_with_only_shared_context_delivers_mid(self):
         with patch.object(context, "gather", return_value={"change description": "Describes this change."}):
             code, report = self.check("--tier", "max")
@@ -315,7 +381,7 @@ class TierTests(unittest.TestCase):
 
     def test_verifier_can_use_more_than_the_planning_reserve(self):
         issue = dict(finding(42, "Detailed"), issue_content="Verified behavior in the changed routine. " * 350)
-        self.answers(review=answer(issue), verification=answer(issue))
+        self.answers(review=answer(issue), verification=verified_answer(issue))
         code, report = self.check("--tier", "mid", "--max-input-tokens", "5000")
         self.assertEqual((code, report["verification"]["state"]), (0, "filtered"))
         self.assertGreater(report["passes"][-1]["estimated_input_tokens"], 5000 // 4)
@@ -323,23 +389,96 @@ class TierTests(unittest.TestCase):
 
     def test_verification_rejects_a_rewritten_finding_and_can_retry(self):
         real = finding(42, "Real")
-        self.answers(verification=answer(dict(real, issue_content="Rewritten detail.")))
+        self.answers(verification=verified_answer(dict(real, issue_content="Rewritten detail.")))
         code, report = self.check("--tier", "mid")
         self.assertEqual((code, report["state"]), (2, "degraded"))
         self.assertEqual(report["verification"], {"state": "unavailable", "before": 2})
         self.assertEqual([(row["title"], row["message"]) for row in report["findings"]],
                          [("Real", "Real detail."), ("Spurious", "Spurious detail.")])
+        self.assertEqual([row["verification_status"] for row in report["findings"]], ["unverified", "unverified"])
         self.assertEqual(report["passes"][-1]["state"], "failed")
         self.assertEqual(report["passes"][-1]["model_usage"]["input_tokens"], 15)
         self.assertEqual(report["model_invocations"], 2)
 
-        self.answers(verification=answer(real))
+        self.answers(verification=verified_answer(real))
         code, report = self.check("--tier", "mid")
         self.assertEqual((code, report["state"]), (0, "reviewed"))
         self.assertEqual(report["verification"], {"state": "filtered", "before": 2, "after": 1})
         self.assertEqual([row["state"] for row in report["passes"]], ["cached", "called"])
         self.assertEqual([row["title"] for row in report["findings"]], ["Real"])
         self.assertEqual(report["model_invocations"], 1)
+
+        with patch.object(cli, "fit_verification", return_value=(None, 0)):
+            code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["verification"]["state"]), (2, "unavailable"))
+        self.assertEqual([row["verification_status"] for row in report["findings"]], ["unverified", "unverified"])
+
+    def test_malformed_verifier_finding_cannot_silently_remove_originals(self):
+        self.answers(verification=verified_answer(finding(60, "Outside")))
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"]), (2, "degraded"))
+        self.assertEqual(report["verification"], {"state": "unavailable", "before": 2})
+        self.assertEqual([row["title"] for row in report["findings"]], ["Real", "Spurious"])
+        self.assertEqual([row["verification_status"] for row in report["findings"]], ["unverified", "unverified"])
+        self.assertEqual(report["passes"][-1]["state"], "failed")
+        self.answers(verification=verified_answer(finding(42, "Real")))
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"]), (0, "reviewed"))
+        self.assertEqual([row["state"] for row in report["passes"]], ["cached", "called"])
+        self.assertEqual([row["title"] for row in report["findings"]], ["Real"])
+
+    def test_dropped_rows_and_a_verified_empty_result_have_distinct_messages(self):
+        self.answers(review=answer(finding(42, "Real"), "malformed"), verification=verified_answer())
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"], report["findings"]), (0, "reviewed", []))
+        self.assertEqual(report["verification"], {"state": "filtered", "before": 1, "after": 0})
+        with patch.object(cli, "post_comment") as post:
+            cli.publish("org/repo#1", self.head, report)
+        body = post.call_args.args[3]
+        self.assertIn("Dropped 1 model finding: malformed finding.", body)
+        self.assertIn("No model findings remained after verification.", body)
+        self.assertNotIn("No model finding passed the checks.", body)
+
+    def test_verification_retains_the_original_quoted_evidence_status(self):
+        real = finding(42, "Real")
+        self.answers(review=answer(dict(real, relevant_code="42 +    return value * 2")),
+                     verification=verified_answer(real))
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"]), (0, "reviewed"))
+        self.assertEqual(report["verification"], {"state": "filtered", "before": 1, "after": 1})
+        self.assertEqual([row["evidence"] for row in report["findings"]], ["verified"])
+
+    def test_max_keeps_verified_evidence_from_a_duplicate_deep_finding(self):
+        real = finding(42, "Real")
+        self.answers(review=answer(real), deep=answer(dict(real, relevant_code="return value * 2")),
+                     verification=verified_answer(real))
+        code, report = self.check("--tier", "max")
+        self.assertEqual((code, report["state"], report["delivered"]), (0, "reviewed", "max"))
+        self.assertEqual([(row["title"], row["evidence"]) for row in report["findings"]], [("Real", "verified")])
+
+    def test_malformed_yaml_cannot_filter_original_findings(self):
+        keep = dict(finding(42, "Real"), verification_status="INVALID_DATE")
+        malformed_status = yaml.safe_dump({"review": {"key_issues_to_review": [keep]}}).replace("INVALID_DATE", "2026-02-30")
+        for name, verdict in (("merge", "review: {<<: invalid, key_issues_to_review: []}"),
+                              ("status", malformed_status),
+                              ("metadata", "review: {key_issues_to_review: [], checked_on: 2026-02-30}"),
+                              ("tagged", "review: {key_issues_to_review: [], count: !!int ''}")):
+            with self.subTest(name=name):
+                self.answers(verification=verdict)
+                code, report = self.check("--tier", "mid", "--model", name)
+                self.assertEqual((code, report["state"]), (2, "degraded"))
+                self.assertEqual(report["verification"], {"state": "unavailable", "before": 2})
+                self.assertEqual([row["title"] for row in report["findings"]], ["Real", "Spurious"])
+
+    def test_an_answer_with_only_invalid_findings_does_not_poison_a_retry(self):
+        self.answers(review=answer(finding(60, "Outside")))
+        code, report = self.check()
+        self.assertEqual((code, report["state"], report["cache_hit"]), (2, "findings-dropped", False))
+        self.answers(review=answer(finding(42, "Real")))
+        code, report = self.check()
+        self.assertEqual((code, report["state"], report["cache_hit"]), (0, "reviewed", False))
+        self.assertEqual([row["title"] for row in report["findings"]], ["Real"])
+        self.assertTrue(self.check()[1]["cache_hit"])
 
     def test_tier_falls_back_to_the_one_below_and_says_so(self):
         change = cli.local_change(self.root, "main", self.head)
@@ -391,7 +530,7 @@ class TierTests(unittest.TestCase):
         self.assertEqual((code, report["state"], report["delivered"]), (2, "over-budget", None))
         self.assertNotIn("delivered", comment(report))
         # A failed deep pass sent none of its own context.
-        self.answers(review=answer(finding(42, "Real")), deep="fail", verification=answer(finding(42, "Real")))
+        self.answers(review=answer(finding(42, "Real")), deep="fail", verification=verified_answer(finding(42, "Real")))
         code, report = self.check("--tier", "max", "--model", "other")
         states = {row["name"]: row["state"] for row in report["context"]}
         self.assertEqual((report["delivered"], states["whole changed files"], states["surrounding code"]),
@@ -607,18 +746,17 @@ class TierRequestTests(unittest.TestCase):
         self.assertEqual([discovery.is_request(self.gh, 3, note, self.since) for note in notes],
                          [True, True, True, False, False])
         jobs, ran = Jobs(self.state), []
-        with patch.object(discovery, "open_changes", return_value=[3]), \
-             patch.object(discovery, "comment_threads", return_value={3: notes}):
+        with patch.object(discovery, "open_changes", return_value=([3], True)), \
+             patch.object(discovery, "comment_threads", return_value=({3: notes}, True)):
             cycle({self.gh.key: self.gh}, self.state, jobs, {self.gh.key: self.since},
                   lambda project, number, state, *tier: ran.append(tier) or "reviewed")
         self.assertEqual(ran, [(), ("mid",), ("max",)])
         self.assertEqual(Jobs(self.state).tier((self.gh.key, 3, 83)), "max")  # Survives a restart.
 
     def test_poller_passes_the_tier_to_the_review_command(self):
-        done = subprocess.CompletedProcess([], 0, stdout=json.dumps({"state": "reviewed",
-                                                                     "publication": "posted-or-already-present"}))
+        done = json.dumps({"state": "reviewed", "publication": "posted-or-already-present"}).encode()
         for tier, expected in (("regular", False), ("mid", True), ("max", True)):
-            with patch("cursor_pr.poll.subprocess.run", return_value=done) as run, \
+            with patch("cursor_pr.poll.supervised", return_value=done) as run, \
                  patch("cursor_pr.poll.history.interval", return_value=0):
                 self.assertEqual(run_review(self.gh, 3, self.state, tier), "reviewed")
             argv = run.call_args.args[0]
@@ -627,17 +765,16 @@ class TierRequestTests(unittest.TestCase):
                 self.assertEqual(argv[argv.index("--tier") + 1], tier)
 
     def test_poller_passes_the_cap_of_the_requested_tier(self):
-        done = subprocess.CompletedProcess([], 0, stdout=json.dumps({"state": "reviewed",
-                                                                     "publication": "posted-or-already-present"}))
-        os.environ.update(REVIEW_MAX_FINDINGS="2", REVIEW_MAX_FINDINGS_MID="5")
-        for tier, expected in (("regular", "2"), ("mid", "5"), ("max", None)):
-            with patch("cursor_pr.poll.subprocess.run", return_value=done) as run, \
-                 patch("cursor_pr.poll.history.interval", return_value=0):
-                self.assertEqual(run_review(self.gh, 3, self.state, tier), "reviewed")
-            argv = run.call_args.args[0]
-            self.assertEqual(argv[argv.index("--max-findings") + 1] if "--max-findings" in argv else None, expected)
-            # The child inherits the other tiers' caps, which a max review's first pass needs.
-            self.assertEqual(run.call_args.kwargs["env"]["REVIEW_MAX_FINDINGS_MID"], "5")
+        done = json.dumps({"state": "reviewed", "publication": "posted-or-already-present"}).encode()
+        with patch.dict(os.environ, {"REVIEW_MAX_FINDINGS": "2", "REVIEW_MAX_FINDINGS_MID": "5"}):
+            os.environ.pop("REVIEW_MAX_FINDINGS_MAX", None)
+            for tier, expected in (("regular", "2"), ("mid", "5"), ("max", None)):
+                with patch("cursor_pr.poll.supervised", return_value=done) as run, \
+                     patch("cursor_pr.poll.history.interval", return_value=0):
+                    self.assertEqual(run_review(self.gh, 3, self.state, tier), "reviewed")
+                argv = run.call_args.args[0]
+                self.assertEqual(argv[argv.index("--max-findings") + 1] if "--max-findings" in argv else None, expected)
+                self.assertEqual(run.call_args.kwargs["env"]["REVIEW_MAX_FINDINGS_MID"], "5")
 
 
 if __name__ == "__main__":

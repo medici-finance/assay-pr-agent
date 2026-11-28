@@ -49,7 +49,7 @@ func execute(verb string, in request) (any, error) {
 	}
 	var capture *forgeCapture
 	visibility := make(commentVisibility)
-	if verb == "change-with-description" || (verb == "context-comments" && in.Forge == "github") {
+	if verb == "change" || verb == "change-with-description" || (verb == "context-comments" && in.Forge == "github") {
 		if transport == nil {
 			transport = &http.Client{Transport: http.DefaultTransport}
 		}
@@ -108,9 +108,18 @@ func execute(verb string, in request) (any, error) {
 			if err != nil || capture == nil {
 				return change, err
 			}
-			return capture.describe(change, in.Forge), nil
+			described := capture.describe(change, in.Forge)
+			if verb == "change" {
+				described.Title, described.Body, described.DescriptionTruncated = "", "", false
+			}
+			return described, nil
 		}
 		return client.ChangedFiles(in.Numbers[0])
+	case "check-publication":
+		// Use the same visibility, head, and content checks as comment publication.
+		// The checked-only path never sends a comment.
+		in.Publication.AlreadyPosted = true
+		return nil, client.PublishComment(in.Publication)
 	case "comment":
 		err := client.PublishComment(in.Publication)
 		return nil, err

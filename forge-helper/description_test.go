@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/medici-finance/assay/tools/desk/forgechange"
 )
 
 type testTransport func(*http.Request) (*http.Response, error)
@@ -15,18 +17,19 @@ func (f testTransport) RoundTrip(req *http.Request) (*http.Response, error) { re
 
 func TestChangeDescriptionUsesTheValidatedForgeResponse(t *testing.T) {
 	head := strings.Repeat("a", 40)
+	base := strings.Repeat("b", 40)
 	for _, fixture := range []struct {
 		forge, project, endpoint, header, credential, payload string
 	}{
 		{
 			"github", "https://github.com/org/repo", "https://api.github.com/repos/org/repo/pulls/7",
 			"Authorization", "token fixture",
-			`{"number":7,"state":"open","changed_files":2,"html_url":"https://github.com/org/repo/pull/7","head":{"sha":"%HEAD%"},"base":{"ref":"main"},"title":"Short title","body":"Acceptance criteria"}`,
+			`{"number":7,"state":"open","changed_files":2,"html_url":"https://github.com/org/repo/pull/7","head":{"sha":"%HEAD%"},"base":{"ref":"main","sha":"%BASE%"},"title":"Short title","body":"Acceptance criteria"}`,
 		},
 		{
 			"gitlab", "https://gitlab.example/prefix/org/repo", "https://gitlab.example/prefix/api/v4/projects/org%2Frepo/merge_requests/7",
 			"Private-Token", "fixture",
-			`{"iid":7,"state":"opened","changes_count":"2","web_url":"https://gitlab.example/prefix/org/repo/-/merge_requests/7","sha":"%HEAD%","target_branch":"main","title":"Short title","description":"Acceptance criteria"}`,
+			`{"iid":7,"state":"opened","changes_count":"2","web_url":"https://gitlab.example/prefix/org/repo/-/merge_requests/7","sha":"%HEAD%","target_branch":"main","diff_refs":{"head_sha":"%HEAD%","base_sha":"%BASE%"},"title":"Short title","description":"Acceptance criteria"}`,
 		},
 	} {
 		t.Run(fixture.forge, func(t *testing.T) {
@@ -39,7 +42,7 @@ func TestChangeDescriptionUsesTheValidatedForgeResponse(t *testing.T) {
 					t.Fatalf("unexpected %s request to %s", req.Method, req.URL)
 				}
 				return &http.Response{StatusCode: 200, Header: make(http.Header),
-					Body:    io.NopCloser(strings.NewReader(strings.ReplaceAll(fixture.payload, "%HEAD%", head))),
+					Body:    io.NopCloser(strings.NewReader(strings.NewReplacer("%HEAD%", head, "%BASE%", base).Replace(fixture.payload))),
 					Request: req}, nil
 			})
 			in := request{Forge: fixture.forge, ProjectURL: fixture.project, Repository: "org/repo",
@@ -53,6 +56,12 @@ func TestChangeDescriptionUsesTheValidatedForgeResponse(t *testing.T) {
 				result.Title != "Short title" || result.Body != "Acceptance criteria" || calls != 1 {
 				t.Fatalf("unexpected response %#v (%d calls)", value, calls)
 			}
+			if fixture.forge == "github" && (result.BaseSHA != base || result.DiffBaseSHA != "") {
+				t.Fatalf("expected the base tip from GitHub, got %#v", result)
+			}
+			if fixture.forge == "gitlab" && (result.BaseSHA != "" || result.DiffBaseSHA != base) {
+				t.Fatalf("expected the diff base from GitLab, got %#v", result)
+			}
 			regular, err := execute("change", in)
 			if err != nil {
 				t.Fatal(err)
@@ -65,6 +74,19 @@ func TestChangeDescriptionUsesTheValidatedForgeResponse(t *testing.T) {
 				t.Fatalf("regular change exposed description: %s", encoded)
 			}
 		})
+	}
+}
+
+func TestChangeReportsMetadataTruncation(t *testing.T) {
+	capture := forgeCapture{}
+	payload, err := json.Marshal(map[string]string{"title": "title", "body": strings.Repeat("a", maxChangeBody+1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = capture.Write(payload)
+	described := capture.describe(forgechange.Change{}, "github")
+	if !described.DescriptionTruncated || len(described.Body) != maxChangeBody {
+		t.Fatalf("bounded body length %d, truncated %t", len(described.Body), described.DescriptionTruncated)
 	}
 }
 

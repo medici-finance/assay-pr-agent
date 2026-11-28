@@ -90,8 +90,10 @@ class ForgeHelperTests(unittest.TestCase):
                        "REVIEW_GITLAB_LOCAL_CA": str(cert)}
                 try:
                     with patch.dict(os.environ, env, clear=True), forge_credentials({project.key: project}):
-                        self.assertEqual(discovery.open_changes(project), [9])
-                        self.assertEqual(discovery.comment_threads(project, (9,))[9][0]["databaseId"], 14)
+                        self.assertEqual(discovery.open_changes(project), ([9], True))
+                        threads, complete = discovery.comment_threads(project, (9,))
+                        self.assertTrue(complete)
+                        self.assertEqual(threads[9][0]["databaseId"], 14)
                         reviewed = source.forge_change("org/repo#9", project=project)
                         self.assertEqual((reviewed.head, reviewed.files[0].path), (original, "app.py"))
                         self.assertEqual(reviewed.description, "")
@@ -99,6 +101,7 @@ class ForgeHelperTests(unittest.TestCase):
                         self.assertEqual((described.title, described.description),
                                          ("Align acceptance criteria", "Verify the expected state."))
                         self.assertEqual(described.head, original)
+                        source.check_publication(project, 9, original, "Status text checked.")
                         source.post_comment(project, 9, original, "Review finished.", root)
                         source.post_comment(project, 9, original, "Review finished.", root)
                         change["sha"] = "b" * 40

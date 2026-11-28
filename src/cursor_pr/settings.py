@@ -9,7 +9,8 @@ import ssl
 import tempfile
 
 from . import accounts, gitlab_tls, providers, setup
-from .config import DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, FINDINGS_SETTINGS, MAX_FINDINGS_LIMIT, parse_projects
+from .config import (DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, DEFAULT_VISUAL_MAX_INPUT_TOKENS, FINDINGS_SETTINGS,
+                     MAX_FINDINGS_LIMIT, gitlab_base, parse_projects)
 from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secret, validate_operator, validate_pem, validate_token
 from .login import login_directory, login_env
 
@@ -17,6 +18,10 @@ FIELDS = (
     {"name": "REVIEW_MAX_INPUT_TOKENS", "section": "Timing and limits", "label": "Maximum input tokens per review",
      "help": "Reviews whose estimated prompt exceeds this many tokens are skipped as over-budget.",
      "default": str(DEFAULT_MAX_INPUT_TOKENS)},
+    {"name": "REVIEW_VISUAL_MAX_INPUT_TOKENS", "section": "Timing and limits", "label": "Maximum input tokens per visual review",
+     "help": "A visual review explains the whole change, so it has its own budget. Over it, the comment still maps "
+             "where the diff is, but nothing explains it.",
+     "default": str(DEFAULT_VISUAL_MAX_INPUT_TOKENS)},
     *({"name": FINDINGS_SETTINGS[tier], "section": "Timing and limits", "label": label,
        "help": f"The most findings {command} asks the model for and reports, from 1 to {MAX_FINDINGS_LIMIT}.",
        "default": str(DEFAULT_MAX_FINDINGS)}
@@ -61,6 +66,10 @@ LOCATION_HELP = {
     "none": "Not set."}
 
 
+class StaleSettings(ValueError):
+    """A different installer has saved since the settings view was read."""
+
+
 def from_environment(name, what="the saved value"):
     """Why a row is read-only: the page's own process environment sets it. Never includes the value."""
     # Only this process's environment is visible here; each service reads its own.
@@ -96,6 +105,14 @@ def gitlab_access(config, old):
     instances = setup.gitlab_instances(setup.effective_projects(config))
     if not instances:
         return None, None, True
+    if len(instances) != 1:
+        raise ValueError("Configure one GitLab instance per container")
+    base, = instances
+    api_base = os.getenv("GITLAB_API_BASE", "").rstrip("/")
+    if api_base and api_base != base + "/api/v4":
+        raise ValueError("GITLAB_API_BASE must match the selected projects")
+    if os.getenv("REVIEW_GITLAB_BASE_URL") and gitlab_base(os.environ["REVIEW_GITLAB_BASE_URL"]) != base:
+        raise ValueError("REVIEW_GITLAB_BASE_URL must match the selected projects")
     same_instances = instances == setup.gitlab_instances(config["projects"])
     try:
         token = accounts.saved_token()
@@ -103,34 +120,84 @@ def gitlab_access(config, old):
             token = stored(config, old, TOKEN)
     except ValueError:
         token = None
-    return sorted(instances)[0], token, gitlab_tls.context(old) if same_instances else True
+    trust = [name for name in gitlab_tls.NAMES
+             if name in os.environ or name + "_FILE" in os.environ or (same_instances and name in config["secrets"])]
+    verify = True
+    if trust:
+        with tempfile.TemporaryDirectory(prefix="review-gitlab-settings-") as temp:
+            bundle = Path(temp)
+            for name in trust:
+                private_file(bundle / gitlab_tls.NAMES[name], gitlab_tls.validate(name, stored(config, old, name)))
+            try:
+                verify = gitlab_tls.context(bundle)
+            except ssl.SSLError:
+                raise ValueError("The GitLab certificate files could not be loaded for TLS") from None
+    return base, token, verify
 
 
 def model(value, config, state, old):
     return None if value in ("", "auto") else value
 
 
+def cursor_login_home(state, profile):
+    return Path(login_env("cursor", login_directory(state, profile))["HOME"])
+
+
+def check_cursor_team(account, value):
+    key, home = account
+    if home is not None:
+        return providers.eligible_team(key, value, home)
+    with tempfile.TemporaryDirectory(prefix="review-team-check-") as temp:
+        return providers.eligible_team(key, value, Path(temp))
+
+
 def cursor_team(value, config, state, old):
     saved = config["settings"]
+    saved_backend = saved.get("REVIEW_PROVIDER", "cursor")
+    saved_profile = saved.get("REVIEW_LOGIN_PROFILE", "")
     backend, mode = setup.effective_backend(saved)
-    if mode == "api-key":
-        with tempfile.TemporaryDirectory(prefix="review-team-check-") as temp:
-            # Like the poller, check against a throwaway configuration.
-            return providers.eligible_team(stored(config, old, setup.CURSOR), value, Path(temp))
-    # Never switch the live sign-in profile here: a review may be using it.
-    profile = saved.get("REVIEW_LOGIN_PROFILE", "") if backend == saved.get("REVIEW_PROVIDER", "cursor") else ""
-    home = login_env("cursor", login_directory(state, os.getenv("REVIEW_LOGIN_PROFILE", profile)))["HOME"]
-    return providers.eligible_team(None, value, Path(home))
+    profile = os.getenv("REVIEW_LOGIN_PROFILE", saved_profile if backend == saved_backend else "")
+    # Inspect team membership without switching the live sign-in profile.
+    effective = ((stored(config, old, setup.CURSOR), None) if mode == "api-key"
+                 else (None, cursor_login_home(state, profile)))
+    chosen = check_cursor_team(effective, value)
+    if saved_backend != "cursor" or chosen == saved.get("REVIEW_CURSOR_TEAM_ID", ""):
+        return chosen
+    if saved.get("REVIEW_AUTH_MODE") == "login":
+        fallback = (None, cursor_login_home(state, saved_profile))
+    elif location := config["secrets"].get(setup.CURSOR):
+        try:
+            fallback = ((old / location).read_text().strip(), None)
+        except OSError:
+            raise ValueError("The saved Cursor key is unavailable here. Make it readable before changing the shared team.") from None
+    else:
+        return chosen  # The saved API-key setup requires an environment-supplied key.
+    if fallback != effective:
+        try:
+            check_cursor_team(fallback, chosen)
+        except ValueError as err:
+            raise ValueError(f"The saved Cursor account cannot use that team. {err}") from None
+    return chosen
 
 
 def operator(value, config, state, old):
+    if ":" in value:
+        return validate_operator(value)
+    effective = setup.effective_projects(config)
+    forges = {row["provider"] for row in effective}
+    saved_forges = {row["provider"] for row in config["projects"]}
+    if forges != saved_forges or (forges == {"gitlab"} and
+                                 setup.gitlab_instances(effective) != setup.gitlab_instances(config["projects"])):
+        raise ValueError("Repository overrides change the forge for lookup. Enter username:numeric-id for the saved setup.")
+    if forges != {"gitlab"}:
+        return validate_operator(accounts.resolve_operator(value, forges))
     base, token, verify = gitlab_access(config, old)
-    forges = {row["provider"] for row in setup.effective_projects(config)}
     return validate_operator(accounts.resolve_operator(value, forges, base=base, token=token, verify=verify))
 
 
 VALIDATORS = {
     "REVIEW_MAX_INPUT_TOKENS": plain(setup.number), "REVIEW_POLL_SECONDS": plain(setup.number),
+    "REVIEW_VISUAL_MAX_INPUT_TOKENS": plain(setup.number),
     **dict.fromkeys(FINDINGS_SETTINGS.values(), plain(setup.findings_cap)),
     "REVIEW_SYNC_SECONDS": plain(setup.number), "REVIEW_QUALGEN_INTERVAL_SECONDS": plain(setup.nonnegative),
     "REVIEW_OSV_DOWNLOAD_DATABASES": plain(choice(("1", "0"))), "REVIEW_MODEL": model,
@@ -228,14 +295,15 @@ def project_rows(config):
 def view(state):
     """What the settings page shows. Credential values never leave the state volume."""
     with setup.locked(state, fcntl.LOCK_SH):
-        config = json.loads((setup.active_bundle(state) / "settings.json").read_text())
+        bundle = setup.active_bundle(state)
+        config = json.loads((bundle / "settings.json").read_text())
     sections = []
     for row in [*global_rows(config), *credential_rows(config)]:
         section = row.pop("section")
         if not sections or sections[-1]["title"] != section:
             sections.append({"title": section, "settings": []})
         sections[-1]["settings"].append(row)
-    return {"sections": sections, "projects": project_rows(config)}
+    return {"revision": bundle.name, "sections": sections, "projects": project_rows(config)}
 
 
 def edit_setting(config, state, old, name, value):
@@ -275,7 +343,9 @@ def edit_project(config, state, old, url, name, value):
     else:
         row.pop("go_analysis", None)
     setup.validate_rows(rows)
-    base, token, verify = gitlab_access(config, old)
+    token, verify = None, True
+    if accounts.pending(row for row in rows if row["provider"] == "gitlab"):
+        _, token, verify = gitlab_access(config, old)
     rows = accounts.resolve(rows, token=token, verify=verify)
     if accounts.pending(rows):
         raise ValueError("GitLab usernames need the reviewer token; enter numeric IDs for: " + ", ".join(accounts.pending(rows)))
@@ -299,17 +369,57 @@ def replace_credential(config, name, value, remove, written):
     written[name] = (validate_pem(value) if name == KEY
                      else gitlab_tls.validate(name, value) if name in gitlab_tls.NAMES else validate_token(value))
     if name == setup.CURSOR:
-        team = os.getenv("REVIEW_CURSOR_TEAM_ID", config["settings"].get("REVIEW_CURSOR_TEAM_ID", ""))
+        saved = config["settings"]
+        saved_team = saved.get("REVIEW_CURSOR_TEAM_ID", "")
+        teams = [os.getenv("REVIEW_CURSOR_TEAM_ID", saved_team)]
+        if saved.get("REVIEW_PROVIDER", "cursor") == "cursor" and saved.get("REVIEW_AUTH_MODE") != "login":
+            teams.append(saved_team)
         with tempfile.TemporaryDirectory(prefix="review-team-check-") as temp:
             try:
-                providers.select_team(written[name], team, Path(temp))
+                for team in dict.fromkeys(teams):
+                    providers.select_team(written[name], team, Path(temp))
             except ValueError as err:
                 raise ValueError(f"{err} Use the setup wizard if the key and team need to change together.") from None
     config["secrets"][name] = setup.SECRETS[name]
 
 
-def save(state, change):
-    """Change one setting, project field or credential of the saved setup."""
+def references_bundle(path, old, replacement):
+    """Would an absolute credential path lose part of its resolution after activation?"""
+    parent = old.parent.resolve()
+    retired, staged, active = parent / old.name, parent / replacement.name, parent / "setup"
+    directory = Path("/")
+    remaining = list(reversed(path.parts[1:]))
+    links = 0
+    while remaining:
+        name = remaining.pop()
+        if name == "..":
+            directory = directory.parent
+            continue
+        candidate = directory / name
+        if candidate == retired or directory == staged:
+            return True
+        if candidate == active:
+            # Substitute the new target so /setup/../secrets remains a live mount.
+            directory = staged
+            continue
+        try:
+            target = candidate.readlink()
+        except OSError:
+            directory = candidate
+            continue
+        links += 1
+        if links > 40:  # Bound traversal of broken references with link cycles.
+            return False
+        if target.is_absolute():
+            directory = Path("/")
+            remaining.extend(reversed(target.parts[1:]))
+        else:
+            remaining.extend(reversed(target.parts))
+    return False
+
+
+def save(state, change, *, revision=None):
+    """Change one setting and report whether the previous bundle was removed."""
     name, value, project = change.get("name"), change.get("value", ""), change.get("project")
     if not isinstance(name, str) or not isinstance(value, str) or project is not None and not isinstance(project, str):
         raise ValueError("Unknown setting")
@@ -320,6 +430,8 @@ def save(state, change):
             old = setup.active_bundle(state)
             if not old:
                 raise ValueError("Run setup before changing its settings.")
+            if revision is not None and old.name != revision:
+                raise StaleSettings("The settings changed in another installer")
             config = json.loads((old / "settings.json").read_text())
         config = copy.deepcopy(config)
         written = {}
@@ -336,9 +448,15 @@ def save(state, change):
                     raise ValueError("Unknown credential in saved setup")
                 if secret in written:
                     private_file(bundle / setup.SECRETS[secret], written[secret])
-                elif not Path(location).is_absolute():
-                    # A mounted file stays a reference; a stored copy moves with its bundle.
-                    shutil.copy(old / location, bundle / setup.SECRETS[secret])
+                elif not Path(location).is_absolute() or references_bundle(Path(location), old, bundle):
+                    # Copy credentials whose configured paths would break when the old bundle is removed.
+                    destination = bundle / setup.SECRETS[secret]
+                    try:
+                        shutil.copyfile(old / location, destination)
+                        destination.chmod(0o600)
+                    except OSError:
+                        raise ValueError(f"Could not preserve the configured {secret} in a new setup bundle.") from None
+                    config["secrets"][secret] = setup.SECRETS[secret]
             if written.keys() & gitlab_tls.NAMES.keys():
                 try:
                     gitlab_tls.context(bundle)  # as the wizard does: refuse PEM data that TLS cannot load
@@ -352,4 +470,5 @@ def save(state, change):
         try:
             shutil.rmtree(old)
         except OSError:
-            pass  # The change is active; a failure here must not be reported as an unsaved change.
+            return False
+        return True

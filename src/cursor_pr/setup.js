@@ -15,7 +15,7 @@ const quit = document.querySelector("#quit");
 let quitting = false;
 quit.onclick = async () => {
   quitting = true;
-  quit.disabled = true;
+  settingsNavigation(true);
   try {
     await api("POST", {id: step.id, action: "quit"});
     document.querySelector("#registration").hidden = true;
@@ -25,8 +25,9 @@ quit.onclick = async () => {
     message.textContent = "Setup closed. You can close this tab.";
   } catch (error) {
     quitting = false;
-    quit.disabled = false;
     await load().catch(fail);
+  } finally {
+    settingsNavigation(false);
   }
 };
 // The installer console prints a random setup key; it is kept in a session cookie.
@@ -34,7 +35,11 @@ async function api(method, data, path = "/step") {
   const res = await fetch(path, {method, headers: {"Content-Type": "application/json"},
     body: data === undefined ? undefined : JSON.stringify(data), cache: "no-store"});
   if (res.status === 401) throw Error("key");
-  if (!res.ok) throw Error("The installer refused the request. Open http://127.0.0.1:8765/ in this browser and try again.");
+  if (!res.ok) {
+    const error = Error("The installer refused the request. Open http://127.0.0.1:8765/ in this browser and try again.");
+    error.status = res.status;
+    throw error;
+  }
   return res;
 }
 function show_unlock(text) {
@@ -66,13 +71,17 @@ document.querySelector("#reprint").onclick = async () => {
 // A saved setup opens on a list where each setting is saved on its own.
 const list = document.querySelector("#settings"), groups = document.querySelector("#groups");
 const row = document.querySelector("#setting").content, wizard = document.querySelector("#wizard");
+function settingsNavigation(active) {
+  quit.disabled = wizard.disabled = groups.inert = active;
+}
 function heading(tag, text) {
   const node = document.createElement(tag); node.textContent = text; return node;
 }
 function field(item, project) {
   const node = row.cloneNode(true), find = selector => node.querySelector(selector);
   const key = (project ? project.url + " " : "") + item.name;
-  const box = find(".editor"), toggle = find(".change"), submit = find(".save"), drop = find(".remove"), problem = find(".error");
+  const box = find(".editor"), toggle = find(".change"), submit = find(".save"), drop = find(".remove");
+  const cancel = find(".cancel"), problem = find(".error");
   const text = find(".input"), area = find(".multi"), pick = find(".choice"), disk = find(".file");
   const masked = item.kind === "secret", control = item.choices ? pick : item.multiline || item.kind === "json" ? area : text;
   node.firstElementChild.dataset.key = key;
@@ -89,27 +98,64 @@ function field(item, project) {
   find(".import").hidden = !masked;
   drop.hidden = !(item.optional && ["stored", "mounted"].includes(item.state));
   toggle.hidden = item.locked || item.wizard;
+  const lockOtherRows = locked => {
+    for (const change of groups.querySelectorAll(".change")) change.disabled = locked;
+  };
+  let importVersion = 0, importing = false, saving = false;
+  const updateControls = () => {
+    submit.disabled = drop.disabled = control.disabled = importing || saving;
+    cancel.disabled = disk.disabled = saving;
+  };
   toggle.onclick = () => {
+    lockOtherRows(true);
     toggle.hidden = true; box.hidden = false; problem.textContent = "";
     if (!masked) control.value = item.value;
     control.focus();
   };
-  let importVersion = 0;
-  find(".cancel").onclick = () => {
+  cancel.onclick = () => {
     importVersion++;
+    importing = false;
+    updateControls();
     if (masked) { control.value = ""; disk.value = ""; }
+    lockOtherRows(false);
     box.hidden = true; toggle.hidden = false; toggle.focus();
   };
   disk.onchange = async () => {
-    const version = ++importVersion, chosen = disk.files[0];
+    const chosen = disk.files[0];
+    if (!chosen) return;
+    const version = ++importVersion;
     disk.value = "";
-    if (chosen && chosen.size <= (item.multiline ? 900000 : 24000)) {
+    importing = true;
+    control.value = "";
+    problem.textContent = "";
+    updateControls();
+    try {
+      if (chosen.size > (item.multiline ? 900000 : 24000)) {
+        problem.textContent = "This file is too large to import.";
+        return;
+      }
       const value = await chosen.text();
-      if (version === importVersion) control.value = value;
-    } else problem.textContent = "This file is too large to import.";
+      if (version !== importVersion) return;
+      const imported = item.multiline ? value : value.trim();
+      if (!item.multiline && /[\r\n]/.test(imported)) {
+        problem.textContent = "This token file contains a line break.";
+        return;
+      }
+      control.value = imported;
+    } catch {
+      if (version === importVersion) problem.textContent = "This file could not be read.";
+    } finally {
+      if (version === importVersion) {
+        importing = false;
+        updateControls();
+      }
+    }
   };
   const keep = async data => {
-    submit.disabled = drop.disabled = true;
+    if (importing || saving || groups.inert || quitting) return;
+    saving = true;
+    updateControls();
+    quit.disabled = wizard.disabled = true;
     try {
       const res = await fetch("/setting", {method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({id: step.id, name: item.name, ...(project ? {project: project.url} : {}), ...data}), cache: "no-store"});
@@ -124,7 +170,11 @@ function field(item, project) {
     } catch (error) {
       if (error.message === "key") show_unlock("Enter the setup key printed in the installer console.");
       else problem.textContent = "The installer could not be reached. Open http://127.0.0.1:8765/ in this browser and try again.";
-    } finally { submit.disabled = drop.disabled = false; }
+    } finally {
+      saving = false;
+      updateControls();
+      quit.disabled = wizard.disabled = false;
+    }
   };
   submit.onclick = () => keep({value: control.value});
   drop.onclick = () => keep({remove: true});
@@ -144,9 +194,16 @@ function render(view) {
       [heading("h3", project.url), ...project.settings.map(item => field(item, project))]));
 }
 wizard.onclick = async () => {
-  wizard.disabled = true;
-  try { await api("POST", {id: step.id, action: "wizard"}); await load(); } catch (error) { fail(error); }
-  finally { wizard.disabled = false; }
+  settingsNavigation(true);
+  try {
+    await api("POST", {id: step.id, action: "wizard"});
+    await load();
+  } catch (error) {
+    if (error.status === 409) await load().catch(fail);
+    else fail(error);
+  } finally {
+    settingsNavigation(false);
+  }
 };
 async function load() {
   if (quitting) return;
@@ -197,6 +254,7 @@ async function load() {
   if (view.label.startsWith("Human requester")) message.textContent = "Only these accounts can trigger a paid review. Enter GitHub or GitLab usernames (or numeric IDs); the installer looks the IDs up on the forge.";
   if (view.label.startsWith("Responsible human")) message.textContent = "Enter the operator’s forge username, or username:numeric ID, for example alice or alice:12345.";
   if (view.label.startsWith("Maximum estimated")) message.textContent = "Reviews whose estimated prompt exceeds this many tokens are skipped as over-budget. Raise it for large pull requests.";
+  if (view.label.startsWith("Maximum estimated input tokens per visual")) message.textContent = "A visual review explains the whole change, so it has its own budget. Over it, the comment still maps where the diff is, but nothing explains it.";
   const prior = view.label.match(/\[([^\]]+)\]:?$/)?.[1];
   if (options.includes(prior)) choices.value = prior;
   choices.hidden = !items.length;
