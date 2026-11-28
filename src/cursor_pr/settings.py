@@ -22,12 +22,15 @@ FIELDS = (
      "help": "A visual review explains the whole change, so it has its own budget. Over it, the comment still maps "
              "where the diff is, but nothing explains it.",
      "default": str(DEFAULT_VISUAL_MAX_INPUT_TOKENS)},
+    # A max review asks each of its two passes for the mid cap and reports up to the max cap.
     *({"name": FINDINGS_SETTINGS[tier], "section": "Timing and limits", "label": label,
-       "help": f"The most findings {command} asks the model for and reports, from 1 to {MAX_FINDINGS_LIMIT}.",
-       "default": str(DEFAULT_MAX_FINDINGS)}
-      for tier, label, command in (("regular", "Findings per review", "/review"),
-                                   ("mid", "Findings per mid review", "/review-mid"),
-                                   ("max", "Findings per max review", "/review-max"))),
+       "help": f"{text} From 1 to {MAX_FINDINGS_LIMIT}.", "default": str(DEFAULT_MAX_FINDINGS)}
+      for tier, label, text in (
+          ("regular", "Findings per review", "The most findings /review asks the model for and reports."),
+          ("mid", "Findings per mid review", "The most findings /review-mid asks the model for and reports. "
+                                             "Each pass of /review-max asks for this many too."),
+          ("max", "Findings per max review", "The most findings /review-max reports across its two passes, "
+                                             "each of which asks for the mid cap."))),
     {"name": "REVIEW_POLL_SECONDS", "section": "Timing and limits", "label": "Seconds between polls",
      "help": "How often the reviewer looks for new /review comments.", "default": "120"},
     {"name": "REVIEW_SYNC_SECONDS", "section": "Timing and limits", "label": "Seconds between repository syncs",

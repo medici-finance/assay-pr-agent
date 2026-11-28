@@ -615,6 +615,9 @@ class SettingsTests(unittest.TestCase):
         for name in ("REVIEW_MAX_FINDINGS", "REVIEW_MAX_FINDINGS_MID", "REVIEW_MAX_FINDINGS_MAX"):
             row = item(view, name)
             self.assertEqual((row["kind"], row["source"], row["value"], row["locked"]), ("number", "default", "6", False))
+        # The max row says what it bounds: its passes ask for the mid cap.
+        self.assertIn("/review-max asks for this many too", item(view, "REVIEW_MAX_FINDINGS_MID")["help"])
+        self.assertIn("each of which asks for the mid cap", item(view, "REVIEW_MAX_FINDINGS_MAX")["help"])
         settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS_MID", "value": " 09 "})
         settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS_MAX", "value": "12"})
         saved = self.document()["settings"]
@@ -623,7 +626,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual((item(settings.view(self.state), "REVIEW_MAX_FINDINGS_MID")["source"]), "saved")
         self.assertEqual(setup.max_findings(self.state), {"regular": 6, "mid": 9, "max": 12})
         document = (setup.active_bundle(self.state) / "settings.json").read_bytes()
-        for value in ("0", "13", "six", "+6", "6_0", "-1", ""):
+        for value in ("0", "13", "six", "+6", "6_0", "-1", "", "1" * 5000):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "Enter an integer from 1 to 12"):
                 settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS", "value": value})
         self.assertEqual((setup.active_bundle(self.state) / "settings.json").read_bytes(), document)
@@ -638,11 +641,12 @@ class SettingsTests(unittest.TestCase):
         self.seed()
         row = item(settings.view(self.state), "REVIEW_VISUAL_MAX_INPUT_TOKENS")
         self.assertEqual((row["kind"], row["source"], row["value"], row["locked"]), ("number", "default", "12000", False))
+        before = setup.max_input_tokens(self.state)
         settings.save(self.state, {"name": "REVIEW_VISUAL_MAX_INPUT_TOKENS", "value": " 20000 "})
         self.assertEqual(self.document()["settings"]["REVIEW_VISUAL_MAX_INPUT_TOKENS"], "20000")
         self.assertEqual(setup.visual_max_input_tokens(self.state), 20000)
         # The review budget is another setting, and stays as it was.
-        self.assertEqual(setup.max_input_tokens(self.state), int(self.document()["settings"]["REVIEW_MAX_INPUT_TOKENS"]))
+        self.assertEqual((before, setup.max_input_tokens(self.state)), (6000, 6000))
         for value in ("0", "many", "-5", ""):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 settings.save(self.state, {"name": "REVIEW_VISUAL_MAX_INPUT_TOKENS", "value": value})

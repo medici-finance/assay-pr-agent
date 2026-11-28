@@ -193,7 +193,9 @@ def number(value):
 
 def findings_cap(value):
     """A findings cap as the settings page saves it: plain digits within the bound."""
-    if not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= MAX_FINDINGS_LIMIT:
+    # Short before it is read as a number: Python refuses to convert a very long run of digits,
+    # with a message of its own.
+    if len(value) > 4 or not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= MAX_FINDINGS_LIMIT:
         raise ValueError(f"Enter an integer from 1 to {MAX_FINDINGS_LIMIT}")
     return str(int(value))
 
