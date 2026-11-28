@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,17 +15,17 @@ NO_DRIFT = {"state": "could-not-check", "behind": None, "both": [], "references"
 
 
 class CoverageStateTests(unittest.TestCase):
-    def run_review(self, files, *flags, repo=None, head="a" * 40):
+    def run_review(self, files, *flags, repo=None, head="a" * 40, base=""):
         shown, posts = [], []
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         args = cli.parser().parse_args(["--change", "org/repo#1", "--repo", repo or tmp.name, "--cache-dir", str(Path(tmp.name) / "cache"),
                                         "--max-input-tokens", "6000", *flags])
 
-        def invoke(prompt, model, anchors):
+        def invoke(prompt, model, anchors, **kwargs):
             shown.append(prompt)
             return {"findings": [], "dropped": [], "cursor_usage": None}
-        with patch.object(cli, "forge_change", return_value=source.Change(head, files, "org/repo#1")), \
+        with patch.object(cli, "forge_change", return_value=source.Change(head, files, "org/repo#1", patch_base=base)), \
              patch.object(cli.drift, "forge", return_value=NO_DRIFT), patch.object(cli, "scan_files", return_value=[]), \
              patch.object(engine, "invoke", side_effect=invoke), \
              patch.object(cli, "post_comment", side_effect=lambda *args: posts.append(args[3])):
@@ -70,13 +71,13 @@ class CoverageStateTests(unittest.TestCase):
 
     def test_a_missing_patch_on_a_text_blob_is_lost_coverage_and_on_a_binary_blob_is_not(self):
         repo, head = self.head_repo({"big.py": b"x = 1\n" * 50_000, "blob.dat.txt": b"PK\x03\x04\0\0rest",
-                                     "empty.py": b"", "moved.py": b"y = 2\n"})
+                                     "empty.py": b""})
         files = [source.File("big.py", "", "modified", True), source.File("blob.dat.txt", "", "added", True),
-                 source.File("empty.py", "", "added", True), source.File("moved.py", "", "renamed", True, previous="old.py")]
+                 source.File("empty.py", "", "added", True)]
         report, code, shown, posts = self.run_review(files, repo=repo, head=head)
         self.assertEqual((code, report["state"], shown), (2, "partial", []))
         self.assertEqual(report["omitted"], ["big.py"])
-        self.assertEqual(report["not_reviewable"], ["blob.dat.txt", "empty.py", "moved.py"])
+        self.assertEqual(report["not_reviewable"], ["blob.dat.txt", "empty.py"])
         self.assertIn("- Outside review coverage: ` big.py `", posts[0])
 
     def test_binary_files_alone_are_not_partial(self):
@@ -84,12 +85,41 @@ class CoverageStateTests(unittest.TestCase):
         report, code, _, _ = self.run_review([source.File("logo.png", "", "modified", True), ADDED], repo=repo, head=head)
         self.assertEqual((code, report["state"], report["omitted"], report["not_reviewable"]), (0, "reviewed", [], ["logo.png"]))
 
-    def test_without_the_head_blob_only_a_binary_name_counts_as_no_text(self):
-        files = [source.File("icon.PNG", "", "modified", True), source.File("font.woff2", "", "added", True),
-                 source.File("main.go", "", "modified", True)]
+    def test_patchless_rename_requires_an_unchanged_blob(self):
+        repo, base = self.head_repo({"old.py": b"x = 1\n", "old_edited.py": b"y = 1\n"})
+        root = Path(repo)
+        (root / "old.py").rename(root / "moved.py")
+        (root / "old_edited.py").rename(root / "edited.py")
+        (root / "edited.py").write_bytes(b"y = 2\n")
+        source.git(root, "add", ".")
+        source.git(root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "renames")
+        head = source.commit(root, "HEAD")
+        files = [source.File("moved.py", "", "renamed", True, previous="old.py"),
+                 source.File("edited.py", "", "renamed", True, previous="old_edited.py")]
+        report, code, _, _ = self.run_review(files, repo=repo, head=head, base=base)
+        self.assertEqual((code, report["state"]), (2, "partial"))
+        self.assertEqual((report["not_reviewable"], report["omitted"]), (["moved.py"], ["edited.py"]))
+
+    def test_without_the_head_blob_even_a_binary_suffix_is_unavailable(self):
+        files = [source.File("records.dat", "", "modified", True), source.File("icon.PNG", "", "added", True)]
         report, code, _, _ = self.run_review(files)
         self.assertEqual((code, report["state"]), (2, "partial"))
-        self.assertEqual((report["omitted"], report["not_reviewable"]), (["main.go"], ["font.woff2", "icon.PNG"]))
+        self.assertEqual((report["omitted"], report["not_reviewable"]), (["icon.PNG", "records.dat"], []))
+
+    def test_unsuccessful_short_blob_read_is_unavailable(self):
+        file = source.File("broken.dat", "", "modified", True)
+        popen = subprocess.Popen
+        for output in (b"", b"\0partial"):
+            command = [sys.executable, "-c", f"import sys; sys.stdout.buffer.write({output!r}); sys.exit(9)"]
+            with self.subTest(output=output), patch.object(source.subprocess, "Popen",
+                                                          side_effect=lambda *args, **kw: popen(command, **kw)):
+                files = source.classify_absent(Path("."), "a" * 40, [file], base_root=Path("."), base="")
+            self.assertTrue(files[0].patch_unavailable)
+
+    def test_estimate_marks_an_unavailable_patch_incomplete(self):
+        missing = source.File("app.py", "", "modified", True)
+        report, code, shown, _ = self.run_review([missing], "--estimate")
+        self.assertEqual((code, report["state"], shown, report["omitted"]), (2, "estimate", [], ["app.py"]))
 
     def test_what_is_left_out_of_a_review_still_makes_it_partial(self):
         other = source.File("other.py", "@@ -0,0 +1 @@\n+y = 2\n", "added")
