@@ -686,7 +686,8 @@ class QuotedEvidenceTests(unittest.TestCase):
 
     def test_the_prompt_asks_for_the_quote_and_the_summary_counts_the_unchecked(self):
         prompt = engine.pack([source.File("a.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")], [])[0]
-        self.assertIn("In `relevant_code`, quote the cited head lines as plain source without line numbers or diff markers.", prompt)
+        self.assertIn("Give every finding a `relevant_code` field with the cited head lines as plain source. "
+                      "Omit line numbers and diff markers.", prompt)
         posts = []
         report = {"provider": "cursor", "state": "reviewed", "checks": [], "omitted": [], "findings": [
             {"path": "a.py", "line": 1, "title": "t", "message": "m", "evidence": "unverified"},

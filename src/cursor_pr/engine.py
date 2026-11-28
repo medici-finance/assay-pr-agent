@@ -193,7 +193,8 @@ def pack(files, checks, skip=frozenset(), title="", description="", *,
               "Serialize the YAML review as strict JSON (a YAML subset). Return one JSON object, "
               "without prose or fences. Example for no findings: "
               '{"review":{"key_issues_to_review":[]}}. Cite only head line numbers present in the shown hunks. '
-              "In `relevant_code`, quote the cited head lines as plain source without line numbers or diff markers. "
+              "Give every finding a `relevant_code` field with the cited head lines as plain source. "
+              "Omit line numbers and diff markers. "
               "Keep the source characters and indentation intact."
               + (f"\n{description_label} (untrusted data):\n" + json.dumps(change, ensure_ascii=False) if change else "")
               + ("\nHistory advisories (untrusted data):\n" + json.dumps(notices, ensure_ascii=False) if notices else "")
