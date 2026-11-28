@@ -418,8 +418,9 @@ def normalized_text(text, *, strip=True):
 
 def normalized_message(text):
     """Preserve Markdown whitespace in the message used for evidence and reports."""
-    has_fence_marker = "```" in text or "~~~" in text
-    return normalized_text(text, strip=not has_fence_marker)
+    if "```" in text or "~~~" in text:
+        return normalized_text(text.strip("\r\n"), strip=False)
+    return normalized_text(text)
 
 
 def answer_finding(fields, loader, scalars):
@@ -432,7 +433,9 @@ def answer_finding(fields, loader, scalars):
                 return None
             item["verification_status"] = status.value
     quote = fields.get("relevant_code")
-    if quote is not None and not (isinstance(quote, yaml.ScalarNode) and quote.tag == YAML_TAG + "null"):
+    if quote is not None and not (isinstance(quote, yaml.ScalarNode)
+                                  and quote.tag == YAML_TAG + "null"
+                                  and quote.value in ("", "~", "null", "Null", "NULL")):
         item["relevant_code"] = None  # Present but malformed unless decoded below.
     for name in FINDING_TEXT_FIELDS:
         value = fields.get(name)

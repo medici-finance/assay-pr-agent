@@ -502,12 +502,12 @@ class QuotedEvidenceTests(unittest.TestCase):
     def test_fence_indentation_matches_the_report_and_verifier_message(self):
         body = "  ```python\nif ready:\n      send()\n  ```"
         anchors = shown("if ready:", "    send()")
-        primary = envelope([issue(start=1, end=2, body=body)])
+        primary = envelope([issue(start=1, end=2, body="\n" + body + "\r\n")])
         [finding] = engine.parse_answer(primary, anchors)["findings"]
         self.assertEqual(finding["evidence"], "verified")
         self.assertEqual(finding["message"], body)
         self.assertEqual(engine.fenced_quote(finding["message"]), "if ready:\n    send()\n")
-        reply = envelope([dict(issue(start=1, end=2, body=finding["message"]), verification_status="confirmed")])
+        reply = envelope([dict(issue(start=1, end=2, body=body), verification_status="confirmed")])
         verifier = engine.parse_answer(reply, anchors, verification=True)
         self.assertEqual(engine.kept([finding], verifier), [dict(finding, verification_status="confirmed")])
 
@@ -521,6 +521,18 @@ class QuotedEvidenceTests(unittest.TestCase):
                 self.assertEqual([item["evidence"] for item in parsed["findings"]], ["verified"])
                 self.assertEqual(parsed["dropped"], [{"path": "a.py", "line": 1, "reason": "malformed quoted code"}])
         parsed = engine.parse_answer(envelope([dict(fallback, relevant_code=None)]), anchors)
+        self.assertEqual([item["evidence"] for item in parsed["findings"]], ["verified"])
+
+    def test_explicit_yaml_null_tag_requires_a_valid_null_spelling(self):
+        issue_with_quote = dict(issue(start=1, end=1, body="```python\nsend()\n```"), relevant_code="QUOTE")
+        reply = json.loads(envelope([]))
+        payload = yaml.safe_dump({"review": {"key_issues_to_review": [issue_with_quote]}})
+        reply["result"] = payload.replace("relevant_code: QUOTE", "relevant_code: !!null different()")
+        parsed = engine.parse_answer(json.dumps(reply), shown("send()"))
+        self.assertEqual(parsed["findings"], [])
+        self.assertEqual(parsed["dropped"][0]["reason"], "malformed quoted code")
+        reply["result"] = payload.replace("relevant_code: QUOTE", "relevant_code: !!null ~")
+        parsed = engine.parse_answer(json.dumps(reply), shown("send()"))
         self.assertEqual([item["evidence"] for item in parsed["findings"]], ["verified"])
 
     def test_a_fenced_explicit_quote_cannot_normalize_nul_into_source_text(self):
