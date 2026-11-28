@@ -109,7 +109,7 @@ def render(receipt):
     # A budget refusal already reports the full estimate as its prompt size.
     full = receipt["full_input_tokens"]
     if receipt["state"] != "over-budget" and full is not None and full > receipt["first_prompt_limit"]:
-        head += f"; before budget trimming: {full:,}"
+        head += f". The first pass was estimated at {full:,} tokens before trimming"
     input_label = "uncached input" if receipt["provider"] == "claude" and ("cached" in usage or "cache_write" in usage) else "input"
     usage_labels = (("input", input_label), ("cached", "cache read"),
                     ("cache_write", "cache write"), ("output", "output"))

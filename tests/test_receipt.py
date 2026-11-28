@@ -57,10 +57,11 @@ class ReceiptTests(unittest.TestCase):
         # A degraded review sent less than the whole change, so both sizes are worth stating.
         self.assertEqual(receipt.render(receipt.build(report(
                 state="degraded", estimated_input_tokens=5000, full_input_tokens=9120)))[0],
-                         "Receipt: 1 model call. Prompt 5,000 of 6,000 estimated input tokens; before budget trimming: 9,120.")
-        trimmed = receipt.build(report(state="degraded", estimated_input_tokens=10000, full_input_tokens=11500,
+                         "Receipt: 1 model call. Prompt 5,000 of 6,000 estimated input tokens. "
+                         "The first pass was estimated at 9,120 tokens before trimming.")
+        trimmed = receipt.build(report(state="degraded", estimated_input_tokens=11750, full_input_tokens=11500,
                                        max_input_tokens=12000, first_prompt_limit=10500))
-        self.assertIn("before budget trimming: 11,500.", receipt.render(trimmed)[0])
+        self.assertIn("The first pass was estimated at 11,500 tokens before trimming.", receipt.render(trimmed)[0])
         self.assertEqual(receipt.render(receipt.build(report(coverage={"reviewed": 0, "text": 0, "no_text": 2})))[1],
                          "Coverage: no text files to review. Skipped for budget: 0. Not reviewable: 2. Outside the selection: 0. "
                          "Findings: 0 model and 0 static; 0 dropped; 0 without a quote to check. "

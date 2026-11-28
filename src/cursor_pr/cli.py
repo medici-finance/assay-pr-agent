@@ -398,7 +398,7 @@ def publish(address, head, report, *, project=None, state=None):
                     f"over the limit of {report.get('prompt_limit', report['max_input_tokens'])}. "
                     f"{label} did not review these files:")
     elif degraded:
-        body.append(f"{label} did not review these files because a review pass failed:")
+        body.append(f"{label} could not cover these files because a review pass failed.")
     coverage = [f"- Not reviewed ({'pass failed' if path in failed_coverage else 'token limit'}): {fence(path)}"
                 for path in degraded[:MAX_DEGRADED_ROWS]]
 
