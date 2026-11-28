@@ -344,6 +344,15 @@ class QuotedEvidenceTests(unittest.TestCase):
                     self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
                     self.assertEqual(parsed["dropped"], [])
 
+    def test_an_embedded_carriage_return_in_a_shown_row_remains_source_text(self):
+        patch = "@@ -0,0 +1,2 @@\n+x\ry\n+ready()\n"
+        display, anchors = engine.section(source.File("a.py", patch, "modified"))
+        quote = display.split("__new hunk__\n", 1)[1]
+        raw = envelope([dict(issue(start=1, end=2), relevant_code=quote)])
+        parsed = engine.parse_answer(raw, {"a.py": anchors})
+        self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
+        self.assertEqual(parsed["dropped"], [])
+
     def test_blank_separators_outside_the_quoted_code_around_hunk_markers(self):
         quote = "__new hunk__\n\n1 +send()\n\n__old hunk__"
         raw = envelope([dict(issue(start=1, end=1), relevant_code=quote)])
@@ -443,6 +452,15 @@ class QuotedEvidenceTests(unittest.TestCase):
         raw = envelope([dict(issue(start=1, end=3), relevant_code=quote)])
         parsed = engine.parse_answer(raw, shown(lines[0], "", lines[1]))
         self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_explicit_interior_whitespace_preserves_blank_source_contents(self):
+        start, end = 'text = """first', 'last"""'
+        anchors = shown(start, " ", end)
+        for middle, evidence in ((" ", "verified"), ("\t", "unverified")):
+            with self.subTest(middle=middle):
+                raw = envelope([dict(issue(start=1, end=3), relevant_code="\n".join((start, middle, end)))])
+                parsed = engine.parse_answer(raw, anchors)
+                self.assertEqual([row["evidence"] for row in parsed["findings"]], [evidence])
 
     def test_canonically_equivalent_substantive_text_has_the_same_threshold(self):
         for word in ("\u1100\u1161\u11a8", "\uac01"):

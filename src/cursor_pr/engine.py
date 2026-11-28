@@ -30,6 +30,7 @@ MAX_FINDINGS = DEFAULT_MAX_FINDINGS
 EVIDENCE_WORK_LIMIT = 250_000
 DROPPED_PATH_CHARS = 32_768
 LINE_ENDING = re.compile(r"\r\n?|\n")
+LF_LINE_ENDING = re.compile(r"\r?\n")
 LOCKS = {"package-lock.json", "pnpm-lock.yaml", "go.sum", "npm-shrinkwrap.json"}
 
 
@@ -620,9 +621,20 @@ def quoted_evidence(code, message, lines, start, end, budget):
 
 
 def quote_coverage(quote, cited, budget):
-    parts = checkable(quote)
+    literal_status = None
+    if "\r" in quote and any("\r" in line for _, line in cited):
+        # The patch can show a literal CR inside a source row. Try that before treating it as a break.
+        if not budget.spend(len(quote) + len(cited)):
+            return "unverified"
+        literal_status = quote_rows_coverage(checkable(quote, separator=LF_LINE_ENDING), cited, budget)
+        if literal_status == "verified":
+            return literal_status
+    return quote_rows_coverage(checkable(quote), cited, budget) or literal_status
+
+
+def quote_rows_coverage(parts, cited, budget):
     concrete = [part for part in parts if part is not ELIDED]
-    if not any(part[0] for part in concrete):
+    if not any(part[0].strip(" \t") for part in concrete):
         return "unverified"
     if not quoted_in_order(concrete, cited):
         return None
@@ -642,7 +654,6 @@ ELISION = re.compile(r"(?:(?:#|//)[ \t]*)?(?:\.{3,}|…)")
 # The patch display's hunk markers stand for no code at all.
 MARKER = re.compile(r"__(?:new|old) hunk__")
 ELIDED = object()
-BLANK_QUOTE_ROW = ("", None, "")
 # These printable glyphs are blank, including the Hangul fillers and blank Braille cell.
 BLANK_GLYPHS = frozenset("\u115f\u1160\u2800\u3164\uffa0")
 
@@ -666,29 +677,26 @@ def fenced_quote(message, *, whole=False):
     return fence.content
 
 
-def checkable(quote):
+def checkable(quote, *, separator=LINE_ENDING):
     """The quote's lines in order: each as its raw and numbered forms, or ELIDED for an explicit elision.
 
     Drop hunk markers before checking whether blank lines are inside the quote.
     """
     parts = []
-    for raw in LINE_ENDING.split(quote):
+    for raw in separator.split(quote):
         shown = SHOWN.fullmatch(raw.lstrip(" \t"))
         if shown:
             parts.append((raw, shown[1], shown[2]))
             continue
         standalone = raw.strip(" \t")
-        if not standalone:
-            if parts:
-                parts.append(BLANK_QUOTE_ROW)
-        elif MARKER.fullmatch(standalone):
+        if (not standalone and not parts) or MARKER.fullmatch(standalone):
             continue
-        elif ELISION.fullmatch(standalone):
+        if ELISION.fullmatch(standalone):
             if parts[-1:] != [ELIDED]:
                 parts.append(ELIDED)
         else:
             parts.append((raw, None, raw))
-    while parts and parts[-1] == BLANK_QUOTE_ROW:
+    while parts and parts[-1] is not ELIDED and not parts[-1][0].strip(" \t"):
         parts.pop()
     return parts
 
@@ -735,9 +743,8 @@ def candidate_margins(parts, cited, budget):
 
 
 def evidence_key(text, margin, single_line):
-    stripped = text.lstrip(" \t")
-    if single_line or not stripped:
-        return stripped
+    if single_line:
+        return text.lstrip(" \t")
     return text.removeprefix(margin) if text.startswith(margin) else None
 
 
