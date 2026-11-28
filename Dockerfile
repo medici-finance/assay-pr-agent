@@ -1,3 +1,4 @@
+ARG GIT_VERSION=2.56.1
 FROM golang:1.27.4-bookworm AS forge
 ARG ASSAY_FORGE_COMMIT=273d62d941b34d8249a1e1889d838a3fc8e5010f
 RUN git init -q /assay \
@@ -11,16 +12,40 @@ FROM rhysd/actionlint:1.7.7 AS actionlint
 FROM registry.k8s.io/git-sync/git-sync:v4.8.0 AS sync
 FROM node:22-bookworm-slim AS models
 RUN npm install --prefix /opt/model-clis @openai/codex@0.171.0 @anthropic-ai/claude-code@2.1.331
+# Build the pinned upstream release on the same Debian base as the runtime.
+FROM python:3.12-slim-trixie AS git-build
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG GIT_VERSION
+# hadolint ignore=DL3008
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates cargo curl gettext libcurl4-openssl-dev libexpat1-dev \
+      libpcre2-dev libssl-dev perl xz-utils zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --fail --silent --show-error --location --retry 3 \
+      "https://www.kernel.org/pub/software/scm/git/git-${GIT_VERSION}.tar.xz" -o /tmp/git.tar.xz \
+    && echo 'f0b0bf89264b9bd2e1c640363e7529643989da76281600473c50745cd34a607f  /tmp/git.tar.xz' | sha256sum -c - \
+    && tar -xJf /tmp/git.tar.xz -C /tmp \
+    && CARGO_NET_OFFLINE=true make -C "/tmp/git-${GIT_VERSION}" -j "$(nproc)" \
+      prefix=/usr/local sysconfdir=/etc USE_LIBPCRE2=YesPlease NO_TCLTK=YesPlease \
+      PYTHON_PATH=/usr/local/bin/python3 INSTALL_SYMLINKS=YesPlease INSTALL_STRIP=-s DESTDIR=/git-root install \
+    && install -D -m 0644 "/tmp/git-${GIT_VERSION}/COPYING" /git-root/usr/local/share/doc/git/COPYING
+
 # git-sync uses the Git 2.46+ config subcommands.
 FROM python:3.12-slim-trixie
 # pipefail: a failed download or checksum must fail the RUN, not hide behind a pipe.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG TARGETARCH
+ARG GIT_VERSION
 RUN test "$TARGETARCH" = amd64 || (echo 'Assay release requires --platform linux/amd64' >&2 && exit 1)
 # System packages track the base image's Debian security updates; the tools whose
 # exact versions matter are digest-pinned below.
 # hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl haproxy curl git shellcheck bash gzip tar && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash ca-certificates curl gettext-base gzip haproxy libcurl4t64 libexpat1 libpcre2-8-0 \
+      libssl3t64 openssl perl shellcheck tar zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=git-build /git-root/usr/local/ /usr/local/
+RUN test "$(git --version)" = "git version ${GIT_VERSION}"
 RUN curl --fail --silent --show-error --location --retry 3 \
       https://github.com/medici-finance/assay/releases/download/v1.0.94/qualgen-linux-amd64 -o /usr/local/bin/qualgen \
     && echo 'cc3cf51fb2ee2f03e9e704385b59ae4ea57757e6bd9b66e613fec2abd62ce01e  /usr/local/bin/qualgen' | sha256sum -c - \
