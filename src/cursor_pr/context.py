@@ -305,7 +305,7 @@ def is_review_summary(body):
     label = label.removesuffix(" visual")  # A visual review opens "<provider> visual review of <head>".
     state = remainder.partition("\n")[0].strip()
     return (label in LABELS.values() and valid_sha(head)
-            and state in ("reviewed", "partial", "empty", "degraded", "over-budget", "model-unavailable"))
+            and state in ("reviewed", "partial", "empty", "degraded", "over-budget", "model-unavailable", "findings-dropped"))
 
 
 @guarded

@@ -272,6 +272,8 @@ class Jobs:
 
 
 def run_review(project, number, state, tier="regular", comment=None):
+    explain_dropped = tier.startswith("dropped-")
+    tier = tier.removeprefix("dropped-")
     address = f"{project.slug}#{number}"
     argv = [sys.executable, "-I", "-m", "cursor_pr.cli", "--repo", str(project.checkout),
             "--change", address, "--expected-change-url", project.change_url(number),
@@ -296,6 +298,8 @@ def run_review(project, number, state, tier="regular", comment=None):
         argv.append("--visual")
     elif tier != "regular":
         argv.extend(["--tier", tier])
+    if explain_dropped:
+        argv.append("--explain-dropped")
     if comment is not None:
         # The child keeps the request's row itself: the head it resolves, which a repeat of the
         # request is held to, and how it ended, for a poller that stops before it can read the report.
@@ -493,7 +497,7 @@ def container_main():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Poll GitHub and GitLab for /review and /visual-review comments")
+    parser = argparse.ArgumentParser(description="Poll GitHub and GitLab for review commands, including /review-dropped")
     parser.add_argument("--state-dir", type=Path, default=setup.state_dir())
     parser.add_argument("--interval", type=int,
                         help="seconds to wait after each cycle (default 120)")

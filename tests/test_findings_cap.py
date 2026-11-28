@@ -174,6 +174,13 @@ class UpperBoundCommentTests(unittest.TestCase):
                 comment = post.call_args.args[3]
                 self.assertLessEqual(len(comment.encode("utf-8")), cli.FORGE_COMMENT_BYTES)
                 self.assertEqual(comment.count(" — "), cap)
+                report.update(explain_dropped=True, dropped=[dict(path=wide * 300, line=99999, end_line=100000,
+                    reason="quoted code does not match the cited lines", diff_markers=True)] * 5)
+                with patch.object(cli, "post_comment") as post:
+                    cli.publish("org/repo#1", "a" * 40, report)
+                comment = post.call_args.args[3]
+                self.assertLessEqual(len(comment.encode("utf-8")), cli.FORGE_COMMENT_BYTES)
+                self.assertIn("Removing leading `+` diff markers", comment)
 
 
 if __name__ == "__main__":

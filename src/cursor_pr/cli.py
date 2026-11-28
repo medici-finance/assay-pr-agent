@@ -30,7 +30,7 @@ from .artifacts import forge_go_report
 from .checks import blob, go_report, scan_files
 from .sync import scan_checkout
 from . import forge_status
-from .discovery import context_comments
+from .discovery import DROPPED_COMMANDS, context_comments
 from .engine import (MAX_FINDINGS, CursorFailure, fit_verification, merge_findings, pack, prompt_advisories, rank,
                      render_sections, review, tokens, visible_advisories)
 from .source import ReviewError, ci_refs, classify_absent, forge_change, local_change, post_comment, valid_sha
@@ -192,6 +192,8 @@ def with_context(files, checks, packed, estimated, dropped, limit, cap, names, r
 def run_pass(row, prompt, anchors, args, source, *, cap, timeout, originals=None, **options):
     """Run one pass and record billing data only for fresh provider calls."""
     before = engine.started
+    if args.explain_dropped and originals is None:
+        options["explain_dropped"] = True
     try:
         answer, cached = review(prompt, args.model, anchors, args.cache_dir, source,
                                 limit=cap, timeout=timeout, originals=originals, **options)
@@ -372,6 +374,25 @@ def evidence(report):
     return body
 
 
+def rejection_rows(dropped):
+    rows = []
+    for item in dropped[:engine.REJECTION_DETAILS]:
+        where = fence(item["path"], 100) or "Unknown path"
+        if (start := item["line"]) is not None:
+            where += f" at line {start}"
+            if (end := item.get("end_line", start)) != start:
+                where += f" through {end}"
+        row = f"- {where} — {item['reason']}."
+        if item.get("diff_markers"):
+            row += " Removing leading `+` diff markers makes the quoted rows match the cited lines in order."
+        elif unmatched := item.get("unmatched_quote_row"):
+            row += f" The first unmatched code row is {unmatched} in the quote."
+        rows.append(row)
+    if len(dropped) > len(rows):
+        rows.append(f"{len(dropped) - len(rows)} additional rejections omitted from these details.")
+    return rows
+
+
 def publish(address, head, report, *, project=None, state=None):
     _, number = address.rsplit("#", 1)
     if "map" in report:
@@ -394,6 +415,10 @@ def publish(address, head, report, *, project=None, state=None):
 
     intro, body = body, []
     tier = report.get("tier", "regular")
+    explain_dropped = report.get("explain_dropped")
+    if explain_dropped:
+        request = report.get("diagnostic_request")
+        intro.append(f"Rejection details for request {request}." if request is not None else "Rejection details.")
     if tier != "regular" and report.get("delivered") is None:
         # Nothing reached the model: the state line below says why, and no tier or context was delivered.
         body.append(f"Tier {tier}: budget {report['max_input_tokens']} tokens ({TIERS[tier]}× the configured "
@@ -432,6 +457,13 @@ def publish(address, head, report, *, project=None, state=None):
     dropped_counts = Counter(item["reason"] for item in report.get("dropped", []))
     for reason, count in sorted(dropped_counts.items()):
         header.append(f"Dropped {count} model finding{'s' if count > 1 else ''}: {reason}.")
+    if explain_dropped:
+        if dropped_counts:
+            first, *more = rejection_rows(report["dropped"])
+            header.append(first)  # Keep one actionable detail even when other evidence has to be shortened.
+            body.extend(more)
+        elif any(row["state"] == "called" for row in report.get("passes", ())):
+            body.append("This rerun discarded no findings.")
     unchecked = sum(entry.get("evidence") == "unverified" for entry in report["findings"])
     if unchecked:
         header.append(f"Could not verify quoted code for {unchecked} model finding{'s' if unchecked > 1 else ''}.")
@@ -442,6 +474,8 @@ def publish(address, head, report, *, project=None, state=None):
         body.append(f"{label} could not complete the review.")
     elif report["state"] == "findings-dropped":
         body.append("No model finding passed the checks.")
+        if not explain_dropped:
+            header.append(f"Post `{DROPPED_COMMANDS[tier]}` to rerun this tier and see the rejection details.")
     elif not report["findings"]:
         body.append("No model findings remained after verification."
                     if report.get("verification", {}).get("state") == "filtered"
@@ -588,8 +622,11 @@ def parser():
     p.add_argument("--head", help="Local head revision (default HEAD with --base)")
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="Checkout for local Git and scanners")
     p.add_argument("--path", action="append", default=[], help="Limit review to an exact changed path; repeatable")
-    p.add_argument("--visual", action="store_true",
-                   help="Map where the diff is worth reading and explain the change, instead of hunting for issues")
+    review_mode = p.add_mutually_exclusive_group()
+    review_mode.add_argument("--visual", action="store_true",
+                             help="Map where the diff is worth reading and explain the change, instead of hunting for issues")
+    review_mode.add_argument("--explain-dropped", action="store_true",
+                             help="Run a fresh review and report why findings failed validation")
     evidence = p.add_mutually_exclusive_group()
     evidence.add_argument("--go-analysis-producer", help="Trusted CI producer for --expected-change-url")
     evidence.add_argument("--go-report", type=Path, help="Assay go-analysis/v1 JSON for this head")
@@ -615,7 +652,16 @@ def parser():
 
 def execute(args):
     with ExitStack() as verification_resources:
-        return execute_review(args, verification_resources)
+        if not args.explain_dropped:
+            return execute_review(args, verification_resources)
+        if args.estimate or args.visual:
+            raise ReviewError("--explain-dropped requires a review that can call the model and return findings")
+        cache_dir = args.cache_dir
+        args.cache_dir = Path(verification_resources.enter_context(tempfile.TemporaryDirectory(prefix="review-dropped-")))
+        try:
+            return execute_review(args, verification_resources)
+        finally:
+            args.cache_dir = cache_dir
 
 
 def execute_review(args, verification_resources):
@@ -948,6 +994,10 @@ def visual_review(args, change, files, unselected, checks, static, qualgen, drif
 
 def run_request(args):
     report, code = execute(args)
+    if args.explain_dropped:
+        report["explain_dropped"] = True
+        if args.request:
+            report["diagnostic_request"] = request_row(args)[2]
     if args.request and args.post:
         prepare_publication(args, report, code)
     backend = report["provider"]

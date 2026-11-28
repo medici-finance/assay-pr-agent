@@ -140,6 +140,31 @@ class PollTests(unittest.TestCase):
                 self.assertEqual(argv[argv.index("--go-analysis-producer")+1], producer)
                 self.assertEqual(argv[argv.index("--expected-change-url")+1], project.change_url(3))
 
+    def test_diagnostics_use_the_same_request_checks_and_keep_the_tier(self):
+        job = Jobs(self.state)
+        notes = [self.note | {"body": "/review-dropped mid"},
+                 self.note | {"body": "/review-dropped", "authorId": 8},
+                 self.note | {"body": "/review-dropped max", "authorType": "Bot"}]
+        for project in (self.gh, self.gl):
+            with self.subTest(project=project.provider), \
+                 patch("cursor_pr.discovery.open_changes", return_value=([3], True)), \
+                 patch("cursor_pr.discovery.comment_threads", return_value=({3: notes}, True)), \
+                 patch("cursor_pr.discovery.public_gitlab_request", return_value=project == self.gh), \
+                 patch("cursor_pr.poll.supervised") as run, \
+                 patch.dict(os.environ, {"REVIEW_MAX_INPUT_TOKENS": "4000", "REVIEW_MAX_FINDINGS_MID": "3"}):
+                run.return_value = b'{"state":"findings-dropped","publication":"posted-or-already-present"}'
+                cycle({project.key: project}, self.state, job, {project.key: self.since})
+                if project == self.gl:
+                    run.assert_not_called()
+                    continue
+                run.assert_called_once()
+                argv = run.call_args.args[0]
+                self.assertIn("--explain-dropped", argv)
+                self.assertEqual(argv[argv.index("--tier") + 1], "mid")
+                self.assertEqual(argv[argv.index("--max-input-tokens") + 1], "4000")
+                self.assertEqual(argv[argv.index("--max-findings") + 1], "3")
+                self.assertEqual(job.tier((project.key, 3, 81)), "dropped-mid")
+
     def test_publication_failure_reason_is_logged(self):
         with patch("cursor_pr.poll.supervised") as run:
             run.return_value = json.dumps({
@@ -229,12 +254,19 @@ print(json.dumps(dict(type='result',subtype='success',is_error=False,
                     with closing(sqlite3.connect(jobs.path)) as db:
                         self.assertEqual(db.execute("SELECT status, attempts, head FROM requests WHERE project=?",
                                                     (project.key,)).fetchall(), [("reviewed", 1, "a"*40)])
+                    jobs.set_tier(project.key, 3, 82, "dropped-regular")
+                    jobs.enqueue(project.key, 3, 82)
+                    request = jobs.next()
+                    self.assertEqual(request, (project.key, 3, 82))
+                    self.assertEqual(run_review(project, 3, self.state, jobs.tier(request), comment=82), "reviewed")
                     with patch.dict(os.environ,{"REVIEW_MAX_INPUT_TOKENS":"1"}):
                         self.assertEqual(run_review(project,3,self.state),"over-budget")
             with patch.dict(os.environ,{"FIXTURE_CHANGE":self.gl.change_url(3),"FIXTURE_SLUG":self.gh.slug}):
                 self.assertEqual(run_review(self.gh,3,self.state),"failed")
-        self.assertEqual(posts.read_text().count("historically coupled to partner.py"), 4)
-        self.assertEqual(calls.read_text().splitlines(),["called"] * 4)
+        self.assertEqual(posts.read_text().count("historically coupled to partner.py"), 6)
+        self.assertEqual(calls.read_text().splitlines(),["called"] * 6)
+        self.assertEqual(posts.read_text().count("Rejection details for request 82."), 2)
+        self.assertEqual(posts.read_text().count("This rerun discarded no findings."), 2)
         self.assertEqual(posts.read_text().count("Skipped Cursor"),2)
-        self.assertEqual(posts.read_text().count("Review by [Assay PR Agent](https://pr-agent.assay.guide/)."), 6)
+        self.assertEqual(posts.read_text().count("Review by [Assay PR Agent](https://pr-agent.assay.guide/)."), 8)
         self.assertNotIn("the-pr-agent", posts.read_text())
