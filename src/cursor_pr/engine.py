@@ -628,7 +628,7 @@ def quoted_evidence(code, message, lines, start, end, budget):
     if not asked:
         # A fenced block in the message may be a suggested fix.
         return status or "unverified"
-    candidates = [quote]
+    unwrapped = []
     if status != "verified" and ("```" in code or "~~~" in code):
         fence_modes = (True, False) if can_quote_literal_cr(code, cited) else (False,)
         for preserve_cr in fence_modes:
@@ -639,10 +639,10 @@ def quoted_evidence(code, message, lines, start, end, budget):
                 status = quote_coverage(wrapped, cited, budget) or status
                 if status == "verified":
                     return status
-                candidates.append(wrapped)
+                unwrapped.append(wrapped)
     # Give existing quote formats the full work budget before trying the fallback.
     if status != "verified" and isinstance(lines, DiffAnchors) and any(number in lines.added for number, _ in cited):
-        for candidate in candidates:
+        for candidate in (*unwrapped, quote):
             if exact_diff_rows(candidate, cited, lines.added, budget):
                 return "verified" if any(substantive(line) for _, line in cited) else "unverified"
     return status

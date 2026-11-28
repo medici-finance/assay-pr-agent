@@ -553,6 +553,13 @@ class QuotedEvidenceTests(unittest.TestCase):
         budget.remaining = 57
         self.assertEqual(engine.quoted_evidence(quote, "", lines, 1, 1, budget), "verified")
 
+    def test_diff_fallback_checks_the_fence_content_before_the_wrapper(self):
+        _, lines = engine.section(source.File("a.py", "@@ -0,0 +1 @@\n+notify(item)\n", "added"))
+        quote = "```diff\n+notify(item)\n```"
+        budget = engine.EvidenceBudget()
+        budget.remaining = 67
+        self.assertEqual(engine.quoted_evidence(quote, "", lines, 1, 1, budget), "verified")
+
     def test_one_markdown_fence_can_wrap_an_explicit_quote(self):
         anchors = shown("return value * 2")
         exact = dict(issue(start=1, end=1), relevant_code="```python\n1 +return value * 2\n```")
