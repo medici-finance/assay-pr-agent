@@ -33,6 +33,10 @@ FIELDS = (
                                              "each of which asks for the mid cap."))),
     {"name": "REVIEW_POLL_SECONDS", "section": "Timing and limits", "label": "Seconds between polls",
      "help": "How often the reviewer looks for new /review comments.", "default": "120"},
+    {"name": "REVIEW_POLL_IDLE_MAX_SECONDS", "section": "Timing and limits", "label": "Longest wait before a quiet change is read again",
+     "help": "A change with no new comments is read less often, up to this many seconds apart, so a /review on it can "
+             "wait that long to be seen. A value no larger than the seconds between polls reads every change on every poll.",
+     "default": "900"},
     {"name": "REVIEW_SYNC_SECONDS", "section": "Timing and limits", "label": "Seconds between repository syncs",
      "help": "How often the sync service refreshes managed checkouts.", "default": "120"},
     {"name": "REVIEW_QUALGEN_INTERVAL_SECONDS", "section": "Timing and limits", "label": "Seconds between history refreshes",
@@ -200,7 +204,7 @@ def operator(value, config, state, old):
 
 VALIDATORS = {
     "REVIEW_MAX_INPUT_TOKENS": plain(setup.number), "REVIEW_POLL_SECONDS": plain(setup.number),
-    "REVIEW_VISUAL_MAX_INPUT_TOKENS": plain(setup.number),
+    "REVIEW_VISUAL_MAX_INPUT_TOKENS": plain(setup.number), "REVIEW_POLL_IDLE_MAX_SECONDS": plain(setup.number),
     **dict.fromkeys(FINDINGS_SETTINGS.values(), plain(setup.findings_cap)),
     "REVIEW_SYNC_SECONDS": plain(setup.number), "REVIEW_QUALGEN_INTERVAL_SECONDS": plain(setup.nonnegative),
     "REVIEW_OSV_DOWNLOAD_DATABASES": plain(choice(("1", "0"))), "REVIEW_MODEL": model,

@@ -22,7 +22,8 @@ from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secr
 CURSOR = "CURSOR_API_KEY"
 SECRETS = {CURSOR: "cursor.key", "ANTHROPIC_API_KEY": "claude.key", "CODEX_API_KEY": "codex.key", KEY: "github.pem", TOKEN: "gitlab.token", **gitlab_tls.NAMES}
 # Carry saved settings that the wizard does not ask for into the next bundle.
-PRESERVED_SETTINGS = (*FINDINGS_SETTINGS.values(), "REVIEW_SYNC_SECONDS", "REVIEW_OSV_DOWNLOAD_DATABASES")
+PRESERVED_SETTINGS = (*FINDINGS_SETTINGS.values(), "REVIEW_SYNC_SECONDS", "REVIEW_OSV_DOWNLOAD_DATABASES",
+                      "REVIEW_POLL_IDLE_MAX_SECONDS")
 SETTINGS = ("REVIEW_OPERATOR", APP_ID, INSTALL_ID, "REVIEW_MODEL", "REVIEW_MAX_INPUT_TOKENS",
             "REVIEW_VISUAL_MAX_INPUT_TOKENS", "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER",
             "REVIEW_CURSOR_TEAM_ID", "REVIEW_AUTH_MODE", "REVIEW_LOGIN_PROFILE", *PRESERVED_SETTINGS)
@@ -193,11 +194,12 @@ def number(value):
 
 def findings_cap(value):
     """A findings cap as the settings page saves it: plain digits within the bound."""
-    # Short before it is read as a number: Python refuses to convert a very long run of digits,
-    # with a message of its own.
-    if len(value) > 4 or not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= MAX_FINDINGS_LIMIT:
+    # Leading zeros are dropped before the number is read, and what is left must be short: Python
+    # refuses to convert a very long run of digits, with a message of its own.
+    digits = value.lstrip("0") if value.isascii() and value.isdecimal() else ""
+    if not digits or len(digits) > 2 or not 1 <= int(digits) <= MAX_FINDINGS_LIMIT:
         raise ValueError(f"Enter an integer from 1 to {MAX_FINDINGS_LIMIT}")
-    return str(int(value))
+    return digits
 
 
 def nonnegative(value):
