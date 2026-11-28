@@ -382,6 +382,17 @@ class QuotedEvidenceTests(unittest.TestCase):
         parsed = engine.parse_answer(envelope([dict(issue(start=1, end=5), relevant_code=quote)]), anchors)
         self.assertEqual(parsed["findings"][0]["evidence"], "verified")
 
+    def test_marker_padding_retries_charge_for_the_cited_range(self):
+        marker = "__new hunk__"
+        source_lines = [marker] + ["send()"] * 999
+        quote = (marker + "\n\n") * 30 + "absent()\n\n" + (marker + "\n\n") * 30
+        raw = envelope([dict(issue(start=1, end=len(source_lines)), relevant_code=quote)])
+        with (patch.object(engine, "EVIDENCE_WORK_LIMIT", 4500),
+              patch.object(engine, "quoted_in_order", wraps=engine.quoted_in_order) as order):
+            parsed = engine.parse_answer(raw, shown(*source_lines))
+        self.assertEqual([row["evidence"] for row in parsed["findings"]], ["unverified"])
+        self.assertLessEqual(order.call_count, 4)
+
     def test_an_earlier_duplicate_does_not_choose_the_only_indent(self):
         for indent in ("", "  "):
             with self.subTest(indent=indent):

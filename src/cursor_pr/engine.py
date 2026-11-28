@@ -643,7 +643,7 @@ def quote_coverage(quote, cited, budget):
         padding = product(marker_padding_offsets(parts), marker_padding_offsets(reversed(parts)))
         for leading, trailing in padding:
             if leading or trailing:
-                if not budget.spend(len(parts)):
+                if not budget.spend(len(parts) + len(cited)):
                     return "unverified"
                 if leading + trailing >= len(parts):
                     continue
