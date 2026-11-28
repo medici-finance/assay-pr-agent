@@ -83,11 +83,15 @@ class TierContextTests(unittest.TestCase):
     def test_prior_review_summaries_do_not_displace_human_comments(self):
         notes = [{"body": "Please keep this design note."},
                  *[{"body": f"Codex review of {'a' * 40}\nreviewed\nOld model finding {i}"} for i in range(12)],
-                 {"body": "/review-max"}, {"body": "This is a new design note."}]
+                 {"body": "/review-max"}, {"body": "/review-dropped mid"},
+                 {"body": f"Codex review of {'a' * 40}\nfindings-dropped\nRejection details"},
+                 {"body": "This is a new design note."}]
         context_text = context.earlier_comments(notes)
         self.assertIn("## Comment 1\nPlease keep this design note.", context_text)
         self.assertIn("## Comment 2\nThis is a new design note.", context_text)
         self.assertNotIn("Old model finding", context_text)
+        self.assertNotIn("Rejection details", context_text)
+        self.assertNotIn("/review-dropped", context_text)
 
     def test_verification_preserves_distinct_findings_at_the_same_location(self):
         issue = dict(path="app.py", line=1, end_line=1, title="First issue", message="First defect")

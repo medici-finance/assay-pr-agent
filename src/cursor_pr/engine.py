@@ -29,6 +29,7 @@ VERSION = "2"
 MAX_FINDINGS = DEFAULT_MAX_FINDINGS
 EVIDENCE_WORK_LIMIT = 250_000
 DROPPED_PATH_CHARS = 32_768
+REJECTION_DETAILS = 5
 LINE_ENDING = re.compile(r"\r\n?|\n")
 LF_LINE_ENDING = re.compile(r"\r?\n")
 LOCKS = {"package-lock.json", "pnpm-lock.yaml", "go.sum", "npm-shrinkwrap.json"}
@@ -472,7 +473,7 @@ def answer_finding(fields, loader, scalars):
     return item
 
 
-def answer_findings(answer, anchors):
+def answer_findings(answer, anchors, *, explain_dropped=False):
     """Read the flat finding schema without constructing unrelated YAML values."""
     loader = yaml.SafeLoader(answer)
     try:
@@ -483,6 +484,7 @@ def answer_findings(answer, anchors):
             raise ReviewError("Invalid Cursor finding list")
         entries, scalars = {}, {}
         evidence_budget = EvidenceBudget()
+        remaining = REJECTION_DETAILS if explain_dropped else 0
         for node in issues.value:
             if node not in entries:
                 try:
@@ -491,7 +493,11 @@ def answer_findings(answer, anchors):
                     item = None
                 else:
                     item = answer_finding(fields, loader, scalars)
-                entries[node] = finding(item, anchors, normalized=True, evidence_budget=evidence_budget)
+                valid, dropped = finding(item, anchors, normalized=True, evidence_budget=evidence_budget)
+                if dropped and remaining:
+                    dropped = explain_rejection(item, anchors, dropped)
+                    remaining -= 1
+                entries[node] = valid, dropped
             yield entries[node]
     except RecursionError:
         raise ReviewError("YAML nesting in the review response is too deep") from None
@@ -516,7 +522,7 @@ def model_text(raw):
     return text, usage if isinstance(usage, dict) else None
 
 
-def parse_answer(raw, anchors, limit=MAX_FINDINGS, *, verification=False):
+def parse_answer(raw, anchors, limit=MAX_FINDINGS, *, verification=False, explain_dropped=False):
     answer, usage = model_text(raw)
     if verification:
         # A verdict can remove original findings, so validate its entire YAML document.
@@ -530,7 +536,7 @@ def parse_answer(raw, anchors, limit=MAX_FINDINGS, *, verification=False):
             raise ReviewError("Invalid verifier finding list")
         checked = (finding(issue, anchors, verification=True) for issue in issues)
     else:
-        checked = answer_findings(answer, anchors)
+        checked = answer_findings(answer, anchors, explain_dropped=explain_dropped)
     # A bad finding costs the others nothing: the call is already paid for and there is no retry.
     clean, dropped = [], []
     path_budget = DROPPED_PATH_CHARS
@@ -538,7 +544,10 @@ def parse_answer(raw, anchors, limit=MAX_FINDINGS, *, verification=False):
         if not why and len(clean) < limit:
             clean.append(dict(valid))
             continue
-        why = why or {"path": valid["path"], "line": valid["line"], "reason": "over the finding limit"}
+        if not why:
+            why = {"path": valid["path"], "line": valid["line"], "reason": "over the finding limit"}
+            if explain_dropped:
+                why["end_line"] = valid["end_line"]
         path_size = len(why["path"])
         if path_size > path_budget:
             why = dict(why, path="")
@@ -758,12 +767,61 @@ def numbered_match(part, index, line):
 
 def quoted_in_order(parts, cited):
     """Check for a matching ordered subset before testing complete coverage."""
+    return quoted_prefix(parts, cited) == len(parts)
+
+
+def quoted_prefix(parts, cited):
+    """Count the leading quote rows that have an ordered match in the cited lines."""
     remaining = iter(cited)
-    for part in parts:
+    for index, part in enumerate(parts):
         text = part[0].lstrip(" \t")
-        if not any(numbered_match(part, index, line) or text == line.lstrip(" \t") for index, line in remaining):
-            return False
-    return True
+        if not any(numbered_match(part, line_no, line) or text == line.lstrip(" \t") for line_no, line in remaining):
+            return index
+    return len(parts)
+
+
+def explain_rejection(issue, anchors, dropped):
+    """Return bounded line references and comparison results without copying model text."""
+    if not isinstance(issue, dict):
+        return dropped
+    start, end = dropped["line"], issue.get("end_line")
+    if start is not None and type(end) is int and 0 < end <= 2**31 - 1:
+        dropped = dict(dropped, end_line=end)
+    if dropped["reason"] != "quoted code does not match the cited lines":
+        return dropped
+    quote = issue["relevant_code"]
+    if len(quote) > 8_000 or end - start >= 200:
+        return dropped
+    lines = anchors[dropped["path"]]
+    cited = [(line, lines[line].rstrip("\r\n")) for line in range(start, end + 1)]
+    if "```" in quote or "~~~" in quote:
+        quote = fenced_quote(quote, whole=True) or quote
+    # Keep the snippet's row numbers even when its elisions and hunk markers are skipped.
+    numbered = [(number, part) for number, line in enumerate(LINE_ENDING.split(quote), 1)
+                for part in checkable(line) if part is not ELIDED]
+    parts = [part for _, part in numbered]
+    kept = quoted_prefix(parts, cited)
+    if kept == len(parts):
+        return dropped
+    # Python's multiline anchor covers LF. The quote validator also accepts CR-only rows.
+    line_start = r"(?:^|(?<=\r))"
+    stripped, count = re.subn(line_start + r"[ \t]*\+", "", quote, flags=re.M)
+    diff_markers = False
+    if count:
+        # A diff may put a leading space on its unchanged rows. Require the same validator
+        # to verify a candidate after removing markers, including full citation coverage.
+        # Try literal first-column markers as well, so context beginning with a real '+'
+        # keeps it after the first-column space is removed.
+        first_column = re.sub(line_start + r"[+ ]", "", quote, flags=re.M)
+        with_context_stripped = re.sub(line_start + r"(?:[ \t]*\+| )", "", quote, flags=re.M)
+        # The model can mix raw source rows with rows copied from the diff.
+        source_rows = {line.lstrip(" \t") for _, line in cited}
+        mixed = re.sub(line_start + r"[ \t]*\+([^\r\n]*)",
+                       lambda row: row[0] if row[0].lstrip(" \t") in source_rows else row[1],
+                       quote, flags=re.M)
+        diff_markers = any(quoted_evidence(candidate, "", lines, start, end, EvidenceBudget()) == "verified"
+                           for candidate in dict.fromkeys((first_column, stripped, with_context_stripped, mixed)))
+    return dict(dropped, unmatched_quote_row=numbered[kept][0], diff_markers=diff_markers)
 
 
 def candidate_margins(parts, cited, budget):
@@ -893,7 +951,8 @@ def substantive(content):
     return len(visible) >= 3 and any(char.isalnum() for char in visible)
 
 
-def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120, *, verification=False, parse=None):
+def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120, *, verification=False, parse=None,
+           explain_dropped=False):
     """One call of the provider CLI. `parse` reads an answer that is not a list of findings."""
     global started
     backend = provider()
@@ -984,7 +1043,7 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120, *, verificat
     try:
         if parse is not None:
             return parse(response.stdout, anchors)
-        return parse_answer(response.stdout, anchors, limit, verification=verification)
+        return parse_answer(response.stdout, anchors, limit, verification=verification, explain_dropped=explain_dropped)
     except (ReviewError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError) as err:
         try:
             usage = json.loads(response.stdout).get("usage")
@@ -995,12 +1054,14 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120, *, verificat
 
 
 def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout=120, originals=None,
-           parse=None, version=None):
+           parse=None, version=None, explain_dropped=False):
     """A cached model answer. A prompt with its own answer format passes its parser and its own
     cache version, so that neither format is ever read as the other."""
     signature = json.dumps([version or VERSION, "pr-agent:0.50.0", model, source, prompt], ensure_ascii=False)
     if originals is not None:
         signature = json.dumps(["strict-verifier", signature])
+    elif explain_dropped and parse is None:
+        signature = json.dumps(["explain-dropped", signature])
     if provider() != "cursor" or os.getenv("REVIEW_CURSOR_TEAM_ID"):
         signature = json.dumps([provider(), os.getenv("REVIEW_CURSOR_TEAM_ID") if provider() == "cursor" else None, signature])
     key = hashlib.sha256(signature.encode()).hexdigest()
@@ -1023,6 +1084,8 @@ def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout
         extra = {} if (limit, timeout) == (MAX_FINDINGS, 120) else {"limit": limit, "timeout": timeout}
         if originals is not None:
             extra["verification"] = True
+        elif explain_dropped and parse is None:
+            extra["explain_dropped"] = True
         if parse is not None:
             extra["parse"] = parse
         result = invoke(prompt, model, anchors, **extra)

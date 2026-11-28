@@ -47,6 +47,66 @@ class ParseAnswerTests(unittest.TestCase):
         for dropped in engine.parse_answer(envelope(["junk", issue("a.py", 50)]), ANCHORS)["dropped"]:
             self.assertEqual(set(dropped), {"path", "line", "reason"})
 
+    def test_rejection_details_identify_copied_diff_markers_without_including_the_quote(self):
+        anchors = {"a.py": {2: "    start()", 3: "    build()", 4: "    finish()"}}
+        quoted = dict(issue(end=4, body="@team this alleged problem is untrusted"),
+                      relevant_code="     start()\n+    build()\n+    finish()")
+        wrong = dict(quoted, relevant_code="    start()\nnever_shown_to_the_model")
+        raw = envelope([quoted, wrong, issue(path="untrusted filename", start=92, end=94)])
+        ordinary = engine.parse_answer(raw, anchors)
+        diagnosed = engine.parse_answer(raw, anchors, explain_dropped=True)
+        self.assertEqual(diagnosed["findings"], ordinary["findings"])
+        self.assertEqual([d["reason"] for d in diagnosed["dropped"]], [d["reason"] for d in ordinary["dropped"]])
+        first, second, unknown = diagnosed["dropped"]
+        self.assertEqual((first["line"], first["end_line"], first["unmatched_quote_row"], first["diff_markers"]),
+                         (2, 4, 2, True))
+        self.assertEqual((second["unmatched_quote_row"], second["diff_markers"]), (2, False))
+        self.assertEqual((unknown["path"], unknown["line"], unknown["end_line"]), ("", 92, 94))
+        for rejected_text in ("@team", "start()", "never_shown_to_the_model", "untrusted filename"):
+            self.assertNotIn(rejected_text, json.dumps(diagnosed["dropped"]))
+
+    def test_diagnostic_uses_snippet_line_numbers_and_requires_a_full_match_for_marker_hints(self):
+        anchors = {"a.py": {2: "first()", 3: "middle()", 4: "last()"}}
+        with_elision = dict(issue(end=4), relevant_code="first()\n...\nmissing()")
+        incomplete = dict(issue(end=4), relevant_code="+first()\n+last()")
+        diagnosed = engine.parse_answer(envelope([with_elision, incomplete]), anchors, explain_dropped=True)
+        first, second = diagnosed["dropped"]
+        self.assertEqual(first["unmatched_quote_row"], 3)
+        self.assertFalse(second["diff_markers"])
+
+    def test_diff_marker_hint_keeps_literal_plus_on_context_rows(self):
+        anchors = {"a.py": {2: "+value", 3: "next()"}}
+        for separator in ("\n", "\r\n", "\r"):
+            raw = envelope([dict(issue(end=3), relevant_code=separator.join((" +value", "+next()")))])
+            with self.subTest(separator=separator):
+                parsed = engine.parse_answer(raw, anchors, explain_dropped=True)
+                self.assertEqual(parsed["findings"], [])
+                self.assertTrue(parsed["dropped"][0]["diff_markers"])
+
+    def test_diff_marker_hint_detects_source_rows_mixed_with_diff_rows(self):
+        anchors = {"a.py": {2: "+value", 3: "next()"}}
+        raw = envelope([dict(issue(end=3), relevant_code="+value\n+next()")])
+        parsed = engine.parse_answer(raw, anchors, explain_dropped=True)
+        self.assertEqual(parsed["findings"], [])
+        self.assertTrue(parsed["dropped"][0]["diff_markers"])
+
+    def test_engine_keeps_diagnostics_distinct_when_a_caller_uses_the_same_cache(self):
+        raw = envelope([issue(), issue(start=81, end=82)])
+
+        def invoke(prompt, model, anchors, **kwargs):
+            return engine.parse_answer(raw, anchors, **kwargs)
+
+        with tempfile.TemporaryDirectory() as cache, patch.object(engine, "invoke", side_effect=invoke) as call:
+            args = ("same prompt", None, ANCHORS, Path(cache), "org/repo#1")
+            ordinary, ordinary_cached = engine.review(*args)
+            debug, debug_cached = engine.review(*args, explain_dropped=True)
+            self.assertEqual(engine.review(*args, explain_dropped=True), (debug, True))
+        self.assertFalse(ordinary_cached)
+        self.assertFalse(debug_cached)
+        self.assertEqual(call.call_count, 2)
+        self.assertNotIn("end_line", ordinary["dropped"][0])
+        self.assertEqual(debug["dropped"][0]["end_line"], 82)
+
     def test_dropped_line_number_cannot_break_result_serialization(self):
         raw = json.loads(envelope([issue(), issue(start=123456)]))
         raw["result"] = raw["result"].replace("123456", "9" * 4500)
@@ -201,6 +261,7 @@ class DroppedSummaryTests(unittest.TestCase):
         self.assertIn("Dropped 2 model findings: cited line outside the reviewed patch.", posts[0])
         self.assertIn("Dropped 1 model finding: malformed finding.", posts[0])
         self.assertIn("No model finding passed the checks.", posts[0])
+        self.assertIn("Post `/review-dropped`", posts[0])
         self.assertNotIn("No model findings in the reviewed scope.", posts[0])
         self.assertNotIn("@all", posts[0])
         self.assertNotIn("Dropped", posts[1])
@@ -223,6 +284,60 @@ class DroppedSummaryTests(unittest.TestCase):
         self.assertIn("Dropped 1 model finding: cited line outside the reviewed patch.", posts[0])
         self.assertNotIn("No model findings in the reviewed scope.", posts[0])
         self.assertIn("findings-dropped", posts[0])
+
+    def test_findings_dropped_advertises_the_matching_deeper_command(self):
+        for tier in ("mid", "max"):
+            report = self.report(state="findings-dropped", tier=tier, delivered=None,
+                                 base_input_tokens=6000, max_input_tokens=6000 * cli.TIERS[tier])
+            with self.subTest(tier=tier), patch.object(cli, "post_comment") as posted:
+                cli.publish("org/repo#1", "a" * 40, report)
+                self.assertIn(f"Post `/review-dropped {tier}`", posted.call_args.args[3])
+
+    def test_diagnostic_comment_distinguishes_rejections_from_later_verification(self):
+        report = self.report(explain_dropped=True, tier="mid", delivered="mid", context=[],
+                             base_input_tokens=6000, max_input_tokens=12000, estimated_input_tokens=1000,
+                             passes=[{"state": "called"}], verification={"state": "filtered", "before": 1, "after": 0})
+        with patch.object(cli, "post_comment") as post:
+            cli.publish("org/repo#1", "a" * 40, report)
+        body = post.call_args.args[3]
+        self.assertIn("No findings failed the citation or quote checks", body)
+        self.assertIn("No model findings remained after verification", body)
+
+    def test_diagnostic_rerun_ignores_a_shared_cache_and_reports_the_fresh_result(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        argv = ["--repo", tmp.name, "--cache-dir", str(Path(tmp.name) / "cache"),
+                "--change", "org/repo#1", "--post", "--max-input-tokens", "6000"]
+        file = source.File("a.py", "@@ -0,0 +1,2 @@\n+x = 1\n+y = 2\n", "added")
+        change = source.Change("a" * 40, [file], "org/repo#1")
+        clean = envelope([dict(issue(start=1, end=2), relevant_code="x = 1\ny = 2")])
+        mismatched = envelope([dict(issue(start=1, end=2, body="@team x"), relevant_code="+x = 1\n+y = 2")])
+
+        def invoke(prompt, model, anchors, limit=engine.MAX_FINDINGS, **kwargs):
+            explain = kwargs.get("explain_dropped", False)
+            raw = (mismatched if calls.call_count == 2 else clean) if explain else clean
+            return engine.parse_answer(raw, anchors, limit, explain_dropped=explain)
+
+        with patch.object(cli, "forge_change", return_value=change), patch.object(cli, "scan_files", return_value=[]), \
+             patch.object(engine, "invoke", side_effect=invoke) as calls, patch.object(cli, "post_comment") as post:
+            regular = cli.parser().parse_args(argv)
+            diagnostic = cli.parser().parse_args(argv + ["--explain-dropped"])
+            first, _ = cli.run_request(regular)
+            rejected, _ = cli.run_request(diagnostic)
+            next_diagnostic, _ = cli.run_request(diagnostic)
+            cached, _ = cli.run_request(regular)
+        self.assertEqual(calls.call_count, 3)
+        self.assertTrue(cached["cache_hit"])
+        self.assertEqual(cached["findings"], first["findings"])
+        self.assertEqual(rejected["state"], "findings-dropped")
+        self.assertEqual(rejected["findings"], [])
+        self.assertEqual(next_diagnostic["dropped"], [])
+        _, rejection_post, no_drops_post, _ = [call.args[3] for call in post.call_args_list]
+        self.assertIn("at line 1 through 2", rejection_post)
+        self.assertIn("Removing copied diff markers (such as a leading `+` or space)", rejection_post)
+        self.assertNotIn("@team", rejection_post)
+        self.assertNotIn("+x = 1", rejection_post)
+        self.assertIn("No findings failed the citation or quote checks in this rerun.", no_drops_post)
 
     def run_with(self, parsed, files=None, scan=()):
         tmp = tempfile.TemporaryDirectory()
