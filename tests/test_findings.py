@@ -530,6 +530,12 @@ class QuotedEvidenceTests(unittest.TestCase):
         self.assertEqual(parsed["findings"], [])
         self.assertEqual(parsed["dropped"][0]["reason"], "quoted code does not match the cited lines")
 
+    def test_a_fenced_message_quote_cannot_normalize_nul_into_source_text(self):
+        body = "```python\nvalue = '\x00'\n```"
+        parsed = engine.parse_answer(envelope([issue(start=1, end=1, body=body)]), shown("value = '\ufffd'"))
+        self.assertEqual([row["evidence"] for row in parsed["findings"]], ["unverified"])
+        self.assertEqual(parsed["dropped"], [])
+
     def test_fenced_quote_in_an_ordered_list(self):
         body = "10. Code:\n    ```python\n    send()\n    ```"
         parsed = engine.parse_answer(envelope([issue(start=1, end=1, body=body)]), shown("send()"))

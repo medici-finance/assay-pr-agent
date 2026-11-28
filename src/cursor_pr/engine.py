@@ -631,8 +631,8 @@ BLANK_GLYPHS = frozenset("\u115f\u1160\u2800\u3164\uffa0")
 
 
 def fenced_quote(message, *, whole=False):
-    if whole and "\x00" in message:
-        # CommonMark would silently replace NUL in an explicit quote.
+    if "\x00" in message:
+        # CommonMark would silently replace NUL in the evidence text.
         return None
     tokens = MARKDOWN.parse(message)
     fence = next((token for token in tokens if token.type == "fence"), None)
