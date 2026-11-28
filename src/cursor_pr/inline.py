@@ -73,7 +73,9 @@ def github_comments(client, headers, endpoint):
         if not isinstance(rows, list):
             raise ReviewError("Invalid GitHub comment list")
         yield from (row for row in rows if isinstance(row, dict))
-        if len(rows) < 100 and "next" not in response.links:
+        # A short page that names no next one is the last. So is the last page this reads, when
+        # full and naming none: exactly PAGES pages of comments is all of them, not too many.
+        if "next" not in response.links and (len(rows) < 100 or page == PAGES):
             return
     raise ReviewError("Too many GitHub comments to check for earlier review publication")
 
@@ -146,7 +148,9 @@ def github(client, headers, project, slug, number, rows, me, head, progress):
         submit(rows)
         progress.posted += len(rows)
     except httpx.HTTPStatusError as error:
-        if error.response.status_code != 422:
+        # 422 is also how GitHub turns a review away as spam. That is not a line it could not
+        # place: sending each finding again by itself would only add to it.
+        if error.response.status_code != 422 or b"spam" in error.response.content.lower():
             raise
         if len(rows) == 1:
             progress.refused += 1
@@ -196,7 +200,11 @@ def gitlab(client, headers, project, base, slug, number, rows, me, head, previou
     if not pending:
         return True
     authorize(project, number, head, pending, previous)
-    for path, line, body in pending:
+    for index, (path, line, body) in enumerate(pending):
+        if index:
+            # Time has passed since the first was authorized, and a push in it would put the rest
+            # on a diff that is no longer the merge request's.
+            unmoved(project, number, head)
         try:
             client.post(root + "/discussions", headers=headers, json={
                 "body": f"{body}\n\n{marker(head, [path, line, body])}", "commit_id": head,

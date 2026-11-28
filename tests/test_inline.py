@@ -105,6 +105,10 @@ class InlineTests(unittest.TestCase):
     def respond(self, request):
         self.requests.append(request)
         self.events.append("http:" + request.method + " " + str(request.url))
+        # A test's own answer to a request, or None to leave it to what follows.
+        answer = self.intercept(request) if getattr(self, "intercept", None) else None
+        if answer is not None:
+            return answer
         if self.error:
             raise self.error
         if request.url.host == "api.github.com":
@@ -114,7 +118,9 @@ class InlineTests(unittest.TestCase):
                     return httpx.Response(200, json=self.comments)
                 page = int(request.url.params["page"])
                 self.assertEqual(str(request.url), NOTES + f"?page={page}&per_page=100")
-                return httpx.Response(200, json=self.review_pages.get(page, self.reviews if page == 1 else []))
+                # As GitHub does, a page names the next one when there is one.
+                more = {"Link": f'<{NOTES}?page={page + 1}&per_page=100>; rel="next"'} if page + 1 in self.review_pages else {}
+                return httpx.Response(200, json=self.review_pages.get(page, self.reviews if page == 1 else []), headers=more)
             self.assertEqual((request.method, str(request.url)), ("POST", REVIEW))
             comments = json.loads(request.content)["comments"]
             refused = (self.refuse_combined and len(comments) > 1) or any(c["path"] in self.refused for c in comments)
@@ -188,7 +194,9 @@ class InlineTests(unittest.TestCase):
                                               position={"position_type": "text", **REFS, "new_path": path, "old_path": path, "new_line": line})
                                          for path, line, body in inline.comments(report)[0]])
         self.assertEqual(self.events, ["summary", "http:GET " + USER, "http:GET " + MR, "http:GET " + THREADS + "?page=1&per_page=100",
-                                      "forge:change", "policy", *(["http:POST " + THREADS] * 2)])
+                                      "forge:change", "policy", "http:POST " + THREADS,
+                                      # The head is read again before each discussion after the first.
+                                      "forge:change", "http:POST " + THREADS])
         self.assertEqual((posts, self.lookup.call_args.args), (1, ("gitlab", SLUG, self.root)))
 
     def test_github_binds_review_identity_to_configured_app(self):
@@ -311,6 +319,11 @@ class InlineTests(unittest.TestCase):
         self.assertEqual(report["inline_publication"], "failed")
         self.assertIn("Too many GitHub comments", logs.output[0])
         self.assertFalse(any(r.method == "POST" for r in self.requests))
+        # Exactly as many full pages as are read, and no next one named: that is all of them.
+        self.review_pages, self.requests = dict.fromkeys(range(1, inline.PAGES + 1), [note(7, "other")] * 100), []
+        report, *_ = self.exercise("github", "--post", "--inline-comments")
+        self.assertEqual(report["inline_publication"], "posted")
+        self.assertEqual(len([r for r in self.requests if r.method == "GET" and str(r.url).startswith(NOTES)]), inline.PAGES)
 
     def test_a_moved_head_refuses_to_post(self):
         self.head = "b" * 40
@@ -375,6 +388,28 @@ class InlineTests(unittest.TestCase):
         self.assertEqual((report["inline_publication"], report["inline_posted"]), ("stale", 0))
         self.assertEqual([len(r["comments"]) for r in self.posted()], [2])  # No review of one finding followed.
         self.assertIn("the change moved on since the review", logs.output[0])
+
+    def test_a_push_between_two_gitlab_discussions_stops_the_rest(self):
+        def pushed_during_the_first(request):
+            if request.method == "POST":
+                self.head = "b" * 40
+        self.intercept = pushed_during_the_first
+        with self.assertLogs(LOG, level="WARNING") as logs:
+            report, *_ = self.exercise("gitlab", "--post", "--inline-comments")
+        # The one already posted is counted; the second is not sent to a diff that has moved on.
+        self.assertEqual((report["inline_publication"], report["inline_posted"], len(self.posted())), ("stale", 1, 1))
+        self.assertIn("the change moved on since the review", logs.output[0])
+
+    def test_a_review_turned_away_as_spam_is_not_sent_again_finding_by_finding(self):
+        def spam(request):
+            if request.method == "POST":
+                return httpx.Response(422, json={"message": "Validation Failed", "errors": [
+                    {"resource": "PullRequestReview", "code": "custom", "message": "was flagged as spam"}]})
+        self.intercept = spam
+        with self.assertLogs(LOG, level="WARNING") as logs:
+            report, *_ = self.exercise("github", "--post", "--inline-comments")
+        self.assertEqual((report["inline_publication"], report["inline_refused"], len(self.posted())), ("failed", 0, 1))
+        self.assertIn("HTTP 422", logs.output[0])
 
     def test_it_runs_only_when_enabled_for_a_posted_forge_review(self):
         report, code, _ = self.exercise("github", "--post")

@@ -302,6 +302,7 @@ def existing_tests(repo, head, files):
 def is_review_summary(body):
     first, _, remainder = body.partition("\n")
     label, _, head = first.partition(" review of ")
+    label = label.removesuffix(" visual")  # A visual review opens "<provider> visual review of <head>".
     state = remainder.partition("\n")[0].strip()
     return (label in LABELS.values() and valid_sha(head)
             and state in ("reviewed", "partial", "empty", "degraded", "over-budget", "model-unavailable"))
@@ -311,7 +312,10 @@ def is_review_summary(body):
 def earlier_comments(notes):
     """The change's conversation so far, newest last, each comment bounded."""
     rows = [note["body"].strip() for note in notes if isinstance(note.get("body"), str)]
-    rows = [body for body in rows if body and not body.startswith("/review") and not is_review_summary(body)]
+    # Not the commands, and not what the reviewer itself answered them with.
+    # A comment that only starts like /visual-review is discussion, as it is to the poller.
+    rows = [body for body in rows if body and not body.startswith("/review") and body != "/visual-review"
+            and not is_review_summary(body)]
     return "\n\n".join(f"## Comment {index}\n{body[:1500]}" for index, body in enumerate(rows[-10:], 1))
 
 

@@ -609,11 +609,79 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown repository"):
             settings.save(self.state, {"project": "https://github.com/org/other", "name": "visibility", "value": "internal"})
 
+    def test_findings_caps_are_edited_per_tier_within_the_bound(self):
+        self.seed()
+        view = settings.view(self.state)
+        for name in ("REVIEW_MAX_FINDINGS", "REVIEW_MAX_FINDINGS_MID", "REVIEW_MAX_FINDINGS_MAX"):
+            row = item(view, name)
+            self.assertEqual((row["kind"], row["source"], row["value"], row["locked"]), ("number", "default", "6", False))
+        # The max row says what it bounds: its passes ask for the mid cap.
+        self.assertIn("/review-max asks for this many too", item(view, "REVIEW_MAX_FINDINGS_MID")["help"])
+        self.assertIn("each of which asks for the mid cap", item(view, "REVIEW_MAX_FINDINGS_MAX")["help"])
+        settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS_MID", "value": " 09 "})
+        settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS_MAX", "value": "12"})
+        saved = self.document()["settings"]
+        self.assertEqual((saved["REVIEW_MAX_FINDINGS_MID"], saved["REVIEW_MAX_FINDINGS_MAX"]), ("9", "12"))
+        self.assertNotIn("REVIEW_MAX_FINDINGS", saved)
+        self.assertEqual((item(settings.view(self.state), "REVIEW_MAX_FINDINGS_MID")["source"]), "saved")
+        self.assertEqual(setup.max_findings(self.state), {"regular": 6, "mid": 9, "max": 12})
+        for value, saved in (("00009", "9"), ("012", "12"), ("0" * 5000 + "7", "7")):
+            settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS", "value": value})
+            self.assertEqual(self.document()["settings"]["REVIEW_MAX_FINDINGS"], saved)
+        document = (setup.active_bundle(self.state) / "settings.json").read_bytes()
+        for value in ("0", "000", "13", "0013", "six", "+6", "6_0", "-1", "", "1" * 5000):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "Enter an integer from 1 to 12"):
+                settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS", "value": value})
+        self.assertEqual((setup.active_bundle(self.state) / "settings.json").read_bytes(), document)
+        with patch.dict(os.environ, {"REVIEW_MAX_FINDINGS": "4"}):
+            row = item(settings.view(self.state), "REVIEW_MAX_FINDINGS")
+            self.assertEqual((row["locked"], row["source"], row["value"]), (True, "env", "4"))
+            self.assertIn("Set by REVIEW_MAX_FINDINGS in the environment", row["help"])
+            with self.assertRaisesRegex(ValueError, "container environment"):
+                settings.save(self.state, {"name": "REVIEW_MAX_FINDINGS", "value": "5"})
+
+    def test_the_visual_budget_is_edited_beside_the_review_budget(self):
+        self.seed()
+        row = item(settings.view(self.state), "REVIEW_VISUAL_MAX_INPUT_TOKENS")
+        self.assertEqual((row["kind"], row["source"], row["value"], row["locked"]), ("number", "default", "12000", False))
+        before = setup.max_input_tokens(self.state)
+        settings.save(self.state, {"name": "REVIEW_VISUAL_MAX_INPUT_TOKENS", "value": " 20000 "})
+        self.assertEqual(self.document()["settings"]["REVIEW_VISUAL_MAX_INPUT_TOKENS"], "20000")
+        self.assertEqual(setup.visual_max_input_tokens(self.state), 20000)
+        # The review budget is another setting, and stays as it was.
+        self.assertEqual((before, setup.max_input_tokens(self.state)), (6000, 6000))
+        for value in ("0", "many", "-5", ""):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                settings.save(self.state, {"name": "REVIEW_VISUAL_MAX_INPUT_TOKENS", "value": value})
+        with patch.dict(os.environ, {"REVIEW_VISUAL_MAX_INPUT_TOKENS": "9000"}):
+            row = item(settings.view(self.state), "REVIEW_VISUAL_MAX_INPUT_TOKENS")
+            self.assertEqual((row["locked"], row["source"], row["value"]), (True, "env", "9000"))
+
+    def test_the_wait_for_a_quiet_change_is_edited_on_the_page_and_reaches_the_poller(self):
+        self.seed()
+        row = item(settings.view(self.state), "REVIEW_POLL_IDLE_MAX_SECONDS")
+        self.assertEqual((row["kind"], row["source"], row["value"], row["locked"]), ("number", "default", "900", False))
+        self.assertIn("no larger than the seconds between polls reads every change on every poll", row["help"])
+        settings.save(self.state, {"name": "REVIEW_POLL_IDLE_MAX_SECONDS", "value": " 60 "})
+        self.assertEqual(self.document()["settings"]["REVIEW_POLL_IDLE_MAX_SECONDS"], "60")
+        # The poller reads it from its environment, where the saved setup puts it at each start.
+        with patch.dict(os.environ, {}):
+            os.environ.pop("REVIEW_POLL_IDLE_MAX_SECONDS", None)
+            setup.apply_saved_setup(self.state)
+            self.assertEqual(os.environ["REVIEW_POLL_IDLE_MAX_SECONDS"], "60")
+        for value in ("0", "soon", "-5", ""):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                settings.save(self.state, {"name": "REVIEW_POLL_IDLE_MAX_SECONDS", "value": value})
+        with patch.dict(os.environ, {"REVIEW_POLL_IDLE_MAX_SECONDS": "1"}):
+            row = item(settings.view(self.state), "REVIEW_POLL_IDLE_MAX_SECONDS")
+            self.assertEqual((row["locked"], row["source"], row["value"]), (True, "env", "1"))
+
     def test_a_wizard_rerun_keeps_what_only_the_settings_page_edits(self):
         wizard(self.state, ["gitlab", "", "https://gitlab.com/org/repo", str(self.checkout), "13,27", "public", "", "n",
-                            "owner:13", "", "", "", "codex", "", "", "paste"], ["fixture-forge"])
+                            "owner:13", "", "", "", "", "codex", "", "", "paste"], ["fixture-forge"])
         settings.save(self.state, {"name": "REVIEW_SYNC_SECONDS", "value": "300"})
         settings.save(self.state, {"name": "REVIEW_OSV_DOWNLOAD_DATABASES", "value": "0"})
+        settings.save(self.state, {"name": "REVIEW_POLL_IDLE_MAX_SECONDS", "value": "60"})
         bundle = setup.active_bundle(self.state) / "settings.json"
         config = json.loads(bundle.read_text())
         config["settings"]["REVIEW_MAX_FINDINGS_MID"] = "4"
@@ -629,12 +697,13 @@ class SettingsTests(unittest.TestCase):
             return remove(path)
 
         with patch.object(shutil, "rmtree", side_effect=remove_bundle), contextlib.redirect_stderr(io.StringIO()) as warning:
-            wizard(self.state, ["y", "", "", "", "", "", "", "", "keep"], [])
+            wizard(self.state, ["y", "", "", "", "", "", "", "", "", "keep"], [])
         self.assertIn("Settings were saved", warning.getvalue())
         self.assertNotEqual(setup.active_bundle(self.state), old)
         kept = self.document()["settings"]
         self.assertEqual((kept["REVIEW_SYNC_SECONDS"], kept["REVIEW_OSV_DOWNLOAD_DATABASES"]), ("300", "0"))
         self.assertEqual(kept["REVIEW_MAX_FINDINGS_MID"], "4")
+        self.assertEqual(kept["REVIEW_POLL_IDLE_MAX_SECONDS"], "60")
 
 
 class SettingsSessionTests(unittest.TestCase):

@@ -12,8 +12,9 @@ from .gitlab_tls import client_options
 from .source import ReviewError, reviewer_token, run_forge
 
 log = logging.getLogger(__name__)
-# A request is a comment holding exactly one of these commands; the value is the review tier.
-COMMANDS = {"/review": "regular", "/review-mid": "mid", "/review-max": "max"}
+# A request is a comment holding exactly one of these commands. The value is the review tier, or
+# "visual" for the comment that explains the change instead of looking for defects in it.
+COMMANDS = {"/review": "regular", "/review-mid": "mid", "/review-max": "max", "/visual-review": "visual"}
 
 
 def open_changes(project):

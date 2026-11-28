@@ -26,6 +26,7 @@ SENTENCES = {
     "degraded": "The review completed with less than the requested coverage.",
     "over-budget": "The model was skipped because the estimated prompt is over the budget.",
     "model-unavailable": "The model could not complete the review.",
+    "findings-dropped": "None of the model's findings passed validation.",
 }
 
 

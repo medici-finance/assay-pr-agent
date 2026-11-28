@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import yaml
+
 from cursor_pr import cli, context, discovery, engine
 from cursor_pr.config import project_from
 from cursor_pr.poll import Jobs, cycle, run_review
@@ -203,7 +205,10 @@ class TierTests(unittest.TestCase):
         # The fixture's review answer has two findings.
         os.environ["REVIEW_MAX_FINDINGS"] = "1"
         code, report = self.check()
-        self.assertEqual((code, report["state"], report["max_findings"]), (2, "model-unavailable", 1))
+        self.assertEqual((code, report["state"], report["max_findings"]), (0, "reviewed", 1))
+        self.assertEqual([f["title"] for f in report["findings"]], ["Real"])
+        self.assertEqual(report["dropped"],
+                         [{"path": "src/app.py", "line": 41, "reason": "over the finding limit"}])
         self.assertIn("A concise list (0-1 issues)", self.prompts()[-1][1])
         os.environ["REVIEW_MAX_FINDINGS"] = "2"
         code, report = self.check()
@@ -356,6 +361,18 @@ class TierTests(unittest.TestCase):
                 self.assertEqual([item["path"] for item in report["findings"]], ["src/data.py"])
                 self.assertLessEqual(report["estimated_input_tokens"], report["max_input_tokens"])
 
+    def test_max_collects_dropped_findings_from_both_review_passes(self):
+        real = finding(42, "Real")
+        self.answers(review=answer(finding(60, "Out of scope")), deep=answer(real, "malformed"),
+                     verification=verified_answer(real))
+        code, report = self.check("--tier", "max")
+        self.assertEqual((code, report["state"], report["delivered"]), (0, "reviewed", "max"))
+        self.assertEqual([row["title"] for row in report["findings"]], ["Real"])
+        self.assertEqual(report["dropped"], [
+            {"path": "src/app.py", "line": 60, "reason": "cited line outside the reviewed patch"},
+            {"path": "", "line": None, "reason": "malformed finding"},
+        ])
+
     def test_max_with_only_shared_context_delivers_mid(self):
         with patch.object(context, "gather", return_value={"change description": "Describes this change."}):
             code, report = self.check("--tier", "max")
@@ -395,6 +412,73 @@ class TierTests(unittest.TestCase):
             code, report = self.check("--tier", "mid")
         self.assertEqual((code, report["verification"]["state"]), (2, "unavailable"))
         self.assertEqual([row["verification_status"] for row in report["findings"]], ["unverified", "unverified"])
+
+    def test_malformed_verifier_finding_cannot_silently_remove_originals(self):
+        self.answers(verification=verified_answer(finding(60, "Outside")))
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"]), (2, "degraded"))
+        self.assertEqual(report["verification"], {"state": "unavailable", "before": 2})
+        self.assertEqual([row["title"] for row in report["findings"]], ["Real", "Spurious"])
+        self.assertEqual([row["verification_status"] for row in report["findings"]], ["unverified", "unverified"])
+        self.assertEqual(report["passes"][-1]["state"], "failed")
+        self.answers(verification=verified_answer(finding(42, "Real")))
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"]), (0, "reviewed"))
+        self.assertEqual([row["state"] for row in report["passes"]], ["cached", "called"])
+        self.assertEqual([row["title"] for row in report["findings"]], ["Real"])
+
+    def test_dropped_rows_and_a_verified_empty_result_have_distinct_messages(self):
+        self.answers(review=answer(finding(42, "Real"), "malformed"), verification=verified_answer())
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"], report["findings"]), (0, "reviewed", []))
+        self.assertEqual(report["verification"], {"state": "filtered", "before": 1, "after": 0})
+        with patch.object(cli, "post_comment") as post:
+            cli.publish("org/repo#1", self.head, report)
+        body = post.call_args.args[3]
+        self.assertIn("Dropped 1 model finding: malformed finding.", body)
+        self.assertIn("No model findings remained after verification.", body)
+        self.assertNotIn("No model finding passed the checks.", body)
+
+    def test_verification_retains_the_original_quoted_evidence_status(self):
+        real = finding(42, "Real")
+        self.answers(review=answer(dict(real, relevant_code="42 +    return value * 2")),
+                     verification=verified_answer(real))
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"]), (0, "reviewed"))
+        self.assertEqual(report["verification"], {"state": "filtered", "before": 1, "after": 1})
+        self.assertEqual([row["evidence"] for row in report["findings"]], ["verified"])
+
+    def test_max_keeps_verified_evidence_from_a_duplicate_deep_finding(self):
+        real = finding(42, "Real")
+        self.answers(review=answer(real), deep=answer(dict(real, relevant_code="return value * 2")),
+                     verification=verified_answer(real))
+        code, report = self.check("--tier", "max")
+        self.assertEqual((code, report["state"], report["delivered"]), (0, "reviewed", "max"))
+        self.assertEqual([(row["title"], row["evidence"]) for row in report["findings"]], [("Real", "verified")])
+
+    def test_malformed_yaml_cannot_filter_original_findings(self):
+        keep = dict(finding(42, "Real"), verification_status="INVALID_DATE")
+        malformed_status = yaml.safe_dump({"review": {"key_issues_to_review": [keep]}}).replace("INVALID_DATE", "2026-02-30")
+        for name, verdict in (("merge", "review: {<<: invalid, key_issues_to_review: []}"),
+                              ("status", malformed_status),
+                              ("metadata", "review: {key_issues_to_review: [], checked_on: 2026-02-30}"),
+                              ("tagged", "review: {key_issues_to_review: [], count: !!int ''}")):
+            with self.subTest(name=name):
+                self.answers(verification=verdict)
+                code, report = self.check("--tier", "mid", "--model", name)
+                self.assertEqual((code, report["state"]), (2, "degraded"))
+                self.assertEqual(report["verification"], {"state": "unavailable", "before": 2})
+                self.assertEqual([row["title"] for row in report["findings"]], ["Real", "Spurious"])
+
+    def test_an_answer_with_only_invalid_findings_does_not_poison_a_retry(self):
+        self.answers(review=answer(finding(60, "Outside")))
+        code, report = self.check()
+        self.assertEqual((code, report["state"], report["cache_hit"]), (2, "findings-dropped", False))
+        self.answers(review=answer(finding(42, "Real")))
+        code, report = self.check()
+        self.assertEqual((code, report["state"], report["cache_hit"]), (0, "reviewed", False))
+        self.assertEqual([row["title"] for row in report["findings"]], ["Real"])
+        self.assertTrue(self.check()[1]["cache_hit"])
 
     def test_tier_falls_back_to_the_one_below_and_says_so(self):
         change = cli.local_change(self.root, "main", self.head)

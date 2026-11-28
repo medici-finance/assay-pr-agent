@@ -626,7 +626,7 @@ class NoticeTests(Offline):
             self.assertEqual(read.call_count, 1)
             self.assertLessEqual(read.call_args.kwargs.pop("timeout"), 45)
             read.assert_called_once_with("change", self.gh, numbers=[3])
-            post.assert_called_once_with(self.gh, 3, head, NOTICE.format(request=self.gh.change_url(3) + "#issuecomment-81"),
+            post.assert_called_once_with(self.gh, 3, head, NOTICE.format(command="/review", request=self.gh.change_url(3) + "#issuecomment-81"),
                                          self.state)
             post.side_effect = ReviewError("pr-agent-forge comment exited 1: change is no longer open")
             with self.assertLogs("cursor_pr.acknowledge", level="WARNING") as logged:
@@ -708,9 +708,9 @@ class NoticeTests(Offline):
         self.assertEqual([args for args, _ in sent[1::2]], [["pr-agent-forge", "comment"]] * 3)
         comments = [request["Publication"] for _, request in sent[1::2]]
         self.assertEqual([(c["Number"], c["Head"], c["Body"], c["AlreadyPosted"]) for c in comments],
-                         [(3, head, NOTICE.format(request=self.gh.change_url(3) + f"#issuecomment-{comment}"), posted)
+                         [(3, head, NOTICE.format(command="/review", request=self.gh.change_url(3) + f"#issuecomment-{comment}"), posted)
                           for comment, posted in ((81, False), (81, True), (82, False))])
-        self.assertIn("#note_81", NOTICE.format(request=self.gl.change_url(3) + acknowledge.NOTE["gitlab"] + "81"))
+        self.assertIn("#note_81", NOTICE.format(command="/review", request=self.gl.change_url(3) + acknowledge.NOTE["gitlab"] + "81"))
 
     def test_cycle_marks_each_new_request_once_and_reports_only_a_failed_review(self):
         jobs = Jobs(self.state)

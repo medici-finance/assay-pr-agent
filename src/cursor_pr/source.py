@@ -1,11 +1,11 @@
 """Read a forge snapshot with Assay, or compare two immutable local Git revisions."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import selectors
 import subprocess
@@ -203,6 +203,11 @@ class File:
     status: str
     absent: bool = False
     previous: str = ""
+    known_no_text: bool = False
+
+    @property
+    def patch_unavailable(self):
+        return self.absent and not self.known_no_text and self.status not in ("removed", "deleted", "D")
 
 
 @dataclass(frozen=True)
@@ -279,6 +284,89 @@ def commit(root, ref):
     return git(root, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}").decode().strip()
 
 
+def coverage_git(root, *args, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ReviewError("patch coverage time budget exhausted")
+    return git(root, "--no-replace-objects", *args, timeout=remaining)
+
+
+def git_metadata_path(root, path, deadline):
+    value = coverage_git(root, "rev-parse", "--path-format=absolute", "--git-path", path, deadline=deadline)
+    return Path(os.fsdecode(value.removesuffix(b"\n")))
+
+
+def blob_entry(root, revision, path, deadline):
+    """Read a blob's mode and object ID from an immutable tree."""
+    try:
+        entry = coverage_git(root, "ls-tree", "-z", "--full-tree", revision, "--", path,
+                             deadline=deadline).partition(b"\t")[0]
+    except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
+        return b""
+    return entry if b" blob " in entry else b""
+
+
+def blob_prefix(root, spec, limit, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    command = ["git", "--no-replace-objects", "--literal-pathspecs", "-C", str(root), "cat-file", "blob", spec]
+    return command_prefix(command, limit, timeout=remaining)
+
+
+def default_diff_applies(root, head, path, deadline):
+    """A NUL prefix proves binary only when Git can confirm the default diff rule."""
+    try:
+        # Git loads local overrides even with --source.
+        if git_metadata_path(root, "info/attributes", deadline).exists():
+            return False
+        attrs = [str(parent / ".gitattributes") for parent in PurePosixPath(path).parents]
+        entries = coverage_git(root, "ls-tree", "-z", "--full-tree", head, "--", *attrs, deadline=deadline)
+        for record in entries.split(b"\0")[:-1]:
+            mode, kind, oid = record.partition(b"\t")[0].split()
+            if kind == b"blob" and mode != b"120000":
+                # check-attr can silently ignore an attribute blob it cannot read.
+                content = blob_prefix(root, oid.decode(), 1_000_001, deadline)
+                if content is None or len(content) > 1_000_000:
+                    return False
+        attributes = coverage_git(root, "check-attr", f"--source={head}", "-z", "--all", "--", path,
+                                  deadline=deadline).split(b"\0")
+    except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return b"diff" not in attributes[1::3]
+
+
+def without_text(root, head, file, *, base_root, base, deadline):
+    """Prove that an absent forge patch has no changed head-side text."""
+    if base and file.previous and file.status in ("renamed", "R"):
+        old = blob_entry(base_root, base, file.previous, deadline)
+        if not old and base_root != root:
+            old = blob_entry(root, base, file.previous, deadline)
+        if old and old == blob_entry(root, head, file.path, deadline):
+            return True
+    prefix = blob_prefix(root, f"{head}:{file.path}", 8000, deadline)
+    return prefix is not None and (not prefix or b"\0" in prefix and default_diff_applies(root, head, file.path, deadline))
+
+
+def complete_history(root, deadline):
+    try:
+        shallow = coverage_git(root, "rev-parse", "--is-shallow-repository", deadline=deadline)
+        return shallow.strip() == b"false" and not git_metadata_path(root, "info/grafts", deadline).exists()
+    except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def classify_absent(root, head, files, *, base_root, base, supplied_base=False):
+    """Mark proven no-text files while keeping unverified patches unavailable."""
+    deadline = time.monotonic() + 45
+    if base and not supplied_base and any(f.patch_unavailable and f.previous for f in files):
+        if not all(complete_history(repo, deadline) for repo in {root, base_root}):
+            base = ""
+    return [replace(f, known_no_text=True)
+            if f.patch_unavailable and without_text(root, head, f, base_root=base_root, base=base, deadline=deadline)
+            else f for f in files]
+
+
 def local_change(root, base, head):
     from pr_agent.algo.git_patch_processing import to_hunk_only_patch
     head = commit(root, head)
@@ -289,41 +377,53 @@ def local_change(root, base, head):
     files = []
     for status, path in zip(names[0:-1:2], names[1::2], strict=True):
         raw = git(root, *flags, "--unified=3", base, head, "--", path)
+        known_no_text = False
         try:
             patch = to_hunk_only_patch(raw.decode("utf8"))
+            known_no_text = not patch
         except UnicodeDecodeError:
+            # A textual diff in another encoding is incomplete coverage.
             patch = ""
-        files.append(File(path, patch, status, not bool(patch)))
+        files.append(File(path, patch, status, not bool(patch), known_no_text=known_no_text))
     return Change(head, files, str(root.resolve()), base=tip, description=local_description(root, base, head),
                   patch_base=base)
 
 
-def local_description(root, base, head):
-    """Collect bounded optional context from the most recent commits in chronological order."""
-    byte_limit = 4 * DESCRIPTION_LIMIT
+def command_prefix(args, limit, *, timeout=45):
+    """Read a bounded prefix, requiring success if the command emits fewer bytes."""
     output = bytearray()
-    deadline = time.monotonic() + 45
-    args = ["git", "--literal-pathspecs", "-C", str(root), "log", "--no-show-signature", "--encoding=UTF-8",
-            f"-{DESCRIPTION_COMMITS + 1}", "--format=%s%n%n%b%x00", base + ".." + head, "--"]
+    deadline = time.monotonic() + timeout
     try:
         with selectors.DefaultSelector() as ready, \
              subprocess.Popen(args, env=child_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
             try:
                 ready.register(process.stdout, selectors.EVENT_READ)
-                while len(output) <= byte_limit:
+                while len(output) < limit:
                     remaining = max(0, deadline - time.monotonic())
                     if not ready.select(remaining):
-                        return ""
-                    chunk = os.read(process.stdout.fileno(), byte_limit + 1 - len(output))
+                        return None
+                    chunk = os.read(process.stdout.fileno(), limit - len(output))
                     if not chunk:
                         if process.wait(timeout=max(0, deadline - time.monotonic())):
-                            return ""
+                            return None
                         break
                     output.extend(chunk)
             finally:
-                if process.poll() is None:
+                status = process.poll()
+                if status is None:
                     process.kill()
     except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    return bytes(output) if status in (None, 0) else None
+
+
+def local_description(root, base, head):
+    """Collect bounded optional context from the most recent commits in chronological order."""
+    byte_limit = 4 * DESCRIPTION_LIMIT
+    args = ["git", "--literal-pathspecs", "-C", str(root), "log", "--no-show-signature", "--encoding=UTF-8",
+            f"-{DESCRIPTION_COMMITS + 1}", "--format=%s%n%n%b%x00", base + ".." + head, "--"]
+    output = command_prefix(args, byte_limit + 1)
+    if output is None:
         return ""
     # Spend the budget newest-first, then display the retained messages in chronological order.
     clipped = len(output) > byte_limit
