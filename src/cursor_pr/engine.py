@@ -4,7 +4,7 @@ from collections import defaultdict, deque
 import fcntl
 import hashlib
 from importlib.metadata import distribution
-from itertools import islice
+from itertools import islice, product
 import json
 import os
 from pathlib import Path
@@ -614,29 +614,45 @@ def quoted_evidence(code, message, lines, start, end, budget):
         return status or "unverified"
     if status == "verified" or ("```" not in code and "~~~" not in code):
         return status
-    if not budget.spend(len(code) + len(cited)):
-        return "unverified"
-    wrapped = fenced_quote(code, whole=True)
-    return (quote_coverage(wrapped, cited, budget) or status) if wrapped is not None else status
+    fence_modes = (True, False) if can_quote_literal_cr(code, cited) else (False,)
+    for preserve_cr in fence_modes:
+        if not budget.spend(len(code) + len(cited)):
+            return "unverified"
+        wrapped = fenced_quote(code, whole=True, preserve_cr=preserve_cr)
+        if wrapped is not None:
+            status = quote_coverage(wrapped, cited, budget) or status
+            if status == "verified":
+                break
+    return status
+
+
+def can_quote_literal_cr(quote, cited):
+    return "\r" in quote and any("\r" in line for _, line in cited)
 
 
 def quote_coverage(quote, cited, budget):
-    literal_status = None
-    if "\r" in quote and any("\r" in line for _, line in cited):
-        # The patch can show a literal CR inside a source row. Try that before treating it as a break.
-        if not budget.spend(len(quote) + len(cited)):
+    separators = (LF_LINE_ENDING, LINE_ENDING) if can_quote_literal_cr(quote, cited) else (LINE_ENDING,)
+    literals = set()
+    if MARKER.search(quote):
+        literals = {line.lstrip(" \t") for _, line in cited if MARKER.fullmatch(line.strip(" \t"))}
+    marker_modes = (literals, ()) if literals else ((),)
+    status = None
+    for attempt, (separator, markers) in enumerate(product(separators, marker_modes)):
+        if attempt and not budget.spend(len(quote) + len(cited)):
             return "unverified"
-        literal_status = quote_rows_coverage(checkable(quote, separator=LF_LINE_ENDING), cited, budget)
-        if literal_status == "verified":
-            return literal_status
-    return quote_rows_coverage(checkable(quote), cited, budget) or literal_status
+        parts = checkable(quote, separator=separator, literal_markers=markers)
+        status = quote_rows_coverage(parts, cited, budget) or status
+        if status == "verified":
+            break
+    return status
 
 
 def quote_rows_coverage(parts, cited, budget):
     concrete = [part for part in parts if part is not ELIDED]
     if not any(part[0].strip(" \t") for part in concrete):
         return "unverified"
-    if not quoted_in_order(concrete, cited):
+    required = [part for part in concrete if part[1] is not OPTIONAL_MARKER]
+    if not quoted_in_order(required, cited):
         return None
     if covers(parts, cited, single_line=len(concrete) == 1, budget=budget):
         return "verified"
@@ -647,22 +663,28 @@ def quote_rows_coverage(parts, cited, budget):
 
 
 MARKDOWN = MarkdownIt("commonmark").disable("inline")
+LITERAL_CR_MARKDOWN = MarkdownIt("commonmark").disable(["inline", "normalize"])
 # A quoted line as the patch shows it: indented, numbered, and marked as added.
 SHOWN = re.compile(r"([1-9]\d*) (?:\+| )(.*)")
 # An explicit elision such as "..." or "# …": it stands for cited lines the quote leaves out.
 ELISION = re.compile(r"(?:(?:#|//)[ \t]*)?(?:\.{3,}|…)")
-# The patch display's hunk markers stand for no code at all.
+# A hunk marker may come from the patch display or from an actual source row.
 MARKER = re.compile(r"__(?:new|old) hunk__")
 ELIDED = object()
+OPTIONAL_MARKER = object()
 # These printable glyphs are blank, including the Hangul fillers and blank Braille cell.
 BLANK_GLYPHS = frozenset("\u115f\u1160\u2800\u3164\uffa0")
 
 
-def fenced_quote(message, *, whole=False):
+def fenced_quote(message, *, whole=False, preserve_cr=False):
     if "\x00" in message:
         # CommonMark would silently replace NUL in the evidence text.
         return None
-    tokens = MARKDOWN.parse(message)
+    if preserve_cr:
+        # Match LF or CRLF-delimited source, letting the block parser keep CR inside code rows.
+        message = message.replace("\r\n", "\n")
+    parser = LITERAL_CR_MARKDOWN if preserve_cr else MARKDOWN
+    tokens = parser.parse(message)
     fence = next((token for token in tokens if token.type == "fence"), None)
     if fence is None:
         return None
@@ -671,16 +693,17 @@ def fenced_quote(message, *, whole=False):
             return None
         # The parser can consume link definitions without producing any tokens.
         start, end = fence.map
-        lines = LINE_ENDING.split(message)
+        separator = LF_LINE_ENDING if preserve_cr else LINE_ENDING
+        lines = separator.split(message)
         if any(line.strip(" \t") for line in lines[:start] + lines[end:]):
             return None
     return fence.content
 
 
-def checkable(quote, *, separator=LINE_ENDING):
+def checkable(quote, *, separator=LINE_ENDING, literal_markers=()):
     """The quote's lines in order: each as its raw and numbered forms, or ELIDED for an explicit elision.
 
-    Drop hunk markers before checking whether blank lines are inside the quote.
+    Keep hunk markers that might match source as optional rows.
     """
     parts = []
     for raw in separator.split(quote):
@@ -689,9 +712,12 @@ def checkable(quote, *, separator=LINE_ENDING):
             parts.append((raw, shown[1], shown[2]))
             continue
         standalone = raw.strip(" \t")
-        if (not standalone and not parts) or MARKER.fullmatch(standalone):
+        if not standalone and not parts:
             continue
-        if ELISION.fullmatch(standalone):
+        if MARKER.fullmatch(standalone):
+            if raw.lstrip(" \t") in literal_markers:
+                parts.append((raw, OPTIONAL_MARKER, raw))
+        elif ELISION.fullmatch(standalone):
             if parts[-1:] != [ELIDED]:
                 parts.append(ELIDED)
         else:
@@ -725,7 +751,7 @@ def candidate_margins(parts, cited, budget):
         indents[stripped][line[:len(line) - len(stripped)]] = None
         numbered[str(index)] = line
     parts = [part for part in parts if part[0]]
-    raw = [part for part in parts if numbered.get(part[1]) != part[2]]
+    raw = [part for part in parts if part[1] is not OPTIONAL_MARKER and numbered.get(part[1]) != part[2]]
     # Every covering alignment must match this row as raw code. Start with the fewest possible shifts.
     seeds = [min(raw, key=lambda part: len(indents[part[0].lstrip(" \t")]))] if raw else parts
     seen = {("", "")}
@@ -792,11 +818,12 @@ def covers(parts, cited, *, quote_margin="", source_margin="", single_line=False
         if part is ELIDED:
             eliding = True
             continue
+        optional = part[1] is OPTIONAL_MARKER
         if eliding:
             eliding = False
             first = min(reach)
             strong_from = min((pos for pos, strong in reach.items() if strong), default=len(cited) + 1)
-            if offset + 1 < len(parts) and parts[offset + 1] is ELIDED:
+            if not optional and offset + 1 < len(parts) and parts[offset + 1] is ELIDED:
                 if indexed is None:
                     if not budget.spend(len(cited)):
                         return False
@@ -806,7 +833,7 @@ def covers(parts, cited, *, quote_margin="", source_margin="", single_line=False
             if not budget.spend(len(cited) + 1 - first):
                 return False
             reach = {pos: pos >= strong_from for pos in range(first, len(cited) + 1)}
-        step = {}
+        step = reach.copy() if optional else {}
         last = max(reach)
         reachable = strong = False
         for position in range(min(reach), len(cited)):
@@ -817,7 +844,7 @@ def covers(parts, cited, *, quote_margin="", source_margin="", single_line=False
                 strong = strong or reach[position]
             index, line = cited[position]
             if reachable and evidence_matches(part, index, line, quote_margin, source_margin, single_line):
-                step[position + 1] = strong or substantive(line)
+                step[position + 1] = step.get(position + 1, False) or strong or substantive(line)
             if line.strip(" \t"):
                 if position >= last:
                     break

@@ -348,10 +348,13 @@ class QuotedEvidenceTests(unittest.TestCase):
         patch = "@@ -0,0 +1,2 @@\n+x\ry\n+ready()\n"
         display, anchors = engine.section(source.File("a.py", patch, "modified"))
         quote = display.split("__new hunk__\n", 1)[1]
-        raw = envelope([dict(issue(start=1, end=2), relevant_code=quote)])
-        parsed = engine.parse_answer(raw, {"a.py": anchors})
-        self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
-        self.assertEqual(parsed["dropped"], [])
+        for ending, supplied in (("\n", quote), ("\n", "```text\n" + quote + "\n```"),
+                                 ("\r\n", "```text\n" + quote + "\n```")):
+            with self.subTest(ending=ending, supplied=supplied):
+                raw = envelope([dict(issue(start=1, end=2), relevant_code=supplied.replace("\n", ending))])
+                parsed = engine.parse_answer(raw, {"a.py": anchors})
+                self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
+                self.assertEqual(parsed["dropped"], [])
 
     def test_blank_separators_outside_the_quoted_code_around_hunk_markers(self):
         quote = "__new hunk__\n\n1 +send()\n\n__old hunk__"
@@ -359,6 +362,19 @@ class QuotedEvidenceTests(unittest.TestCase):
         parsed = engine.parse_answer(raw, shown("send()"))
         self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
         self.assertEqual(parsed["dropped"], [])
+
+    def test_unnumbered_hunk_marker_rows_can_be_literal_source(self):
+        for marker in ("__new hunk__", "__old hunk__"):
+            relevant = f"prepare()\n{marker}\nsend()"
+            anchors = shown("prepare()", marker, "send()")
+            for quote in (relevant, f"{marker}\n{relevant}",
+                          f"{marker}\n\n1 +prepare()\n2 +{marker}\n3 +send()",
+                          f"...\nprepare()\n{marker}\nsend()\n..."):
+                with self.subTest(quote=quote):
+                    raw = envelope([dict(issue(start=1, end=3), relevant_code=quote)])
+                    parsed = engine.parse_answer(raw, anchors)
+                    self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
+                    self.assertEqual(parsed["dropped"], [])
 
     def test_a_numbered_match_does_not_set_the_raw_indentation_margin(self):
         anchors = shown("3 +    first()", "if enabled:", "    first()", "    second()", "    third()")
