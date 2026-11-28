@@ -624,22 +624,27 @@ def quoted_evidence(code, message, lines, start, end, budget):
     if not quote or not isinstance(lines, dict) or not budget.spend(end - start + 1):
         return "unverified"
     cited = [(line, lines[line].rstrip("\r\n")) for line in range(start, end + 1)]
-    added = lines.added if asked and isinstance(lines, DiffAnchors) else frozenset()
-    status = quote_coverage(quote, cited, budget, added=added)
+    status = quote_coverage(quote, cited, budget)
     if not asked:
         # A fenced block in the message may be a suggested fix.
         return status or "unverified"
-    if status == "verified" or ("```" not in code and "~~~" not in code):
-        return status
-    fence_modes = (True, False) if can_quote_literal_cr(code, cited) else (False,)
-    for preserve_cr in fence_modes:
-        if not budget.spend(len(code) + len(cited)):
-            return "unverified"
-        wrapped = fenced_quote(code, whole=True, preserve_cr=preserve_cr)
-        if wrapped is not None:
-            status = quote_coverage(wrapped, cited, budget, added=added) or status
-            if status == "verified":
-                break
+    candidates = [quote]
+    if status != "verified" and ("```" in code or "~~~" in code):
+        fence_modes = (True, False) if can_quote_literal_cr(code, cited) else (False,)
+        for preserve_cr in fence_modes:
+            if not budget.spend(len(code) + len(cited)):
+                return "unverified"
+            wrapped = fenced_quote(code, whole=True, preserve_cr=preserve_cr)
+            if wrapped is not None:
+                status = quote_coverage(wrapped, cited, budget) or status
+                if status == "verified":
+                    return status
+                candidates.append(wrapped)
+    # Give existing quote formats the full work budget before trying the fallback.
+    if status != "verified" and isinstance(lines, DiffAnchors) and any(number in lines.added for number, _ in cited):
+        for candidate in candidates:
+            if exact_diff_rows(candidate, cited, lines.added, budget):
+                return "verified" if any(substantive(line) for _, line in cited) else "unverified"
     return status
 
 
@@ -647,7 +652,7 @@ def can_quote_literal_cr(quote, cited):
     return "\r" in quote and any("\r" in line for _, line in cited)
 
 
-def quote_coverage(quote, cited, budget, *, added=frozenset()):
+def quote_coverage(quote, cited, budget):
     separators = (LF_LINE_ENDING, LINE_ENDING) if can_quote_literal_cr(quote, cited) else (LINE_ENDING,)
     literals = set()
     if MARKER.search(quote):
@@ -667,18 +672,22 @@ def quote_coverage(quote, cited, budget, *, added=frozenset()):
             status = quote_rows_coverage(parts[leading:len(parts) - trailing], cited, budget) or status
             if status == "verified":
                 return status
-        if added and budget.spend(len(quote) + len(cited)) and exact_diff_rows(quote, cited, added, separator):
-            return "verified" if any(substantive(line) for _, line in cited) else "unverified"
     return status
 
 
-def exact_diff_rows(quote, cited, added, separator):
+def exact_diff_rows(quote, cited, added, budget):
     """Match a complete head range copied with its original diff markers and no line numbers."""
-    rows = separator.split(quote.strip("\r\n"))
-    return len(rows) == len(cited) and any(number in added for number, _ in cited) and all(
-        row[:1] == ("+" if number in added else " ") and row[1:] == line
-        for row, (number, line) in zip(rows, cited)
-    )
+    separators = (LF_LINE_ENDING, LINE_ENDING) if can_quote_literal_cr(quote, cited) else (LINE_ENDING,)
+    for separator in separators:
+        if not budget.spend(len(quote) + len(cited)):
+            return False
+        rows = separator.split(quote.strip("\r\n"))
+        if len(rows) == len(cited) and all(
+            row[:1] == ("+" if number in added else " ") and row[1:] == line
+            for row, (number, line) in zip(rows, cited)
+        ):
+            return True
+    return False
 
 
 def marker_padding_offsets(parts):
