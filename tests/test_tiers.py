@@ -359,6 +359,9 @@ class TierTests(unittest.TestCase):
                 self.assertEqual([row["name"] for row in report["passes"]],
                                  (["deep", "verification"] if deep_only_scope else ["review", "deep", "verification"]))
                 self.assertEqual([item["path"] for item in report["findings"]], ["src/data.py"])
+                reviewed = 1 if deep_only_scope else 2
+                self.assertEqual(report["receipt"]["coverage"]["reviewed"], reviewed)
+                self.assertEqual((report["receipt"]["skipped"], mid["receipt"]["skipped"]), (0, 1))
                 self.assertLessEqual(report["estimated_input_tokens"], report["max_input_tokens"])
 
     def test_max_collects_dropped_findings_from_both_review_passes(self):

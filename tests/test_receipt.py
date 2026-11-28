@@ -79,6 +79,13 @@ class ReceiptTests(unittest.TestCase):
         line = receipt.render(receipt.build(report(model_usage=usage)))[0]
         self.assertIn("7 uncached input and 5 cache read and 1 cache write and 2 output tokens", line)
 
+    def test_partial_coverage_does_not_round_to_full_or_zero(self):
+        for reviewed, text, percent in ((199, 200, 99.5), (2999, 3000, 99.9), (1, 3000, 0.1)):
+            with self.subTest(reviewed=reviewed, text=text):
+                value = receipt.build(report(coverage={"reviewed": reviewed, "text": text}))
+                self.assertEqual(value["coverage"]["percent"], percent)
+                self.assertIn(f"({percent}%)", receipt.render(value)[1])
+
     def test_a_degraded_review_counts_the_files_it_kept(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -143,21 +150,27 @@ class ReceiptTests(unittest.TestCase):
         body = post.call_args.args[3]
         self.assertLessEqual(len(body.encode()), cli.visual.MAX_COMMENT_BYTES)
         self.assertIn("Coverage: 1 of 2 text files reviewed (50%).", body)
+        self.assertIn("Text counted only: 1.", body)
         self.assertTrue(body.endswith(providers.ATTRIBUTION + "\n"))
 
     def test_cache_hit_does_not_republish_the_same_review(self):
         project = SimpleNamespace(key="github/org/repo", visibility="private")
-        value = report(omitted=[])
+        value = report(omitted=["big.py"], coverage={"reviewed": 1, "text": 1, "excluded": 1, "unavailable": 1})
         head = "a" * 40
         with tempfile.TemporaryDirectory() as tmp, patch.object(source, "run_forge") as forge:
             for invocations in (1, 0):
                 value.update(model_invocations=invocations, cache_hit=not invocations)
                 value["receipt"] = receipt.build(value)
                 cli.publish("org/repo#1", head, value, project=project, state=Path(tmp))
-            first, second = (call.kwargs["publication"] for call in forge.call_args_list)
+            value["coverage"].update(text=2, unavailable=0)
+            value["receipt"] = receipt.build(value)
+            cli.publish("org/repo#1", head, value, project=project, state=Path(tmp))
+            first, second, corrected = (call.kwargs["publication"] for call in forge.call_args_list)
             self.assertFalse(first["AlreadyPosted"])
             self.assertTrue(second["AlreadyPosted"])
             self.assertNotEqual(first["Body"], second["Body"])
+            self.assertFalse(corrected["AlreadyPosted"])
+            self.assertIn("Coverage: 1 of 2 text files reviewed (50%).", corrected["Body"])
 
 
 if __name__ == "__main__":

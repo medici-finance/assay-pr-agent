@@ -384,7 +384,7 @@ def publish(address, head, report, *, project=None, state=None):
                 if receipt_lines else baseline)
         if len(text.encode("utf-8")) > visual.MAX_COMMENT_BYTES:
             raise ReviewError("Visual review exceeded the forge comment limit")
-        options = {"dedupe_body": baseline} if receipt_lines else {}
+        options = {"dedupe_body": receipt.dedupe_body(baseline, report)} if receipt_lines else {}
         post_comment(project, int(number), head, text, state, **options)
         return
     label = providers.LABELS[report.get("provider", "cursor")]
@@ -496,8 +496,7 @@ def publish(address, head, report, *, project=None, state=None):
     text = format_comment(["", *receipt_lines, *footer]) if receipt_lines else baseline
     if size_of(text) > FORGE_COMMENT_BYTES:
         raise ReviewError("Review exceeded the forge comment limit")
-    # Cache status and billed usage can change on a retry of the same review.
-    options = {"dedupe_body": baseline} if receipt_lines else {}
+    options = {"dedupe_body": receipt.dedupe_body(baseline, report)} if receipt_lines else {}
     post_comment(project, int(number), head, text, state, **options)
 
 
@@ -728,8 +727,7 @@ def execute_review(args, verification_resources):
     advisories = qualgen["advisories"] if qualgen else ()
 
     if args.visual:
-        counts = receipt.count_files(all_files, selected, {}, visual=True)
-        return visual_review(args, change, files, sorted(paths - selected), checks, static, qualgen, drifted, counts)
+        return visual_review(args, change, files, all_files, checks, static, qualgen, drifted)
 
     tier, base = args.tier, args.max_input_tokens
     budget = base * TIERS[tier]
@@ -739,7 +737,6 @@ def execute_review(args, verification_resources):
     first_tier = "regular" if tier == "regular" else "mid"
     cap = caps[first_tier]
     rendered = render_sections(files)
-    counts = receipt.count_files(all_files, selected, rendered, visual=False)
     scoped = selected != paths
     if not args.change or not (change.title or change.description):
         description_kind = "history"
@@ -821,6 +818,7 @@ def execute_review(args, verification_resources):
     context_fates = merged_fates([fates, deep_fates])
     planned_tier = reached([(row["name"], blocks) for row, _, _, blocks in plans]) if plans else None
     reviewable = selected - set(unseen)
+    counts = receipt.count_files(all_files, selected, reviewable, validated=rendered)
     planned_paths = {path for _, _, locations, _ in plans for path, lines in locations.items() if lines}
     degraded = sorted(reviewable - planned_paths) if plans else []
     counts["skipped"] = len(degraded) if plans else len(reviewable)
@@ -922,7 +920,7 @@ def execute_review(args, verification_resources):
     return report, 2 if incomplete or degraded or lowered else 0
 
 
-def visual_review(args, change, files, unselected, checks, static, qualgen, drifted, counts):
+def visual_review(args, change, files, all_files, checks, static, qualgen, drifted):
     """Explain the change in one prompt of its own: no tiers, no context beyond the patch, no findings.
 
     The scanners, history and drift are the same evidence a review gathers, and none of it enters
@@ -930,7 +928,10 @@ def visual_review(args, change, files, unselected, checks, static, qualgen, drif
     """
     prompt, anchors, unseen, has_text = visual.pack(files)
     estimated = tokens(prompt) if has_text else 0
-    omitted = sorted(set(unseen) | set(unselected))
+    selected = {f.path for f in files}
+    omitted = sorted(set(unseen) | {f.path for f in all_files if f.path not in selected})
+    shown = {f.path for f in files if visual.shows_hunks(f)}
+    counts = receipt.count_files(all_files, selected, shown, validated=selected)
     backend = providers.provider()
     limit = args.max_input_tokens
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
@@ -938,7 +939,7 @@ def visual_review(args, change, files, unselected, checks, static, qualgen, drif
               "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
               "findings": [], "cursor_usage": None, "drift": drifted, "coverage": counts,
               # The map costs no tokens and stays in the report when the model is skipped or fails.
-              "map": dict(visual.survey(files), shown=sorted(file.path for file in files if visual.shows_hunks(file)))}
+              "map": dict(visual.survey(files), shown=sorted(shown))}
     if static:
         report["static_checks"] = [static[key] for key in sorted(static)]
     if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
@@ -946,7 +947,7 @@ def visual_review(args, change, files, unselected, checks, static, qualgen, drif
     if qualgen:
         report["qualgen"] = qualgen
     if estimated > limit:
-        counts["skipped"] = len(report["map"]["shown"])
+        counts["skipped"] = len(shown)
         return dict(report, state="over-budget"), 2
     if args.estimate:
         return dict(report, state="estimate"), 0
@@ -959,7 +960,7 @@ def visual_review(args, change, files, unselected, checks, static, qualgen, drif
         if answer is None:
             # The map and the deterministic evidence are kept even if the model failed.
             return dict(report, state="model-unavailable", error=error), 2
-        counts["reviewed"] = len(report["map"]["shown"])
+        counts["reviewed"] = len(shown)
         report.update({name: value for name, value in answer.items() if name != "cursor_usage"}, cache_hit=row["state"] == "cached")
     incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
     report["state"] = "partial" if incomplete else ("reviewed" if has_text else "empty")

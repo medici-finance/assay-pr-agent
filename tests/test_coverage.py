@@ -37,6 +37,8 @@ class CoverageStateTests(unittest.TestCase):
         report, code, shown, posts = self.run_review([BINARY, ADDED, DELETED])
         self.assertEqual((code, report["state"], report["omitted"]), (0, "reviewed", []))
         self.assertEqual(report["not_reviewable"], ["logo.png", "old.py"])
+        self.assertEqual(report["receipt"]["coverage"], {"reviewed": 1, "text": 2, "percent": 50})
+        self.assertIn("Text counted only: 1.", posts[0])
         self.assertEqual(len(shown), 1)
         self.assertIn("- Not reviewed, no text to review: ` logo.png `, ` old.py `", posts[0])
         self.assertNotIn("Outside review coverage", posts[0])
