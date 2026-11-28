@@ -313,7 +313,9 @@ def earlier_comments(notes):
     """The change's conversation so far, newest last, each comment bounded."""
     rows = [note["body"].strip() for note in notes if isinstance(note.get("body"), str)]
     # Not the commands, and not what the reviewer itself answered them with.
-    rows = [body for body in rows if body and not body.startswith(("/review", "/visual-review")) and not is_review_summary(body)]
+    # A comment that only starts like /visual-review is discussion, as it is to the poller.
+    rows = [body for body in rows if body and not body.startswith("/review") and body != "/visual-review"
+            and not is_review_summary(body)]
     return "\n\n".join(f"## Comment {index}\n{body[:1500]}" for index, body in enumerate(rows[-10:], 1))
 
 

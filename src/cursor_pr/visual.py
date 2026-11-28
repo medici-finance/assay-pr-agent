@@ -154,7 +154,11 @@ def generated(path, patch="", status=""):
         text = lines[number][:HEADER_LINE]
         if not text.strip():
             continue
-        if not block and (not COMMENT.match(text) or text.lstrip().startswith("#") and HASH_IS_CODE.search(path)):
+        # Outside a block comment a line that starts with * is code, a CSS rule for one: only
+        # inside an open /* does * continue a comment.
+        start = text.lstrip()
+        if not block and (not COMMENT.match(text) or start.startswith("#") and HASH_IS_CODE.search(path)
+                          or start.startswith("*")):
             return False
         # Where a block comment ends on the line, only what is before its end is comment. Code after
         # it can hold any text, and ends the leading comment.
@@ -256,7 +260,12 @@ def pack(files):
         kind, read = category(f.path, f.patch, f.status), narrated(f.path, f.patch, f.status)
         # A deletion, a binary or legal text is named in the inventory and counted in the map. Only
         # a file the model should have read, but the forge sent no patch for, is coverage lost.
-        if f.absent and read and not gone(f.status):
+        # What falls to Logic only because no rule knows its name (assets/cache.dat, an
+        # extensionless binary) is not known to be code: with no text patch it is most likely a
+        # binary, and the forge does not say. It is named in the comment as having no text, and
+        # does not make the review partial. A name with a source extension still does.
+        unknown = kind == "Logic" and not re.search(r"\." + SOURCE + "$", f.path)
+        if f.absent and read and not gone(f.status) and not unknown:
             unseen.append(f.path)
         shown = shows_hunks(f)
         row = f"{f.path} | {kind} | " + ("no text patch" if f.absent else f"+{added} -{deleted}")
