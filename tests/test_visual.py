@@ -519,6 +519,7 @@ class VisualTests(unittest.TestCase):
         self.answer.write_text(json.dumps({"review": {"key_issues_to_review": []}}))
         code, report = self.check("--model", "another-model")
         self.assertEqual((code, report["state"], report["model_invocations"]), (2, "model-unavailable", 1))
+        self.assertEqual(report["receipt"]["failed"], len(report["map"]["shown"]))
         self.assertEqual(report["map"]["to_read"], 7)
         self.assertEqual(len(self.prompts()), 3)
 

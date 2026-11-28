@@ -14,7 +14,7 @@ USAGE_KEYS = (("input", ("input_tokens", "inputTokens")),
 
 def count_files(files, selected, reviewable, *, validated):
     """Count confirmed text across the change, including paths outside the selection."""
-    counts = dict(changed=len(files), text=0, reviewed=0, skipped=0, excluded=0, no_text=0,
+    counts = dict(changed=len(files), text=0, reviewed=0, skipped=0, failed=0, excluded=0, no_text=0,
                   unavailable=0, counted_only=0)
     for file in files:
         counts["excluded"] += file.path not in selected
@@ -84,6 +84,7 @@ def build(report):
         "usage": usage_totals(report.get("model_usage") or {}),
         "coverage": {"reviewed": reviewed, "text": text, "percent": percent},
         "skipped": coverage.get("skipped", 0), "no_text": coverage.get("no_text", 0),
+        "failed": coverage.get("failed", 0),
         "excluded": coverage.get("excluded", 0), "unavailable": coverage.get("unavailable", 0),
         "counted_only": coverage.get("counted_only", 0),
         "findings": {"model": len(report["findings"]), "static": sum(len(c["findings"]) for c in checks),
@@ -127,6 +128,8 @@ def render(receipt):
     if coverage["reviewed"] is not None:
         foot += (f" Skipped for budget: {receipt['skipped']}. Not reviewable: {receipt['no_text']}. "
                  f"Outside the selection: {receipt['excluded']}.")
+        if receipt["failed"]:
+            foot += f" Unreviewed after a pass failed: {receipt['failed']}."
         if receipt["unavailable"]:
             foot += f" Unavailable patches: {receipt['unavailable']}."
         if receipt["counted_only"]:

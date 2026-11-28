@@ -909,7 +909,9 @@ def execute_review(args, verification_resources):
                   cursor_invocations=sum(row["model_invocations"] for row in passes))
     counts["reviewed"] = len(coverage)
     degraded = sorted(reviewable - coverage.keys())
-    report.update(degraded=degraded, failed_coverage=sorted(planned_paths - coverage.keys()))
+    failed_coverage = sorted(planned_paths - coverage.keys())
+    counts["failed"] = len(failed_coverage)
+    report.update(degraded=degraded, failed_coverage=failed_coverage)
     if has_text and not completed:
         return dict(report, state="model-unavailable", error=last_error), 2
     if report["delivered"] == "max":
@@ -966,6 +968,7 @@ def visual_review(args, change, files, all_files, checks, static, qualgen, drift
         report.update(cursor_invocations=row["model_invocations"], cursor_usage=row.get("model_usage"))
         if answer is None:
             # The map and the deterministic evidence are kept even if the model failed.
+            counts["failed"] = len(shown)
             return dict(report, state="model-unavailable", error=error), 2
         counts["reviewed"] = len(shown)
         report.update({name: value for name, value in answer.items() if name != "cursor_usage"}, cache_hit=row["state"] == "cached")

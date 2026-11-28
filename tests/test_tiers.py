@@ -376,11 +376,17 @@ class TierTests(unittest.TestCase):
         code, report = self.check("--tier", "max", "--max-input-tokens", "1000")
         self.assertEqual((code, report["state"], report["degraded"]), (2, "degraded", ["src/data.py"]))
         self.assertEqual(report["receipt"]["skipped"], 0)
+        self.assertEqual(report["receipt"]["failed"], 1)
         with patch.object(cli, "post_comment") as post:
             cli.publish("org/repo#1", self.head, report)
         comment = post.call_args.args[3]
         self.assertIn("- Not reviewed (pass failed): ` src/data.py `", comment)
         self.assertNotIn("Not reviewed (token limit)", comment)
+        with patch.object(cli, "MAX_DEGRADED_ROWS", 0), patch.object(cli, "post_comment") as post:
+            cli.publish("org/repo#1", self.head, report)
+        compact = post.call_args.args[3]
+        self.assertNotIn("src/data.py", compact)
+        self.assertIn("Unreviewed after a pass failed: 1.", compact)
 
     def test_max_collects_dropped_findings_from_both_review_passes(self):
         real = finding(42, "Real")
