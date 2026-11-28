@@ -310,7 +310,20 @@ def without_text(root, head, file, *, base_root, base, deadline):
     # Git treats a NUL in the first 8000 bytes as binary. An unreadable prefix is unknown.
     command = ["git", "--literal-pathspecs", "-C", str(root), "cat-file", "blob", f"{head}:{file.path}"]
     start = command_prefix(command, 8000, timeout=remaining)
-    return start is not None and (not start or b"\0" in start)
+    if start is None:
+        return False
+    if not start:
+        return True
+    remaining = deadline - time.monotonic()
+    if b"\0" not in start or remaining <= 0:
+        return False
+    # A committed diff attribute can make a NUL-containing blob reviewable as text.
+    try:
+        attribute = git(root, "check-attr", f"--source={head}", "-z", "diff", "--", file.path,
+                        timeout=remaining).split(b"\0")
+    except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return len(attribute) == 4 and attribute[1] == b"diff" and attribute[2] in (b"unspecified", b"unset")
 
 
 def classify_absent(root, head, files, *, base_root, base):
@@ -363,11 +376,12 @@ def command_prefix(args, limit, *, timeout=45):
                         break
                     output.extend(chunk)
             finally:
-                if process.poll() is None:
+                status = process.poll()
+                if status is None:
                     process.kill()
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
-    return bytes(output)
+    return bytes(output) if status in (None, 0) else None
 
 
 def local_description(root, base, head):

@@ -116,6 +116,22 @@ class CoverageStateTests(unittest.TestCase):
                 files = source.classify_absent(Path("."), "a" * 40, [file], base_root=Path("."), base="")
             self.assertTrue(files[0].patch_unavailable)
 
+    def test_committed_diff_attribute_can_make_a_nul_blob_reviewable(self):
+        repo, head = self.head_repo({".gitattributes": b"forced.dat diff\n",
+                                     "forced.dat": b"x\0y\n", "ordinary.dat": b"x\0y\n"})
+        (Path(repo) / ".gitattributes").write_text("forced.dat -diff\n")
+        files = [source.File(name, "", "modified", True) for name in ("forced.dat", "ordinary.dat")]
+        report, code, _, _ = self.run_review(files, repo=repo, head=head)
+        self.assertEqual((code, report["state"]), (2, "partial"))
+        self.assertEqual((report["omitted"], report["not_reviewable"]), (["forced.dat"], ["ordinary.dat"]))
+
+    def test_full_prefix_is_discarded_when_the_command_already_failed(self):
+        command = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'a\\x00'); sys.exit(9)"]
+        process = subprocess.Popen(command, stdout=subprocess.PIPE)
+        self.assertEqual(process.wait(timeout=5), 9)
+        with patch.object(source.subprocess, "Popen", return_value=process):
+            self.assertIsNone(source.command_prefix(command, 2))
+
     def test_estimate_marks_an_unavailable_patch_incomplete(self):
         missing = source.File("app.py", "", "modified", True)
         report, code, shown, _ = self.run_review([missing], "--estimate")
