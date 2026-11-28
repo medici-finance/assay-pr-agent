@@ -5,7 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import selectors
 import subprocess
@@ -284,17 +284,56 @@ def commit(root, ref):
     return git(root, "rev-parse", "--verify", "--end-of-options", ref + "^{commit}").decode().strip()
 
 
-def blob_entry(root, revision, path, deadline):
-    """Read a blob's mode and object ID from an immutable tree."""
+def coverage_git(root, *args, deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        return b""
+        raise ReviewError("patch coverage time budget exhausted")
+    return git(root, "--no-replace-objects", *args, timeout=remaining)
+
+
+def git_metadata_path(root, path, deadline):
+    value = coverage_git(root, "rev-parse", "--path-format=absolute", "--git-path", path, deadline=deadline)
+    return Path(os.fsdecode(value.removesuffix(b"\n")))
+
+
+def blob_entry(root, revision, path, deadline):
+    """Read a blob's mode and object ID from an immutable tree."""
     try:
-        entry = git(root, "--no-replace-objects", "ls-tree", "-z", "--full-tree", revision, "--", path,
-                    timeout=remaining).partition(b"\t")[0]
+        entry = coverage_git(root, "ls-tree", "-z", "--full-tree", revision, "--", path,
+                             deadline=deadline).partition(b"\t")[0]
     except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
         return b""
     return entry if b" blob " in entry else b""
+
+
+def blob_prefix(root, spec, limit, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    command = ["git", "--no-replace-objects", "--literal-pathspecs", "-C", str(root), "cat-file", "blob", spec]
+    return command_prefix(command, limit, timeout=remaining)
+
+
+def default_diff_applies(root, head, path, deadline):
+    """A NUL prefix proves binary only when Git can confirm the default diff rule."""
+    try:
+        # Git loads local overrides even with --source.
+        if git_metadata_path(root, "info/attributes", deadline).exists():
+            return False
+        attrs = [str(parent / ".gitattributes") for parent in PurePosixPath(path).parents]
+        entries = coverage_git(root, "ls-tree", "-z", "--full-tree", head, "--", *attrs, deadline=deadline)
+        for record in entries.split(b"\0")[:-1]:
+            mode, kind, oid = record.partition(b"\t")[0].split()
+            if kind == b"blob" and mode != b"120000":
+                # check-attr can silently ignore an attribute blob it cannot read.
+                content = blob_prefix(root, oid.decode(), 1_000_001, deadline)
+                if content is None or len(content) > 1_000_000:
+                    return False
+        attributes = coverage_git(root, "check-attr", f"--source={head}", "-z", "--all", "--", path,
+                                  deadline=deadline).split(b"\0")
+    except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return b"diff" not in attributes[1::3]
 
 
 def without_text(root, head, file, *, base_root, base, deadline):
@@ -305,39 +344,24 @@ def without_text(root, head, file, *, base_root, base, deadline):
             old = blob_entry(root, base, file.previous, deadline)
         if old and old == blob_entry(root, head, file.path, deadline):
             return True
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        return False
-    # Git treats a NUL in the first 8000 bytes as binary. An unreadable prefix is unknown.
-    command = ["git", "--no-replace-objects", "--literal-pathspecs", "-C", str(root),
-               "cat-file", "blob", f"{head}:{file.path}"]
-    start = command_prefix(command, 8000, timeout=remaining)
-    if start is None:
-        return False
-    if not start:
-        return True
-    remaining = deadline - time.monotonic()
-    if b"\0" not in start or remaining <= 0:
-        return False
+    prefix = blob_prefix(root, f"{head}:{file.path}", 8000, deadline)
+    return prefix is not None and (not prefix or b"\0" in prefix and default_diff_applies(root, head, file.path, deadline))
+
+
+def complete_history(root, deadline):
     try:
-        # Git loads the local override even with --source, so it cannot prove forge coverage here.
-        info = git(root, "rev-parse", "--path-format=absolute", "--git-path", "info/attributes", timeout=remaining)
-        if Path(os.fsdecode(info.removesuffix(b"\n"))).exists():
-            return False
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        # A committed diff attribute can make a NUL-containing blob reviewable as text.
-        attribute = git(root, "--no-replace-objects", "check-attr", f"--source={head}", "-z", "diff", "--",
-                        file.path, timeout=remaining).split(b"\0")
+        shallow = coverage_git(root, "rev-parse", "--is-shallow-repository", deadline=deadline)
+        return shallow.strip() == b"false" and not git_metadata_path(root, "info/grafts", deadline).exists()
     except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
         return False
-    return len(attribute) == 4 and attribute[1] == b"diff" and attribute[2] in (b"unspecified", b"unset")
 
 
-def classify_absent(root, head, files, *, base_root, base):
+def classify_absent(root, head, files, *, base_root, base, supplied_base=False):
     """Mark proven no-text files while keeping unverified patches unavailable."""
     deadline = time.monotonic() + 45
+    if base and not supplied_base and any(f.patch_unavailable and f.previous for f in files):
+        if not all(complete_history(repo, deadline) for repo in {root, base_root}):
+            base = ""
     return [replace(f, known_no_text=True)
             if f.patch_unavailable and without_text(root, head, f, base_root=base_root, base=base, deadline=deadline)
             else f for f in files]

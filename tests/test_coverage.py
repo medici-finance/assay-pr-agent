@@ -15,7 +15,7 @@ NO_DRIFT = {"state": "could-not-check", "behind": None, "both": [], "references"
 
 
 class CoverageStateTests(unittest.TestCase):
-    def run_review(self, files, *flags, repo=None, head="a" * 40, base=""):
+    def run_review(self, files, *flags, repo=None, head="a" * 40, base="", base_tip=""):
         shown, posts = [], []
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -25,7 +25,7 @@ class CoverageStateTests(unittest.TestCase):
         def invoke(prompt, model, anchors, **kwargs):
             shown.append(prompt)
             return {"findings": [], "dropped": [], "cursor_usage": None}
-        with patch.object(cli, "forge_change", return_value=source.Change(head, files, "org/repo#1", patch_base=base)), \
+        with patch.object(cli, "forge_change", return_value=source.Change(head, files, "org/repo#1", base=base_tip, patch_base=base)), \
              patch.object(cli.drift, "forge", return_value=NO_DRIFT), patch.object(cli, "scan_files", return_value=[]), \
              patch.object(engine, "invoke", side_effect=invoke), \
              patch.object(cli, "post_comment", side_effect=lambda *args: posts.append(args[3])):
@@ -100,6 +100,36 @@ class CoverageStateTests(unittest.TestCase):
         self.assertEqual((code, report["state"]), (2, "partial"))
         self.assertEqual((report["not_reviewable"], report["omitted"]), (["moved.py"], ["edited.py"]))
 
+    def test_shallow_merge_base_cannot_prove_a_patchless_rename(self):
+        repo, root_commit = self.head_repo({"old.py": b"head text\n"})
+        root = Path(repo)
+        identity = ("-c", "user.name=t", "-c", "user.email=t@t")
+
+        def new_commit(tree, *parents, message):
+            parent_args = [part for parent in parents for part in ("-p", parent)]
+            return source.git(root, *identity, "commit-tree", tree, *parent_args, "-m", message).decode().strip()
+
+        root_tree = source.git(root, "write-tree").decode().strip()
+        (root / "old.py").write_bytes(b"old text\n")
+        source.git(root, "add", "old.py")
+        old_tree = source.git(root, "write-tree").decode().strip()
+        real_base = new_commit(old_tree, root_commit, message="real base")
+        hidden_parent = new_commit(old_tree, real_base, message="shallow boundary")
+        side_parent = new_commit(root_tree, root_commit, message="other parent")
+        base_tip = new_commit(old_tree, hidden_parent, side_parent, message="base tip")
+        (root / "old.py").unlink()
+        (root / "new.py").write_bytes(b"head text\n")
+        source.git(root, "add", "-A")
+        head_tree = source.git(root, "write-tree").decode().strip()
+        head = new_commit(head_tree, real_base, message="rename and edit")
+        self.assertEqual(source.git(root, "merge-base", base_tip, head).decode().strip(), real_base)
+        (root / ".git" / "shallow").write_text(hidden_parent + "\n")
+        self.assertEqual(source.git(root, "merge-base", base_tip, head).decode().strip(), root_commit)
+
+        files = [source.File("new.py", "", "renamed", True, previous="old.py")]
+        report, code, _, _ = self.run_review(files, repo=repo, head=head, base_tip=base_tip)
+        self.assertEqual((code, report["state"], report["omitted"]), (2, "partial", ["new.py"]))
+
     def test_without_the_head_blob_even_a_binary_suffix_is_unavailable(self):
         files = [source.File("records.dat", "", "modified", True), source.File("icon.PNG", "", "added", True)]
         report, code, _, _ = self.run_review(files)
@@ -144,6 +174,15 @@ class CoverageStateTests(unittest.TestCase):
         report, code, _, _ = self.run_review(files, repo=repo, head=head)
         self.assertEqual((code, report["state"], report["omitted"]), (2, "partial", ["large.py"]))
         self.assertEqual(report["not_reviewable"], [])
+
+    def test_unreadable_committed_attributes_leave_a_nul_blob_unavailable(self):
+        repo, head = self.head_repo({".gitattributes": b"forced.dat diff\n", "forced.dat": b"x\0y\n"})
+        root = Path(repo)
+        oid = source.git(root, "rev-parse", f"{head}:.gitattributes").decode().strip()
+        (root / ".git" / "objects" / oid[:2] / oid[2:]).unlink()
+        files = [source.File("forced.dat", "", "modified", True)]
+        report, code, _, _ = self.run_review(files, repo=repo, head=head)
+        self.assertEqual((code, report["state"], report["omitted"]), (2, "partial", ["forced.dat"]))
 
     def test_full_prefix_is_discarded_when_the_command_already_failed(self):
         command = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'a\\x00'); sys.exit(9)"]

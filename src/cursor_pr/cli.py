@@ -676,7 +676,8 @@ def execute_review(args, verification_resources):
                 args.sarif_checkout = checkout
         patch_base = drift.patch_base(root, checkout, change)
         if args.change and not args.visual:
-            files = classify_absent(checkout, change.head, files, base_root=root, base=patch_base)
+            files = classify_absent(checkout, change.head, files, base_root=root, base=patch_base,
+                                    supplied_base=bool(change.patch_base))
         checks = scan_files(checkout, change.head, files, base_root=root, base=patch_base)
         deadline = time.monotonic() + 180
         for tool, path in missing:
