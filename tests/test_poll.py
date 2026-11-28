@@ -236,4 +236,5 @@ print(json.dumps(dict(type='result',subtype='success',is_error=False,
         self.assertEqual(posts.read_text().count("historically coupled to partner.py"), 4)
         self.assertEqual(calls.read_text().splitlines(),["called"] * 4)
         self.assertEqual(posts.read_text().count("Skipped Cursor"),2)
-        self.assertEqual(posts.read_text().count("[PR-Agent](https://github.com/the-pr-agent/pr-agent)"),6)
+        self.assertEqual(posts.read_text().count("Review by [Assay PR Agent](https://pr-agent.assay.guide/)."), 6)
+        self.assertNotIn("the-pr-agent", posts.read_text())

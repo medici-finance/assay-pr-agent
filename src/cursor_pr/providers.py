@@ -9,6 +9,9 @@ import tempfile
 
 KEYS = {"cursor": "CURSOR_API_KEY", "claude": "ANTHROPIC_API_KEY", "codex": "CODEX_API_KEY"}
 LABELS = {"cursor": "Cursor", "claude": "Claude", "codex": "Codex"}
+# The one line every posted review closes with, whichever kind of review it is. What this project
+# builds on and takes ideas from is credited in the README, not in each comment.
+ATTRIBUTION = "Review by [Assay PR Agent](https://pr-agent.assay.guide/)."
 
 
 def provider(value=None):
