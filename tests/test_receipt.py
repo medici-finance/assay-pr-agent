@@ -22,8 +22,9 @@ def report(**extra):
 
 class ReceiptTests(unittest.TestCase):
     def test_usage_is_read_from_each_cli(self):
-        self.assertEqual(receipt.usage_totals({"inputTokens": 4, "cacheReadTokens": 66, "outputTokens": 9}),
-                         {"input": 4, "cached": 66, "output": 9})
+        self.assertEqual(receipt.usage_totals({"inputTokens": 4, "cacheReadTokens": 66, "cacheWriteTokens": 7,
+                                               "outputTokens": 9}),
+                         {"input": 4, "cached": 66, "cache_write": 7, "output": 9})
         self.assertEqual(receipt.usage_totals({"input_tokens": 10, "cached_input_tokens": 3, "output_tokens": 2}),
                          {"input": 10, "cached": 3, "output": 2})
         self.assertEqual(receipt.usage_totals({"input_tokens": 7, "cache_read_input_tokens": 5, "cache_creation_input_tokens": 1,
@@ -57,6 +58,9 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(receipt.render(receipt.build(report(
                 state="degraded", estimated_input_tokens=5000, full_input_tokens=9120)))[0],
                          "Receipt: 1 model call. Prompt 5,000 of 6,000 estimated input tokens; before budget trimming: 9,120.")
+        trimmed = receipt.build(report(state="degraded", estimated_input_tokens=10000, full_input_tokens=11500,
+                                       max_input_tokens=12000, first_prompt_limit=10500))
+        self.assertIn("before budget trimming: 11,500.", receipt.render(trimmed)[0])
         self.assertEqual(receipt.render(receipt.build(report(coverage={"reviewed": 0, "text": 0, "no_text": 2})))[1],
                          "Coverage: no text files to review. Skipped for budget: 0. Not reviewable: 2. Outside the selection: 0. "
                          "Findings: 0 model and 0 static; 0 dropped; 0 without a quote to check. "

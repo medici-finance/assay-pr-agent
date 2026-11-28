@@ -827,7 +827,8 @@ def execute_review(args, verification_resources):
     not_reviewable = sorted(set(unseen) - unavailable)
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
               "estimated_input_tokens": sum(row["estimated_input_tokens"] for row in passes),
-              "max_input_tokens": budget, "base_input_tokens": base, "prompt_limit": limit, "tier": tier,
+              "max_input_tokens": budget, "base_input_tokens": base, "prompt_limit": limit,
+              "first_prompt_limit": limit, "tier": tier,
               "cursor_invocations": 0, "cache_hit": False, "omitted": omitted,
               "not_reviewable": not_reviewable, "checks": checks, "coverage": counts,
               "findings": [], "cursor_usage": None, "full_input_tokens": full, "degraded": degraded,

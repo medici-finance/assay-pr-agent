@@ -8,7 +8,7 @@ from .source import ReviewError, hunks
 
 USAGE_KEYS = (("input", ("input_tokens", "inputTokens")),
               ("cached", ("cache_read_input_tokens", "cached_input_tokens", "cacheReadTokens")),
-              ("cache_write", ("cache_creation_input_tokens",)),
+              ("cache_write", ("cache_creation_input_tokens", "cacheWriteTokens")),
               ("output", ("output_tokens", "outputTokens")))
 
 
@@ -66,6 +66,7 @@ def build(report):
         if 0 < reviewed < text:
             percent = min(99.9, max(0.1, percent))
     checks = [*report["checks"], *(report.get("static_checks") or [])]
+    prompt_limit = report.get("prompt_limit", report["max_input_tokens"])
     return {
         "state": report["state"],
         "provider": report.get("provider"),
@@ -73,7 +74,8 @@ def build(report):
         "cache_hit": report.get("cache_hit"),
         "estimated_input_tokens": report["estimated_input_tokens"],
         "max_input_tokens": report["max_input_tokens"],
-        "prompt_limit": report.get("prompt_limit", report["max_input_tokens"]),
+        "prompt_limit": prompt_limit,
+        "first_prompt_limit": report.get("first_prompt_limit", prompt_limit),
         "full_input_tokens": report.get("full_input_tokens"),
         "usage": usage_totals(report.get("model_usage") or {}),
         "coverage": {"reviewed": reviewed, "text": text, "percent": percent},
@@ -100,7 +102,7 @@ def render(receipt):
     head += f". Prompt {receipt['estimated_input_tokens']:,} of {limit:,} estimated input tokens"
     # A budget refusal already reports the full estimate as its prompt size.
     full = receipt["full_input_tokens"]
-    if receipt["state"] != "over-budget" and full is not None and full > receipt["max_input_tokens"]:
+    if receipt["state"] != "over-budget" and full is not None and full > receipt["first_prompt_limit"]:
         head += f"; before budget trimming: {full:,}"
     input_label = "uncached input" if receipt["provider"] == "claude" and ("cached" in usage or "cache_write" in usage) else "input"
     usage_labels = (("input", input_label), ("cached", "cache read"),
