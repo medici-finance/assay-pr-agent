@@ -1,6 +1,6 @@
 # Assay PR Agent
 
-A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It builds on [PR-Agent](https://github.com/the-pr-agent/pr-agent). The PR-Agent contributors provide the review prompt, line-numbered diff formatter and token estimator used here. We ship their [MIT-licensed](https://github.com/the-pr-agent/pr-agent/blob/main/LICENSE) Python package in the container, with its original license notice. Choose Cursor Agent, Claude Code, or Codex CLI for inference. The `pr-agent-forge` helper uses Assay’s Go library for authenticated forge access when you use a change number. Local and CI runs require only the Git objects.
+A standalone, single-pass reviewer for GitHub pull requests, GitLab merge requests and local branches. It builds on [PR-Agent](https://github.com/the-pr-agent/pr-agent). The review prompt, line-numbered diff format and token estimator used here started as copies from the PR-Agent contributors' [MIT-licensed](https://github.com/the-pr-agent/pr-agent/blob/main/LICENSE) release 0.50.0. They are kept, modified, under `src/cursor_pr/vendor/` with the original license notice; the package itself is not installed. Choose Cursor Agent, Claude Code, or Codex CLI for inference. The `pr-agent-forge` helper uses Assay’s Go library for authenticated forge access when you use a change number. Local and CI runs require only the Git objects.
 
 ## Install with Docker Compose
 

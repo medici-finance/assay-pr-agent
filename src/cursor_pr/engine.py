@@ -1,7 +1,7 @@
-"""One bounded Cursor request using the published PR-Agent review rubric."""
+"""One bounded model request using the review rubric adapted from PR-Agent."""
 import fcntl
 import hashlib
-from importlib.metadata import distribution
+from importlib.resources import files
 from itertools import islice
 import json
 import os
@@ -10,9 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-import tomllib
 
-from jinja2 import Environment
 import yaml
 from unidiff import PatchSet
 
@@ -20,9 +18,17 @@ from .source import ReviewError
 from .login import auth_mode, login_directory, login_env
 from .setup import state_dir
 from .providers import KEYS, LABELS, provider
+from .vendor.patch import numbered, one_line
+from .vendor.tokens import encoding
 
 VERSION = "1"
 MAX_FINDINGS = 3
+
+# The review rubric, adapted from PR-Agent 0.50.0's (see vendor/README.md). Only the finding limit is substituted.
+RUBRIC = files("cursor_pr.vendor").joinpath("pr_review_prompt.system.txt").read_text(encoding="utf-8")
+# Names the rubric in the cache signature. The prompt, rubric included, is in the signature too, so an
+# answer made with another rubric is never served from the cache.
+RUBRIC_ID = "rubric:" + hashlib.sha256(RUBRIC.encode()).hexdigest()[:16]
 
 
 class ModelFailure(ReviewError):
@@ -43,16 +49,15 @@ def hunks(f):
 
 def section(f):
     """Prompt text and head-side anchors for one file; no text when it has no reviewable patch."""
-    from pr_agent.algo.git_patch_processing import decouple_and_convert_to_hunks_with_lines_numbers
-    from pr_agent.algo.types import FilePatchInfo
     if f.absent or not f.patch:
         return None, {}
     # The head-side text of each shown line, without its marker: what quoted code is checked against.
-    anchors = {line.target_line_no: line.value for hunk in hunks(f) for line in hunk if line.target_line_no is not None}
+    parsed = hunks(f)
+    anchors = {line.target_line_no: line.value for hunk in parsed for line in hunk if line.target_line_no is not None}
     if not anchors:
         return None, anchors
-    rendered = decouple_and_convert_to_hunks_with_lines_numbers(f.patch, FilePatchInfo("", "", f.patch, f.path))
-    return f"Change {f.status} {f.previous}\n{rendered}", anchors
+    # The text is built from the same parsed hunks, so every line it numbers is an anchor and the reverse.
+    return f"Change {one_line(f.status)} {one_line(f.previous)}\n{numbered(f.path, parsed)}", anchors
 
 
 def pack(files, checks, skip=frozenset(), title="", description="", advisories=(), scoped=False, *, commit_messages=False):
@@ -61,16 +66,11 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
     scoped says the caller passed only some of the changed files. The third result lists the
     files without reviewable text in the supplied patch.
     """
-    template = distribution("pr-agent").locate_file("pr_agent/settings/pr_reviewer_prompts.toml")
-    with template.open("rb") as stream:
-        rubric = tomllib.load(stream)["pr_review_prompt"]["system"]
-    instructions = Environment().from_string(rubric).render(
-        num_max_findings=MAX_FINDINGS,
-        diff_hunk_format="New hunks are numbered at the head; old hunks show the former code.",
-    )
+    instructions = RUBRIC.replace("__MAX_FINDINGS__", str(MAX_FINDINGS))
     sections, anchors, no_text = [], {}, []
     for f in files:
-        if not f.path or any(ord(c) < 32 for c in f.path) or f.path in anchors:
+        # The former path of a rename is shown too, so it is held to the same rule.
+        if not f.path or any(ord(c) < 32 for c in f.path + f.previous) or f.path in anchors:
             raise ReviewError("Invalid or duplicate forge filename")
         text, anchors[f.path] = section(f)
         if text is None:
@@ -108,8 +108,7 @@ def pack(files, checks, skip=frozenset(), title="", description="", advisories=(
               "such as a file that usually changes together with a changed one. They are hints to check against "
               "the patch, not findings, and a finding still has to cite head lines present in the shown hunks." if notices else "")
     prompt = (instructions + "\nUse only the supplied " + sources + "." + about + " Do not use tools. "
-              "Serialize the YAML review as strict JSON (a YAML subset). Return one JSON object, "
-              "without prose or fences. Example for no findings: "
+              "Return one strict JSON object, without prose or fences. Example for no findings: "
               '{"review":{"key_issues_to_review":[]}}. Cite only head line numbers present in the shown hunks. '
               "Give each finding a `relevant_code` field quoting the lines it cites, exactly as shown."
               + (f"\n{description_label} (untrusted data):\n" + json.dumps(change, ensure_ascii=False) if change else "")
@@ -130,8 +129,7 @@ def encodings(model):
 def tokens(prompt, model=None):
     # Claude's tokenizer is not public and Cursor serves several vendors, so an unknown model gets the
     # larger of the two public counts: the estimate then errs on the safe side of the budget.
-    from pr_agent.algo.token_handler import TokenEncoder
-    return max(len(TokenEncoder.get_token_encoder(name).encode(prompt, disallowed_special=())) for name in encodings(model))
+    return max(len(encoding(name).encode(prompt, disallowed_special=())) for name in encodings(model))
 
 
 def parse_answer(raw, anchors):
@@ -171,12 +169,11 @@ def finding(issue, anchors):
     path, start, end = issue.get("relevant_file"), issue.get("start_line"), issue.get("end_line")
     header, body = issue.get("issue_header"), issue.get("issue_content")
     if isinstance(path, str):
-        dropped["path"] = path.strip()[:500]
+        dropped["path"] = path[:500]
     if type(start) is int and 0 < start <= 2**31 - 1:
         dropped["line"] = start
     if not isinstance(path, str) or type(start) is not int or type(end) is not int:
         return None, dropped
-    path = path.strip()
     lines = anchors.get(path, set())
     if (start > end or start not in lines or end not in lines or end - start >= len(lines)
             or not all(line in lines for line in range(start, end + 1))):
@@ -192,7 +189,7 @@ def finding(issue, anchors):
     if not any(part is not ELIDED for part in parts):
         # Nothing to check against the patch is not a mismatch: the finding is kept and marked.
         return dict(valid, evidence="unverified"), None
-    cited = [(line, lines[line].rstrip("\r\n")) for line in range(start, end + 1)]
+    cited = [(line, lines[line].removesuffix("\n").removesuffix("\r")) for line in range(start, end + 1)]
     if not quoted_in_order([part for part in parts if part is not ELIDED], cited):
         if not asked:
             # A fenced block in the text may be a suggested fix rather than a quote.
@@ -250,7 +247,8 @@ def checkable(quote):
 
 def matches(part, index, line):
     text, number, content = part
-    return text == line.strip(" \t") or (number == str(index) and content == line)
+    return any(text == form.strip(" \t") or (number == str(index) and content == form)
+               for form in (line, one_line(line)))
 
 
 def quoted_in_order(parts, cited):
@@ -379,7 +377,7 @@ def invoke(prompt, model, anchors):
 
 
 def review(prompt, model, anchors, cache, source):
-    signature = json.dumps([VERSION, "pr-agent:0.50.0", model, source, prompt], ensure_ascii=False)
+    signature = json.dumps([VERSION, RUBRIC_ID, model, source, prompt], ensure_ascii=False)
     if provider() != "cursor" or os.getenv("REVIEW_CURSOR_TEAM_ID"):
         signature = json.dumps([provider(), os.getenv("REVIEW_CURSOR_TEAM_ID") if provider() == "cursor" else None, signature])
     key = hashlib.sha256(signature.encode()).hexdigest()

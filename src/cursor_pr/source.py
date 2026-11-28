@@ -252,7 +252,7 @@ def commit(root, ref):
 
 
 def local_change(root, base, head):
-    from pr_agent.algo.git_patch_processing import to_hunk_only_patch
+    from .vendor.patch import to_hunk_only_patch
     head = commit(root, head)
     tip = commit(root, base)
     base = git(root, "merge-base", tip, head).decode().strip()
