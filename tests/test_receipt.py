@@ -79,6 +79,11 @@ class ReceiptTests(unittest.TestCase):
                 self.assertEqual(value["state"], expected)
                 self.assertEqual((value["coverage"]["reviewed"], value["coverage"]["skipped"]), (0, 0))
                 self.assertEqual(value["receipt"]["coverage"], {"reviewed": 0, "text": 1, "percent": 0})
+                if expected == "model-unavailable":
+                    self.assertEqual(value["failed_coverage"], ["app.py"])
+                    with patch.object(cli, "post_comment") as post:
+                        cli.publish("org/repo#1", value["head"], value)
+                    self.assertIn("- Not reviewed (pass failed): ` app.py `", post.call_args.args[3])
 
     def test_receipt_reports_cache_reads_and_writes(self):
         line = receipt.render(receipt.build(report(model_usage={"cacheReadTokens": 66})))[0]

@@ -908,10 +908,10 @@ def execute_review(args, verification_resources):
                   cache_hit=bool(passes) and all(row["state"] == "cached" for row in passes),
                   cursor_invocations=sum(row["model_invocations"] for row in passes))
     counts["reviewed"] = len(coverage)
-    if has_text and not completed:
-        return dict(report, state="model-unavailable", error=last_error), 2
     degraded = sorted(reviewable - coverage.keys())
     report.update(degraded=degraded, failed_coverage=sorted(planned_paths - coverage.keys()))
+    if has_text and not completed:
+        return dict(report, state="model-unavailable", error=last_error), 2
     if report["delivered"] == "max":
         report["prompt_limit"] = deep_limit
     if all_findings_dropped:
