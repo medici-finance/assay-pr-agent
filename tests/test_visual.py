@@ -696,6 +696,26 @@ class VisualCommentTests(unittest.TestCase):
         self.assertNotIn("\n/merge", body)
 
 
+    def test_every_list_full_beside_a_full_answer_still_fits_the_comment(self):
+        # The largest comment there can be: every list full of long paths and an answer at every limit.
+        wide = "目录/" * 40
+        paths = [f"{wide}{n}.py" for n in range(60)]
+        files = [source.File(path, hunk(3, 1), "modified") for path in paths[:12]]
+        diff_map = dict(visual.survey(files), shown=paths[:12], generated=paths, unread_unknown=paths, deleted=paths,
+                        renamed=[[path, path + "x"] for path in paths])
+        answer = {"summary": "字" * 400, "changes": [{"title": "题" * 160, "paths": paths[:8]}] * visual.MAX_CHANGES,
+                  "hotspots": [{"path": paths[0], "line": 1, "end_line": 2, "severity": "verify", "title": "题" * 160,
+                                "why": "因" * 320}] * visual.MAX_HOTSPOTS}
+        report = {"provider": "cursor", "state": "partial", "head": "a" * 40, "omitted": paths, "checks": [],
+                  "map": diff_map, "visual": answer}
+        evidence = ["- " + "证" * 300] * 40
+        text = "\n".join(visual.comment(report, evidence)) + "\n"
+        self.assertLessEqual(len(text.encode("utf-8")), visual.MAX_COMMENT_BYTES)
+        # The map and the explanation are whole; the lists say what they left out.
+        self.assertIn("**What to check**", text)
+        self.assertIn("additional entries omitted to fit the comment limit.", text)
+        self.assertIn("- Outside review coverage:", text)
+
     def test_a_rename_with_no_line_changed_is_named_in_the_comment(self):
         files = [source.File("src/new_name.py", "", "renamed", previous="src/old_name.py"),
                  source.File("src/edited.py", hunk(2, 1), "renamed", previous="src/before.py"),

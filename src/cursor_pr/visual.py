@@ -508,18 +508,30 @@ def comment(report, evidence=()):
         body += ["", "No changed file has text the model can read."]
     footer = ["", f"Visual review after {CREDIT}. "
                   "Review tooling built on [PR-Agent](https://github.com/the-pr-agent/pr-agent)."]
-    coverage = limited_rows((f"- Outside review coverage: {fence(path, 200)}" for path in report["omitted"]), 1200)
-    # A file's own header can keep it from the model, so each one that did is named.
-    coverage += limited_rows((f"- Treated as generated from its content, hunks not sent: {fence(path, 200)}"
-                              for path in report.get("map", {}).get("generated", [])), 1200)
-    # Not known to be code and sent without text: named, so that a script the forge left the patch
-    # out for is not passed over as a binary without anyone seeing which file it was.
-    coverage += limited_rows((f"- No text from the forge, not known to be code, not read: {fence(path, 200)}"
-                              for path in report.get("map", {}).get("unread_unknown", [])), 1200)
-    coverage += limited_rows((f"- Deleted, counted in the map and not listed above: {fence(path, 200)}"
-                              for path in report.get("map", {}).get("deleted", [])), 1200)
-    coverage += limited_rows((f"- Renamed with no line changed: {fence(old, 200)} to {fence(new, 200)}"
-                              for old, new in report.get("map", {}).get("renamed", [])), 1200)
+    diff_map = report.get("map", {})
+    # Each list names what was kept from the model or is named nowhere else: a file outside the
+    # review, one its own header kept back, one sent without text and not known to be code, a
+    # deleted file no panel lists, and a rename with no line changed.
+    lists = ((f"- Outside review coverage: {fence(path, 200)}" for path in report["omitted"]),
+             (f"- Treated as generated from its content, hunks not sent: {fence(path, 200)}"
+              for path in diff_map.get("generated", [])),
+             (f"- No text from the forge, not known to be code, not read: {fence(path, 200)}"
+              for path in diff_map.get("unread_unknown", [])),
+             (f"- Deleted, counted in the map and not listed above: {fence(path, 200)}" for path in diff_map.get("deleted", [])),
+             (f"- Renamed with no line changed: {fence(old, 200)} to {fence(new, 200)}"
+              for old, new in diff_map.get("renamed", [])))
+
+    def size(lines):
+        return sum(len(line.encode("utf-8")) + 1 for line in lines)
+    # One allowance for all of them, out of what the map and the explanation leave of the comment:
+    # five full lists beside a full answer would not fit, and a comment over the limit is not
+    # posted at all. Room is kept for each list's count of what it left out.
+    room = MAX_COMMENT_BYTES - size(body + footer) - 1 - 80 * len(lists)
+    coverage = []
+    for rows in lists:
+        kept = limited_rows(rows, max(min(1200, room + 80), 0))
+        coverage += kept
+        room -= size(kept)
     if coverage:
         coverage.insert(0, "")
     if evidence:
