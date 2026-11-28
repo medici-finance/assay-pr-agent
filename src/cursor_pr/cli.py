@@ -323,7 +323,7 @@ def fit_comment_rows(rows, allowance, label, *, already_omitted=0):
     return "".join(included) + omission_notice(omitted, label)
 
 
-def fit_tier_comment(header, findings, coverage, extra_coverage, outside, details, footer):
+def fit_tier_comment(header, findings, coverage, extra_coverage, outside, details, footer, *, coverage_label):
     """Keep finding summaries and coverage before spending space on optional evidence."""
     body = comment_text(header + ["Some review details were shortened to fit the forge comment."])
     end = comment_text(footer)
@@ -340,7 +340,7 @@ def fit_tier_comment(header, findings, coverage, extra_coverage, outside, detail
     evidence_notice = len(omission_notice(len(details), evidence_label).encode("utf-8"))
     outside_notice = len(omission_notice(len(outside), outside_label).encode("utf-8"))
     skipped = fit_comment_rows(coverage, space - evidence_notice - outside_notice,
-                               "files skipped by the token limit", already_omitted=extra_coverage)
+                               coverage_label, already_omitted=extra_coverage)
     space -= len(skipped.encode("utf-8"))
     outside_text = fit_comment_rows(outside, space - evidence_notice, outside_label)
     space -= len(outside_text.encode("utf-8"))
@@ -390,13 +390,17 @@ def publish(address, head, report, *, project=None, state=None):
     label = providers.LABELS[report.get("provider", "cursor")]
     body = [f"{label} review of {head}", report["state"]]
     degraded = report.get("degraded") or []
-    coverage = []
+    failed_coverage = set(report.get("failed_coverage", ()))
+    coverage_label = "unreviewed files" if failed_coverage else "files skipped by the token limit"
     extra_coverage = max(0, len(degraded) - MAX_DEGRADED_ROWS)
-    if degraded:
+    if any(path not in failed_coverage for path in degraded):
         body.append(f"Degraded review: the full prompt is an estimated {report['full_input_tokens']} tokens, "
                     f"over the limit of {report.get('prompt_limit', report['max_input_tokens'])}. "
                     f"{label} did not review these files:")
-        coverage.extend(f"- Not reviewed (token limit): {fence(path)}" for path in degraded[:MAX_DEGRADED_ROWS])
+    elif degraded:
+        body.append(f"{label} did not review these files because a review pass failed:")
+    coverage = [f"- Not reviewed ({'pass failed' if path in failed_coverage else 'token limit'}): {fence(path)}"
+                for path in degraded[:MAX_DEGRADED_ROWS]]
 
     intro, body = body, []
     tier = report.get("tier", "regular")
@@ -477,7 +481,8 @@ def publish(address, head, report, *, project=None, state=None):
         more = f" and {extra_files} more" if extra_files > 0 else ""
         body.append(f"- Not reviewed, no text to review: {listed}{more}.")
     outside = [f"- Outside review coverage: {fence(path)}" for path in report["omitted"]]
-    extra = [f"- Not reviewed (token limit): {extra_coverage} more files"] if extra_coverage else []
+    extra_label = "Not reviewed" if failed_coverage else "Not reviewed (token limit)"
+    extra = [f"- {extra_label}: {extra_coverage} more files"] if extra_coverage else []
     def format_comment(footer):
         text = comment_text(intro + coverage + extra + header + findings + body + outside + footer)
         # The forge helper refuses a body over 16 KiB: shorten rather than lose the whole comment.
@@ -488,7 +493,8 @@ def publish(address, head, report, *, project=None, state=None):
             if rows is not None:
                 text = before + "".join(rows) + after
         if size_of(text) > FORGE_COMMENT_BYTES:
-            text = fit_tier_comment(intro + header, report["findings"], coverage, extra_coverage, outside, body, footer)
+            text = fit_tier_comment(intro + header, report["findings"], coverage, extra_coverage, outside, body, footer,
+                                    coverage_label=coverage_label)
         return text
 
     footer = ["", providers.ATTRIBUTION]
@@ -905,7 +911,7 @@ def execute_review(args, verification_resources):
     if has_text and not completed:
         return dict(report, state="model-unavailable", error=last_error), 2
     degraded = sorted(reviewable - coverage.keys())
-    report["degraded"] = degraded
+    report.update(degraded=degraded, failed_coverage=sorted(planned_paths - coverage.keys()))
     if report["delivered"] == "max":
         report["prompt_limit"] = deep_limit
     if all_findings_dropped:

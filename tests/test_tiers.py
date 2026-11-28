@@ -189,6 +189,11 @@ class TierTests(unittest.TestCase):
         self.assertEqual(deep.count("double the value"), 1)
         self.assertEqual([(row["name"], row["state"]) for row in report["passes"]],
                          [("review", "cached"), ("deep", "called"), ("verification", "called")])
+        self.assertFalse(report["receipt"]["cache_hit"])
+        self.assertEqual(report["receipt"]["cached_passes"], 1)
+        with patch.object(cli, "post_comment") as post:
+            cli.publish("org/repo#1", self.head, report)
+        self.assertIn("Receipt: 2 model calls (1 cached pass).", post.call_args.args[3])
         self.assertEqual(report["passes"][0]["estimated_input_tokens"], engine.tokens(mid_prompt))
         self.assertNotIn("model_usage", report["passes"][0])
         self.assertEqual([row["model_usage"]["input_tokens"] for row in report["passes"][1:]], [50, 15])
@@ -363,6 +368,19 @@ class TierTests(unittest.TestCase):
                 self.assertEqual(report["receipt"]["coverage"]["reviewed"], reviewed)
                 self.assertEqual((report["receipt"]["skipped"], mid["receipt"]["skipped"]), (0, 1))
                 self.assertLessEqual(report["estimated_input_tokens"], report["max_input_tokens"])
+
+    def test_a_failed_deep_pass_is_not_reported_as_a_budget_skip(self):
+        self.write("src/data.py", "".join(f"VALUE_{n} = {n}  # generated row\n" for n in range(250)))
+        self.commit("add data rows")
+        self.answers(review=answer(), deep="fail")
+        code, report = self.check("--tier", "max", "--max-input-tokens", "1000")
+        self.assertEqual((code, report["state"], report["degraded"]), (2, "degraded", ["src/data.py"]))
+        self.assertEqual(report["receipt"]["skipped"], 0)
+        with patch.object(cli, "post_comment") as post:
+            cli.publish("org/repo#1", self.head, report)
+        comment = post.call_args.args[3]
+        self.assertIn("- Not reviewed (pass failed): ` src/data.py `", comment)
+        self.assertNotIn("Not reviewed (token limit)", comment)
 
     def test_max_collects_dropped_findings_from_both_review_passes(self):
         real = finding(42, "Real")

@@ -67,11 +67,15 @@ def build(report):
             percent = min(99.9, max(0.1, percent))
     checks = [*report["checks"], *(report.get("static_checks") or [])]
     prompt_limit = report.get("prompt_limit", report["max_input_tokens"])
+    passes = report.get("passes")
+    cached_passes = (sum(row["state"] == "cached" for row in passes) if passes is not None
+                     else int(bool(report.get("cache_hit"))))
     return {
         "state": report["state"],
         "provider": report.get("provider"),
         "model_calls": report.get("model_invocations"),
         "cache_hit": report.get("cache_hit"),
+        "cached_passes": cached_passes,
         "estimated_input_tokens": report["estimated_input_tokens"],
         "max_input_tokens": report["max_input_tokens"],
         "prompt_limit": prompt_limit,
@@ -94,6 +98,8 @@ def render(receipt):
     head = f"Receipt: {calls if calls is not None else 'an unknown number of'} model call{'s' if calls != 1 else ''}"
     if receipt["cache_hit"]:
         head += " (a cached result)"
+    elif count := receipt["cached_passes"]:
+        head += f" ({count} cached pass{'es' if count != 1 else ''})"
     if receipt["state"] == "estimate":
         head = "Receipt: estimate only, no model call"
     elif receipt["state"] == "over-budget":
