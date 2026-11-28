@@ -9,12 +9,35 @@ from urllib.parse import quote
 import httpx
 
 from .gitlab_tls import client_options
+from .providers import ATTRIBUTION
 from .source import ReviewError, reviewer_token, run_forge
 
 log = logging.getLogger(__name__)
 # A request is a comment holding exactly one of these commands. The value is the review tier, or
 # "visual" for the comment that explains the change instead of looking for defects in it.
-COMMANDS = {"/review": "regular", "/review-mid": "mid", "/review-max": "max", "/visual-review": "visual"}
+# "help" is the comment that lists these commands, which no model takes part in.
+COMMANDS = {"/review": "regular", "/review-mid": "mid", "/review-max": "max", "/visual-review": "visual",
+            "/help": "help"}
+# What the /help comment says of each kind. The facts are the README's: keep the two in step.
+HELP = {
+    "regular": "Looks for defects in the patch, with the scanner evidence, in one model call within the configured "
+               "token limit. The cheapest of the three reviews for defects.",
+    "mid": "A deeper review at 2 times that limit, in up to 2 model calls. It adds context from outside the patch "
+           "and a second call that verifies the findings.",
+    "max": "The deepest review, at 10 times the limit and in up to 3 model calls. It adds a deep pass over the whole "
+           "changed files, existing tests and earlier comments, then verifies the findings. The most expensive of the three.",
+    "visual": "Explains the change instead of looking for defects: where the diff is, what changed and what to check. "
+              "At most one model call, with a token limit of its own.",
+    "help": "Posts this list. It calls no model.",
+}
+HELP_HEADING = "Assay PR Agent commands"
+
+
+def help_text():
+    """The /help comment. Fixed text: nothing of the change or of what a requester wrote is in it."""
+    rows = [f"- `{command}`: {HELP[kind]}" for command, kind in COMMANDS.items()]
+    return "\n".join([HELP_HEADING, "", "Post a new comment that holds one of these commands and nothing else. "
+                      "Only the accounts configured as requesters are answered.", "", *rows, "", ATTRIBUTION]) + "\n"
 
 
 def open_changes(project):

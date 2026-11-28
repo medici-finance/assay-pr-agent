@@ -223,7 +223,8 @@ class Change:
     patch_base: str = ""  # immutable preimage commit when the comparison supplies it
 
 
-def forge_change(address, expected_url=None, *, project=None, with_description=False):
+def open_change(address, expected_url, project):
+    """The number of an open change of the configured project and the forge's first read of it, head included."""
     if not re.fullmatch(r"[\w.\-]+/[\w.\-]+#[1-9][0-9]*", address):
         raise ReviewError("Use an owner/repo#number address from the configured projects")
     repo, number = address.rsplit("#", 1)
@@ -233,9 +234,14 @@ def forge_change(address, expected_url=None, *, project=None, with_description=F
     first = run_forge("change", project, numbers=numbers)
     if first.get("url") != (expected_url or project.change_url(number)) or first.get("state") not in ("open", "opened"):
         raise ReviewError("Forge resolved a different or closed change")
-    head = first.get("headSha")
-    if not valid_sha(head):
+    if not valid_sha(first.get("headSha")):
         raise ReviewError("Forge did not identify the reviewed head")
+    return numbers, first
+
+
+def forge_change(address, expected_url=None, *, project=None, with_description=False):
+    numbers, first = open_change(address, expected_url, project)
+    head = first["headSha"]
     result = run_forge("change-files", project, numbers=numbers)
     if result.get("headSha") != head:
         raise ReviewError("Forge files do not match the reviewed head")

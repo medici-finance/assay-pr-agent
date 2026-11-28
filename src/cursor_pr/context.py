@@ -10,6 +10,7 @@ import re
 import subprocess
 import threading
 
+from .discovery import COMMANDS, HELP_HEADING
 from .drift import git
 from .engine import rank, tokens
 from .providers import LABELS
@@ -301,6 +302,8 @@ def existing_tests(repo, head, files):
 
 def is_review_summary(body):
     first, _, remainder = body.partition("\n")
+    if first == HELP_HEADING:
+        return True  # The answer to /help is the reviewer's own comment as well.
     label, _, head = first.partition(" review of ")
     label = label.removesuffix(" visual")  # A visual review opens "<provider> visual review of <head>".
     state = remainder.partition("\n")[0].strip()
@@ -313,8 +316,8 @@ def earlier_comments(notes):
     """The change's conversation so far, newest last, each comment bounded."""
     rows = [note["body"].strip() for note in notes if isinstance(note.get("body"), str)]
     # Not the commands, and not what the reviewer itself answered them with.
-    # A comment that only starts like /visual-review is discussion, as it is to the poller.
-    rows = [body for body in rows if body and not body.startswith("/review") and body != "/visual-review"
+    # A comment that only starts like /visual-review or /help is discussion, as it is to the poller.
+    rows = [body for body in rows if body and not body.startswith("/review") and body not in COMMANDS
             and not is_review_summary(body)]
     return "\n\n".join(f"## Comment {index}\n{body[:1500]}" for index, body in enumerate(rows[-10:], 1))
 
