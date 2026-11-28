@@ -168,8 +168,10 @@ def generated(path, patch="", status=""):
     for number in range(1, LEADING + 1):
         if number not in lines:
             return False
-        # A header line is short; reading at most HEADER_LINE characters bounds the work per line.
-        text = lines[number][:HEADER_LINE]
+        # The whole line is read for where a comment starts and ends, which is a plain search. A
+        # marker is looked for in at most HEADER_LINE characters of comment: a header line is short,
+        # and that bounds the work of the pattern.
+        text = lines[number]
         if not text.strip():
             continue
         start = text.lstrip()
@@ -182,7 +184,7 @@ def generated(path, patch="", status=""):
             comment, code = start, ""
         else:
             return False  # Code: the leading comment is over, and nothing after it counts.
-        if GO_GENERATED.match(text) or MARKERS.search(comment):
+        if GO_GENERATED.match(text[:HEADER_LINE]) or MARKERS.search(comment[:HEADER_LINE]):
             return True
         if code.strip():
             return False
@@ -203,6 +205,11 @@ def by_content(path, patch="", status=""):
 def narrated(path, patch="", status=""):
     """Whether the model is shown a file's hunks; machine-written files and legal text are only counted."""
     return category(path, patch, status) not in COUNTED_ONLY and not BOILERPLATE.search(path)
+
+
+def unknown_kind(f):
+    """Whether a file is Logic only because no rule knows its name, and so is not known to be code."""
+    return category(f.path, f.patch, f.status) == "Logic" and not re.search(r"\." + SOURCE + "$", f.path)
 
 
 def shows_hunks(f):
@@ -257,6 +264,7 @@ def survey(files):
     return {"lines": sum(row["added"] + row["deleted"] for row in rows),
             "to_read": sum(k["added"] + k["deleted"] for k in kinds if k["read"]),
             "categories": kinds, "files": rows, "no_text": sorted(f.path for f in files if f.absent),
+            "unread_unknown": sorted(f.path for f in files if f.absent and not gone(f.status) and unknown_kind(f)),
             "generated": sorted(f.path for f in files if by_content(f.path, f.patch, f.status)),
             # A file moved without a changed line has no row in the chart, which counts lines. Said
             # only where the forge sent the patch and it is empty: a patch it left out can hold edits.
@@ -280,8 +288,7 @@ def pack(files):
         # extensionless binary) is not known to be code: with no text patch it is most likely a
         # binary, and the forge does not say. It is named in the comment as having no text, and
         # does not make the review partial. A name with a source extension still does.
-        unknown = kind == "Logic" and not re.search(r"\." + SOURCE + "$", f.path)
-        if f.absent and read and not gone(f.status) and not unknown:
+        if f.absent and read and not gone(f.status) and not unknown_kind(f):
             unseen.append(f.path)
         shown = shows_hunks(f)
         row = f"{f.path} | {kind} | " + ("no text patch" if f.absent else f"+{added} -{deleted}")
@@ -496,6 +503,10 @@ def comment(report, evidence=()):
     # A file's own header can keep it from the model, so each one that did is named.
     coverage += limited_rows((f"- Treated as generated from its content, hunks not sent: {fence(path, 200)}"
                               for path in report.get("map", {}).get("generated", [])), 1200)
+    # Not known to be code and sent without text: named, so that a script the forge left the patch
+    # out for is not passed over as a binary without anyone seeing which file it was.
+    coverage += limited_rows((f"- No text from the forge, not known to be code, not read: {fence(path, 200)}"
+                              for path in report.get("map", {}).get("unread_unknown", [])), 1200)
     coverage += limited_rows((f"- Renamed with no line changed: {fence(old, 200)} to {fence(new, 200)}"
                               for old, new in report.get("map", {}).get("renamed", [])), 1200)
     if coverage:
