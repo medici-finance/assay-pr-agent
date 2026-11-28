@@ -439,6 +439,23 @@ class TierTests(unittest.TestCase):
         self.assertIn("No model findings remained after verification.", body)
         self.assertNotIn("No model finding passed the checks.", body)
 
+    def test_verification_retains_the_original_quoted_evidence_status(self):
+        real = finding(42, "Real")
+        self.answers(review=answer(dict(real, relevant_code="42 +    return value * 2")),
+                     verification=verified_answer(real))
+        code, report = self.check("--tier", "mid")
+        self.assertEqual((code, report["state"]), (0, "reviewed"))
+        self.assertEqual(report["verification"], {"state": "filtered", "before": 1, "after": 1})
+        self.assertEqual([row["evidence"] for row in report["findings"]], ["verified"])
+
+    def test_max_keeps_verified_evidence_from_a_duplicate_deep_finding(self):
+        real = finding(42, "Real")
+        self.answers(review=answer(real), deep=answer(dict(real, relevant_code="return value * 2")),
+                     verification=verified_answer(real))
+        code, report = self.check("--tier", "max")
+        self.assertEqual((code, report["state"], report["delivered"]), (0, "reviewed", "max"))
+        self.assertEqual([(row["title"], row["evidence"]) for row in report["findings"]], [("Real", "verified")])
+
     def test_malformed_yaml_cannot_filter_original_findings(self):
         keep = dict(finding(42, "Real"), verification_status="INVALID_DATE")
         malformed_status = yaml.safe_dump({"review": {"key_issues_to_review": [keep]}}).replace("INVALID_DATE", "2026-02-30")

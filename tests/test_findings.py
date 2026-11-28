@@ -251,5 +251,413 @@ class DroppedSummaryTests(unittest.TestCase):
                 self.assertEqual((code, report["state"]), (0, state))
 
 
+PATCH = ["def total(items):", "    total = 0", "    for item in items:", "        total += item", "    return total"]
+
+
+def shown(*lines):
+    return {"a.py": {n + 1: text + "\n" for n, text in enumerate(lines)}}
+
+
+class QuotedEvidenceTests(unittest.TestCase):
+    def parse(self, finding):
+        return engine.parse_answer(envelope([finding]), shown(*PATCH))
+
+    def test_a_quote_must_match_the_cited_lines(self):
+        cases = (("        total += item\n    return total", 4, 5, "verified"),
+                 ("4 +        total += item\n5 +    return total", 4, 5, "verified"),
+                 ("total +=", 4, 4, "quoted code does not match the cited lines"),
+                 ("return tot", 5, 5, "quoted code does not match the cited lines"),
+                 ("4 +    return total", 5, 5, "quoted code does not match the cited lines"),
+                 ("return total\ntotal += item", 4, 5, "quoted code does not match the cited lines"),
+                 ("return total", 2, 3, "quoted code does not match the cited lines"),
+                 ("raise ValueError", 4, 5, "quoted code does not match the cited lines"),
+                 ("", 4, 5, "unverified"),
+                 ("    for item in items:\n    ...\n    return total", 3, 5, "verified"),
+                 ("3 +    for item in items:\n# …\n5 +    return total", 3, 5, "verified"),
+                 ("__new hunk__\n4 +        total += item", 4, 4, "verified"),
+                 ("4 +\n5 +", 4, 5, "quoted code does not match the cited lines"),
+                 ("...\nraise ValueError", 4, 5, "quoted code does not match the cited lines"))
+        for quote, start, end, expected in cases:
+            with self.subTest(quote=quote):
+                parsed = self.parse(dict(issue(start=start, end=end), relevant_code=quote))
+                if expected in ("verified", "unverified"):
+                    self.assertEqual([(f["evidence"], f["line"], f["end_line"]) for f in parsed["findings"]],
+                                     [(expected, start, end)])
+                    self.assertEqual(parsed["dropped"], [])
+                else:
+                    self.assertEqual(parsed["findings"], [])
+                    self.assertEqual(parsed["dropped"], [{"path": "a.py", "line": start, "reason": expected}])
+
+    def test_a_quote_must_account_for_every_cited_line(self):
+        cases = (("    return total", 4, 5, "unverified"),
+                 ("        total += item", 3, 5, "unverified"),
+                 ("    for item in items:\n    return total", 3, 5, "unverified"),
+                 ("    for item in items:\n...", 3, 5, "verified"),
+                 ("...\n    return total", 3, 5, "verified"),
+                 ("    for item in items:\n        total += item\n    return total", 3, 5, "verified"))
+        for quote, start, end, expected in cases:
+            with self.subTest(quote=quote):
+                parsed = self.parse(dict(issue(start=start, end=end), relevant_code=quote))
+                self.assertEqual(([f["evidence"] for f in parsed["findings"]], parsed["dropped"]), ([expected], []))
+
+    def test_numbered_rows_are_matched_as_code_even_when_they_look_like_elisions(self):
+        for bogus in ("5 +...", "5 +# …", "5 +__new hunk__", "5 +"):
+            with self.subTest(bogus=bogus):
+                parsed = self.parse(dict(issue(start=4, end=5),
+                                         relevant_code="4 +        total += item\n" + bogus))
+                self.assertEqual(parsed["findings"], [])
+                self.assertEqual(parsed["dropped"][0]["reason"], "quoted code does not match the cited lines")
+        for literal in ("...", "__new hunk__", ""):
+            with self.subTest(literal=literal):
+                anchors = shown("result = 1", literal)
+                explicit = dict(issue(start=1, end=2), relevant_code="1 +result = 1\n2 +" + literal)
+                [finding] = engine.parse_answer(envelope([explicit]), anchors)["findings"]
+                self.assertEqual(finding["evidence"], "verified")
+
+    def test_numbered_quotes_preserve_trailing_whitespace_from_the_prompt(self):
+        parsed = engine.parse_answer(envelope([dict(issue(start=1, end=1), relevant_code="1 +  result = 1  ")]),
+                                     shown("  result = 1  "))
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_raw_quote_preserves_relative_indentation(self):
+        anchors = shown("    if ready:", "        send()", "    finish()")
+        for quote, expected in (("if ready:\n    send()\nfinish()", "verified"),
+                                ("if ready:\n    send()\n    finish()", "unverified")):
+            with self.subTest(quote=quote):
+                parsed = engine.parse_answer(envelope([dict(issue(start=1, end=3), relevant_code=quote)]), anchors)
+                self.assertEqual(parsed["findings"][0]["evidence"], expected)
+
+    def test_uniform_shift_is_allowed_when_the_elision_skips_an_outdent(self):
+        anchors = shown("if ready:", "    prepare()", "    send()")
+        parsed = engine.parse_answer(envelope([dict(issue(start=1, end=3),
+                                                   relevant_code="...\nprepare()\nsend()")]), anchors)
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_common_line_endings_match_in_raw_numbered_and_fenced_quotes(self):
+        anchors = shown("prepare()", "send()")
+        for ending in ("\n", "\r\n", "\r"):
+            for rows in (("prepare()", "send()"), ("1 +prepare()", "2 +send()"),
+                         ("```python", "prepare()", "send()", "```")):
+                with self.subTest(ending=ending, rows=rows):
+                    raw = envelope([dict(issue(start=1, end=2), relevant_code=ending.join(rows))])
+                    parsed = engine.parse_answer(raw, anchors)
+                    self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
+                    self.assertEqual(parsed["dropped"], [])
+
+    def test_an_embedded_carriage_return_in_a_shown_row_remains_source_text(self):
+        patch = "@@ -0,0 +1,2 @@\n+x\ry\n+ready()\n"
+        display, anchors = engine.section(source.File("a.py", patch, "modified"))
+        quote = display.split("__new hunk__\n", 1)[1]
+        for ending, supplied in (("\n", quote), ("\n", "```text\n" + quote + "\n```"),
+                                 ("\r\n", "```text\n" + quote + "\n```")):
+            with self.subTest(ending=ending, supplied=supplied):
+                raw = envelope([dict(issue(start=1, end=2), relevant_code=supplied.replace("\n", ending))])
+                parsed = engine.parse_answer(raw, {"a.py": anchors})
+                self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
+                self.assertEqual(parsed["dropped"], [])
+
+    def test_blank_separators_outside_the_quoted_code_around_hunk_markers(self):
+        quote = "__new hunk__\n\n1 +send()\n\n__old hunk__"
+        raw = envelope([dict(issue(start=1, end=1), relevant_code=quote)])
+        parsed = engine.parse_answer(raw, shown("send()"))
+        self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
+        self.assertEqual(parsed["dropped"], [])
+
+    def test_unnumbered_hunk_marker_rows_can_be_literal_source(self):
+        for marker in ("__new hunk__", "__old hunk__"):
+            relevant = f"prepare()\n{marker}\nsend()"
+            anchors = shown("prepare()", marker, "send()")
+            for quote in (relevant, f"{marker}\n{relevant}", f"{marker}\n\n{relevant}\n\n{marker}",
+                          f"{marker}\n\n1 +prepare()\n2 +{marker}\n3 +send()",
+                          f"...\nprepare()\n{marker}\nsend()\n..."):
+                with self.subTest(quote=quote):
+                    raw = envelope([dict(issue(start=1, end=3), relevant_code=quote)])
+                    parsed = engine.parse_answer(raw, anchors)
+                    self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
+                    self.assertEqual(parsed["dropped"], [])
+
+    def test_a_numbered_match_does_not_set_the_raw_indentation_margin(self):
+        anchors = shown("3 +    first()", "if enabled:", "    first()", "    second()", "    third()")
+        quote = "...\n3 +    first()\nsecond()\nthird()"
+        parsed = engine.parse_answer(envelope([dict(issue(start=1, end=5), relevant_code=quote)]), anchors)
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_marker_padding_retries_charge_for_the_cited_range(self):
+        marker = "__new hunk__"
+        source_lines = [marker] + ["send()"] * 999
+        quote = (marker + "\n\n") * 30 + "absent()\n\n" + (marker + "\n\n") * 30
+        raw = envelope([dict(issue(start=1, end=len(source_lines)), relevant_code=quote)])
+        with (patch.object(engine, "EVIDENCE_WORK_LIMIT", 4500),
+              patch.object(engine, "quoted_in_order", wraps=engine.quoted_in_order) as order):
+            parsed = engine.parse_answer(raw, shown(*source_lines))
+        self.assertEqual([row["evidence"] for row in parsed["findings"]], ["unverified"])
+        self.assertLessEqual(order.call_count, 4)
+
+    def test_an_earlier_duplicate_does_not_choose_the_only_indent(self):
+        for indent in ("", "  "):
+            with self.subTest(indent=indent):
+                anchors = shown(indent + "prepare()", "    prepare()", "    send()")
+                quote = "...\nprepare()\nsend()"
+                parsed = engine.parse_answer(envelope([dict(issue(start=1, end=3), relevant_code=quote)]), anchors)
+                self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_raw_quotes_cannot_change_trailing_source_whitespace(self):
+        anchors = shown("    Authorization: token ")
+        exact = dict(issue(start=1, end=1), relevant_code="Authorization: token ")
+        [finding] = engine.parse_answer(envelope([exact]), anchors)["findings"]
+        self.assertEqual(finding["evidence"], "verified")
+        edited = dict(exact, relevant_code="Authorization: token")
+        parsed = engine.parse_answer(envelope([edited]), anchors)
+        self.assertEqual(parsed["findings"], [])
+        self.assertEqual(parsed["dropped"][0]["reason"], "quoted code does not match the cited lines")
+
+    def test_display_markers_and_elisions_must_keep_their_spelling(self):
+        for extra in ("__newhunk__", ". . .", ".\u00a0.\u00a0."):
+            with self.subTest(extra=extra):
+                quoted = dict(issue(start=1, end=1), relevant_code="check_config()\n" + extra)
+                parsed = engine.parse_answer(envelope([quoted]), shown("check_config()"))
+                self.assertEqual(parsed["findings"], [])
+                self.assertEqual(parsed["dropped"][0]["reason"], "quoted code does not match the cited lines")
+
+    def test_covered_alignment_must_include_a_substantive_match(self):
+        parsed = engine.parse_answer(envelope([dict(issue(start=1, end=2), relevant_code="1 +x\n...")]),
+                                     shown("x", "1 +x"))
+        self.assertEqual(parsed["findings"][0]["evidence"], "unverified")
+
+    def test_non_ascii_space_is_not_a_blank_source_line(self):
+        parsed = engine.parse_answer(envelope([dict(issue(start=1, end=3), relevant_code="before()\nafter()")]),
+                                     shown("before()", "\u00a0", "after()"))
+        self.assertEqual(parsed["findings"][0]["evidence"], "unverified")
+
+    def test_an_elision_scans_a_blank_run_once_per_quote_line(self):
+        class BlankLine(str):
+            inspections = 0
+
+            def strip(self, *args):
+                BlankLine.inspections += 1
+                return super().strip(*args)
+
+        cited = [(n, BlankLine(" ")) for n in range(1, 101)] + [(101, "return x")]
+        self.assertTrue(engine.covers(engine.checkable("...\nreturn x"), cited))
+        self.assertLess(BlankLine.inspections, 4 * len(cited))
+
+    def test_repeated_elisions_do_not_revisit_each_remaining_source_line(self):
+        cited = [(n, "check()") for n in range(1, 501)]
+        parts = engine.checkable("...\ncheck()\n" * 50 + "...")
+        with patch.object(engine, "evidence_matches", wraps=engine.evidence_matches) as matches:
+            self.assertTrue(engine.covers(parts, cited))
+        self.assertLess(matches.call_count, 5 * len(cited))
+
+    def test_expensive_alignment_retains_the_finding_as_unverified(self):
+        source_lines = ["check()"] * 220
+        quote = "...\ncheck()\ncheck()\n" * 25 + "..."
+        raw = envelope([dict(issue(start=1, end=len(source_lines)), relevant_code=quote)])
+        with patch.object(engine, "EVIDENCE_WORK_LIMIT", 1200):
+            parsed = engine.parse_answer(raw, shown(*source_lines))
+        self.assertEqual([row["evidence"] for row in parsed["findings"]], ["unverified"])
+        self.assertEqual(parsed["dropped"], [])
+
+    def test_invisible_formatting_does_not_make_a_quote_substantive(self):
+        for invisible in ("\u200d", "\u115f", "\u1160", "\u2800", "\u3164", "\uffa0"):
+            with self.subTest(invisible=invisible):
+                source_line = "x" + invisible * 2
+                raw = envelope([dict(issue(start=1, end=1), relevant_code=source_line)])
+                self.assertEqual(engine.parse_answer(raw, shown(source_line))["findings"][0]["evidence"], "unverified")
+
+    def test_blank_cited_lines_need_no_quote(self):
+        anchors = shown("first = 1", "", "second = 2")
+        parsed = engine.parse_answer(envelope([dict(issue(start=1, end=3), relevant_code="first = 1\nsecond = 2")]), anchors)
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_an_interior_quoted_blank_line_must_exist_in_source(self):
+        lines = ['text = """first', 'second"""']
+        quote = "\n".join([lines[0], "", lines[1]])
+        raw = envelope([dict(issue(start=1, end=2), relevant_code=quote)])
+        parsed = engine.parse_answer(raw, shown(*lines))
+        self.assertEqual(parsed["findings"], [])
+        self.assertEqual(parsed["dropped"][0]["reason"], "quoted code does not match the cited lines")
+        raw = envelope([dict(issue(start=1, end=3), relevant_code=quote)])
+        parsed = engine.parse_answer(raw, shown(lines[0], "", lines[1]))
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_explicit_interior_whitespace_preserves_blank_source_contents(self):
+        start, end = 'text = """first', 'last"""'
+        anchors = shown(start, " ", end)
+        for middle, evidence in ((" ", "verified"), ("\t", "unverified")):
+            with self.subTest(middle=middle):
+                raw = envelope([dict(issue(start=1, end=3), relevant_code="\n".join((start, middle, end)))])
+                parsed = engine.parse_answer(raw, anchors)
+                self.assertEqual([row["evidence"] for row in parsed["findings"]], [evidence])
+
+    def test_canonically_equivalent_substantive_text_has_the_same_threshold(self):
+        for word in ("\u1100\u1161\u11a8", "\uac01"):
+            with self.subTest(word=word):
+                raw = envelope([dict(issue(start=1, end=1), relevant_code=word)])
+                parsed = engine.parse_answer(raw, shown(word))
+                self.assertEqual(parsed["findings"][0]["evidence"], "unverified")
+
+    def test_a_quote_of_only_trivial_lines_is_unverified_not_dropped(self):
+        anchors = shown("call(", "    x", ")", "}", "return x", "x = 1", "});")
+        cases = (("x", 2, 2, "unverified"), (")", 3, 3, "unverified"), ("}", 4, 4, "unverified"),
+                 ("});", 7, 7, "unverified"), ("3 +)\n4 +}", 3, 4, "unverified"), ("...\n}", 1, 4, "unverified"),
+                 ("return x", 5, 5, "verified"), ("x = 1", 6, 6, "verified"), ("return x\nx = 1\n});", 5, 7, "verified"),
+                 ("call(\n...\n}", 1, 4, "verified"))
+        for quote, start, end, expected in cases:
+            with self.subTest(quote=quote):
+                parsed = engine.parse_answer(envelope([dict(issue(start=start, end=end), relevant_code=quote)]), anchors)
+                self.assertEqual(([f["evidence"] for f in parsed["findings"]], parsed["dropped"]), ([expected], []))
+        # A short quote that is not on the cited lines still contradicts them.
+        wrong = engine.parse_answer(envelope([dict(issue(start=4, end=4), relevant_code=")")]), anchors)
+        self.assertEqual(wrong["dropped"][0]["reason"], "quoted code does not match the cited lines")
+
+    def test_raw_numbers_plus_signs_and_literal_whitespace_stay_significant(self):
+        anchors = shown("+value", "1 + 2", 'return "a  b"', 'value = "one\u2028two"', "offset,")
+        for line, quote in ((1, "+value"), (1, "1 ++value"), (2, "1 + 2"), (3, 'return "a  b"'),
+                            (4, '4 +value = "one\u2028two"')):
+            with self.subTest(quote=quote):
+                parsed = engine.parse_answer(envelope([dict(issue(start=line, end=line), relevant_code=quote)]), anchors)
+                self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+        for line, quote in ((3, 'return "a b"'), (5, "5 + offset,")):
+            wrong = engine.parse_answer(envelope([dict(issue(start=line, end=line), relevant_code=quote)]), anchors)
+            self.assertEqual(wrong["dropped"][0]["reason"], "quoted code does not match the cited lines")
+
+    def test_one_markdown_fence_can_wrap_an_explicit_quote(self):
+        anchors = shown("return value * 2")
+        exact = dict(issue(start=1, end=1), relevant_code="```python\n1 +return value * 2\n```")
+        parsed = engine.parse_answer(envelope([exact]), anchors)
+        self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
+        self.assertEqual(parsed["dropped"], [])
+        for quote in ("```python\nreturn value * 3\n```",
+                      "Prose before the quote.\n\n" + exact["relevant_code"],
+                      exact["relevant_code"] + "\n\n[ref]: /elsewhere"):
+            with self.subTest(quote=quote):
+                wrong = engine.parse_answer(envelope([dict(exact, relevant_code=quote)]), anchors)
+                self.assertEqual(wrong["findings"], [])
+                self.assertEqual(wrong["dropped"][0]["reason"], "quoted code does not match the cited lines")
+
+    def test_wrapped_quote_can_cover_code_outside_a_literal_fence(self):
+        quote = "```python\n...\nsend()\n...\n```"
+        raw = envelope([dict(issue(start=1, end=5), relevant_code=quote)])
+        parsed = engine.parse_answer(raw, shown("Before.", "```python", "send()", "```", "After."))
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_explicit_quote_can_include_literal_source_fences(self):
+        quote = "```text\nvalue\n```"
+        raw = envelope([dict(issue(start=1, end=3), relevant_code=quote)])
+        parsed = engine.parse_answer(raw, shown("```text", "value", "```"))
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_a_fenced_block_counts_as_the_quote_and_inline_spans_do_not(self):
+        fenced = issue(start=4, end=4, body="It adds up.\n```\ntotal += item\n```\n")
+        self.assertEqual(self.parse(fenced)["findings"][0]["evidence"], "verified")
+        inline = issue(start=4, end=4, body="It uses `total` and `undefined_elsewhere()`.")
+        self.assertEqual(self.parse(inline)["findings"][0]["evidence"], "unverified")
+        both = dict(issue(start=4, end=4, body="```\nraise ValueError\n```"), relevant_code="total += item")
+        self.assertEqual(self.parse(both)["findings"][0]["evidence"], "verified")
+        # Without relevant_code, a fenced block that does not match may be a suggested fix: kept, unverified.
+        fix = issue(start=4, end=4, body="It adds up.\n```\ntotal = sum(items)\n```\n")
+        parsed = self.parse(fix)
+        self.assertEqual(([f["evidence"] for f in parsed["findings"]], parsed["dropped"]), (["unverified"], []))
+
+    def test_a_fenced_quote_can_contain_a_shorter_backtick_run(self):
+        source_line = 'const fence = "```";'
+        body = "````js\n" + source_line + "\n````"
+        [finding] = engine.parse_answer(envelope([issue(start=1, end=1, body=body)]), shown(source_line))["findings"]
+        self.assertEqual(finding["evidence"], "verified")
+
+    def test_tilde_fences_and_first_block_fallback(self):
+        exact = "~~~~py\nresult = 1\n~~~~"
+        anchors = shown("result = 1")
+        first = engine.parse_answer(envelope([issue(start=1, end=1, body=exact)]), anchors)
+        self.assertEqual(first["findings"][0]["evidence"], "verified")
+        later = engine.parse_answer(envelope([issue(start=1, end=1, body="~~~\nresult = 2\n~~~\n" + exact)]), anchors)
+        self.assertEqual(later["findings"][0]["evidence"], "unverified")
+
+    def test_fenced_quote_inside_a_blockquote_matches_source(self):
+        for body, source in (("> ```python\n> send()\n> ```", "send()"),
+                             ("> > ~~~~\n> > > result\n> > ~~~~", "> result")):
+            with self.subTest(body=body):
+                parsed = engine.parse_answer(envelope([issue(start=1, end=1, body=body)]), shown(source))
+                self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_fence_indentation_matches_the_report_and_verifier_message(self):
+        body = "  ```python\nif ready:\n      send()\n  ```"
+        anchors = shown("if ready:", "    send()")
+        primary = envelope([issue(start=1, end=2, body="\n \n" + body + "\r\n \t\r\n")])
+        [finding] = engine.parse_answer(primary, anchors)["findings"]
+        self.assertEqual(finding["evidence"], "verified")
+        self.assertEqual(finding["message"], body)
+        self.assertEqual(engine.fenced_quote(finding["message"]), "if ready:\n    send()\n")
+        reply = envelope([dict(issue(start=1, end=2, body=body), verification_status="confirmed")])
+        verifier = engine.parse_answer(reply, anchors, verification=True)
+        self.assertEqual(engine.kept([finding], verifier), [dict(finding, verification_status="confirmed")])
+
+    def test_malformed_explicit_quote_cannot_use_the_message_fallback(self):
+        fallback = issue(start=1, end=1, body="```python\nsend()\n```")
+        anchors = shown("send()")
+        for code in (["different()"], {"text": "different()"}, 123, False, "\ud800"):
+            with self.subTest(code=code):
+                reply = envelope([dict(fallback, relevant_code=code), fallback])
+                parsed = engine.parse_answer(reply, anchors)
+                self.assertEqual([item["evidence"] for item in parsed["findings"]], ["verified"])
+                self.assertEqual(parsed["dropped"], [{"path": "a.py", "line": 1, "reason": "malformed quoted code"}])
+        parsed = engine.parse_answer(envelope([dict(fallback, relevant_code=None)]), anchors)
+        self.assertEqual([item["evidence"] for item in parsed["findings"]], ["verified"])
+
+    def test_explicit_yaml_null_tag_requires_a_valid_null_spelling(self):
+        issue_with_quote = dict(issue(start=1, end=1, body="```python\nsend()\n```"), relevant_code="QUOTE")
+        reply = json.loads(envelope([]))
+        payload = yaml.safe_dump({"review": {"key_issues_to_review": [issue_with_quote]}})
+        reply["result"] = payload.replace("relevant_code: QUOTE", "relevant_code: !!null different()")
+        parsed = engine.parse_answer(json.dumps(reply), shown("send()"))
+        self.assertEqual(parsed["findings"], [])
+        self.assertEqual(parsed["dropped"][0]["reason"], "malformed quoted code")
+        reply["result"] = payload.replace("relevant_code: QUOTE", "relevant_code: !!null ~")
+        parsed = engine.parse_answer(json.dumps(reply), shown("send()"))
+        self.assertEqual([item["evidence"] for item in parsed["findings"]], ["verified"])
+
+    def test_a_fenced_explicit_quote_cannot_normalize_nul_into_source_text(self):
+        quote = "```python\nvalue = '\x00'\n```"
+        parsed = engine.parse_answer(envelope([dict(issue(start=1, end=1), relevant_code=quote)]),
+                                     shown("value = '\ufffd'"))
+        self.assertEqual(parsed["findings"], [])
+        self.assertEqual(parsed["dropped"][0]["reason"], "quoted code does not match the cited lines")
+
+    def test_a_fenced_message_quote_cannot_normalize_nul_into_source_text(self):
+        body = "```python\nvalue = '\x00'\n```"
+        parsed = engine.parse_answer(envelope([issue(start=1, end=1, body=body)]), shown("value = '\ufffd'"))
+        self.assertEqual([row["evidence"] for row in parsed["findings"]], ["unverified"])
+        self.assertEqual(parsed["dropped"], [])
+
+    def test_fenced_quote_in_an_ordered_list(self):
+        body = "10. Code:\n    ```python\n    send()\n    ```"
+        parsed = engine.parse_answer(envelope([issue(start=1, end=1, body=body)]), shown("send()"))
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_fenced_quote_can_end_without_a_closing_fence(self):
+        for body in ("> ```python\n> send()\nDiscussion outside the quote.", "```python\nsend()"):
+            with self.subTest(body=body):
+                parsed = engine.parse_answer(envelope([issue(start=1, end=1, body=body)]), shown("send()"))
+                self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_pack_records_the_text_of_every_shown_head_line(self):
+        patch = "@@ -1,2 +1,2 @@\n first()\n-old\n+  third( x )\n"
+        self.assertEqual(engine.pack([source.File("a.py", patch, "modified")], [])[1],
+                         {"a.py": {1: "first()\n", 2: "  third( x )\n"}})
+
+    def test_the_prompt_asks_for_the_quote_and_the_summary_counts_the_unchecked(self):
+        prompt = engine.pack([source.File("a.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")], [])[0]
+        self.assertIn("Give each finding a `relevant_code` field quoting the lines it cites, exactly as shown.", prompt)
+        posts = []
+        report = {"provider": "cursor", "state": "reviewed", "checks": [], "omitted": [], "findings": [
+            {"path": "a.py", "line": 1, "title": "t", "message": "m", "evidence": "unverified"},
+            {"path": "a.py", "line": 1, "title": "t", "message": "m", "evidence": "verified"}]}
+        with patch.object(cli, "post_comment", side_effect=lambda *args: posts.append(args[3])):
+            cli.publish("org/repo#1", "a" * 40, report)
+            cli.publish("org/repo#1", "a" * 40, dict(report, findings=report["findings"][1:]))
+        self.assertIn("Could not verify quoted code for 1 model finding.", posts[0])
+        self.assertNotIn("Could not verify quoted code", posts[1])
+
+
 if __name__ == "__main__":
     unittest.main()

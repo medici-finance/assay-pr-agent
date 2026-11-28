@@ -432,6 +432,9 @@ def publish(address, head, report, *, project=None, state=None):
     dropped_counts = Counter(item["reason"] for item in report.get("dropped", []))
     for reason, count in sorted(dropped_counts.items()):
         header.append(f"Dropped {count} model finding{'s' if count > 1 else ''}: {reason}.")
+    unchecked = sum(entry.get("evidence") == "unverified" for entry in report["findings"])
+    if unchecked:
+        header.append(f"Could not verify quoted code for {unchecked} model finding{'s' if unchecked > 1 else ''}.")
     if report["state"] == "over-budget":
         body.append(f"Skipped {label}. Estimated prompt {report['estimated_input_tokens']} tokens "
                     f"exceeds the limit of {report.get('prompt_limit', report['max_input_tokens'])}.")
