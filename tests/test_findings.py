@@ -333,6 +333,24 @@ class QuotedEvidenceTests(unittest.TestCase):
                                                    relevant_code="...\nprepare()\nsend()")]), anchors)
         self.assertEqual(parsed["findings"][0]["evidence"], "verified")
 
+    def test_common_line_endings_match_in_raw_numbered_and_fenced_quotes(self):
+        anchors = shown("prepare()", "send()")
+        for ending in ("\n", "\r\n", "\r"):
+            for rows in (("prepare()", "send()"), ("1 +prepare()", "2 +send()"),
+                         ("```python", "prepare()", "send()", "```")):
+                with self.subTest(ending=ending, rows=rows):
+                    raw = envelope([dict(issue(start=1, end=2), relevant_code=ending.join(rows))])
+                    parsed = engine.parse_answer(raw, anchors)
+                    self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
+                    self.assertEqual(parsed["dropped"], [])
+
+    def test_blank_separators_outside_the_quoted_code_around_hunk_markers(self):
+        quote = "__new hunk__\n\n1 +send()\n\n__old hunk__"
+        raw = envelope([dict(issue(start=1, end=1), relevant_code=quote)])
+        parsed = engine.parse_answer(raw, shown("send()"))
+        self.assertEqual([row["evidence"] for row in parsed["findings"]], ["verified"])
+        self.assertEqual(parsed["dropped"], [])
+
     def test_a_numbered_match_does_not_set_the_raw_indentation_margin(self):
         anchors = shown("3 +    first()", "if enabled:", "    first()", "    second()", "    third()")
         quote = "...\n3 +    first()\nsecond()\nthird()"

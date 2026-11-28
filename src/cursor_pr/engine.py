@@ -29,6 +29,7 @@ VERSION = "2"
 MAX_FINDINGS = DEFAULT_MAX_FINDINGS
 EVIDENCE_WORK_LIMIT = 250_000
 DROPPED_PATH_CHARS = 32_768
+LINE_ENDING = re.compile(r"\r\n?|\n")
 LOCKS = {"package-lock.json", "pnpm-lock.yaml", "go.sum", "npm-shrinkwrap.json"}
 
 
@@ -423,8 +424,8 @@ def trim_blank_edges(text):
         return ""
     start = max(text.rfind("\n", 0, leading), text.rfind("\r", 0, leading)) + 1
     trailing = len(text.rstrip(" \t\r\n"))
-    line_end = re.search(r"[\r\n]", text[trailing:])
-    end = trailing + line_end.start() if line_end else len(text)
+    line_end = LINE_ENDING.search(text, trailing)
+    end = line_end.start() if line_end else len(text)
     return text[start:end]
 
 
@@ -641,6 +642,7 @@ ELISION = re.compile(r"(?:(?:#|//)[ \t]*)?(?:\.{3,}|…)")
 # The patch display's hunk markers stand for no code at all.
 MARKER = re.compile(r"__(?:new|old) hunk__")
 ELIDED = object()
+BLANK_QUOTE_ROW = ("", None, "")
 # These printable glyphs are blank, including the Hangul fillers and blank Braille cell.
 BLANK_GLYPHS = frozenset("\u115f\u1160\u2800\u3164\uffa0")
 
@@ -658,7 +660,7 @@ def fenced_quote(message, *, whole=False):
             return None
         # The parser can consume link definitions without producing any tokens.
         start, end = fence.map
-        lines = re.split(r"\r\n|\r|\n", message)
+        lines = LINE_ENDING.split(message)
         if any(line.strip(" \t") for line in lines[:start] + lines[end:]):
             return None
     return fence.content
@@ -667,18 +669,18 @@ def fenced_quote(message, *, whole=False):
 def checkable(quote):
     """The quote's lines in order: each as its raw and numbered forms, or ELIDED for an explicit elision.
 
-    Boundary blank lines and hunk markers are left out. Interior blanks must match a cited blank.
+    Drop hunk markers before checking whether blank lines are inside the quote.
     """
     parts = []
-    for raw in trim_blank_edges(quote).split("\n"):
-        raw = raw.removesuffix("\r")
+    for raw in LINE_ENDING.split(quote):
         shown = SHOWN.fullmatch(raw.lstrip(" \t"))
         if shown:
             parts.append((raw, shown[1], shown[2]))
             continue
         standalone = raw.strip(" \t")
         if not standalone:
-            parts.append(("", None, ""))
+            if parts:
+                parts.append(BLANK_QUOTE_ROW)
         elif MARKER.fullmatch(standalone):
             continue
         elif ELISION.fullmatch(standalone):
@@ -686,6 +688,8 @@ def checkable(quote):
                 parts.append(ELIDED)
         else:
             parts.append((raw, None, raw))
+    while parts and parts[-1] == BLANK_QUOTE_ROW:
+        parts.pop()
     return parts
 
 
