@@ -15,8 +15,8 @@ import uuid
 
 from . import accounts, dialog, providers, provision, gitlab_tls
 from .login import auth_mode, ensure_session, login_directory, login_env
-from .config import (DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, FINDINGS_SETTINGS, MAX_FINDINGS_LIMIT,
-                     parse_projects, project_base, prompt_config)
+from .config import (DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, DEFAULT_VISUAL_MAX_INPUT_TOKENS, FINDINGS_SETTINGS,
+                     MAX_FINDINGS_LIMIT, parse_projects, project_base, prompt_config)
 from .credentials import APP_ID, INSTALL_ID, KEY, TOKEN, private_file, read_secret, validate_pem, validate_token
 
 CURSOR = "CURSOR_API_KEY"
@@ -24,7 +24,7 @@ SECRETS = {CURSOR: "cursor.key", "ANTHROPIC_API_KEY": "claude.key", "CODEX_API_K
 # Carry saved settings that the wizard does not ask for into the next bundle.
 PRESERVED_SETTINGS = (*FINDINGS_SETTINGS.values(), "REVIEW_SYNC_SECONDS", "REVIEW_OSV_DOWNLOAD_DATABASES")
 SETTINGS = ("REVIEW_OPERATOR", APP_ID, INSTALL_ID, "REVIEW_MODEL", "REVIEW_MAX_INPUT_TOKENS",
-            "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER",
+            "REVIEW_VISUAL_MAX_INPUT_TOKENS", "REVIEW_POLL_SECONDS", "REVIEW_QUALGEN_INTERVAL_SECONDS", "REVIEW_PROVIDER",
             "REVIEW_CURSOR_TEAM_ID", "REVIEW_AUTH_MODE", "REVIEW_LOGIN_PROFILE", *PRESERVED_SETTINGS)
 
 
@@ -165,6 +165,11 @@ def saved_integer(state, name, default, upper=None):
 def max_input_tokens(state):
     """Effective prompt budget."""
     return saved_integer(state, "REVIEW_MAX_INPUT_TOKENS", DEFAULT_MAX_INPUT_TOKENS)
+
+
+def visual_max_input_tokens(state):
+    """Effective prompt budget of a visual review, which is its own."""
+    return saved_integer(state, "REVIEW_VISUAL_MAX_INPUT_TOKENS", DEFAULT_VISUAL_MAX_INPUT_TOKENS)
 
 
 def max_findings(state, *, tier=None, override=None):
@@ -378,12 +383,17 @@ def configure_locked(state, force_login):
         setting(INSTALL_ID, "GitHub App installation ID", number)
     default_limit = str(DEFAULT_MAX_INPUT_TOKENS)
     defaults = {"REVIEW_POLL_SECONDS": "120", "REVIEW_MAX_INPUT_TOKENS": default_limit,
+                "REVIEW_VISUAL_MAX_INPUT_TOKENS": str(DEFAULT_VISUAL_MAX_INPUT_TOKENS),
                 "REVIEW_QUALGEN_INTERVAL_SECONDS": "86400"}
-    if session and not old and ask(f"Use recommended settings (2-minute polling, {DEFAULT_MAX_INPUT_TOKENS:,} input tokens, daily history refresh)? (y/n)", "y").lower() in ("y", "yes"):
+    if session and not old and ask(f"Use recommended settings (2-minute polling, {DEFAULT_MAX_INPUT_TOKENS:,} input tokens "
+                                   f"per review and {DEFAULT_VISUAL_MAX_INPUT_TOKENS:,} per visual review, daily history "
+                                   "refresh)? (y/n)", "y").lower() in ("y", "yes"):
         settings.update(defaults)
     else:
         setting("REVIEW_POLL_SECONDS", "Seconds between polls", number, "120")
         setting("REVIEW_MAX_INPUT_TOKENS", "Maximum estimated input tokens per review", number, default_limit)
+        setting("REVIEW_VISUAL_MAX_INPUT_TOKENS", "Maximum estimated input tokens per visual review", number,
+                str(DEFAULT_VISUAL_MAX_INPUT_TOKENS))
         setting("REVIEW_QUALGEN_INTERVAL_SECONDS", "Seconds between Qualgen history refreshes (0 disables)",
                 nonnegative, "86400")
     backend = retry(lambda: providers.provider(ask("Review provider (cursor/claude/codex)", previous.get("REVIEW_PROVIDER", "cursor"))))

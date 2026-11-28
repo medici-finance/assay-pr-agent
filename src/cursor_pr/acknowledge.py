@@ -8,6 +8,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
+from .discovery import COMMANDS
 from .gitlab_tls import client_options
 from .source import ReviewError, post_comment, reviewer_token, run_forge, valid_sha
 
@@ -16,8 +17,8 @@ log = logging.getLogger(__name__)
 MARK = {"github": ("eyes", "content"), "gitlab": ("hourglass", "name")}
 # Names its request, so that a second request failing at the same head gets a notice of its own:
 # the helper posts a given text once per head.
-NOTICE = ("The `/review` request {request} was not completed: the review could not be finished or "
-          "published. Post `/review` again to retry it.\n")
+NOTICE = ("The `{command}` request {request} was not completed: the review could not be finished or "
+          "published. Post `{command}` again to retry it.\n")
 NOTE = {"github": "#issuecomment-", "gitlab": "#note_"}
 # A removal or a notice that failed is tried again after this long, then after twice as long each
 # time up to an hour, and given up after this many tries, about six hours in all. Each of the two
@@ -251,7 +252,7 @@ def left_in_place(project, number, comment, response):
                     project.slug, number, comment, response.status_code)
 
 
-def notify(project, number, comment, state, deadline=None):
+def notify(project, number, comment, state, deadline=None, command="/review"):
     # The helper publishes only on the change's current head. The notice is about the request, not a
     # head, so it goes on whatever head the change has now, once per head like any comment.
     left = HELPER_SECONDS if deadline is None else min(HELPER_SECONDS, deadline - time.monotonic())
@@ -266,7 +267,7 @@ def notify(project, number, comment, state, deadline=None):
     # Started within the deadline and then never cut short: a helper stopped just after the forge
     # took the comment would leave no receipt, and the next try would post the notice again.
     request = f"{project.change_url(number)}{NOTE[project.provider]}{comment}"
-    post_comment(project, number, head, NOTICE.format(request=request), state)
+    post_comment(project, number, head, NOTICE.format(command=command, request=request), state)
 
 
 class Acknowledgement:
@@ -321,7 +322,10 @@ class Acknowledgement:
                 remove(project, number, comment, deadline, said)
 
         def report_failure():
-            notify(project, number, comment, self.state, deadline)
+            # Named for what was asked: posting another command would start another kind of review.
+            kind = self.jobs.tier(job)
+            command = next((name for name, value in COMMANDS.items() if value == kind), "/review")
+            notify(project, number, comment, self.state, deadline, command)
 
         # Kept apart: each is done, tried again and given up by itself, and while only one is owed
         # the other is left alone. The notice goes first and has the whole of the time. A removal

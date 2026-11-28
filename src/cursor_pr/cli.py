@@ -21,8 +21,10 @@ import yaml
 from . import context, drift, engine, history, providers, sarif, scanners
 from .scanners import fence
 from .login import auth_mode, login_directory
-from .setup import locked, apply_saved_setup, load_provider_key, max_findings, max_input_tokens, state_dir
-from .config import DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, FINDINGS_SETTINGS, MAX_FINDINGS_LIMIT, load_config, project_from
+from .setup import (locked, apply_saved_setup, load_provider_key, max_findings, max_input_tokens, state_dir,
+                    visual_max_input_tokens)
+from .config import (DEFAULT_MAX_FINDINGS, DEFAULT_MAX_INPUT_TOKENS, DEFAULT_VISUAL_MAX_INPUT_TOKENS, FINDINGS_SETTINGS,
+                     MAX_FINDINGS_LIMIT, load_config, project_from)
 from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import blob, go_report, scan_files
@@ -32,6 +34,7 @@ from .discovery import context_comments
 from .engine import (MAX_FINDINGS, CursorFailure, fit_verification, merge_findings, pack, prompt_advisories, rank,
                      render_sections, review, tokens, visible_advisories)
 from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
+from . import visual
 
 
 MAX_DEGRADED_ROWS = 50
@@ -186,12 +189,12 @@ def with_context(files, checks, packed, estimated, dropped, limit, cap, names, r
     return packed, estimated, fates, text, baseline
 
 
-def run_pass(row, prompt, anchors, args, source, *, cap, timeout, originals=None):
+def run_pass(row, prompt, anchors, args, source, *, cap, timeout, originals=None, **options):
     """Run one pass and record billing data only for fresh provider calls."""
     before = engine.started
     try:
         answer, cached = review(prompt, args.model, anchors, args.cache_dir, source,
-                                limit=cap, timeout=timeout, originals=originals)
+                                limit=cap, timeout=timeout, originals=originals, **options)
     except CursorFailure as err:
         row.update(state="failed", model_invocations=engine.started - before)
         if row["model_invocations"] and err.usage is not None:
@@ -351,8 +354,33 @@ def fit_tier_comment(header, findings, coverage, extra_coverage, outside, detail
     return body + "".join(model) + skipped + outside_text + evidence + end
 
 
+def evidence(report):
+    """Scanner, history and drift rows. None of it comes from the model or enters a prompt."""
+    body = []
+    for check in report["checks"]:
+        if check["state"] != "complete":
+            body.append(f"- {check['tool']}: could not check {fence(check.get('path') or check.get('reason', ''))}")
+        for item in check["findings"]:
+            detail = " ".join(part for part in (fence(item["rule"]), fence(item.get("message", ""))) if part)
+            body.append(f"- {fence(item['path'])}:{item['line']} — {detail}")
+    if report.get("static_checks"):
+        body.extend(["", *scanners.summary(report["static_checks"]), ""])
+    if "qualgen" in report:
+        body.extend(["", *history.summary(report["qualgen"]), ""])
+    if "drift" in report:
+        body.extend(["", *drift.summary(report["drift"]), ""])
+    return body
+
+
 def publish(address, head, report, *, project=None, state=None):
     _, number = address.rsplit("#", 1)
+    if "map" in report:
+        # A visual review is a comment of its own shape, laid out and bounded by its module.
+        text = "\n".join(visual.comment(report, evidence(report))) + "\n"
+        if len(text.encode("utf-8")) > visual.MAX_COMMENT_BYTES:
+            raise ReviewError("Visual review exceeded the forge comment limit")
+        post_comment(project, int(number), head, text, state if state is not None else state_dir())
+        return
     label = providers.LABELS[report.get("provider", "cursor")]
     body = [f"{label} review of {head}", report["state"]]
     degraded = report.get("degraded") or []
@@ -552,6 +580,8 @@ def parser():
     p.add_argument("--head", help="Local head revision (default HEAD with --base)")
     p.add_argument("--repo", type=Path, default=Path.cwd(), help="Checkout for local Git and scanners")
     p.add_argument("--path", action="append", default=[], help="Limit review to an exact changed path; repeatable")
+    p.add_argument("--visual", action="store_true",
+                   help="Map where the diff is worth reading and explain the change, instead of hunting for issues")
     evidence = p.add_mutually_exclusive_group()
     evidence.add_argument("--go-analysis-producer", help="Trusted CI producer for --expected-change-url")
     evidence.add_argument("--go-report", type=Path, help="Assay go-analysis/v1 JSON for this head")
@@ -559,7 +589,8 @@ def parser():
     p.add_argument("--qualgen-store", type=Path, help="Read the poller’s mined Qualgen history for this project")
     p.add_argument("--model", help="Explicit provider model (otherwise the CLI default)")
     p.add_argument("--max-input-tokens", type=int,
-                   help=f"Preflight estimate limit (default {DEFAULT_MAX_INPUT_TOKENS}, or the saved REVIEW_MAX_INPUT_TOKENS setting)")
+                   help=f"Preflight estimate limit (default {DEFAULT_MAX_INPUT_TOKENS}, or the saved REVIEW_MAX_INPUT_TOKENS setting; "
+                        f"{DEFAULT_VISUAL_MAX_INPUT_TOKENS} or REVIEW_VISUAL_MAX_INPUT_TOKENS with --visual)")
     p.add_argument("--max-findings", type=findings_option,
                    help=f"Findings cap of the requested tier, 1 to {MAX_FINDINGS_LIMIT} (default {DEFAULT_MAX_FINDINGS}, or the "
                         "saved " + ", ".join(FINDINGS_SETTINGS.values()) + " setting for that tier)")
@@ -584,6 +615,10 @@ def execute_review(args, verification_resources):
         raise ReviewError("Invalid budget or incompatible --head/--post options")
     if bool(args.queue) != bool(args.request) or (args.request and not args.change):
         raise ReviewError("--queue and --request go together and require --change")
+    if args.visual and (args.tier != "regular" or args.max_findings is not None):
+        raise ReviewError("--visual has no tiers and reports no findings: it takes neither --tier nor --max-findings")
+    if args.visual and args.sarif:
+        raise ReviewError("--visual reports no findings, so there is nothing to write with --sarif")
     root = args.repo.resolve()
     if args.expected_change_url and not args.change:
         raise ReviewError("--expected-change-url requires --change")
@@ -609,7 +644,8 @@ def execute_review(args, verification_resources):
             report, code = json.loads(prepared)
             return report, code
 
-    caps = max_findings(state_dir().resolve(), tier=args.tier, override=args.max_findings)
+    # A visual review reports no findings, so a cap that is set wrongly is not its problem.
+    caps = {} if args.visual else max_findings(state_dir().resolve(), tier=args.tier, override=args.max_findings)
     paths = {f.path for f in change.files}
     selected = set(args.path) if args.path else paths
     if not selected <= paths:
@@ -665,6 +701,9 @@ def execute_review(args, verification_resources):
 
     qualgen = history.screen(root, args.qualgen_store, selected, change.head) if args.qualgen_store else None
     advisories = qualgen["advisories"] if qualgen else ()
+
+    if args.visual:
+        return visual_review(args, change, files, sorted(paths - selected), checks, static, qualgen, drifted)
 
     tier, base = args.tier, args.max_input_tokens
     budget = base * TIERS[tier]
@@ -850,6 +889,48 @@ def execute_review(args, verification_resources):
     return report, 2 if incomplete or degraded or lowered else 0
 
 
+def visual_review(args, change, files, unselected, checks, static, qualgen, drifted):
+    """Explain the change in one prompt of its own: no tiers, no context beyond the patch, no findings.
+
+    The scanners, history and drift are the same evidence a review gathers, and none of it enters
+    this prompt either.
+    """
+    prompt, anchors, unseen, has_text = visual.pack(files)
+    estimated = tokens(prompt) if has_text else 0
+    omitted = sorted(set(unseen) | set(unselected))
+    backend = providers.provider()
+    limit = args.max_input_tokens
+    report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
+              "estimated_input_tokens": estimated, "max_input_tokens": limit, "prompt_limit": limit,
+              "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
+              "findings": [], "cursor_usage": None, "drift": drifted,
+              # The map costs no tokens and stays in the report when the model is skipped or fails.
+              "map": dict(visual.survey(files), shown=sorted(file.path for file in files if visual.shows_hunks(file)))}
+    if static:
+        report["static_checks"] = [static[key] for key in sorted(static)]
+    if backend == "cursor" and os.getenv("REVIEW_CURSOR_TEAM_ID"):
+        report["cursor_team_id"] = os.environ["REVIEW_CURSOR_TEAM_ID"]
+    if qualgen:
+        report["qualgen"] = qualgen
+    if estimated > limit:
+        return dict(report, state="over-budget"), 2
+    if args.estimate:
+        return dict(report, state="estimate"), 0
+    if has_text:
+        row = {"name": "visual", "estimated_input_tokens": estimated, "state": "planned"}
+        # The visual prompt has its own parser and cache namespace.
+        answer, error = run_pass(row, prompt, anchors, args, change.identity, cap=MAX_FINDINGS, timeout=TIMEOUTS["regular"],
+                                 parse=visual.parse_answer, version=visual.VERSION)
+        report.update(cursor_invocations=row["model_invocations"], cursor_usage=row.get("model_usage"))
+        if answer is None:
+            # The map and the deterministic evidence are kept even if the model failed.
+            return dict(report, state="model-unavailable", error=error), 2
+        report.update({name: value for name, value in answer.items() if name != "cursor_usage"}, cache_hit=row["state"] == "cached")
+    incomplete = bool(omitted or any(c["state"] != "complete" for c in [*checks, *static.values()]))
+    report["state"] = "partial" if incomplete else ("reviewed" if has_text else "empty")
+    return report, 2 if incomplete else 0
+
+
 def run_request(args):
     report, code = execute(args)
     if args.request and args.post:
@@ -868,7 +949,9 @@ def run_request(args):
         except (ReviewError, OSError, ValueError, subprocess.TimeoutExpired) as err:
             return dict(report, publication="failed", publication_error=str(err) or type(err).__name__), 2
         report["publication"] = "posted-or-already-present"
-    report["forge_status"] = forge_status.outcome(args, report)
+    # The check says how a review for defects ended, and a visual review is none: posted under the
+    # same name it would replace that review's findings, or pass for one that never ran.
+    report["forge_status"] = "skipped" if "map" in report else forge_status.outcome(args, report)
     return report, code
 
 
@@ -909,7 +992,7 @@ def main():
             if not args.estimate and os.getenv("CURSOR_REVIEW_POLLER_CHILD") != "1":
                 stack.enter_context(providers.cursor_account())
             if args.max_input_tokens is None:
-                args.max_input_tokens = max_input_tokens(state)
+                args.max_input_tokens = visual_max_input_tokens(state) if args.visual else max_input_tokens(state)
             if args.model is None:
                 args.model = os.getenv("REVIEW_MODEL")
             if args.change:

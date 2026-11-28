@@ -458,18 +458,25 @@ def answer_findings(answer, anchors):
         loader.dispose()
 
 
-def parse_answer(raw, anchors, limit=MAX_FINDINGS, *, verification=False):
+def model_text(raw):
+    """The model's text and usage from one successful terminal result, whatever the text is asked to hold."""
     value = json.loads(raw)
     if value.get("type") != "result" or value.get("subtype") != "success" or value.get("is_error") is not False:
         raise ReviewError("Cursor did not return a successful terminal result")
-    answer = value["result"].strip()
+    text = value["result"].strip()
     # In Auto mode the CLI can prepend its own routing notice to the model text.
-    answer = re.sub(r"^> Auto routed to [^\r\n]+\r?\n\s*\n", "", answer, count=1)
-    fenced = re.fullmatch(r"\x60{3}(?:ya?ml|json)?\s*\n(.*?)\n\x60{3}", answer, re.S)
+    text = re.sub(r"^> Auto routed to [^\r\n]+\r?\n\s*\n", "", text, count=1)
+    fenced = re.fullmatch(r"\x60{3}(?:ya?ml|json)?\s*\n(.*?)\n\x60{3}", text, re.S)
     if fenced:
-        answer = fenced.group(1)
-    if len(answer) > 32_768:
+        text = fenced.group(1)
+    if len(text) > 32_768:
         raise ReviewError("Cursor answer exceeds the review size limit")
+    usage = value.get("usage")
+    return text, usage if isinstance(usage, dict) else None
+
+
+def parse_answer(raw, anchors, limit=MAX_FINDINGS, *, verification=False):
+    answer, usage = model_text(raw)
     if verification:
         # A verdict can remove original findings, so validate its entire YAML document.
         try:
@@ -497,8 +504,7 @@ def parse_answer(raw, anchors, limit=MAX_FINDINGS, *, verification=False):
         else:
             path_budget -= path_size
         dropped.append(why)
-    usage = value.get("usage")
-    return {"findings": clean, "dropped": dropped, "cursor_usage": usage if isinstance(usage, dict) else None}
+    return {"findings": clean, "dropped": dropped, "cursor_usage": usage}
 
 
 def finding(issue, anchors, *, normalized=False):
@@ -538,7 +544,8 @@ def finding(issue, anchors, *, normalized=False):
     return validated, None
 
 
-def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120, *, verification=False):
+def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120, *, verification=False, parse=None):
+    """One call of the provider CLI. `parse` reads an answer that is not a list of findings."""
     global started
     backend = provider()
     label = LABELS[backend]
@@ -626,6 +633,8 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120, *, verificat
                 break
         raise CursorFailure(f"{label} exited {response.returncode}: {reason}. No retry was made.")
     try:
+        if parse is not None:
+            return parse(response.stdout, anchors)
         return parse_answer(response.stdout, anchors, limit, verification=verification)
     except (ReviewError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError) as err:
         try:
@@ -636,8 +645,11 @@ def invoke(prompt, model, anchors, limit=MAX_FINDINGS, timeout=120, *, verificat
                             usage if isinstance(usage, dict) else None) from err
 
 
-def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout=120, originals=None):
-    signature = json.dumps([VERSION, "pr-agent:0.50.0", model, source, prompt], ensure_ascii=False)
+def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout=120, originals=None,
+           parse=None, version=None):
+    """A cached model answer. A prompt with its own answer format passes its parser and its own
+    cache version, so that neither format is ever read as the other."""
+    signature = json.dumps([version or VERSION, "pr-agent:0.50.0", model, source, prompt], ensure_ascii=False)
     if originals is not None:
         signature = json.dumps(["strict-verifier", signature])
     if provider() != "cursor" or os.getenv("REVIEW_CURSOR_TEAM_ID"):
@@ -662,8 +674,12 @@ def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout
         extra = {} if (limit, timeout) == (MAX_FINDINGS, 120) else {"limit": limit, "timeout": timeout}
         if originals is not None:
             extra["verification"] = True
+        if parse is not None:
+            extra["parse"] = parse
         result = invoke(prompt, model, anchors, **extra)
-        if originals is None:
+        if parse is not None:
+            pass  # Not a list of findings: its own parser has checked all there is to check.
+        elif originals is None:
             for finding in result["findings"]:
                 if finding.get("verification_status") == "confirmed":
                     finding.pop("verification_status")
@@ -672,7 +688,7 @@ def review(prompt, model, anchors, cache, source, *, limit=MAX_FINDINGS, timeout
                 result["findings"] = kept(originals, result)
             except ReviewError as err:
                 raise CursorFailure(str(err), result.get("cursor_usage")) from err
-        if result.get("dropped") and not result["findings"]:
+        if parse is None and result.get("dropped") and not result["findings"]:
             return result, False  # A later request can retry a reply that yielded no usable findings.
         with tempfile.NamedTemporaryFile(dir=cache, mode="w", delete=False) as file:
             json.dump(result, file)

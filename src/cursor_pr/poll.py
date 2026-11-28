@@ -282,13 +282,19 @@ def run_review(project, number, state, tier="regular", comment=None):
         argv.extend(["--scanner-ci", json.dumps(project.scanner_ci)])
     if project.go_analysis:
         argv.extend(["--go-analysis-producer", project.go_analysis])
-    if os.getenv("REVIEW_MAX_INPUT_TOKENS"):
-        argv.extend(["--max-input-tokens", os.environ["REVIEW_MAX_INPUT_TOKENS"]])
-    if os.getenv(FINDINGS_SETTINGS[tier]):
+    # A visual review has a budget of its own and no findings to cap. The child resolves a saved
+    # value when the environment is silent.
+    visual = tier == "visual"
+    budget = "REVIEW_VISUAL_MAX_INPUT_TOKENS" if visual else "REVIEW_MAX_INPUT_TOKENS"
+    if os.getenv(budget):
+        argv.extend(["--max-input-tokens", os.environ[budget]])
+    if not visual and os.getenv(FINDINGS_SETTINGS[tier]):
         argv.extend(["--max-findings", os.environ[FINDINGS_SETTINGS[tier]]])
     if os.getenv("REVIEW_MODEL"):
         argv.extend(["--model", os.environ["REVIEW_MODEL"]])
-    if tier != "regular":
+    if visual:
+        argv.append("--visual")
+    elif tier != "regular":
         argv.extend(["--tier", tier])
     if comment is not None:
         # The child keeps the request's row itself: the head it resolves, which a repeat of the
@@ -487,7 +493,7 @@ def container_main():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Poll GitHub and GitLab for /review comments")
+    parser = argparse.ArgumentParser(description="Poll GitHub and GitLab for /review and /visual-review comments")
     parser.add_argument("--state-dir", type=Path, default=setup.state_dir())
     parser.add_argument("--interval", type=int,
                         help="seconds to wait after each cycle (default 120)")
@@ -524,6 +530,7 @@ def main():
             if idle_max < 1:
                 raise ValueError("REVIEW_POLL_IDLE_MAX_SECONDS must be positive")
             setup.max_input_tokens(state)
+            setup.visual_max_input_tokens(state)
             setup.max_findings(state)
             mine_seconds = history.interval()
             projects = load_config(state)

@@ -611,7 +611,7 @@ class SettingsTests(unittest.TestCase):
 
     def test_a_wizard_rerun_keeps_what_only_the_settings_page_edits(self):
         wizard(self.state, ["gitlab", "", "https://gitlab.com/org/repo", str(self.checkout), "13,27", "public", "", "n",
-                            "owner:13", "", "", "", "codex", "", "", "paste"], ["fixture-forge"])
+                            "owner:13", "", "", "", "", "codex", "", "", "paste"], ["fixture-forge"])
         settings.save(self.state, {"name": "REVIEW_SYNC_SECONDS", "value": "300"})
         settings.save(self.state, {"name": "REVIEW_OSV_DOWNLOAD_DATABASES", "value": "0"})
         bundle = setup.active_bundle(self.state) / "settings.json"
@@ -629,7 +629,7 @@ class SettingsTests(unittest.TestCase):
             return remove(path)
 
         with patch.object(shutil, "rmtree", side_effect=remove_bundle), contextlib.redirect_stderr(io.StringIO()) as warning:
-            wizard(self.state, ["y", "", "", "", "", "", "", "", "keep"], [])
+            wizard(self.state, ["y", "", "", "", "", "", "", "", "", "keep"], [])
         self.assertIn("Settings were saved", warning.getvalue())
         self.assertNotEqual(setup.active_bundle(self.state), old)
         kept = self.document()["settings"]
