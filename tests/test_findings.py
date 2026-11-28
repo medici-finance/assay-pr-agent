@@ -521,6 +521,45 @@ class QuotedEvidenceTests(unittest.TestCase):
             wrong = engine.parse_answer(envelope([dict(issue(start=line, end=line), relevant_code=quote)]), anchors)
             self.assertEqual(wrong["dropped"][0]["reason"], "quoted code does not match the cited lines")
 
+    def test_unnumbered_diff_quote_keeps_a_finding_on_added_code(self):
+        patch = "@@ -8,2 +8,3 @@\n def deliver(item):\n+    notify(item)\n     return item\n"
+        _, anchors, _, _ = engine.pack([source.File("a.py", patch, "modified")], [])
+        quoted = dict(issue(start=8, end=10),
+                      relevant_code=" def deliver(item):\n+    notify(item)\n     return item")
+        for quote in (quoted["relevant_code"], "```diff\n" + quoted["relevant_code"] + "\n```"):
+            with self.subTest(quote=quote):
+                parsed = engine.parse_answer(envelope([dict(quoted, relevant_code=quote)]), anchors)
+                self.assertEqual(parsed["dropped"], [])
+                self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_unnumbered_diff_quote_must_match_the_actual_markers_and_source(self):
+        patch = "@@ -8,2 +8,3 @@\n +context\n+    notify(item)\n     return item\n"
+        _, anchors, _, _ = engine.pack([source.File("a.py", patch, "modified")], [])
+        quote = " +context\n+    notify(item)\n     return item"
+        raw = dict(issue(start=8, end=10), relevant_code=quote)
+        [kept] = engine.parse_answer(envelope([raw]), anchors)["findings"]
+        self.assertEqual(kept["evidence"], "verified")
+        for wrong in (quote.replace(" +context", " ++context"), quote.replace("notify(item)", "notify(other)"),
+                      quote.replace("     return item", "+    return item"), "+    notify(item)"):
+            with self.subTest(quote=wrong):
+                rejected = engine.parse_answer(envelope([dict(raw, relevant_code=wrong)]), anchors)
+                self.assertEqual(rejected["findings"], [])
+                self.assertEqual(rejected["dropped"][0]["reason"], "quoted code does not match the cited lines")
+
+    def test_fenced_source_quote_gets_its_budget_before_the_diff_fallback(self):
+        _, lines = engine.section(source.File("a.py", "@@ -0,0 +1 @@\n+notify(item)\n", "added"))
+        quote = "```python\nnotify(item)\n```"
+        budget = engine.EvidenceBudget()
+        budget.remaining = 57
+        self.assertEqual(engine.quoted_evidence(quote, "", lines, 1, 1, budget), "verified")
+
+    def test_diff_fallback_checks_the_fence_content_before_the_wrapper(self):
+        _, lines = engine.section(source.File("a.py", "@@ -0,0 +1 @@\n+notify(item)\n", "added"))
+        quote = "```diff\n+notify(item)\n```"
+        budget = engine.EvidenceBudget()
+        budget.remaining = 67
+        self.assertEqual(engine.quoted_evidence(quote, "", lines, 1, 1, budget), "verified")
+
     def test_one_markdown_fence_can_wrap_an_explicit_quote(self):
         anchors = shown("return value * 2")
         exact = dict(issue(start=1, end=1), relevant_code="```python\n1 +return value * 2\n```")
@@ -647,7 +686,8 @@ class QuotedEvidenceTests(unittest.TestCase):
 
     def test_the_prompt_asks_for_the_quote_and_the_summary_counts_the_unchecked(self):
         prompt = engine.pack([source.File("a.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")], [])[0]
-        self.assertIn("Give each finding a `relevant_code` field quoting the lines it cites, exactly as shown.", prompt)
+        self.assertIn("Give every finding a `relevant_code` field with the cited head lines as plain source. "
+                      "Omit line numbers and diff markers.", prompt)
         posts = []
         report = {"provider": "cursor", "state": "reviewed", "checks": [], "omitted": [], "findings": [
             {"path": "a.py", "line": 1, "title": "t", "message": "m", "evidence": "unverified"},
