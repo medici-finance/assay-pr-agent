@@ -416,10 +416,22 @@ def normalized_text(text, *, strip=True):
         return None
 
 
+def trim_blank_edges(text):
+    """Remove blank lines at the edges while preserving indentation and line contents."""
+    leading = len(text) - len(text.lstrip(" \t\r\n"))
+    if leading == len(text):
+        return ""
+    start = max(text.rfind("\n", 0, leading), text.rfind("\r", 0, leading)) + 1
+    trailing = len(text.rstrip(" \t\r\n"))
+    line_end = re.search(r"[\r\n]", text[trailing:])
+    end = trailing + line_end.start() if line_end else len(text)
+    return text[start:end]
+
+
 def normalized_message(text):
     """Preserve Markdown whitespace in the message used for evidence and reports."""
     if "```" in text or "~~~" in text:
-        return normalized_text(text.strip("\r\n"), strip=False)
+        return normalized_text(trim_blank_edges(text), strip=False)
     return normalized_text(text)
 
 
@@ -609,7 +621,7 @@ def quoted_evidence(code, message, lines, start, end, budget):
 def quote_coverage(quote, cited, budget):
     parts = checkable(quote)
     concrete = [part for part in parts if part is not ELIDED]
-    if not concrete:
+    if not any(part[0] for part in concrete):
         return "unverified"
     if not quoted_in_order(concrete, cited):
         return None
@@ -655,19 +667,21 @@ def fenced_quote(message, *, whole=False):
 def checkable(quote):
     """The quote's lines in order: each as its raw and numbered forms, or ELIDED for an explicit elision.
 
-    Blank lines and hunk markers are left out.
+    Boundary blank lines and hunk markers are left out. Interior blanks must match a cited blank.
     """
     parts = []
-    for raw in quote.split("\n"):
+    for raw in trim_blank_edges(quote).split("\n"):
         raw = raw.removesuffix("\r")
         shown = SHOWN.fullmatch(raw.lstrip(" \t"))
         if shown:
             parts.append((raw, shown[1], shown[2]))
             continue
         standalone = raw.strip(" \t")
-        if not standalone or MARKER.fullmatch(standalone):
+        if not standalone:
+            parts.append(("", None, ""))
+        elif MARKER.fullmatch(standalone):
             continue
-        if ELISION.fullmatch(standalone):
+        elif ELISION.fullmatch(standalone):
             if parts[-1:] != [ELIDED]:
                 parts.append(ELIDED)
         else:
@@ -698,6 +712,7 @@ def candidate_margins(parts, cited, budget):
         stripped = line.lstrip(" \t")
         indents[stripped][line[:len(line) - len(stripped)]] = None
         numbered[str(index)] = line
+    parts = [part for part in parts if part[0]]
     raw = [part for part in parts if numbered.get(part[1]) != part[2]]
     # Every covering alignment must match this row as raw code. Start with the fewest possible shifts.
     seeds = [min(raw, key=lambda part: len(indents[part[0].lstrip(" \t")]))] if raw else parts
@@ -716,8 +731,9 @@ def candidate_margins(parts, cited, budget):
 
 
 def evidence_key(text, margin, single_line):
-    if single_line:
-        return text.lstrip(" \t")
+    stripped = text.lstrip(" \t")
+    if single_line or not stripped:
+        return stripped
     return text.removeprefix(margin) if text.startswith(margin) else None
 
 
@@ -809,7 +825,7 @@ def substantive(content):
 
     `return x` or `x = 1` counts; `}` or `);` alone does not, since it would match almost any range.
     """
-    visible = [char for char in content if char.isprintable() and not char.isspace()
+    visible = [char for char in unicodedata.normalize("NFC", content) if char.isprintable() and not char.isspace()
                and char not in BLANK_GLYPHS and unicodedata.category(char) not in ("Mn", "Me")]
     return len(visible) >= 3 and any(char.isalnum() for char in visible)
 

@@ -415,6 +415,24 @@ class QuotedEvidenceTests(unittest.TestCase):
         parsed = engine.parse_answer(envelope([dict(issue(start=1, end=3), relevant_code="first = 1\nsecond = 2")]), anchors)
         self.assertEqual(parsed["findings"][0]["evidence"], "verified")
 
+    def test_an_interior_quoted_blank_line_must_exist_in_source(self):
+        lines = ['text = """first', 'second"""']
+        quote = "\n".join([lines[0], "", lines[1]])
+        raw = envelope([dict(issue(start=1, end=2), relevant_code=quote)])
+        parsed = engine.parse_answer(raw, shown(*lines))
+        self.assertEqual(parsed["findings"], [])
+        self.assertEqual(parsed["dropped"][0]["reason"], "quoted code does not match the cited lines")
+        raw = envelope([dict(issue(start=1, end=3), relevant_code=quote)])
+        parsed = engine.parse_answer(raw, shown(lines[0], "", lines[1]))
+        self.assertEqual(parsed["findings"][0]["evidence"], "verified")
+
+    def test_canonically_equivalent_substantive_text_has_the_same_threshold(self):
+        for word in ("\u1100\u1161\u11a8", "\uac01"):
+            with self.subTest(word=word):
+                raw = envelope([dict(issue(start=1, end=1), relevant_code=word)])
+                parsed = engine.parse_answer(raw, shown(word))
+                self.assertEqual(parsed["findings"][0]["evidence"], "unverified")
+
     def test_a_quote_of_only_trivial_lines_is_unverified_not_dropped(self):
         anchors = shown("call(", "    x", ")", "}", "return x", "x = 1", "});")
         cases = (("x", 2, 2, "unverified"), (")", 3, 3, "unverified"), ("}", 4, 4, "unverified"),
@@ -502,7 +520,7 @@ class QuotedEvidenceTests(unittest.TestCase):
     def test_fence_indentation_matches_the_report_and_verifier_message(self):
         body = "  ```python\nif ready:\n      send()\n  ```"
         anchors = shown("if ready:", "    send()")
-        primary = envelope([issue(start=1, end=2, body="\n" + body + "\r\n")])
+        primary = envelope([issue(start=1, end=2, body="\n \n" + body + "\r\n \t\r\n")])
         [finding] = engine.parse_answer(primary, anchors)["findings"]
         self.assertEqual(finding["evidence"], "verified")
         self.assertEqual(finding["message"], body)
