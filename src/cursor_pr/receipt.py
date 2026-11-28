@@ -37,9 +37,13 @@ def count_files(files, selected, reviewable, *, validated):
 
 
 def dedupe_body(body, report):
-    """Use stable coverage counts, excluding costs that change on a cached retry."""
+    """Use stable receipt counts, excluding costs that change on a cached retry."""
+    # A pending publication saved before receipts used the original body as its key.
     counts = report.get("coverage")
-    return body if counts is None else json.dumps([body, counts], sort_keys=True)
+    if counts is None:
+        return body
+    value = report["receipt"]
+    return json.dumps([body, counts, value["findings"], value["checks"]], sort_keys=True)
 
 
 def usage_totals(usage):
@@ -69,6 +73,7 @@ def build(report):
         "cache_hit": report.get("cache_hit"),
         "estimated_input_tokens": report["estimated_input_tokens"],
         "max_input_tokens": report["max_input_tokens"],
+        "prompt_limit": report.get("prompt_limit", report["max_input_tokens"]),
         "full_input_tokens": report.get("full_input_tokens"),
         "usage": usage_totals(report.get("model_usage") or {}),
         "coverage": {"reviewed": reviewed, "text": text, "percent": percent},
@@ -91,7 +96,8 @@ def render(receipt):
         head = "Receipt: estimate only, no model call"
     elif receipt["state"] == "over-budget":
         head = "Receipt: over budget, no model call"
-    head += f". Prompt {receipt['estimated_input_tokens']:,} of {receipt['max_input_tokens']:,} estimated input tokens"
+    limit = receipt["prompt_limit"] if receipt["state"] == "over-budget" else receipt["max_input_tokens"]
+    head += f". Prompt {receipt['estimated_input_tokens']:,} of {limit:,} estimated input tokens"
     # A budget refusal already reports the full estimate as its prompt size.
     full = receipt["full_input_tokens"]
     if receipt["state"] != "over-budget" and full is not None and full > receipt["max_input_tokens"]:

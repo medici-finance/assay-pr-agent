@@ -50,6 +50,9 @@ class ReceiptTests(unittest.TestCase):
                 state="over-budget", model_invocations=0, estimated_input_tokens=9120, full_input_tokens=9120,
                 coverage={"reviewed": 0, "text": 4})))[0],
                          "Receipt: over budget, no model call. Prompt 9,120 of 6,000 estimated input tokens.")
+        tier_refusal = receipt.build(report(state="over-budget", estimated_input_tokens=11500,
+                                            max_input_tokens=12000, prompt_limit=10500))
+        self.assertIn("Prompt 11,500 of 10,500 estimated input tokens.", receipt.render(tier_refusal)[0])
         # A degraded review sent less than the whole change, so both sizes are worth stating.
         self.assertEqual(receipt.render(receipt.build(report(
                 state="degraded", estimated_input_tokens=5000, full_input_tokens=9120)))[0],
@@ -171,6 +174,41 @@ class ReceiptTests(unittest.TestCase):
             self.assertNotEqual(first["Body"], second["Body"])
             self.assertFalse(corrected["AlreadyPosted"])
             self.assertIn("Coverage: 1 of 2 text files reviewed (50%).", corrected["Body"])
+
+    def test_check_count_can_change_without_a_change_in_visible_evidence(self):
+        project = SimpleNamespace(key="github/org/repo", visibility="private")
+        head = "a" * 40
+        finding = {"path": "app.py", "line": 1, "rule": "example", "message": "x" * 200}
+        check = {"tool": "example", "state": "complete", "findings": [finding] * 100}
+        extra = {"tool": "another", "state": "could-not-check", "reason": "x" * 350, "findings": []}
+        reading = {"summary": "Adds configuration.", "changes": [], "hotspots": []}
+        diff_map = dict(cli.visual.survey([APP]), shown=[APP.path])
+        value = report(head=head, omitted=[], map=diff_map, visual=reading, checks=[check, extra])
+        with tempfile.TemporaryDirectory() as tmp, patch.object(source, "run_forge") as forge:
+            baseline = cli.visual.comment(value, cli.evidence(value))
+            value["receipt"] = receipt.build(value)
+            cli.publish("org/repo#1", head, value, project=project, state=Path(tmp))
+            extra["state"] = "complete"
+            extra["findings"] = [finding]
+            self.assertEqual(cli.visual.comment(value, cli.evidence(value)), baseline)
+            value["receipt"] = receipt.build(value)
+            cli.publish("org/repo#1", head, value, project=project, state=Path(tmp))
+        updated = forge.call_args.kwargs["publication"]
+        self.assertFalse(updated["AlreadyPosted"])
+        self.assertIn("Checks: 2 of 2 complete.", updated["Body"])
+
+    def test_pending_publication_from_an_older_worker_still_deduplicates(self):
+        project = SimpleNamespace(key="github/org/repo", visibility="private")
+        head = "a" * 40
+        old = report(omitted=[])
+        del old["coverage"]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(source, "run_forge") as forge:
+            cli.publish("org/repo#1", head, old, project=project, state=Path(tmp))
+            old["receipt"] = receipt.build(old)
+            cli.publish("org/repo#1", head, old, project=project, state=Path(tmp))
+        retry = forge.call_args.kwargs["publication"]
+        self.assertTrue(retry["AlreadyPosted"])
+        self.assertIn("Coverage: counts unavailable for this saved review.", retry["Body"])
 
 
 if __name__ == "__main__":
