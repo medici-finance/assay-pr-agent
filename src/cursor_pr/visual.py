@@ -156,8 +156,14 @@ def generated(path, patch="", status=""):
             continue
         if not block and (not COMMENT.match(text) or text.lstrip().startswith("#") and HASH_IS_CODE.search(path)):
             return False
-        if GO_GENERATED.match(text) or MARKERS.search(text):
+        # Where a block comment ends on the line, only what is before its end is comment. Code after
+        # it can hold any text, and ends the leading comment.
+        end = text.find("*/")
+        comment, code = (text[:end], text[end + 2:]) if end >= 0 else (text, "")
+        if GO_GENERATED.match(text) or MARKERS.search(comment):
             return True
+        if code.strip():
+            return False
         # Inside /* ... */ a line need not start with a comment mark.
         opened, closed = text.rfind("/*"), text.rfind("*/")
         block = opened > closed if opened >= 0 or closed >= 0 else block
@@ -232,7 +238,10 @@ def survey(files):
     return {"lines": sum(row["added"] + row["deleted"] for row in rows),
             "to_read": sum(k["added"] + k["deleted"] for k in kinds if k["read"]),
             "categories": kinds, "files": rows, "no_text": sorted(f.path for f in files if f.absent),
-            "generated": sorted(f.path for f in files if by_content(f.path, f.patch, f.status))}
+            "generated": sorted(f.path for f in files if by_content(f.path, f.patch, f.status)),
+            # A file moved without a changed line has no row in the chart, which counts lines.
+            "renamed": sorted([f.previous, f.path] for f in files if f.previous and f.previous != f.path
+                              and not any(counts(f)[:2]))}
 
 
 def pack(files):
@@ -462,6 +471,8 @@ def comment(report, evidence=()):
     # A file's own header can keep it from the model, so each one that did is named.
     coverage += limited_rows((f"- Treated as generated from its content, hunks not sent: {fence(path, 200)}"
                               for path in report.get("map", {}).get("generated", [])), 1200)
+    coverage += limited_rows((f"- Renamed with no line changed: {fence(old, 200)} to {fence(new, 200)}"
+                              for old, new in report.get("map", {}).get("renamed", [])), 1200)
     if coverage:
         coverage.insert(0, "")
     if evidence:
