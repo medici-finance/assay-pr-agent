@@ -172,7 +172,7 @@ class ReviewTest(unittest.TestCase):
         self.shim.write_text("#!/bin/sh\nexit 2\n")
         code,report = self.check("--base",self.base)
         self.assertEqual((code,report["state"]),(2,"model-unavailable"))
-        self.assertEqual(report["cursor_invocations"],1)
+        self.assertEqual(report["model_invocations"],1)
         self.assertTrue(report["checks"][0]["findings"])
         self.assertFalse(list((self.root/"cache").glob("*.json")))
 
@@ -195,10 +195,10 @@ class ReviewTest(unittest.TestCase):
         self.assertEqual(engine.parse_answer(json.dumps({"type":"result","subtype":"success","is_error":False,
                                            "result":json.dumps(info)}),{"x":{1}}),
                          {"findings": [], "dropped": [{"path": "x", "line": 17, "reason": "cited line outside the reviewed patch"}],
-                          "cursor_usage": None})
+                          "model_usage": None})
 
     def test_auto_routing_preamble(self):
         result = '> Auto routed to Example Model\n\n{"review":{"key_issues_to_review":[]}}'
         usage = {"inputTokens": 4, "cacheReadTokens": 66}
         raw = json.dumps(dict(type="result", subtype="success", is_error=False, result=result, usage=usage))
-        self.assertEqual(engine.parse_answer(raw, {}), {"findings": [], "dropped": [], "cursor_usage": usage})
+        self.assertEqual(engine.parse_answer(raw, {}), {"findings": [], "dropped": [], "model_usage": usage})

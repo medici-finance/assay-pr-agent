@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cursor-pr-review"
 version = "0.1.0"
-description = "Single-pass Cursor reviewer for GitHub pull requests and GitLab merge requests"
+description = "Single-pass bounded reviewer for GitHub pull requests and GitLab merge requests, with Cursor, Claude or Codex as the model"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
-dependencies = ["pr-agent==0.50.0", "httpx"]
+dependencies = ["httpx", "pyyaml==6.0.3", "tiktoken==0.14.0", "unidiff==1.0.1"]
 
 [project.scripts]
 cursor-review-setup = "cursor_pr.setup:main"
@@ -22,3 +22,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 cursor_pr = ["setup.html", "setup.css", "setup.js"]
+"cursor_pr.vendor" = ["LICENSE.pr-agent", "README.md", "pr_review_prompt.system.txt", "tiktoken/*"]

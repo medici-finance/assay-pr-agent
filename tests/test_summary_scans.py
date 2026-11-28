@@ -138,7 +138,7 @@ class SummaryScannerTests(unittest.TestCase):
         calls, posts = [], []
         def invoke(prompt, model, anchors):
             calls.append(prompt)
-            return {"findings": [], "cursor_usage": None}
+            return {"findings": [], "model_usage": None}
         def publish(project, number, head, body, state, *args):
             posts.append(body)
         def local(root, head, tool, path, cache, **kwargs):

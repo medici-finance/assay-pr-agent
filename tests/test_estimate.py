@@ -8,8 +8,8 @@ TEXTS = ["def total(items):", "sum += item  # 🙂", "日本語のテキスト�
 
 
 def count(name, text):
-    from pr_agent.algo.token_handler import TokenEncoder
-    return len(TokenEncoder.get_token_encoder(name).encode(text, disallowed_special=()))
+    from cursor_pr.vendor.tokens import encoding
+    return len(encoding(name).encode(text, disallowed_special=()))
 
 
 class EstimateTests(unittest.TestCase):

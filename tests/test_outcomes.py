@@ -45,7 +45,7 @@ class OutcomeTests(unittest.TestCase):
             posts.append(args[3])
         with patch.object(cli, "forge_change", return_value=source.Change(head, files, CHANGE_URL)), \
              patch.object(cli, "scan_files", return_value=[]), \
-             patch.object(engine, "invoke", return_value={"findings": answer, "dropped": [], "cursor_usage": None}), \
+             patch.object(engine, "invoke", return_value={"findings": answer, "dropped": [], "model_usage": None}), \
              patch.object(cli.drift, "forge", return_value={"state": "could-not-check", "behind": None, "both": [], "references": []}), \
              patch.object(cli, "post_comment", side_effect=post):
             report, code = cli.run_request(args)

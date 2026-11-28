@@ -9,7 +9,6 @@ import re
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
 
 from unidiff.errors import UnidiffParseError
@@ -24,7 +23,7 @@ from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import go_report, scan_files
 from .sync import scan_checkout
-from .engine import CursorFailure, pack, review, section, tokens
+from .engine import ModelFailure, pack, review, section, tokens
 from .source import ReviewError, ci_refs, classify_absent, forge_change, local_change, post_comment, valid_sha
 
 
@@ -269,10 +268,10 @@ def execute(args):
     backend = providers.provider()
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
               "estimated_input_tokens": estimated, "max_input_tokens": args.max_input_tokens,
-              "cursor_invocations": 0, "cache_hit": False, "omitted": omitted,
+              "model_invocations": 0, "cache_hit": False, "omitted": omitted,
               "not_reviewable": [path for path in no_text if path not in unavailable],
               "checks": checks,
-              "findings": [], "cursor_usage": None, "full_input_tokens": full, "degraded": degraded,
+              "findings": [], "model_usage": None, "full_input_tokens": full, "degraded": degraded,
               "drift": drifted}
     deselected = [f for f in change.files if f.path not in selected]
     known_no_text = len(report["not_reviewable"]) + sum(not has_reviewable_text(f) for f in deselected)
@@ -295,18 +294,20 @@ def execute(args):
         try:
             answer, cached = review(prompt, args.model, anchors, args.cache_dir,
                                     change.identity)
-        except CursorFailure as err:
+        except ModelFailure as err:
             return dict(report, state="model-unavailable", error=str(err),
-                        cursor_invocations=err.invocations, cursor_usage=err.usage), 2, None
+                        model_invocations=err.invocations, model_usage=err.usage), 2, None
         except (ReviewError, OSError, ValueError, KeyError, TypeError, AttributeError,
                 subprocess.TimeoutExpired, yaml.YAMLError) as err:
             # Preserve deterministic diagnostics even if the model failed.
             return dict(report, state="model-unavailable", error=str(err) if isinstance(err, ReviewError)
-                        else type(err).__name__, cursor_invocations=None), 2, None
-        report.update(answer, cache_hit=cached, cursor_invocations=int(not cached))
+                        else type(err).__name__, model_invocations=None), 2, None
+        # A result cached before the keys were renamed still carries the old one.
+        report.update(answer, cache_hit=cached, model_invocations=int(not cached))
         report["coverage"]["reviewed"] = prompt_files - len(degraded)
+        report.pop("cursor_usage", None)
         if cached:
-            report["cursor_usage"] = None
+            report["model_usage"] = None
     if report.get("dropped") and not report["findings"]:
         # The model answered but nothing it said could be checked: as unusable as no answer, whatever the coverage.
         return dict(report, state="findings-dropped"), 2, (anchors, paths)
@@ -328,13 +329,10 @@ def track(report, tracking, *, persist):
 
 def run_request(args):
     report, code, scope = execute(args)
-    backend = report["provider"]
-    if backend != "cursor":
-        report["model_invocations"] = report["cursor_invocations"]
-        report["model_usage"] = report["cursor_usage"]
-        report.update(cursor_invocations=0, cursor_usage=None)
-    else:
-        report.update(model_invocations=report["cursor_invocations"], model_usage=report["cursor_usage"])
+    # Preserve the legacy JSON fields for consumers that have not migrated to model_*.
+    cursor = report["provider"] == "cursor"
+    report["cursor_invocations"] = report["model_invocations"] if cursor else 0
+    report["cursor_usage"] = report["model_usage"] if cursor else None
     report["receipt"] = receipt.build(report)
     if args.post:
         tracking = None
@@ -355,7 +353,6 @@ def run_request(args):
 
 def main():
     args = parser().parse_args()
-    # Load PR-Agent settings only from an empty directory, independent of the target repo.
     args.repo = args.repo.resolve()
     args.cache_dir = args.cache_dir.resolve()
     if args.go_report:
@@ -400,10 +397,7 @@ def main():
                 args.forge_project = project
                 args.forge_state = state
                 args.managed_project = project if project.managed else None
-            clean = stack.enter_context(tempfile.TemporaryDirectory(prefix="pr-agent-settings-"))
-            os.chdir(clean)
-            from pr_agent.algo.git_patch_processing import to_hunk_only_patch  # noqa: F401
-            from pr_agent.algo.token_handler import TokenEncoder  # noqa: F401
+            # The forge and desk tools discover their configured forge from the caller's checkout.
             os.chdir(args.repo)
             report, status = run_request(args)
         print(json.dumps(report, ensure_ascii=True, indent=2))
