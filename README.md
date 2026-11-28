@@ -480,6 +480,16 @@ The default reviewer credentials cannot post it, and setup still requests the le
 
 GitHub identifies the check by commit SHA. Pull requests that share a head can share its result, and retargeting a pull request can change the diff without changing the check. Use it as a commit-level status. A merge gate that requires a review of the current pull request diff needs a separate check of the base and head. [REST API endpoints for check runs](https://docs.github.com/en/rest/checks/runs#create-a-check-run) · [GitLab commit statuses](https://docs.gitlab.com/api/commits/#set-commit-pipeline-status)
 
+### Post inline comments
+
+Add `--inline-comments`, or set `REVIEW_INLINE_COMMENTS=1`, to add model findings to the diff after the summary posts on a `--change` review. The feature is off by default and never runs for `--estimate`. Inline content goes through the same head, visibility and outbound-text checks as a summary.
+
+GitHub sends the findings in one comment review, then retries individual findings if the forge refuses the batch. It identifies its reviewer by verifying the App ID on the summary against the installed App that minted the reviewer credential. GitLab sends one discussion per finding, using the reviewed head’s diff references and both paths for a rename. Each successful review or discussion records markers for the findings it actually posted. A repeat skips those findings and can retry the rest. Runs using the same state volume serialize the lookup and writes for a change and head.
+
+The JSON report gives `inline_publication` as `posted`, `already-present`, `stale`, `failed` or `skipped`. On an attempted run, `inline_posted` and `inline_refused` report confirmed writes and findings the forge refused or the reviewer could not place, including when a later request fails. The summary remains the full record and controls the review's exit code.
+
+Inline API writes use the configured reviewer credential. The draft still needs verification on both real forges before enablement, including forked GitHub requests and GitLab rename positions. [GitHub review API](https://docs.github.com/en/rest/pulls/reviews#create-a-review-for-a-pull-request) · [GitLab merge request discussions](https://docs.gitlab.com/api/discussions/#create-a-merge-request-thread)
+
 ## Verification
 
 ```sh

@@ -29,7 +29,7 @@ from .credentials import forge_credentials
 from .artifacts import forge_go_report
 from .checks import blob, go_report, scan_files
 from .sync import scan_checkout
-from . import forge_status
+from . import forge_status, inline
 from .discovery import context_comments
 from .engine import (MAX_FINDINGS, CursorFailure, fit_verification, merge_findings, pack, prompt_advisories, rank,
                      render_sections, review, tokens, visible_advisories)
@@ -610,6 +610,8 @@ def parser():
     p.add_argument("--sarif", type=Path, help="Also write the findings as a SARIF 2.1.0 log at this path")
     p.add_argument("--forge-status", action="store_true",
                    help="Report the review on the reviewed head as a GitHub check run or GitLab commit status")
+    p.add_argument("--inline-comments", action="store_true",
+                   help="With --post, also comment on the reviewed head's lines for each model finding")
     return p
 
 
@@ -647,6 +649,9 @@ def execute_review(args, verification_resources):
     if args.request:
         if not getattr(args, "own_row", False):
             raise ReviewError("The request's row was not checked against the change")
+        # Before a prepared report is handed back: its inline comments still need the old path of
+        # a renamed file, and nothing after this point runs for it.
+        args.inline_previous_paths = {file.path: file.previous for file in change.files if file.previous}
         prepared = claim_head(args, change.head)
         if prepared is not None:
             report, code = json.loads(prepared)
@@ -659,6 +664,8 @@ def execute_review(args, verification_resources):
     if not selected <= paths:
         raise ReviewError("--path must name a file changed in this review")
     files = sorted((f for f in change.files if f.path in selected), key=lambda f: f.path)
+    if args.change:
+        args.inline_previous_paths = {file.path: file.previous for file in files if file.previous}
     project = getattr(args, "managed_project", None)
     wanted = scanners.inputs(files) if args.change else set()
     static = scanners.ci_results(args.expected_change_url, change.head, root, wanted, args.scanner_ci or {})
@@ -967,6 +974,7 @@ def run_request(args):
     # The check says how a review for defects ended, and a visual review is none: posted under the
     # same name it would replace that review's findings, or pass for one that never ran.
     report["forge_status"] = "skipped" if "map" in report else forge_status.outcome(args, report)
+    report.update(inline.outcome(args, report))
     return report, code
 
 
