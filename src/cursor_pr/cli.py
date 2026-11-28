@@ -33,7 +33,7 @@ from . import forge_status
 from .discovery import context_comments
 from .engine import (MAX_FINDINGS, CursorFailure, fit_verification, merge_findings, pack, prompt_advisories, rank,
                      render_sections, review, tokens, visible_advisories)
-from .source import ReviewError, ci_refs, forge_change, local_change, post_comment, valid_sha
+from .source import ReviewError, ci_refs, classify_absent, forge_change, local_change, post_comment, valid_sha
 from . import visual
 
 
@@ -465,6 +465,11 @@ def publish(address, head, report, *, project=None, state=None):
         body.extend(["", *history.summary(report["qualgen"]), ""])
     if "drift" in report:
         body.extend(["", *drift.summary(report["drift"]), ""])
+    if not_reviewable := report.get("not_reviewable"):
+        listed = ", ".join(fence(path, 200) for path in not_reviewable[:20])
+        extra_files = len(not_reviewable) - 20
+        more = f" and {extra_files} more" if extra_files > 0 else ""
+        body.append(f"- Not reviewed, no text to review: {listed}{more}.")
     outside = [f"- Outside review coverage: {fence(path)}" for path in report["omitted"]]
     extra = [f"- Not reviewed (token limit): {extra_coverage} more files"] if extra_coverage else []
     footer = ["", providers.ATTRIBUTION]
@@ -670,6 +675,9 @@ def execute_review(args, verification_resources):
             if hasattr(args, "sarif_resources"):
                 args.sarif_checkout = checkout
         patch_base = drift.patch_base(root, checkout, change)
+        if args.change and not args.visual:
+            files = classify_absent(checkout, change.head, files, base_root=root, base=patch_base,
+                                    supplied_base=bool(change.patch_base))
         checks = scan_files(checkout, change.head, files, base_root=root, base=patch_base)
         deadline = time.monotonic() + 180
         for tool, path in missing:
@@ -799,11 +807,14 @@ def execute_review(args, verification_resources):
     reviewable = selected - set(unseen)
     planned_paths = {path for _, _, locations, _ in plans for path, lines in locations.items() if lines}
     degraded = sorted(reviewable - planned_paths) if plans else []
-    omitted = sorted(set(unseen) | (paths - selected))
+    unavailable = {f.path for f in files if f.patch_unavailable}
+    omitted = sorted(unavailable | (paths - selected))
+    not_reviewable = sorted(set(unseen) - unavailable)
     report = {"provider": backend, "source": change.identity, "head": change.head, "model": args.model or f"{backend}-default",
               "estimated_input_tokens": sum(row["estimated_input_tokens"] for row in passes),
               "max_input_tokens": budget, "base_input_tokens": base, "prompt_limit": limit, "tier": tier,
-              "cursor_invocations": 0, "cache_hit": False, "omitted": omitted, "checks": checks,
+              "cursor_invocations": 0, "cache_hit": False, "omitted": omitted,
+              "not_reviewable": not_reviewable, "checks": checks,
               "findings": [], "cursor_usage": None, "full_input_tokens": full, "degraded": degraded,
               "drift": drifted, "passes": passes, "context": list(context_fates.values()),
               "verification": {"state": "not-needed"}, "delivered": planned_tier, "max_findings": caps[tier]}
@@ -816,7 +827,8 @@ def execute_review(args, verification_resources):
     if has_text and not passes:
         return dict(report, state="over-budget", estimated_input_tokens=full, prompt_limit=deep_limit, delivered=None), 2
     if args.estimate:
-        return dict(report, state="estimate"), 2 if degraded or (has_text and planned_tier != tier) else 0
+        incomplete_estimate = degraded or unavailable or (has_text and planned_tier != tier)
+        return dict(report, state="estimate"), 2 if incomplete_estimate else 0
 
     completed, coverage, findings, deep_findings, last_error = [], {}, [], [], None
     dropped_findings = []

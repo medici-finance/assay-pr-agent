@@ -311,7 +311,7 @@ class ReviewTest(unittest.TestCase):
         with patch.object(cli, "load_config", return_value={project.key: project}), \
              patch.object(cli, "forge_credentials"), patch.object(cli, "forge_change", return_value=change):
             code,report = self.check("--change","org/repo#1")
-        self.assertEqual((code,report["omitted"]),(2,["image"]))
+        self.assertEqual((code, report["state"], report["omitted"], report["not_reviewable"]), (2, "partial", ["image"], []))
         self.assertFalse(self.calls.exists())
         report = self.root/"go.json"
         report.write_text(json.dumps({"schema":"go-analysis/v1","source_sha":self.base}))

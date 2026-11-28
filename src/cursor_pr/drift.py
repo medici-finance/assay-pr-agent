@@ -32,7 +32,8 @@ def patch_base(root, checkout, change):
         return change.patch_base
     try:
         objects = None if root == checkout else git(root, "rev-parse", "--path-format=absolute", "--git-path", "objects")
-        bases = git(checkout, "merge-base", "--all", change.base, change.head, alternates=objects).split()
+        bases = git(checkout, "--no-replace-objects", "merge-base", "--all", change.base, change.head,
+                    alternates=objects).split()
     except (ReviewError, OSError, ValueError, subprocess.SubprocessError):
         return ""
     return bases[0] if len(bases) == 1 and valid_sha(bases[0]) else ""
