@@ -74,6 +74,15 @@ class ParseAnswerTests(unittest.TestCase):
         self.assertEqual(first["unmatched_quote_row"], 3)
         self.assertFalse(second["diff_markers"])
 
+    def test_diff_marker_hint_keeps_literal_plus_on_context_rows(self):
+        anchors = {"a.py": {2: "+value", 3: "next()"}}
+        for separator in ("\n", "\r\n", "\r"):
+            raw = envelope([dict(issue(end=3), relevant_code=separator.join((" +value", "+next()")))])
+            with self.subTest(separator=separator):
+                parsed = engine.parse_answer(raw, anchors, explain_dropped=True)
+                self.assertEqual(parsed["findings"], [])
+                self.assertTrue(parsed["dropped"][0]["diff_markers"])
+
     def test_engine_keeps_diagnostics_distinct_when_a_caller_uses_the_same_cache(self):
         raw = envelope([issue(), issue(start=81, end=82)])
 

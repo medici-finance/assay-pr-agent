@@ -803,14 +803,19 @@ def explain_rejection(issue, anchors, dropped):
     kept = quoted_prefix(parts, cited)
     if kept == len(parts):
         return dropped
-    stripped, count = re.subn(r"^[ \t]*\+", "", quote, flags=re.M)
+    # Python's multiline anchor covers LF. The quote validator also accepts CR-only rows.
+    line_start = r"(?:^|(?<=\r))"
+    stripped, count = re.subn(line_start + r"[ \t]*\+", "", quote, flags=re.M)
     diff_markers = False
     if count:
         # A diff may put a leading space on its unchanged rows. Require the same validator
         # to verify a candidate after removing markers, including full citation coverage.
-        with_context_stripped = re.sub(r"^(?:[ \t]*\+| )", "", quote, flags=re.M)
+        # Try literal first-column markers as well, so context beginning with a real '+'
+        # keeps it after the first-column space is removed.
+        first_column = re.sub(line_start + r"[+ ]", "", quote, flags=re.M)
+        with_context_stripped = re.sub(line_start + r"(?:[ \t]*\+| )", "", quote, flags=re.M)
         diff_markers = any(quoted_evidence(candidate, "", lines, start, end, EvidenceBudget()) == "verified"
-                           for candidate in (stripped, with_context_stripped))
+                           for candidate in (first_column, stripped, with_context_stripped))
     return dict(dropped, unmatched_quote_row=numbered[kept][0], diff_markers=diff_markers)
 
 
