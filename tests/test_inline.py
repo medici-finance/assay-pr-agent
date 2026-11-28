@@ -150,7 +150,11 @@ class InlineTests(unittest.TestCase):
                 if self.fail_after == 0:
                     return httpx.Response(502)
                 self.fail_after -= 1
-        return httpx.Response(422 if request.url.host == "api.github.com" and refused else 400 if refused else self.status, json={"id": 5})
+        if request.url.host == "api.github.com" and refused:
+            # As GitHub answered a comment on a line outside the diff of a real pull request.
+            return httpx.Response(422, json={"message": "Unprocessable Entity", "errors": ["Line could not be resolved"],
+                                             "status": "422"})
+        return httpx.Response(400 if refused else self.status, json={"id": 5})
 
     def exercise(self, provider, *options, findings=FINDINGS, model=None, desk_error=None, cache=None, previous=None):
         files = [source.File("demo.py", "@@ -0,0 +1 @@\n+x = 1\n", "added")]
@@ -410,6 +414,18 @@ class InlineTests(unittest.TestCase):
             report, *_ = self.exercise("github", "--post", "--inline-comments")
         self.assertEqual((report["inline_publication"], report["inline_refused"], len(self.posted())), ("failed", 0, 1))
         self.assertIn("HTTP 422", logs.output[0])
+        # Nor is any other 422 that names no line or path: one with no errors, or not JSON at all.
+        for answer in (httpx.Response(422, json={"message": "Unprocessable Entity"}), httpx.Response(422, text="no")):
+            self.intercept, self.requests = (lambda request, answer=answer: answer if request.method == "POST" else None), []
+            with self.assertLogs(LOG, level="WARNING"):
+                report, *_ = self.exercise("github", "--post", "--inline-comments")
+            self.assertEqual((report["inline_publication"], len(self.posted())), ("failed", 1))
+        # A path GitHub cannot place is one finding's problem, like a line.
+        self.intercept = lambda request: (httpx.Response(422, json={"errors": ["Path could not be resolved"]})
+                                          if request.method == "POST" and len(json.loads(request.content)["comments"]) > 1 else None)
+        self.requests = []
+        report, *_ = self.exercise("github", "--post", "--inline-comments")
+        self.assertEqual((report["inline_publication"], report["inline_posted"]), ("posted", 2))
 
     def test_it_runs_only_when_enabled_for_a_posted_forge_review(self):
         report, code, _ = self.exercise("github", "--post")

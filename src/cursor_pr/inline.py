@@ -125,6 +125,21 @@ def authorize(project, number, head, rows, previous):
     check_publication(project, number, head, "\n\n".join(checked))
 
 
+def unplaced(response):
+    """Whether GitHub refused a review because a comment's line or path is not in the diff.
+
+    As it answers a pull request today: 422 with errors ["Line could not be resolved"] or
+    ["Path could not be resolved"]. Any other 422 is a refusal of the review as a whole.
+    """
+    if response.status_code != 422:
+        return False
+    try:
+        errors = response.json().get("errors")
+    except (ValueError, AttributeError):
+        return False
+    return isinstance(errors, list) and any(isinstance(e, str) and e.endswith("could not be resolved") for e in errors)
+
+
 def github(client, headers, project, slug, number, rows, me, head, progress):
     """Return whether all findings were already present, retaining each posting outcome."""
     # Each comment closes with its own marker, as on GitLab, so a later run with a different set of
@@ -148,9 +163,10 @@ def github(client, headers, project, slug, number, rows, me, head, progress):
         submit(rows)
         progress.posted += len(rows)
     except httpx.HTTPStatusError as error:
-        # 422 is also how GitHub turns a review away as spam. That is not a line it could not
-        # place: sending each finding again by itself would only add to it.
-        if error.response.status_code != 422 or b"spam" in error.response.content.lower():
+        # 422 is how GitHub says a comment could not be placed, and also how it turns a review
+        # away for other reasons, such as spam. Only the first is one finding's problem: sending
+        # each finding again by itself after any other refusal would only add to it.
+        if not unplaced(error.response):
             raise
         if len(rows) == 1:
             progress.refused += 1
@@ -164,7 +180,7 @@ def github(client, headers, project, slug, number, rows, me, head, progress):
                     submit([row])
                     progress.posted += 1
                 except httpx.HTTPStatusError as refusal:
-                    if refusal.response.status_code != 422:
+                    if not unplaced(refusal.response):
                         raise
                     progress.refused += 1
     return False
