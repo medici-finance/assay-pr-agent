@@ -17,6 +17,12 @@ from .source import valid_sha
 log = logging.getLogger(__name__)
 HEADER = Path("docs/quality/mine.json")
 DEFAULT_INTERVAL = 86400
+# `qualgen check` prints prose, not structured data: tests/test_history.py reads LINE from each real
+# release named here, and any other release leaves the screen unavailable rather than parsed.
+VERIFIED_RELEASES = frozenset({"v1.0.94"})
+LINE = re.compile(r"(.+?): (NOTICE ([\w-]+) — (.+)|could-not-screen — .+|no advisory signal in this screen)")
+UNVERIFIED = "unverified-release"
+_verified = None  # The last executable identity and the result of its version probe
 
 
 def interval():
@@ -42,11 +48,38 @@ def tip(repo):
     return sha
 
 
-def qualgen(mode, repo, tracking, *args, timeout):
+def qualgen(mode, repo, tracking, *args, timeout, executable="qualgen"):
     # git-sync uses a relative gitdir in a linked worktree. go-git needs its physical path.
-    return subprocess.run(["qualgen", mode, "--repo", str(repo.resolve()), "--out", str(tracking), *args],
+    return subprocess.run([executable, mode, "--repo", str(repo.resolve()), "--out", str(tracking), *args],
                           cwd=tracking, env={"PATH": os.environ["PATH"]}, check=True, text=True,
                           encoding="utf-8", capture_output=True, timeout=timeout).stdout
+
+
+def reported_release(cwd, executable="qualgen"):
+    # Run from the tracking root, as for check, and never from inside the repository.
+    return subprocess.run([executable, "--version"], cwd=cwd, env={"PATH": os.environ["PATH"]}, check=True, text=True,
+                          encoding="utf-8", capture_output=True, timeout=30).stdout.strip()
+
+
+def verified(cwd):
+    """Return the resolved Qualgen executable if this version is known to the parser."""
+    global _verified
+    name = shutil.which("qualgen")
+    if not name:
+        raise FileNotFoundError("qualgen")
+    executable = Path(name).resolve(strict=True)
+    stat = executable.stat()
+    identity = (executable, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    cached = _verified
+    if cached is None or cached[0] != identity:
+        supported = reported_release(cwd, executable) in VERIFIED_RELEASES
+        _verified = (identity, supported)
+        if not supported:
+            # The release qualgen reported is not echoed: it is unverified tool output.
+            log.warning("Qualgen on PATH is not a verified release; history screening is unavailable")
+    else:
+        supported = cached[1]
+    return executable if supported else None
 
 
 def mined_tip(snapshot):
@@ -105,6 +138,9 @@ def screen(repo, store, paths, head):
         with locked(store, fcntl.LOCK_SH):
             snapshot = store / "current"
             result["history_head"] = mined_tip(snapshot)
+            executable = verified(snapshot)
+            if executable is None:
+                return dict(result, reason=UNVERIFIED)
             # check also consults checkout HEAD for live reference-rot notices.
             same_head = tip(repo) == head
             literals = []
@@ -120,12 +156,19 @@ def screen(repo, store, paths, head):
                         continue
                     path = re.sub(r"([\\*?\[])", r"\\\1", path)
                 literals.append(path)
-            output = qualgen("check", repo, snapshot, "--", *literals, timeout=60) if literals else ""
+            output = qualgen("check", repo, snapshot, "--", *literals, timeout=60,
+                             executable=executable) if literals else ""
             same_head = same_head and tip(repo) == head
-        seen = set()
+        # Paths withheld above never reached Qualgen, so they say nothing about its output.
+        sent = set(paths) - set(result["unscreened"])
+        unrecognized, seen = 0, set()
         for line in output.splitlines():
-            match = re.fullmatch(r"(.+?): (NOTICE ([\w-]+) — (.+)|could-not-screen — .+|no advisory signal in this screen)", line)
-            if not match or match[1] not in paths:
+            if not line.strip():
+                continue
+            # A known status for a path this review did not screen is as unexpected as any other text.
+            match = LINE.fullmatch(line)
+            if not match or match[1] not in sent:
+                unrecognized += 1
                 continue
             path, status, kind, detail = match.groups()
             seen.add(path)
@@ -133,8 +176,16 @@ def screen(repo, store, paths, head):
                 result["unscreened"].append(path)
             elif kind and (kind != "reference-rot" or same_head):
                 result["advisories"].append({"path": path, "kind": kind, "detail": detail})
+        missing = sent - seen
+        if unrecognized:
+            # Advisories that did parse are kept: each matched the verified shape for a screened path,
+            # and dropping them would lose real warnings behind a visible format problem. A path with
+            # no recognised line stays unscreened, so unreadable output never reads as a clean screen.
+            # Only counts and screened paths are kept: check output carries repository text.
+            result["unrecognized"] = {"lines": unrecognized, "paths": sorted(missing)}
+            log.warning("Qualgen check printed %d line(s) this reviewer could not read", unrecognized)
         result["unscreened"] = sorted(set(result["unscreened"]) | (set(paths) - seen))
-        result["state"] = "partial" if result["unscreened"] else "complete"
+        result["state"] = "partial" if result["unscreened"] or unrecognized else "complete"
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         pass
     return result
@@ -142,16 +193,24 @@ def screen(repo, store, paths, head):
 
 def summary(result):
     if result["state"] == "unavailable":
-        return ["Qualgen history unavailable for this review."]
+        return ["Qualgen history unavailable for this review." +
+                (" The installed Qualgen release is not one this reviewer has verified." if result.get("reason") == UNVERIFIED else "")]
     rows = [f"- {a['path']} — {a['kind']}: {a['detail']}" for a in result["advisories"]]
-    rows.extend(f"- {p} — insufficient history or unable to screen" for p in result["unscreened"])
+    drift = result.get("unrecognized")
+    unreadable = set(drift["paths"]) if drift else ()
+    rows.extend(f"- {p} — " + ("Qualgen output could not be read" if p in unreadable else "insufficient history or unable to screen")
+                for p in result["unscreened"])
     head = result.get("history_head", "")[:12]
     lines = [f"Qualgen history advisories (baseline {head})" if head else "Qualgen history advisories"]
+    note = (f"Qualgen printed {drift['lines']} line{'s' if drift['lines'] > 1 else ''} this reviewer could not read, "
+            "so this list may be missing advisories.") if drift else None
     if not rows:
-        return lines + ["No historical advisories for the selected files."]
+        return lines + [note or "No historical advisories for the selected files."]
     # Leave room in the forge comment for scanner and model findings.
     for row in rows[:20]:
         lines.append(f"- {fence(row[2:], 500)}")
     if len(rows) > 20:
         lines.append(f"{len(rows) - 20} additional Qualgen entries omitted from this comment.")
+    if note:
+        lines.append(note)
     return lines
